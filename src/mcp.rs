@@ -10,9 +10,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
+use crate::go_index::{
+    IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest, SearchGoSymbolsRequest,
+};
+use crate::memory::{ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest};
 use crate::tools::{
     ListDirRequest, ReadFileLinesRequest, ReadFileRequest, ReplaceRangeRequest, SearchTextRequest,
     Workspace, WorkspaceInfoRequest, WriteFileRequest,
+};
+use crate::ts_index::{
+    IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest, SearchTsSymbolsRequest,
 };
 
 pub async fn handle_mcp_get() -> Response {
@@ -213,6 +220,62 @@ async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value
         "replace_range" => serde_json::to_value(
             workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?,
         )?,
+        "index_go_workspace" => {
+            serde_json::to_value(workspace.index_go_workspace(serde_json::from_value::<
+                IndexGoWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "go_index_status" => {
+            serde_json::to_value(workspace.go_index_status(serde_json::from_value::<
+                IndexGoWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "list_go_symbols" => serde_json::to_value(
+            workspace
+                .list_go_symbols(serde_json::from_value::<ListGoSymbolsRequest>(arguments)?)?,
+        )?,
+        "search_go_symbols" => serde_json::to_value(
+            workspace
+                .search_go_symbols(serde_json::from_value::<SearchGoSymbolsRequest>(arguments)?)?,
+        )?,
+        "read_go_symbol" => serde_json::to_value(
+            workspace.read_go_symbol(serde_json::from_value::<ReadGoSymbolRequest>(arguments)?)?,
+        )?,
+        "index_ts_workspace" => {
+            serde_json::to_value(workspace.index_ts_workspace(serde_json::from_value::<
+                IndexTsWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "ts_index_status" => {
+            serde_json::to_value(workspace.ts_index_status(serde_json::from_value::<
+                IndexTsWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "list_ts_symbols" => serde_json::to_value(
+            workspace
+                .list_ts_symbols(serde_json::from_value::<ListTsSymbolsRequest>(arguments)?)?,
+        )?,
+        "search_ts_symbols" => serde_json::to_value(
+            workspace
+                .search_ts_symbols(serde_json::from_value::<SearchTsSymbolsRequest>(arguments)?)?,
+        )?,
+        "read_ts_symbol" => serde_json::to_value(
+            workspace.read_ts_symbol(serde_json::from_value::<ReadTsSymbolRequest>(arguments)?)?,
+        )?,
+        "record_work_memory" => {
+            serde_json::to_value(workspace.record_work_memory(serde_json::from_value::<
+                RecordWorkMemoryRequest,
+            >(arguments)?)?)?
+        }
+        "list_work_memory" => serde_json::to_value(
+            workspace
+                .list_work_memory(serde_json::from_value::<ListWorkMemoryRequest>(arguments)?)?,
+        )?,
+        "search_work_memory" => {
+            serde_json::to_value(workspace.search_work_memory(serde_json::from_value::<
+                SearchWorkMemoryRequest,
+            >(arguments)?)?)?
+        }
         _ => anyhow::bail!("unknown tool: {name}"),
     };
 
@@ -231,13 +294,14 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "workspace_info",
-            "description": "Return workspace root, platform, allowed access scope, and ignore summary.",
+            "description": "Return workspace root, platform, allowed access scope, and ignore summary. Requires workspace_root.",
             "inputSchema": {
                 "type": "object",
+                "required": ["workspace_root"],
                 "properties": {
                     "workspace_root": {
                         "type": "string",
-                        "description": "Optional absolute project directory to use for this call. Defaults to the server startup directory."
+                        "description": "Absolute project directory to use for this call."
                     }
                 }
             }
@@ -343,6 +407,169 @@ fn tool_definitions() -> Value {
                     "end_line": { "type": "integer" },
                     "replacement": { "type": "string" },
                     "expected_old_text": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "index_go_workspace",
+            "description": "Build or rebuild the Go symbol index for the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "go_index_status",
+            "description": "Check whether the Go symbol index exists for the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "list_go_symbols",
+            "description": "List Go symbols with optional file and kind filters. Builds the Go index automatically if missing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "file_path": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["function", "method", "struct", "interface", "type"] }
+                }
+            }
+        },
+        {
+            "name": "search_go_symbols",
+            "description": "Search Go symbols by name, signature, docstring, or file path. Builds the Go index automatically if missing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }
+        },
+        {
+            "name": "read_go_symbol",
+            "description": "Read an indexed Go symbol with optional caller/callee context.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "symbol_id": { "type": "string" },
+                    "include_context": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
+            "name": "index_ts_workspace",
+            "description": "Build or rebuild the TS/JS symbol index for the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "ts_index_status",
+            "description": "Check whether the TS/JS symbol index exists for the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "list_ts_symbols",
+            "description": "List TS/JS symbols with optional file and kind filters. Builds the TS/JS index automatically if missing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "file_path": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["function", "arrow_function", "class", "method", "interface", "type_alias", "enum", "const", "component"] }
+                }
+            }
+        },
+        {
+            "name": "search_ts_symbols",
+            "description": "Search TS/JS symbols by name, signature, docstring, or file path. Builds the TS/JS index automatically if missing.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }
+        },
+        {
+            "name": "read_ts_symbol",
+            "description": "Read an indexed TS/JS symbol with optional caller/callee context.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "symbol_id": { "type": "string" },
+                    "include_context": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
+            "name": "record_work_memory",
+            "description": "Record an AI work summary for a workspace after code changes or investigation.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "summary"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "summary": { "type": "string" },
+                    "files_changed": { "type": "array", "items": { "type": "string" }, "default": [] },
+                    "implementation": { "type": "string" },
+                    "tests": { "type": "string" },
+                    "risks": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "list_work_memory",
+            "description": "List recent AI work memories for a workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "search_work_memory",
+            "description": "Search AI work memories for a workspace.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
                 }
             }
         }

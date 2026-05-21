@@ -8,6 +8,18 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::go_index::{
+    self, IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest,
+    SearchGoSymbolsRequest,
+};
+use crate::memory::{
+    self, ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest,
+};
+use crate::ts_index::{
+    self, IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest,
+    SearchTsSymbolsRequest,
+};
+
 const DEFAULT_MAX_READ_BYTES: u64 = 1024 * 1024;
 const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_MAX_DEPTH: usize = 1;
@@ -44,6 +56,8 @@ pub enum ToolError {
     NotDirectory(String),
     #[error("workspace_root must be an absolute directory path: {0}")]
     WorkspaceRootMustBeAbsolute(String),
+    #[error("workspace_root is required for this tool")]
+    WorkspaceRootRequired,
     #[error("file is too large: {actual} bytes exceeds limit {limit} bytes")]
     FileTooLarge { actual: u64, limit: u64 },
     #[error("content is too large: {actual} bytes exceeds limit {limit} bytes")]
@@ -196,6 +210,7 @@ pub struct WriteFileRequest {
 pub struct WriteFileResponse {
     pub path: String,
     pub bytes_written: usize,
+    pub go_reindexed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,6 +230,23 @@ pub struct ReplaceRangeResponse {
     pub start_line: usize,
     pub end_line: usize,
     pub bytes_written: usize,
+    pub go_reindexed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GoIndexResult {
+    pub index_path: String,
+    pub files_indexed: usize,
+    pub symbols_indexed: usize,
+    pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TsIndexResult {
+    pub index_path: String,
+    pub files_indexed: usize,
+    pub symbols_indexed: usize,
+    pub generated_at_unix: u64,
 }
 
 impl Workspace {
@@ -236,7 +268,10 @@ impl Workspace {
     }
 
     pub fn workspace_info(&self, request: WorkspaceInfoRequest) -> Result<WorkspaceInfo> {
-        let workspace = self.with_root(request.workspace_root.as_deref())?;
+        let Some(workspace_root) = request.workspace_root.as_deref() else {
+            return Err(ToolError::WorkspaceRootRequired);
+        };
+        let workspace = self.with_root(Some(workspace_root))?;
         Ok(WorkspaceInfo {
             workspace_root: workspace.root.display().to_string(),
             platform: std::env::consts::OS.to_string(),
@@ -432,9 +467,18 @@ impl Workspace {
         }
 
         write_atomic(&path, request.content.as_bytes())?;
+        let go_reindexed = go_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
+        let ts_reindexed = ts_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(WriteFileResponse {
             path: workspace.relative_display(&path)?,
             bytes_written: request.content.len(),
+            go_reindexed: go_reindexed || ts_reindexed,
         })
     }
 
@@ -488,12 +532,152 @@ impl Workspace {
         }
 
         write_atomic(&path, new_content.as_bytes())?;
+        let go_reindexed = go_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
+        let ts_reindexed = ts_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(ReplaceRangeResponse {
             path: workspace.relative_display(&path)?,
             start_line: request.start_line,
             end_line: request.end_line,
             bytes_written: new_content.len(),
+            go_reindexed: go_reindexed || ts_reindexed,
         })
+    }
+
+    pub fn index_go_workspace(&self, request: IndexGoWorkspaceRequest) -> Result<GoIndexResult> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        let result = go_index::index_workspace(&workspace.root).map_err(map_go_index_error)?;
+        Ok(GoIndexResult {
+            index_path: result.index_path,
+            files_indexed: result.files_indexed,
+            symbols_indexed: result.symbols_indexed,
+            generated_at_unix: result.generated_at_unix,
+        })
+    }
+
+    pub fn go_index_status(
+        &self,
+        request: IndexGoWorkspaceRequest,
+    ) -> Result<go_index::GoIndexStatus> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        Ok(go_index::status(&workspace.root))
+    }
+
+    pub fn list_go_symbols(
+        &self,
+        request: ListGoSymbolsRequest,
+    ) -> Result<go_index::ListGoSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        go_index::list_symbols(&workspace.root, request).map_err(map_go_index_error)
+    }
+
+    pub fn search_go_symbols(
+        &self,
+        request: SearchGoSymbolsRequest,
+    ) -> Result<go_index::SearchGoSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        go_index::search_symbols(&workspace.root, request).map_err(map_go_index_error)
+    }
+
+    pub fn read_go_symbol(
+        &self,
+        request: ReadGoSymbolRequest,
+    ) -> Result<go_index::ReadGoSymbolResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        go_index::read_symbol(&workspace.root, request).map_err(map_go_index_error)
+    }
+
+    pub fn index_ts_workspace(&self, request: IndexTsWorkspaceRequest) -> Result<TsIndexResult> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        let result = ts_index::index_workspace(&workspace.root).map_err(map_ts_index_error)?;
+        Ok(TsIndexResult {
+            index_path: result.index_path,
+            files_indexed: result.files_indexed,
+            symbols_indexed: result.symbols_indexed,
+            generated_at_unix: result.generated_at_unix,
+        })
+    }
+
+    pub fn ts_index_status(
+        &self,
+        request: IndexTsWorkspaceRequest,
+    ) -> Result<ts_index::TsIndexStatus> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        Ok(ts_index::status(&workspace.root))
+    }
+
+    pub fn list_ts_symbols(
+        &self,
+        request: ListTsSymbolsRequest,
+    ) -> Result<ts_index::ListTsSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        ts_index::list_symbols(&workspace.root, request).map_err(map_ts_index_error)
+    }
+
+    pub fn search_ts_symbols(
+        &self,
+        request: SearchTsSymbolsRequest,
+    ) -> Result<ts_index::SearchTsSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        ts_index::search_symbols(&workspace.root, request).map_err(map_ts_index_error)
+    }
+
+    pub fn read_ts_symbol(
+        &self,
+        request: ReadTsSymbolRequest,
+    ) -> Result<ts_index::ReadTsSymbolResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        ts_index::read_symbol(&workspace.root, request).map_err(map_ts_index_error)
+    }
+
+    pub fn record_work_memory(
+        &self,
+        request: RecordWorkMemoryRequest,
+    ) -> Result<memory::RecordWorkMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::record(
+            &self.root,
+            RecordWorkMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn list_work_memory(
+        &self,
+        request: ListWorkMemoryRequest,
+    ) -> Result<memory::ListWorkMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::list(
+            &self.root,
+            ListWorkMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn search_work_memory(
+        &self,
+        request: SearchWorkMemoryRequest,
+    ) -> Result<memory::SearchWorkMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::search(
+            &self.root,
+            SearchWorkMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
     }
 
     fn with_root(&self, raw_root: Option<&str>) -> Result<Self> {
@@ -641,6 +825,27 @@ fn default_max_depth() -> usize {
     DEFAULT_MAX_DEPTH
 }
 
+fn map_go_index_error(error: go_index::GoIndexError) -> ToolError {
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
+fn map_memory_error(error: memory::MemoryError) -> ToolError {
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
+fn map_ts_index_error(error: ts_index::TsIndexError) -> ToolError {
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +965,51 @@ mod tests {
             result,
             Err(ToolError::WorkspaceRootMustBeAbsolute(_))
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_info_requires_workspace_root() {
+        let root = temp_workspace("workspace_info_required");
+        let workspace = Workspace::new(&root).unwrap();
+        let result = workspace.workspace_info(WorkspaceInfoRequest {
+            workspace_root: None,
+        });
+
+        assert!(matches!(result, Err(ToolError::WorkspaceRootRequired)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_go_file_refreshes_existing_go_index() {
+        let root = temp_workspace("go_reindex");
+        fs::write(root.join("demo.go"), "package demo\n\nfunc OldName() {}\n").unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+        workspace
+            .index_go_workspace(IndexGoWorkspaceRequest {
+                workspace_root: root.display().to_string(),
+            })
+            .unwrap();
+
+        let result = workspace
+            .write_file(WriteFileRequest {
+                workspace_root: Some(root.display().to_string()),
+                path: "demo.go".to_string(),
+                content: "package demo\n\nfunc NewName() {}\n".to_string(),
+                create_parent_dirs: true,
+            })
+            .unwrap();
+
+        assert!(result.go_reindexed);
+        let search = workspace
+            .search_go_symbols(SearchGoSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "NewName".to_string(),
+                limit: 5,
+            })
+            .unwrap();
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0].name, "NewName");
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -1,5 +1,8 @@
+mod go_index;
 mod mcp;
+mod memory;
 mod tools;
+mod ts_index;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 
