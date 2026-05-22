@@ -14,6 +14,10 @@ use crate::go_index::{
     IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest, SearchGoSymbolsRequest,
 };
 use crate::memory::{ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest};
+use crate::python_index::{
+    IndexPythonWorkspaceRequest, ListPythonSymbolsRequest, ReadPythonSymbolRequest,
+    SearchPythonSymbolsRequest,
+};
 use crate::rust_index::{
     IndexRustWorkspaceRequest, ListRustSymbolsRequest, ReadRustSymbolRequest,
     SearchRustSymbolsRequest,
@@ -288,6 +292,29 @@ async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value
         )?,
         "read_ts_symbol" => serde_json::to_value(
             workspace.read_ts_symbol(serde_json::from_value::<ReadTsSymbolRequest>(arguments)?)?,
+        )?,
+        "index_python_workspace" => {
+            serde_json::to_value(workspace.index_python_workspace(serde_json::from_value::<
+                IndexPythonWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "python_index_status" => {
+            serde_json::to_value(workspace.python_index_status(serde_json::from_value::<
+                IndexPythonWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "list_python_symbols" => serde_json::to_value(
+            workspace
+                .list_python_symbols(serde_json::from_value::<ListPythonSymbolsRequest>(arguments)?)?,
+        )?,
+        "search_python_symbols" => {
+            serde_json::to_value(workspace.search_python_symbols(serde_json::from_value::<
+                SearchPythonSymbolsRequest,
+            >(arguments)?)?)?
+        }
+        "read_python_symbol" => serde_json::to_value(
+            workspace
+                .read_python_symbol(serde_json::from_value::<ReadPythonSymbolRequest>(arguments)?)?,
         )?,
         "record_work_memory" => {
             serde_json::to_value(workspace.record_work_memory(serde_json::from_value::<
@@ -610,6 +637,67 @@ fn tool_definitions() -> Value {
         {
             "name": "read_ts_symbol",
             "description": "Read an indexed TS/JS symbol's exact code range. Set include_context=true when you need dependency edges, imports, callers, callees, and suggested related symbols.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "symbol_id": { "type": "string" },
+                    "include_context": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
+            "name": "index_python_workspace",
+            "description": "Build or rebuild the Python code navigation index. Prefer running this before structural Python investigations so search_python_symbols/read_python_symbol can provide symbols, code positions, callers, and callees.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "python_index_status",
+            "description": "Check whether the Python symbol index exists for the selected workspace. Call this before any Python code investigation — if the index is missing, run index_python_workspace first so symbol tools are available.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "list_python_symbols",
+            "description": "List indexed Python symbols with code positions. Prefer this over raw text search when browsing Python file structure, functions, methods, or classes.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "file_path": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["function", "method", "class"] }
+                }
+            }
+        },
+        {
+            "name": "search_python_symbols",
+            "description": "Search indexed Python symbols by name, signature, docstring, decorator, class name, or file path. Prefer this before search_text when investigating Python code structure or locating definitions.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }
+        },
+        {
+            "name": "read_python_symbol",
+            "description": "Read an indexed Python symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],

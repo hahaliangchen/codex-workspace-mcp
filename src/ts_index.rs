@@ -5,11 +5,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use swc_common::{FileName, SourceMap, Span, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
+use swc_ecma_visit::{Visit, VisitWith};
 
 const INDEX_DIR: &str = ".codex-workspace-mcp";
 const INDEX_FILE: &str = "ts_index.json";
@@ -60,6 +60,10 @@ pub struct TsSymbol {
     pub name: String,
     pub kind: TsSymbolKind,
     pub file_path: String,
+    #[serde(default)]
+    pub scope_path: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     pub signature: String,
@@ -197,6 +201,8 @@ pub struct TsSymbolSummary {
     pub name: String,
     pub kind: TsSymbolKind,
     pub file_path: String,
+    pub scope_path: String,
+    pub parent_id: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
     pub signature: String,
@@ -345,6 +351,7 @@ pub fn search_symbols(
                 symbol.signature.as_str(),
                 symbol.docstring.as_str(),
                 symbol.file_path.as_str(),
+                symbol.scope_path.as_str(),
             ]
             .join("\n")
             .to_lowercase()
@@ -479,6 +486,17 @@ struct TsCollector {
     import_bindings: Vec<TsImport>,
     imports: Vec<String>,
     index_by_name: BTreeMap<String, Vec<String>>,
+    scope_stack: Vec<String>,
+    parent_stack: Vec<Option<String>>,
+    /// Bool flag for each scope: whether we want calls inside it to attach to the
+    /// scope's symbol. True for functions / methods / arrows / classes that hold a body.
+    scope_collects_calls: Vec<bool>,
+    /// Maps symbol id to its index in `symbols`, so visit_call_expr can append calls.
+    id_to_index: BTreeMap<String, usize>,
+    /// Toplevel ModuleItems are visited first to learn which decls are exported.
+    /// We collect those Spans here so visit_*_decl knows to mark `export = true`.
+    exported_spans: BTreeSet<swc_common::BytePos>,
+    default_exported_spans: BTreeSet<swc_common::BytePos>,
 }
 
 impl TsCollector {
@@ -492,34 +510,38 @@ impl TsCollector {
             import_bindings: Vec::new(),
             imports: Vec::new(),
             index_by_name: BTreeMap::new(),
+            scope_stack: Vec::new(),
+            parent_stack: Vec::new(),
+            scope_collects_calls: Vec::new(),
+            id_to_index: BTreeMap::new(),
+            exported_spans: BTreeSet::new(),
+            default_exported_spans: BTreeSet::new(),
         }
     }
 
     fn collect(&mut self, module: &Module) {
+        // Pass 1: walk top-level ModuleItems to record imports / re-exports and
+        // remember which decls are exported (so visit_*_decl can set `export = true`).
         for item in &module.body {
             match item {
-                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    self.collect_import(import);
+                ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => self.collect_import(import),
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                    self.mark_exported(&export.decl);
                 }
-                ModuleItem::Stmt(Stmt::Decl(decl)) => self.collect_decl(decl, false),
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
-                    Decl::Fn(func) => self.collect_fn(&func, true),
-                    Decl::Class(class) => self.collect_class(&class, true),
-                    Decl::TsInterface(interface) => self.collect_interface(&interface, true),
-                    Decl::TsTypeAlias(alias) => self.collect_type_alias(&alias, true),
-                    Decl::TsEnum(enum_decl) => self.collect_enum(&enum_decl, true),
-                    Decl::Var(var) => self.collect_var(&var, true),
-                    _ => {}
-                },
-                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => match &export.decl
-                {
-                    DefaultDecl::Fn(func) => self.collect_default_fn(func, true),
-                    DefaultDecl::Class(class) => self.collect_default_class(class, true),
-                    _ => {}
-                },
+                ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                    match &export.decl {
+                        DefaultDecl::Fn(func) => {
+                            self.default_exported_spans.insert(func.function.span.lo);
+                        }
+                        DefaultDecl::Class(class) => {
+                            self.default_exported_spans.insert(class.class.span.lo);
+                        }
+                        _ => {}
+                    }
+                }
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(expr)) => {
                     if let Expr::Arrow(arrow) = &*expr.expr {
-                        self.collect_arrow(arrow, true, "defaultExport");
+                        self.default_exported_spans.insert(arrow.span.lo);
                     }
                 }
                 ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
@@ -540,6 +562,111 @@ impl TsCollector {
                 _ => {}
             }
         }
+
+        // Pass 2: deep walk via swc Visit — handles nested fn/class/method/arrow,
+        // including HOC patterns and class expressions.
+        module.visit_with(self);
+    }
+
+    fn mark_exported(&mut self, decl: &Decl) {
+        match decl {
+            Decl::Fn(func) => {
+                self.exported_spans.insert(func.function.span.lo);
+            }
+            Decl::Class(class) => {
+                self.exported_spans.insert(class.class.span.lo);
+            }
+            Decl::Var(var) => {
+                for declarator in &var.decls {
+                    self.exported_spans.insert(declarator.span.lo);
+                }
+            }
+            Decl::TsInterface(interface) => {
+                self.exported_spans.insert(interface.span.lo);
+            }
+            Decl::TsTypeAlias(alias) => {
+                self.exported_spans.insert(alias.span.lo);
+            }
+            Decl::TsEnum(enum_decl) => {
+                self.exported_spans.insert(enum_decl.span.lo);
+            }
+            _ => {}
+        }
+    }
+
+    fn scope_path(&self) -> String {
+        self.scope_stack.join(".")
+    }
+
+    fn current_parent_id(&self) -> Option<String> {
+        self.parent_stack.last().cloned().flatten()
+    }
+
+    /// Push a symbol's scope (so nested visits see this symbol as their parent),
+    /// run the callback, then pop. `collects_calls` controls whether calls found
+    /// inside this scope should be attached to the symbol (true for functions /
+    /// methods / arrows; false for classes / enums / interfaces).
+    fn enter_scope<F: FnOnce(&mut Self)>(
+        &mut self,
+        name: String,
+        parent_id: Option<String>,
+        collects_calls: bool,
+        f: F,
+    ) {
+        self.scope_stack.push(name);
+        self.parent_stack.push(parent_id);
+        self.scope_collects_calls.push(collects_calls);
+        f(self);
+        self.scope_collects_calls.pop();
+        self.parent_stack.pop();
+        self.scope_stack.pop();
+    }
+
+    fn push_symbol(
+        &mut self,
+        name: &str,
+        kind: TsSymbolKind,
+        span: Span,
+        signature_span: Span,
+        explicit_export: bool,
+        default_export: bool,
+    ) -> String {
+        let scope_path = self.scope_path();
+        let parent_id = self.current_parent_id();
+        let start_line = line_of(&self.cm, span.lo);
+        let end_line = line_of(&self.cm, span.hi);
+        let signature = self.signature_snippet(signature_span);
+        let docstring = self.docstring_before(span);
+        let id = ts_symbol_id(&self.file_path, &scope_path, name, start_line);
+        let export = explicit_export || default_export;
+        let export_names_val = if default_export {
+            default_export_names()
+        } else {
+            export_names(name, export)
+        };
+        self.index_by_name
+            .entry(name.to_string())
+            .or_default()
+            .push(id.clone());
+        self.id_to_index.insert(id.clone(), self.symbols.len());
+        self.symbols.push(TsSymbol {
+            id: id.clone(),
+            name: name.to_string(),
+            kind,
+            file_path: self.file_path.clone(),
+            scope_path,
+            parent_id,
+            start_line,
+            end_line,
+            signature,
+            docstring,
+            export,
+            export_names: export_names_val,
+            calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
+            imports: self.imports.clone(),
+        });
+        id
     }
 
     fn collect_import(&mut self, import: &ImportDecl) {
@@ -666,371 +793,41 @@ impl TsCollector {
         }
     }
 
-    fn collect_decl(&mut self, decl: &Decl, export: bool) {
-        match decl {
-            Decl::Fn(func) => self.collect_fn(func, export),
-            Decl::Class(class) => self.collect_class(class, export),
-            Decl::Var(var) => self.collect_var(var, export),
-            Decl::TsInterface(interface) => self.collect_interface(interface, export),
-            Decl::TsTypeAlias(alias) => self.collect_type_alias(alias, export),
-            Decl::TsEnum(enum_decl) => self.collect_enum(enum_decl, export),
-            _ => {}
-        }
-    }
-
-    fn collect_fn(&mut self, func: &FnDecl, export: bool) {
-        let name = func.ident.sym.to_string();
-        let start_line = line_of(&self.cm, func.function.span.lo);
-        let end_line = line_of(&self.cm, func.function.span.hi);
-        let signature = self.signature_snippet(func.function.span);
-        let docstring = self.docstring_before(func.function.span);
-        let calls = collect_calls_from_span(&self.content, &self.cm, func.function.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Function,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: export_names(&name, export),
-            calls,
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_default_fn(&mut self, func: &FnExpr, export: bool) {
-        if let Some(ident) = &func.ident {
-            let name = ident.sym.to_string();
-            let start_line = line_of(&self.cm, func.function.span.lo);
-            let end_line = line_of(&self.cm, func.function.span.hi);
-            let signature = self.signature_snippet(func.function.span);
-            let docstring = self.docstring_before(func.function.span);
-            let calls = collect_calls_from_span(&self.content, &self.cm, func.function.span);
-            let id = ts_symbol_id(&self.file_path, &name, start_line);
-            self.index_by_name
-                .entry(name.clone())
-                .or_default()
-                .push(id.clone());
-            self.symbols.push(TsSymbol {
-                id,
-                name: name.clone(),
-                kind: TsSymbolKind::Function,
-                file_path: self.file_path.clone(),
-                start_line,
-                end_line,
-                signature,
-                docstring,
-                export,
-                export_names: default_export_names(),
-                calls,
-                import_bindings: self.import_bindings.clone(),
-                imports: self.imports.clone(),
-            });
-        }
-    }
-
-    fn collect_class(&mut self, class: &ClassDecl, export: bool) {
-        let name = class.ident.sym.to_string();
-        let start_line = line_of(&self.cm, class.class.span.lo);
-        let end_line = line_of(&self.cm, class.class.span.hi);
-        let signature = self.signature_snippet(class.class.span);
-        let docstring = self.docstring_before(class.class.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Class,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: default_export_names(),
-            calls: Vec::new(),
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-        for member in &class.class.body {
-            match member {
-                ClassMember::Method(method) => self.collect_method(&name, method, export),
-                ClassMember::ClassProp(prop) => self.collect_class_prop(&name, prop, export),
-                _ => {}
-            }
-        }
-    }
-
-    fn collect_method(&mut self, class_name: &str, method: &ClassMethod, export: bool) {
-        if let PropName::Ident(ident) = &method.key {
-            let name = ident.sym.to_string();
-            let start_line = line_of(&self.cm, method.span.lo);
-            let end_line = line_of(&self.cm, method.span.hi);
-            let signature = self.signature_snippet(method.span);
-            let docstring = self.docstring_before(method.span);
-            let calls = collect_calls_from_span(&self.content, &self.cm, method.span);
-            let id = ts_symbol_id(&self.file_path, &format!("{class_name}.{name}"), start_line);
-            self.index_by_name
-                .entry(name.clone())
-                .or_default()
-                .push(id.clone());
-            self.symbols.push(TsSymbol {
-                id,
-                name: name.clone(),
-                kind: TsSymbolKind::Method,
-                file_path: self.file_path.clone(),
-                start_line,
-                end_line,
-                signature,
-                docstring,
-                export,
-                export_names: export_names(&name, export),
-                calls,
-                import_bindings: self.import_bindings.clone(),
-                imports: self.imports.clone(),
-            });
-        }
-    }
-
-    fn collect_class_prop(&mut self, class_name: &str, prop: &ClassProp, export: bool) {
-        let PropName::Ident(ident) = &prop.key else {
+    fn record_call_for_current_scope(&mut self, call: &CallExpr) {
+        let Some(parent_id) = self.current_parent_id() else {
             return;
         };
-        let Some(value) = &prop.value else {
-            return;
-        };
-        let Expr::Arrow(arrow) = &**value else {
-            return;
-        };
-        let name = ident.sym.to_string();
-        let start_line = line_of(&self.cm, prop.span.lo);
-        let end_line = line_of(&self.cm, prop.span.hi);
-        let signature = self.signature_snippet(prop.span);
-        let docstring = self.docstring_before(prop.span);
-        let calls = collect_calls_from_span(&self.content, &self.cm, arrow.span);
-        let id = ts_symbol_id(&self.file_path, &format!("{class_name}.{name}"), start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Method,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: export_names(&name, export),
-            calls,
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_interface(&mut self, interface: &TsInterfaceDecl, export: bool) {
-        let name = interface.id.sym.to_string();
-        let start_line = line_of(&self.cm, interface.span.lo);
-        let end_line = line_of(&self.cm, interface.span.hi);
-        let signature = self.signature_snippet(interface.span);
-        let docstring = self.docstring_before(interface.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Interface,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: export_names(&name, export),
-            calls: Vec::new(),
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_type_alias(&mut self, alias: &TsTypeAliasDecl, export: bool) {
-        let name = alias.id.sym.to_string();
-        let start_line = line_of(&self.cm, alias.span.lo);
-        let end_line = line_of(&self.cm, alias.span.hi);
-        let signature = self.signature_snippet(alias.span);
-        let docstring = self.docstring_before(alias.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::TypeAlias,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: export_names(&name, export),
-            calls: Vec::new(),
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_enum(&mut self, enum_decl: &TsEnumDecl, export: bool) {
-        let name = enum_decl.id.sym.to_string();
-        let start_line = line_of(&self.cm, enum_decl.span.lo);
-        let end_line = line_of(&self.cm, enum_decl.span.hi);
-        let signature = self.signature_snippet(enum_decl.span);
-        let docstring = self.docstring_before(enum_decl.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Enum,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: export_names(&name, export),
-            calls: Vec::new(),
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_var(&mut self, var: &VarDecl, export: bool) {
-        if var.kind != VarDeclKind::Const {
+        if !self.scope_collects_calls.last().copied().unwrap_or(false) {
             return;
         }
-        for declarator in &var.decls {
-            if let Pat::Ident(binding) = &declarator.name {
-                let name = binding.id.sym.to_string();
-                if let Some(init) = &declarator.init {
-                    if let Expr::Arrow(arrow) = &**init {
-                        self.collect_arrow(arrow, export, &name);
-                    } else {
-                        let start_line = line_of(&self.cm, declarator.span.lo);
-                        let end_line = line_of(&self.cm, declarator.span.hi);
-                        let signature = self.signature_snippet(declarator.span);
-                        let docstring = self.docstring_before(declarator.span);
-                        let id = ts_symbol_id(&self.file_path, &name, start_line);
-                        self.index_by_name
-                            .entry(name.clone())
-                            .or_default()
-                            .push(id.clone());
-                        self.symbols.push(TsSymbol {
-                            id,
-                            name: name.clone(),
-                            kind: TsSymbolKind::Const,
-                            file_path: self.file_path.clone(),
-                            start_line,
-                            end_line,
-                            signature,
-                            docstring,
-                            export,
-                            export_names: export_names(&name, export),
-                            calls: Vec::new(),
-                            import_bindings: self.import_bindings.clone(),
-                            imports: self.imports.clone(),
-                        });
-                    }
-                }
-            }
+        let Some(idx) = self.id_to_index.get(&parent_id).copied() else {
+            return;
+        };
+        let Some((namespace, target_text)) = describe_callee(&call.callee) else {
+            return;
+        };
+        let line = line_of(&self.cm, call.span.lo);
+        let snippet_line = self
+            .content
+            .lines()
+            .nth(line.saturating_sub(1))
+            .map(|line| line.trim().to_string())
+            .unwrap_or_default();
+        self.symbols[idx].calls.push(TsCall {
+            namespace,
+            target_text,
+            line,
+            snippet: snippet_line,
+        });
+    }
+
+    fn arrow_kind(&self, name: &str) -> TsSymbolKind {
+        if looks_like_component(name) {
+            TsSymbolKind::Component
+        } else {
+            TsSymbolKind::ArrowFunction
         }
     }
-
-    fn collect_default_class(&mut self, class: &ClassExpr, export: bool) {
-        let name = class
-            .ident
-            .as_ref()
-            .map(|ident| ident.sym.to_string())
-            .unwrap_or_else(|| "default".to_string());
-        let start_line = line_of(&self.cm, class.class.span.lo);
-        let end_line = line_of(&self.cm, class.class.span.hi);
-        let signature = self.signature_snippet(class.class.span);
-        let docstring = self.docstring_before(class.class.span);
-        let id = ts_symbol_id(&self.file_path, &name, start_line);
-        self.index_by_name
-            .entry(name.clone())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.clone(),
-            kind: TsSymbolKind::Class,
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: default_export_names(),
-            calls: Vec::new(),
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
-    fn collect_arrow(&mut self, arrow: &ArrowExpr, export: bool, name: &str) {
-        let start_line = line_of(&self.cm, arrow.span.lo);
-        let end_line = line_of(&self.cm, arrow.span.hi);
-        let signature = self.signature_snippet(arrow.span);
-        let docstring = self.docstring_before(arrow.span);
-        let calls = collect_calls_from_span(&self.content, &self.cm, arrow.span);
-        let id = ts_symbol_id(&self.file_path, name, start_line);
-        self.index_by_name
-            .entry(name.to_string())
-            .or_default()
-            .push(id.clone());
-        self.symbols.push(TsSymbol {
-            id,
-            name: name.to_string(),
-            kind: if looks_like_component(name) {
-                TsSymbolKind::Component
-            } else {
-                TsSymbolKind::ArrowFunction
-            },
-            file_path: self.file_path.clone(),
-            start_line,
-            end_line,
-            signature,
-            docstring,
-            export,
-            export_names: default_export_names(),
-            calls,
-            import_bindings: self.import_bindings.clone(),
-            imports: self.imports.clone(),
-        });
-    }
-
     fn signature_snippet(&self, span: Span) -> String {
         snippet(&self.content, &self.cm, span, 5)
     }
@@ -1057,6 +854,311 @@ impl TsCollector {
         }
         docs.reverse();
         docs.join("\n")
+    }
+}
+
+impl Visit for TsCollector {
+    fn visit_fn_decl(&mut self, node: &FnDecl) {
+        let name = node.ident.sym.to_string();
+        let export = self.exported_spans.contains(&node.function.span.lo);
+        let id = self.push_symbol(
+            &name,
+            TsSymbolKind::Function,
+            node.function.span,
+            node.function.span,
+            export,
+            false,
+        );
+        self.enter_scope(name, Some(id), true, |this| {
+            node.function.visit_children_with(this);
+        });
+    }
+
+    fn visit_fn_expr(&mut self, node: &FnExpr) {
+        let name = node
+            .ident
+            .as_ref()
+            .map(|i| i.sym.to_string())
+            .unwrap_or_else(|| "<anonymous-fn>".to_string());
+        let default_export = self.default_exported_spans.contains(&node.function.span.lo);
+        let id = self.push_symbol(
+            &name,
+            TsSymbolKind::Function,
+            node.function.span,
+            node.function.span,
+            false,
+            default_export,
+        );
+        self.enter_scope(name, Some(id), true, |this| {
+            node.function.visit_children_with(this);
+        });
+    }
+
+    fn visit_class_decl(&mut self, node: &ClassDecl) {
+        let name = node.ident.sym.to_string();
+        let export = self.exported_spans.contains(&node.class.span.lo);
+        let id = self.push_symbol(
+            &name,
+            TsSymbolKind::Class,
+            node.class.span,
+            node.class.span,
+            export,
+            false,
+        );
+        // Class scope: calls inside the class declaration itself (decorators, computed
+        // keys) are not attached. Method bodies push their own scope with collects_calls=true.
+        self.enter_scope(name, Some(id), false, |this| {
+            node.class.visit_children_with(this);
+        });
+    }
+
+    fn visit_class_expr(&mut self, node: &ClassExpr) {
+        // Named class expression `const X = class extends ... {}` is handled in
+        // visit_var_declarator (so the var name becomes scope). Truly anonymous class
+        // expressions or `return class extends ... {}` fall here.
+        let name = node
+            .ident
+            .as_ref()
+            .map(|i| i.sym.to_string())
+            .unwrap_or_else(|| "<anonymous-class>".to_string());
+        let default_export = self.default_exported_spans.contains(&node.class.span.lo);
+        let id = self.push_symbol(
+            &name,
+            TsSymbolKind::Class,
+            node.class.span,
+            node.class.span,
+            false,
+            default_export,
+        );
+        self.enter_scope(name, Some(id), false, |this| {
+            node.class.visit_children_with(this);
+        });
+    }
+
+    fn visit_class_method(&mut self, node: &ClassMethod) {
+        let Some(name) = prop_name_text(&node.key) else {
+            node.visit_children_with(self);
+            return;
+        };
+        let id = self.push_symbol(
+            &name,
+            TsSymbolKind::Method,
+            node.span,
+            node.span,
+            false,
+            false,
+        );
+        self.enter_scope(name, Some(id), true, |this| {
+            node.function.visit_children_with(this);
+        });
+    }
+
+    fn visit_class_prop(&mut self, node: &ClassProp) {
+        // Arrow-function class properties: `foo = (x) => {...}` — record as Method.
+        let Some(name) = prop_name_text(&node.key) else {
+            node.visit_children_with(self);
+            return;
+        };
+        let Some(value) = node.value.as_deref() else {
+            node.visit_children_with(self);
+            return;
+        };
+        match value {
+            Expr::Arrow(arrow) => {
+                let id = self.push_symbol(
+                    &name,
+                    TsSymbolKind::Method,
+                    node.span,
+                    arrow.span,
+                    false,
+                    false,
+                );
+                self.enter_scope(name, Some(id), true, |this| {
+                    arrow.visit_children_with(this);
+                });
+            }
+            Expr::Fn(fn_expr) => {
+                let id = self.push_symbol(
+                    &name,
+                    TsSymbolKind::Method,
+                    node.span,
+                    fn_expr.function.span,
+                    false,
+                    false,
+                );
+                self.enter_scope(name, Some(id), true, |this| {
+                    fn_expr.function.visit_children_with(this);
+                });
+            }
+            _ => node.visit_children_with(self),
+        }
+    }
+
+    fn visit_var_declarator(&mut self, node: &VarDeclarator) {
+        if let (Pat::Ident(binding), Some(init)) = (&node.name, node.init.as_deref()) {
+            let name = binding.id.sym.to_string();
+            let export = self.exported_spans.contains(&node.span.lo);
+            match init {
+                Expr::Arrow(arrow) => {
+                    let kind = self.arrow_kind(&name);
+                    let id = self.push_symbol(&name, kind, arrow.span, arrow.span, export, false);
+                    self.enter_scope(name, Some(id), true, |this| {
+                        arrow.visit_children_with(this);
+                    });
+                    return;
+                }
+                Expr::Class(class_expr) => {
+                    let id = self.push_symbol(
+                        &name,
+                        TsSymbolKind::Class,
+                        class_expr.class.span,
+                        class_expr.class.span,
+                        export,
+                        false,
+                    );
+                    self.enter_scope(name, Some(id), false, |this| {
+                        class_expr.class.visit_children_with(this);
+                    });
+                    return;
+                }
+                Expr::Fn(fn_expr) => {
+                    let id = self.push_symbol(
+                        &name,
+                        TsSymbolKind::Function,
+                        fn_expr.function.span,
+                        fn_expr.function.span,
+                        export,
+                        false,
+                    );
+                    self.enter_scope(name, Some(id), true, |this| {
+                        fn_expr.function.visit_children_with(this);
+                    });
+                    return;
+                }
+                _ => {
+                    self.push_symbol(
+                        &name,
+                        TsSymbolKind::Const,
+                        node.span,
+                        node.span,
+                        export,
+                        false,
+                    );
+                }
+            }
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_interface_decl(&mut self, node: &TsInterfaceDecl) {
+        let name = node.id.sym.to_string();
+        let export = self.exported_spans.contains(&node.span.lo);
+        self.push_symbol(
+            &name,
+            TsSymbolKind::Interface,
+            node.span,
+            node.span,
+            export,
+            false,
+        );
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_type_alias_decl(&mut self, node: &TsTypeAliasDecl) {
+        let name = node.id.sym.to_string();
+        let export = self.exported_spans.contains(&node.span.lo);
+        self.push_symbol(
+            &name,
+            TsSymbolKind::TypeAlias,
+            node.span,
+            node.span,
+            export,
+            false,
+        );
+        node.visit_children_with(self);
+    }
+
+    fn visit_ts_enum_decl(&mut self, node: &TsEnumDecl) {
+        let name = node.id.sym.to_string();
+        let export = self.exported_spans.contains(&node.span.lo);
+        self.push_symbol(
+            &name,
+            TsSymbolKind::Enum,
+            node.span,
+            node.span,
+            export,
+            false,
+        );
+        node.visit_children_with(self);
+    }
+
+    fn visit_arrow_expr(&mut self, node: &ArrowExpr) {
+        // Only register a symbol here for `export default () => {}`. Otherwise
+        // the arrow is wrapped by a var_declarator / class_prop / call argument
+        // which already handles naming. Just descend so nested decls inside the
+        // arrow body remain visible.
+        if self.default_exported_spans.contains(&node.span.lo) {
+            let name = "defaultExport";
+            let kind = self.arrow_kind(name);
+            let id = self.push_symbol(name, kind, node.span, node.span, false, true);
+            self.enter_scope(name.to_string(), Some(id), true, |this| {
+                node.visit_children_with(this);
+            });
+            return;
+        }
+        node.visit_children_with(self);
+    }
+
+    fn visit_call_expr(&mut self, node: &CallExpr) {
+        self.record_call_for_current_scope(node);
+        node.visit_children_with(self);
+    }
+}
+
+fn prop_name_text(key: &PropName) -> Option<String> {
+    match key {
+        PropName::Ident(ident) => Some(ident.sym.to_string()),
+        PropName::Str(s) => Some(s.value.to_string_lossy().to_string()),
+        PropName::Num(n) => Some(n.value.to_string()),
+        PropName::BigInt(b) => Some(b.value.to_string()),
+        PropName::Computed(_) => None,
+    }
+}
+
+fn describe_callee(callee: &Callee) -> Option<(Option<String>, String)> {
+    let expr = match callee {
+        Callee::Expr(expr) => expr,
+        _ => return None,
+    };
+    match expr.as_ref() {
+        Expr::Ident(ident) => Some((None, ident.sym.to_string())),
+        Expr::Member(member) => {
+            let target_text = match &member.prop {
+                MemberProp::Ident(ident) => ident.sym.to_string(),
+                MemberProp::PrivateName(p) => format!("#{}", p.name),
+                MemberProp::Computed(_) => return None,
+            };
+            let namespace = expr_to_text(&member.obj);
+            Some((namespace, target_text))
+        }
+        _ => None,
+    }
+}
+
+fn expr_to_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(ident) => Some(ident.sym.to_string()),
+        Expr::This(_) => Some("this".to_string()),
+        Expr::Member(member) => {
+            let head = expr_to_text(&member.obj)?;
+            let tail = match &member.prop {
+                MemberProp::Ident(ident) => ident.sym.to_string(),
+                MemberProp::PrivateName(p) => format!("#{}", p.name),
+                MemberProp::Computed(_) => return None,
+            };
+            Some(format!("{head}.{tail}"))
+        }
+        _ => None,
     }
 }
 
@@ -1195,56 +1297,6 @@ fn build_context(
         }
     }
     (callees, callers, resolved_imports, suggested_reads)
-}
-
-fn collect_calls_from_span(content: &str, cm: &Lrc<SourceMap>, span: Span) -> Vec<TsCall> {
-    let lines: Vec<&str> = content.lines().collect();
-    let start_line = line_of(cm, span.lo);
-    let end_line = line_of(cm, span.hi).min(lines.len().max(1));
-    let call_re = Regex::new(
-        r"(?:(?P<namespace>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
-    )
-    .unwrap();
-    let keywords: BTreeSet<&str> = [
-        "if",
-        "for",
-        "switch",
-        "return",
-        "await",
-        "new",
-        "typeof",
-        "instanceof",
-        "catch",
-    ]
-    .into_iter()
-    .collect();
-    let mut calls = Vec::new();
-    for (idx, line) in lines
-        .iter()
-        .enumerate()
-        .take(end_line)
-        .skip(start_line.saturating_sub(1))
-    {
-        let clean = strip_line_comment(line);
-        for captures in call_re.captures_iter(&clean) {
-            let target = captures
-                .name("target")
-                .map(|value| value.as_str())
-                .unwrap_or("");
-            if target.is_empty() || keywords.contains(target) {
-                continue;
-            }
-            calls.push(TsCall {
-                namespace: captures
-                    .name("namespace")
-                    .map(|value| value.as_str().to_string()),
-                target_text: target.to_string(),
-                line: idx + 1,
-                snippet: line.trim().to_string(),
-            });
-        }
-    }
-    calls
 }
 
 fn resolve_call_targets(
@@ -1596,12 +1648,12 @@ fn normalize_slashes(value: &str) -> String {
     value.replace('\\', "/")
 }
 
-fn ts_symbol_id(file_path: &str, name: &str, line: usize) -> String {
-    format!("ts:{file_path}:{name}:{line}")
-}
-
-fn strip_line_comment(line: &str) -> String {
-    line.split("//").next().unwrap_or(line).to_string()
+fn ts_symbol_id(file_path: &str, scope_path: &str, name: &str, line: usize) -> String {
+    if scope_path.is_empty() {
+        format!("ts:{file_path}:{name}:{line}")
+    } else {
+        format!("ts:{file_path}:{scope_path}.{name}:{line}")
+    }
 }
 
 fn snippet(content: &str, cm: &Lrc<SourceMap>, span: Span, max_lines: usize) -> String {
@@ -1640,6 +1692,8 @@ impl From<&TsSymbol> for TsSymbolSummary {
             name: symbol.name.clone(),
             kind: symbol.kind.clone(),
             file_path: symbol.file_path.clone(),
+            scope_path: symbol.scope_path.clone(),
+            parent_id: symbol.parent_id.clone(),
             start_line: symbol.start_line,
             end_line: symbol.end_line,
             signature: symbol.signature.clone(),
@@ -1984,6 +2038,178 @@ export function run() {
         assert!(read.suggested_reads.iter().any(|suggestion| {
             suggestion.reason == "resolved_import" && suggestion.symbol.name == "createThing"
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexes_hoc_inner_class_with_visit() {
+        let root = temp_workspace("hoc_inner_class");
+        fs::write(
+            root.join("container.tsx"),
+            r#"import React from 'react';
+
+export default function container(Comp: any) {
+  class Wrapper extends React.Component {
+    updateDisk() {
+      this.foo();
+    }
+    getMax() {
+      return 1;
+    }
+    foo() {}
+  }
+  return Wrapper;
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+
+        let update_disk = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "updateDisk".to_string(),
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "updateDisk")
+        .expect("updateDisk should be indexed");
+        assert_eq!(update_disk.kind, TsSymbolKind::Method);
+        assert_eq!(update_disk.scope_path, "container.Wrapper");
+
+        let wrapper = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "Wrapper".to_string(),
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "Wrapper")
+        .expect("Wrapper should be indexed");
+        assert_eq!(wrapper.kind, TsSymbolKind::Class);
+        assert_eq!(wrapper.scope_path, "container");
+        assert_eq!(update_disk.parent_id.as_deref(), Some(wrapper.id.as_str()));
+
+        let read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: update_disk.id.clone(),
+                include_context: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            read.callees.iter().any(|c| c.target_text == "foo"),
+            "updateDisk should record `this.foo()` call"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexes_anonymous_class_expression() {
+        let root = temp_workspace("anon_class_expr");
+        fs::write(
+            root.join("wrap.ts"),
+            r#"class Base {}
+const Wrapped = class extends Base {
+  foo() { return 1; }
+};
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+
+        let foo = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "foo".to_string(),
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "foo")
+        .expect("foo should be indexed");
+        assert_eq!(foo.kind, TsSymbolKind::Method);
+        assert_eq!(foo.scope_path, "Wrapped");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn indexes_nested_function() {
+        let root = temp_workspace("nested_fn");
+        fs::write(
+            root.join("util.ts"),
+            r#"export function outer() {
+  function inner() {
+    return 42;
+  }
+  return inner();
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+
+        let inner = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "inner".to_string(),
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "inner")
+        .expect("inner should be indexed");
+        assert_eq!(inner.kind, TsSymbolKind::Function);
+        assert_eq!(inner.scope_path, "outer");
+
+        let outer = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "outer".to_string(),
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "outer")
+        .expect("outer should be indexed");
+        let read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: outer.id.clone(),
+                include_context: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            read.callees.iter().any(|c| c.target_text == "inner"),
+            "outer should record inner() call as callee"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

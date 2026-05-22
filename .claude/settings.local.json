@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__codex-workspace__list_dir",
+      "Bash(cd /d E:\\\\项目\\\\codex-workspace-mcp)",
+      "Bash(cargo build *)",
+      "Bash(grep -n \"StmtFunctionDef\\\\|pub struct Arguments\\\\|pub args\\\\|Constant\\\\b\\\\|Expr::\" \"/c/Users/梁辰/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustpython-ast-0.4.0/src/gen/ranged.rs\" | head -60)",
+      "Bash(grep -rn \"fn line\\\\|SourceLocation\\\\|LineIndex\\\\|line_number\\\\|to_source_code\\\\|locate\" \"/c/Users/梁辰/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustpython-parser-core-0.4.0/src/\" | head -30)",
+      "mcp__codex-workspace__search_text",
+      "Bash(cargo check *)",
+      "Bash(cargo test *)"
+    ]
+  }
+}

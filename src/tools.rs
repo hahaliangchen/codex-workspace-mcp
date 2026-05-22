@@ -15,6 +15,10 @@ use crate::go_index::{
 use crate::memory::{
     self, ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest,
 };
+use crate::python_index::{
+    self, IndexPythonWorkspaceRequest, ListPythonSymbolsRequest, ReadPythonSymbolRequest,
+    SearchPythonSymbolsRequest,
+};
 use crate::rust_index::{
     self, IndexRustWorkspaceRequest, ListRustSymbolsRequest, ReadRustSymbolRequest,
     SearchRustSymbolsRequest,
@@ -239,6 +243,14 @@ pub struct ReplaceRangeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct GoIndexResult {
+    pub index_path: String,
+    pub files_indexed: usize,
+    pub symbols_indexed: usize,
+    pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PythonIndexResult {
     pub index_path: String,
     pub files_indexed: usize,
     pub symbols_indexed: usize,
@@ -491,10 +503,14 @@ impl Workspace {
             .ok()
             .flatten()
             .is_some();
+        let python_reindexed = python_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(WriteFileResponse {
             path: workspace.relative_display(&path)?,
             bytes_written: request.content.len(),
-            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed,
+            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed || python_reindexed,
         })
     }
 
@@ -560,12 +576,16 @@ impl Workspace {
             .ok()
             .flatten()
             .is_some();
+        let python_reindexed = python_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(ReplaceRangeResponse {
             path: workspace.relative_display(&path)?,
             start_line: request.start_line,
             end_line: request.end_line,
             bytes_written: new_content.len(),
-            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed,
+            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed || python_reindexed,
         })
     }
 
@@ -699,6 +719,53 @@ impl Workspace {
     ) -> Result<ts_index::ReadTsSymbolResponse> {
         let workspace = self.with_root(Some(&request.workspace_root))?;
         ts_index::read_symbol(&workspace.root, request).map_err(map_ts_index_error)
+    }
+
+    pub fn index_python_workspace(
+        &self,
+        request: IndexPythonWorkspaceRequest,
+    ) -> Result<PythonIndexResult> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        let result =
+            python_index::index_workspace(&workspace.root).map_err(map_python_index_error)?;
+        Ok(PythonIndexResult {
+            index_path: result.index_path,
+            files_indexed: result.files_indexed,
+            symbols_indexed: result.symbols_indexed,
+            generated_at_unix: result.generated_at_unix,
+        })
+    }
+
+    pub fn python_index_status(
+        &self,
+        request: IndexPythonWorkspaceRequest,
+    ) -> Result<python_index::PythonIndexStatus> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        Ok(python_index::status(&workspace.root))
+    }
+
+    pub fn list_python_symbols(
+        &self,
+        request: ListPythonSymbolsRequest,
+    ) -> Result<python_index::ListPythonSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        python_index::list_symbols(&workspace.root, request).map_err(map_python_index_error)
+    }
+
+    pub fn search_python_symbols(
+        &self,
+        request: SearchPythonSymbolsRequest,
+    ) -> Result<python_index::SearchPythonSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        python_index::search_symbols(&workspace.root, request).map_err(map_python_index_error)
+    }
+
+    pub fn read_python_symbol(
+        &self,
+        request: ReadPythonSymbolRequest,
+    ) -> Result<python_index::ReadPythonSymbolResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        python_index::read_symbol(&workspace.root, request).map_err(map_python_index_error)
     }
 
     pub fn record_work_memory(
@@ -889,6 +956,13 @@ fn default_max_matches() -> usize {
 
 fn default_max_depth() -> usize {
     DEFAULT_MAX_DEPTH
+}
+
+fn map_python_index_error(error: python_index::PythonIndexError) -> ToolError {
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
 }
 
 fn map_go_index_error(error: go_index::GoIndexError) -> ToolError {

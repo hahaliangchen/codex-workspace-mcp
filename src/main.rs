@@ -1,6 +1,7 @@
 mod go_index;
 mod mcp;
 mod memory;
+mod python_index;
 mod rust_index;
 mod tools;
 mod ts_index;
