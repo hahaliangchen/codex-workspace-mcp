@@ -15,6 +15,10 @@ use crate::go_index::{
 use crate::memory::{
     self, ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest,
 };
+use crate::rust_index::{
+    self, IndexRustWorkspaceRequest, ListRustSymbolsRequest, ReadRustSymbolRequest,
+    SearchRustSymbolsRequest,
+};
 use crate::ts_index::{
     self, IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest,
     SearchTsSymbolsRequest,
@@ -235,6 +239,14 @@ pub struct ReplaceRangeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct GoIndexResult {
+    pub index_path: String,
+    pub files_indexed: usize,
+    pub symbols_indexed: usize,
+    pub generated_at_unix: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RustIndexResult {
     pub index_path: String,
     pub files_indexed: usize,
     pub symbols_indexed: usize,
@@ -475,10 +487,14 @@ impl Workspace {
             .ok()
             .flatten()
             .is_some();
+        let rust_reindexed = rust_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(WriteFileResponse {
             path: workspace.relative_display(&path)?,
             bytes_written: request.content.len(),
-            go_reindexed: go_reindexed || ts_reindexed,
+            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed,
         })
     }
 
@@ -540,12 +556,16 @@ impl Workspace {
             .ok()
             .flatten()
             .is_some();
+        let rust_reindexed = rust_index::maybe_reindex_after_write(&workspace.root, &path)
+            .ok()
+            .flatten()
+            .is_some();
         Ok(ReplaceRangeResponse {
             path: workspace.relative_display(&path)?,
             start_line: request.start_line,
             end_line: request.end_line,
             bytes_written: new_content.len(),
-            go_reindexed: go_reindexed || ts_reindexed,
+            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed,
         })
     }
 
@@ -590,6 +610,52 @@ impl Workspace {
     ) -> Result<go_index::ReadGoSymbolResponse> {
         let workspace = self.with_root(Some(&request.workspace_root))?;
         go_index::read_symbol(&workspace.root, request).map_err(map_go_index_error)
+    }
+
+    pub fn index_rust_workspace(
+        &self,
+        request: IndexRustWorkspaceRequest,
+    ) -> Result<RustIndexResult> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        let result = rust_index::index_workspace(&workspace.root).map_err(map_rust_index_error)?;
+        Ok(RustIndexResult {
+            index_path: result.index_path,
+            files_indexed: result.files_indexed,
+            symbols_indexed: result.symbols_indexed,
+            generated_at_unix: result.generated_at_unix,
+        })
+    }
+
+    pub fn rust_index_status(
+        &self,
+        request: IndexRustWorkspaceRequest,
+    ) -> Result<rust_index::RustIndexStatus> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        Ok(rust_index::status(&workspace.root))
+    }
+
+    pub fn list_rust_symbols(
+        &self,
+        request: ListRustSymbolsRequest,
+    ) -> Result<rust_index::ListRustSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        rust_index::list_symbols(&workspace.root, request).map_err(map_rust_index_error)
+    }
+
+    pub fn search_rust_symbols(
+        &self,
+        request: SearchRustSymbolsRequest,
+    ) -> Result<rust_index::SearchRustSymbolsResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        rust_index::search_symbols(&workspace.root, request).map_err(map_rust_index_error)
+    }
+
+    pub fn read_rust_symbol(
+        &self,
+        request: ReadRustSymbolRequest,
+    ) -> Result<rust_index::ReadRustSymbolResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        rust_index::read_symbol(&workspace.root, request).map_err(map_rust_index_error)
     }
 
     pub fn index_ts_workspace(&self, request: IndexTsWorkspaceRequest) -> Result<TsIndexResult> {
@@ -840,6 +906,13 @@ fn map_memory_error(error: memory::MemoryError) -> ToolError {
 }
 
 fn map_ts_index_error(error: ts_index::TsIndexError) -> ToolError {
+    ToolError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
+fn map_rust_index_error(error: rust_index::RustIndexError) -> ToolError {
     ToolError::Io(std::io::Error::new(
         std::io::ErrorKind::Other,
         error.to_string(),

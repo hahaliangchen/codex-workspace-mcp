@@ -20,3 +20,8 @@ anyhow = "1.0.102"
 chrono = "0.4.42"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
+tree-sitter = "0.25.8"
+tree-sitter-go = "0.25.0"
+syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
+proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
+quote = "1.0.45"

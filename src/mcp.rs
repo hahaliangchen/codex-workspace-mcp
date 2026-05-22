@@ -14,6 +14,10 @@ use crate::go_index::{
     IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest, SearchGoSymbolsRequest,
 };
 use crate::memory::{ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest};
+use crate::rust_index::{
+    IndexRustWorkspaceRequest, ListRustSymbolsRequest, ReadRustSymbolRequest,
+    SearchRustSymbolsRequest,
+};
 use crate::tools::{
     ListDirRequest, ReadFileLinesRequest, ReadFileRequest, ReplaceRangeRequest, SearchTextRequest,
     Workspace, WorkspaceInfoRequest, WriteFileRequest,
@@ -241,6 +245,29 @@ async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value
         "read_go_symbol" => serde_json::to_value(
             workspace.read_go_symbol(serde_json::from_value::<ReadGoSymbolRequest>(arguments)?)?,
         )?,
+        "index_rust_workspace" => {
+            serde_json::to_value(workspace.index_rust_workspace(serde_json::from_value::<
+                IndexRustWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "rust_index_status" => {
+            serde_json::to_value(workspace.rust_index_status(serde_json::from_value::<
+                IndexRustWorkspaceRequest,
+            >(arguments)?)?)?
+        }
+        "list_rust_symbols" => serde_json::to_value(
+            workspace
+                .list_rust_symbols(serde_json::from_value::<ListRustSymbolsRequest>(arguments)?)?,
+        )?,
+        "search_rust_symbols" => {
+            serde_json::to_value(workspace.search_rust_symbols(serde_json::from_value::<
+                SearchRustSymbolsRequest,
+            >(arguments)?)?)?
+        }
+        "read_rust_symbol" => serde_json::to_value(
+            workspace
+                .read_rust_symbol(serde_json::from_value::<ReadRustSymbolRequest>(arguments)?)?,
+        )?,
         "index_ts_workspace" => {
             serde_json::to_value(workspace.index_ts_workspace(serde_json::from_value::<
                 IndexTsWorkspaceRequest,
@@ -308,7 +335,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_dir",
-            "description": "List a directory inside the workspace with optional recursion and ignore filtering.",
+            "description": "List a directory inside the workspace with optional recursion and ignore filtering. Use only to understand project layout or locate files by path — for code symbol lookups prefer the index tools (search_go_symbols, search_ts_symbols, search_rust_symbols).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -325,7 +352,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_file",
-            "description": "Read a UTF-8 file inside the workspace with a byte limit.",
+            "description": "Read a UTF-8 file inside the workspace with a byte limit. Prefer read_go_symbol / read_ts_symbol / read_rust_symbol when you need a specific function or type — they return only the relevant range and include caller/callee context. Use read_file when you need the full file or when no index exists.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -341,7 +368,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_file_lines",
-            "description": "Read a 1-indexed inclusive line range from a UTF-8 file.",
+            "description": "Read a 1-indexed inclusive line range from a UTF-8 file. Use when you already know the exact line numbers (e.g., from an index result). For unknown locations prefer search_go_symbols / search_ts_symbols / search_rust_symbols first.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "start_line", "end_line"],
@@ -358,7 +385,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "search_text",
-            "description": "Search text across workspace files and return structured matches.",
+            "description": "Search raw text across workspace files. Best for UI strings, config keys, error messages, literals, or fallback when symbol index tools do not find enough code structure.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -412,7 +439,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "index_go_workspace",
-            "description": "Build or rebuild the Go symbol index for the selected workspace.",
+            "description": "Build or rebuild the Go code navigation index. Prefer running this before structural Go investigations so search_go_symbols/read_go_symbol can provide symbols, code positions, callers, and callees.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -423,7 +450,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "go_index_status",
-            "description": "Check whether the Go symbol index exists for the selected workspace.",
+            "description": "Check whether the Go symbol index exists for the selected workspace. Call this before any Go code investigation — if the index is missing, run index_go_workspace first so symbol tools are available.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -434,7 +461,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_go_symbols",
-            "description": "List Go symbols with optional file and kind filters. Builds the Go index automatically if missing.",
+            "description": "List indexed Go symbols with code positions. Prefer this over raw text search when browsing Go file structure, functions, methods, structs, interfaces, or types.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -447,7 +474,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "search_go_symbols",
-            "description": "Search Go symbols by name, signature, docstring, or file path. Builds the Go index automatically if missing.",
+            "description": "Search indexed Go symbols by name, signature, docstring, package, or file path. Prefer this before search_text when investigating Go code structure or locating definitions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -460,7 +487,68 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_go_symbol",
-            "description": "Read an indexed Go symbol with optional caller/callee context.",
+            "description": "Read an indexed Go symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "symbol_id": { "type": "string" },
+                    "include_context": { "type": "boolean", "default": false }
+                }
+            }
+        },
+        {
+            "name": "index_rust_workspace",
+            "description": "Build or rebuild the Rust code navigation index. Prefer running this before structural Rust investigations so search_rust_symbols/read_rust_symbol can provide symbols, code positions, callers, and callees.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "rust_index_status",
+            "description": "Check whether the Rust symbol index exists for the selected workspace. Call this before any Rust code investigation — if the index is missing, run index_rust_workspace first so symbol tools are available.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
+                }
+            }
+        },
+        {
+            "name": "list_rust_symbols",
+            "description": "List indexed Rust symbols with code positions. Prefer this over raw text search when browsing Rust modules, functions, methods, structs, enums, traits, aliases, consts, or statics.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "file_path": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["function", "method", "struct", "enum", "trait", "type_alias", "const", "static", "module"] }
+                }
+            }
+        },
+        {
+            "name": "search_rust_symbols",
+            "description": "Search indexed Rust symbols by name, signature, docstring, module, impl type, or file path. Prefer this before search_text when investigating Rust code structure or locating definitions.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 20 }
+                }
+            }
+        },
+        {
+            "name": "read_rust_symbol",
+            "description": "Read an indexed Rust symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],
@@ -473,7 +561,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "index_ts_workspace",
-            "description": "Build or rebuild the TS/JS symbol index for the selected workspace.",
+            "description": "Build or rebuild the TS/JS code navigation index. Prefer running this before structural TS/JS investigations so search_ts_symbols/read_ts_symbol can provide symbols, code positions, imports, callers, and callees.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -484,7 +572,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ts_index_status",
-            "description": "Check whether the TS/JS symbol index exists for the selected workspace.",
+            "description": "Check whether the TS/JS symbol index exists for the selected workspace. Call this before any TS/JS code investigation — if the index is missing, run index_ts_workspace first so symbol tools are available.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -495,7 +583,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_ts_symbols",
-            "description": "List TS/JS symbols with optional file and kind filters. Builds the TS/JS index automatically if missing.",
+            "description": "List indexed TS/JS symbols with code positions. Prefer this over raw text search when browsing TS/JS file structure, functions, components, classes, methods, interfaces, types, enums, or consts.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -508,7 +596,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "search_ts_symbols",
-            "description": "Search TS/JS symbols by name, signature, docstring, or file path. Builds the TS/JS index automatically if missing.",
+            "description": "Search indexed TS/JS symbols by name, signature, docstring, imports, exports, or file path. Prefer this before search_text when investigating TS/JS code structure, locating definitions, or following component/function dependencies.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -521,7 +609,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "read_ts_symbol",
-            "description": "Read an indexed TS/JS symbol with optional caller/callee context.",
+            "description": "Read an indexed TS/JS symbol's exact code range. Set include_context=true when you need dependency edges, imports, callers, callees, and suggested related symbols.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],
@@ -534,7 +622,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "record_work_memory",
-            "description": "Record an AI work summary for a workspace after code changes or investigation.",
+            "description": "Record a work summary after completing code changes or a significant investigation. Always call this when finishing a task — include what changed, why, and any risks. This is how context is preserved for future sessions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "summary"],
@@ -550,7 +638,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_work_memory",
-            "description": "List recent AI work memories for a workspace.",
+            "description": "List recent work summaries for a workspace. Call this at the start of a new task to recall what was previously done — saves re-investigating code that was already understood.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -562,7 +650,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "search_work_memory",
-            "description": "Search AI work memories for a workspace.",
+            "description": "Search past work summaries by keyword. Call before investigating a topic to check whether prior work already covers it — avoids duplicating effort across sessions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],

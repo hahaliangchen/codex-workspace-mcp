@@ -6,8 +6,8 @@ use std::{
 };
 
 use ignore::WalkBuilder;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tree_sitter::{Node, Parser};
 
 const INDEX_DIR: &str = ".codex-workspace-mcp";
 const INDEX_FILE: &str = "go_index.json";
@@ -47,7 +47,26 @@ pub struct GoIndex {
     pub workspace_root: String,
     pub generated_at_unix: u64,
     pub files_indexed: usize,
+    #[serde(default)]
+    pub files: Vec<GoFileInfo>,
     pub symbols: Vec<GoSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoFileInfo {
+    pub file_path: String,
+    pub package: String,
+    #[serde(default)]
+    pub imports: Vec<GoImport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoImport {
+    pub alias: Option<String>,
+    pub path: String,
+    pub package_hint: String,
+    pub dot: bool,
+    pub blank: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +80,13 @@ pub struct GoSymbol {
     pub end_line: usize,
     pub signature: String,
     pub docstring: String,
+    #[serde(default)]
     pub receiver: Option<String>,
+    #[serde(default)]
+    pub receiver_name: Option<String>,
+    #[serde(default)]
+    pub receiver_type: Option<String>,
+    #[serde(default)]
     pub calls: Vec<GoCall>,
 }
 
@@ -77,6 +102,8 @@ pub enum GoSymbolKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoCall {
+    #[serde(default)]
+    pub qualifier: Option<String>,
     pub target_text: String,
     pub line: usize,
     pub snippet: String,
@@ -329,6 +356,7 @@ pub fn read_symbol(root: &Path, request: ReadGoSymbolRequest) -> Result<ReadGoSy
 
 fn build_index(root: &Path) -> Result<GoIndex> {
     let mut symbols = Vec::new();
+    let mut files = Vec::new();
     let mut files_indexed = 0;
     let mut builder = WalkBuilder::new(root);
     builder
@@ -373,102 +401,379 @@ fn build_index(root: &Path) -> Result<GoIndex> {
             Err(_) => continue,
         };
         files_indexed += 1;
-        symbols.extend(parse_go_file(root, path, &content));
+        let parsed = parse_go_file(root, path, &content);
+        files.push(parsed.file);
+        symbols.extend(parsed.symbols);
     }
 
     Ok(GoIndex {
         workspace_root: root.display().to_string(),
         generated_at_unix: now_unix(),
         files_indexed,
+        files,
         symbols,
     })
 }
 
-fn parse_go_file(root: &Path, path: &Path, content: &str) -> Vec<GoSymbol> {
-    let relative_path = relative_display(root, path);
-    let package = parse_package(content);
-    let lines: Vec<&str> = content.lines().collect();
-    let func_re = Regex::new(r"^\s*func\s+(\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap();
-    let type_re =
-        Regex::new(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
-    let mut symbols = Vec::new();
-
-    for (idx, line) in lines.iter().enumerate() {
-        if let Some(captures) = func_re.captures(line) {
-            let start_line = idx + 1;
-            let receiver = captures
-                .get(1)
-                .map(|value| value.as_str().trim().to_string());
-            let name = captures
-                .get(2)
-                .map(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let end_line = find_block_end(&lines, idx);
-            let signature = collect_signature(&lines, idx);
-            let docstring = collect_docstring(&lines, idx);
-            let kind = if receiver.is_some() {
-                GoSymbolKind::Method
-            } else {
-                GoSymbolKind::Function
-            };
-            let calls = collect_calls(&lines, idx, end_line);
-            let id = symbol_id(&relative_path, &name, start_line, receiver.as_deref());
-            symbols.push(GoSymbol {
-                id,
-                name,
-                kind,
-                package: package.clone(),
-                file_path: relative_path.clone(),
-                start_line,
-                end_line,
-                signature,
-                docstring,
-                receiver,
-                calls,
-            });
-        } else if let Some(captures) = type_re.captures(line) {
-            let start_line = idx + 1;
-            let name = captures
-                .get(1)
-                .map(|value| value.as_str())
-                .unwrap_or("")
-                .to_string();
-            let type_kind = captures.get(2).map(|value| value.as_str()).unwrap_or("");
-            let kind = match type_kind {
-                "struct" => GoSymbolKind::Struct,
-                "interface" => GoSymbolKind::Interface,
-                _ => GoSymbolKind::Type,
-            };
-            let end_line = find_block_end(&lines, idx);
-            let signature = collect_signature(&lines, idx);
-            let docstring = collect_docstring(&lines, idx);
-            let id = symbol_id(&relative_path, &name, start_line, None);
-            symbols.push(GoSymbol {
-                id,
-                name,
-                kind,
-                package: package.clone(),
-                file_path: relative_path.clone(),
-                start_line,
-                end_line,
-                signature,
-                docstring,
-                receiver: None,
-                calls: Vec::new(),
-            });
-        }
-    }
-
-    symbols
+struct ParsedGoFile {
+    file: GoFileInfo,
+    symbols: Vec<GoSymbol>,
 }
 
-fn parse_package(content: &str) -> String {
-    content
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("package ").map(str::trim))
-        .unwrap_or("")
+fn parse_go_file(root: &Path, path: &Path, content: &str) -> ParsedGoFile {
+    let relative_path = relative_display(root, path);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut symbols = Vec::new();
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_go::LANGUAGE.into())
+        .is_err()
+    {
+        return ParsedGoFile {
+            file: GoFileInfo {
+                file_path: relative_path,
+                package: String::new(),
+                imports: Vec::new(),
+            },
+            symbols,
+        };
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return ParsedGoFile {
+            file: GoFileInfo {
+                file_path: relative_path,
+                package: String::new(),
+                imports: Vec::new(),
+            },
+            symbols,
+        };
+    };
+    let root_node = tree.root_node();
+    let package = parse_package_ast(root_node, content);
+    let imports = parse_imports_ast(root_node, content);
+
+    collect_symbols_ast(
+        root_node,
+        content,
+        &lines,
+        &relative_path,
+        &package,
+        &mut symbols,
+    );
+
+    ParsedGoFile {
+        file: GoFileInfo {
+            file_path: relative_path,
+            package,
+            imports,
+        },
+        symbols,
+    }
+}
+
+fn parse_package_ast(root: Node<'_>, content: &str) -> String {
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() != "package_clause" {
+            continue;
+        }
+        let mut package_cursor = child.walk();
+        for item in child.children(&mut package_cursor) {
+            if item.kind() == "package_identifier" || item.kind() == "identifier" {
+                return node_text(item, content).to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+fn parse_imports_ast(root: Node<'_>, content: &str) -> Vec<GoImport> {
+    let mut imports = Vec::new();
+    visit_nodes(root, &mut |node| {
+        if node.kind() == "import_spec"
+            && let Some(import) = parse_import_spec(node, content)
+        {
+            imports.push(import);
+        }
+    });
+    imports
+}
+
+fn parse_import_spec(node: Node<'_>, content: &str) -> Option<GoImport> {
+    let mut alias = None;
+    let mut path = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "package_identifier" | "identifier" => {
+                alias = Some(node_text(child, content).to_string())
+            }
+            "." | "_" => alias = Some(child.kind().to_string()),
+            "interpreted_string_literal" | "raw_string_literal" => {
+                path = Some(unquote_import_path(node_text(child, content)));
+            }
+            _ => {}
+        }
+    }
+    let path = path?;
+    let dot = alias.as_deref() == Some(".");
+    let blank = alias.as_deref() == Some("_");
+    let alias = alias.filter(|value| value != "." && value != "_");
+    let package_hint = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path.as_str())
+        .replace('-', "_");
+    Some(GoImport {
+        alias,
+        path,
+        package_hint,
+        dot,
+        blank,
+    })
+}
+
+fn collect_symbols_ast(
+    root: Node<'_>,
+    content: &str,
+    lines: &[&str],
+    relative_path: &str,
+    package: &str,
+    symbols: &mut Vec<GoSymbol>,
+) {
+    visit_nodes(root, &mut |node| match node.kind() {
+        "function_declaration" => {
+            if let Some(symbol) =
+                parse_function_symbol(node, content, lines, relative_path, package)
+            {
+                symbols.push(symbol);
+            }
+        }
+        "method_declaration" => {
+            if let Some(symbol) = parse_method_symbol(node, content, lines, relative_path, package)
+            {
+                symbols.push(symbol);
+            }
+        }
+        "type_spec" => {
+            if let Some(symbol) = parse_type_symbol(node, content, lines, relative_path, package) {
+                symbols.push(symbol);
+            }
+        }
+        _ => {}
+    });
+}
+
+fn parse_function_symbol(
+    node: Node<'_>,
+    content: &str,
+    lines: &[&str],
+    relative_path: &str,
+    package: &str,
+) -> Option<GoSymbol> {
+    let name_node = child_by_kind(node, &["identifier"])?;
+    let name = node_text(name_node, content).to_string();
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+    Some(GoSymbol {
+        id: symbol_id(relative_path, &name, start_line, None),
+        name,
+        kind: GoSymbolKind::Function,
+        package: package.to_string(),
+        file_path: relative_path.to_string(),
+        start_line,
+        end_line,
+        signature: signature_from_node(node, content),
+        docstring: collect_docstring(lines, start_line - 1),
+        receiver: None,
+        receiver_name: None,
+        receiver_type: None,
+        calls: collect_calls_ast(node, content, lines),
+    })
+}
+
+fn parse_method_symbol(
+    node: Node<'_>,
+    content: &str,
+    lines: &[&str],
+    relative_path: &str,
+    package: &str,
+) -> Option<GoSymbol> {
+    let name_node = child_by_kind(node, &["field_identifier", "identifier"])?;
+    let name = node_text(name_node, content).to_string();
+    let receiver_node = child_by_kind(node, &["parameter_list"])?;
+    let receiver = normalize_whitespace(node_text(receiver_node, content));
+    let (receiver_name, receiver_type) = parse_receiver_parts(receiver_node, content);
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+    Some(GoSymbol {
+        id: symbol_id(relative_path, &name, start_line, Some(receiver.as_str())),
+        name,
+        kind: GoSymbolKind::Method,
+        package: package.to_string(),
+        file_path: relative_path.to_string(),
+        start_line,
+        end_line,
+        signature: signature_from_node(node, content),
+        docstring: collect_docstring(lines, start_line - 1),
+        receiver: Some(receiver),
+        receiver_name,
+        receiver_type,
+        calls: collect_calls_ast(node, content, lines),
+    })
+}
+
+fn parse_type_symbol(
+    node: Node<'_>,
+    content: &str,
+    lines: &[&str],
+    relative_path: &str,
+    package: &str,
+) -> Option<GoSymbol> {
+    let name_node = child_by_kind(node, &["type_identifier", "identifier"])?;
+    let name = node_text(name_node, content).to_string();
+    let kind = if child_by_kind(node, &["struct_type"]).is_some() {
+        GoSymbolKind::Struct
+    } else if child_by_kind(node, &["interface_type"]).is_some() {
+        GoSymbolKind::Interface
+    } else {
+        GoSymbolKind::Type
+    };
+    let start_line = node.start_position().row + 1;
+    let end_line = node.end_position().row + 1;
+    Some(GoSymbol {
+        id: symbol_id(relative_path, &name, start_line, None),
+        name,
+        kind,
+        package: package.to_string(),
+        file_path: relative_path.to_string(),
+        start_line,
+        end_line,
+        signature: signature_from_node(node, content),
+        docstring: collect_docstring(lines, start_line - 1),
+        receiver: None,
+        receiver_name: None,
+        receiver_type: None,
+        calls: Vec::new(),
+    })
+}
+
+fn collect_calls_ast(node: Node<'_>, content: &str, lines: &[&str]) -> Vec<GoCall> {
+    let mut calls = Vec::new();
+    visit_nodes(node, &mut |item| {
+        if item.kind() != "call_expression" {
+            return;
+        }
+        let Some(function_node) = item
+            .child_by_field_name("function")
+            .or_else(|| item.child(0))
+        else {
+            return;
+        };
+        let Some((qualifier, target_text)) = parse_call_target(function_node, content) else {
+            return;
+        };
+        let line = function_node.start_position().row + 1;
+        calls.push(GoCall {
+            qualifier,
+            target_text,
+            line,
+            snippet: lines
+                .get(line.saturating_sub(1))
+                .map(|line| line.trim().to_string())
+                .unwrap_or_default(),
+        });
+    });
+    calls
+}
+
+fn parse_call_target(node: Node<'_>, content: &str) -> Option<(Option<String>, String)> {
+    match node.kind() {
+        "identifier" | "field_identifier" => Some((None, node_text(node, content).to_string())),
+        "selector_expression" => {
+            let operand = node
+                .child_by_field_name("operand")
+                .or_else(|| node.child(0))?;
+            let field = node.child_by_field_name("field").or_else(|| {
+                let mut cursor = node.walk();
+                node.children(&mut cursor)
+                    .find(|child| child.kind() == "field_identifier")
+            })?;
+            Some((
+                Some(selector_qualifier_text(operand, content)),
+                node_text(field, content).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn selector_qualifier_text(node: Node<'_>, content: &str) -> String {
+    normalize_whitespace(node_text(node, content))
+}
+
+fn parse_receiver_parts(
+    receiver_node: Node<'_>,
+    content: &str,
+) -> (Option<String>, Option<String>) {
+    let mut receiver_name = None;
+    let mut receiver_type = None;
+    visit_nodes(receiver_node, &mut |node| match node.kind() {
+        "identifier" if receiver_name.is_none() => {
+            receiver_name = Some(node_text(node, content).to_string());
+        }
+        "type_identifier" if receiver_type.is_none() => {
+            receiver_type = Some(node_text(node, content).to_string());
+        }
+        _ => {}
+    });
+    if receiver_type.is_none() {
+        let text = node_text(receiver_node, content);
+        let cleaned = text
+            .trim_matches(|ch| ch == '(' || ch == ')')
+            .replace('*', " ");
+        receiver_type = cleaned
+            .split_whitespace()
+            .last()
+            .map(|value| value.to_string());
+    }
+    (receiver_name, receiver_type)
+}
+
+fn signature_from_node(node: Node<'_>, content: &str) -> String {
+    let end_byte = child_by_kind(node, &["block"])
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    normalize_whitespace(&content[node.start_byte()..end_byte])
+        .trim_end_matches('{')
+        .trim()
         .to_string()
+}
+
+fn child_by_kind<'a>(node: Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|child| kinds.contains(&child.kind()))
+}
+
+fn visit_nodes(node: Node<'_>, visitor: &mut impl FnMut(Node<'_>)) {
+    visitor(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_nodes(child, visitor);
+    }
+}
+
+fn node_text<'a>(node: Node<'_>, content: &'a str) -> &'a str {
+    node.utf8_text(content.as_bytes()).unwrap_or("")
+}
+
+fn unquote_import_path(value: &str) -> String {
+    value.trim().trim_matches('"').trim_matches('`').to_string()
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn collect_docstring(lines: &[&str], decl_idx: usize) -> String {
@@ -490,82 +795,19 @@ fn collect_docstring(lines: &[&str], decl_idx: usize) -> String {
     docs.join("\n")
 }
 
-fn collect_signature(lines: &[&str], start_idx: usize) -> String {
-    let mut parts = Vec::new();
-    for line in &lines[start_idx..] {
-        let before_body = line.split('{').next().unwrap_or(line).trim();
-        if !before_body.is_empty() {
-            parts.push(before_body.to_string());
-        }
-        if line.contains('{') || parens_balanced(&parts.join(" ")) {
-            break;
-        }
-    }
-    parts.join(" ")
-}
-
-fn find_block_end(lines: &[&str], start_idx: usize) -> usize {
-    let mut depth = 0isize;
-    let mut seen_body = false;
-    for (idx, line) in lines.iter().enumerate().skip(start_idx) {
-        for ch in strip_line_comment(line).chars() {
-            match ch {
-                '{' => {
-                    depth += 1;
-                    seen_body = true;
-                }
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        if seen_body && depth <= 0 {
-            return idx + 1;
-        }
-        if !seen_body && !line.trim_end().ends_with(',') && parens_balanced(line) {
-            return idx + 1;
-        }
-    }
-    start_idx + 1
-}
-
-fn collect_calls(lines: &[&str], start_idx: usize, end_line: usize) -> Vec<GoCall> {
-    let call_re = Regex::new(r"(?:\.|\b)([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap();
-    let keywords: BTreeSet<&str> = [
-        "if", "for", "switch", "select", "func", "return", "go", "defer", "range",
-    ]
-    .into_iter()
-    .collect();
-    let mut calls = Vec::new();
-    for (idx, line) in lines.iter().enumerate().take(end_line).skip(start_idx + 1) {
-        let clean = strip_line_comment(line);
-        for captures in call_re.captures_iter(&clean) {
-            let target = captures.get(1).map(|value| value.as_str()).unwrap_or("");
-            if target.is_empty() || keywords.contains(target) {
-                continue;
-            }
-            calls.push(GoCall {
-                target_text: target.to_string(),
-                line: idx + 1,
-                snippet: line.trim().to_string(),
-            });
-        }
-    }
-    calls
-}
-
 fn build_context(
     index: &GoIndex,
     symbol: &GoSymbol,
 ) -> (Vec<GoCaller>, Vec<GoCallee>, Vec<GoSuggestedRead>) {
-    let mut name_to_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut id_to_symbol: BTreeMap<String, &GoSymbol> = BTreeMap::new();
     for item in &index.symbols {
-        name_to_ids
-            .entry(item.name.clone())
-            .or_default()
-            .push(item.id.clone());
         id_to_symbol.insert(item.id.clone(), item);
     }
+    let file_infos: BTreeMap<String, &GoFileInfo> = index
+        .files
+        .iter()
+        .map(|file| (file.file_path.clone(), file))
+        .collect();
 
     let callees: Vec<_> = symbol
         .calls
@@ -574,10 +816,10 @@ fn build_context(
             target_text: call.target_text.clone(),
             line: call.line,
             snippet: call.snippet.clone(),
-            matched_symbol_ids: name_to_ids
-                .get(&call.target_text)
-                .cloned()
-                .unwrap_or_default(),
+            matched_symbol_ids: resolve_call(index, &file_infos, symbol, call)
+                .into_iter()
+                .map(|symbol| symbol.id.clone())
+                .collect(),
         })
         .collect();
     let mut suggested_reads = Vec::new();
@@ -589,7 +831,7 @@ fn build_context(
             }
             if let Some(matched_symbol) = id_to_symbol.get(matched_id) {
                 suggested_reads.push(GoSuggestedRead {
-                    reason: "direct_callee".to_string(),
+                    reason: suggestion_reason(symbol, matched_symbol).to_string(),
                     trigger_call: callee.target_text.clone(),
                     trigger_line: callee.line,
                     trigger_snippet: callee.snippet.clone(),
@@ -605,7 +847,10 @@ fn build_context(
             continue;
         }
         for call in &item.calls {
-            if call.target_text == symbol.name {
+            let matched = resolve_call(index, &file_infos, item, call)
+                .into_iter()
+                .any(|matched| matched.id == symbol.id);
+            if matched {
                 callers.push(GoCaller {
                     symbol_id: item.id.clone(),
                     name: item.name.clone(),
@@ -617,6 +862,89 @@ fn build_context(
         }
     }
     (callers, callees, suggested_reads)
+}
+
+fn resolve_call<'a>(
+    index: &'a GoIndex,
+    file_infos: &BTreeMap<String, &GoFileInfo>,
+    caller: &GoSymbol,
+    call: &GoCall,
+) -> Vec<&'a GoSymbol> {
+    let mut matches = Vec::new();
+    if let Some(qualifier) = call.qualifier.as_deref() {
+        if caller.receiver_name.as_deref() == Some(qualifier)
+            && let Some(receiver_type) = caller.receiver_type.as_deref()
+        {
+            matches.extend(index.symbols.iter().filter(|symbol| {
+                symbol.name == call.target_text
+                    && symbol.receiver_type.as_deref() == Some(receiver_type)
+                    && symbol.package == caller.package
+            }));
+        }
+
+        if let Some(file) = file_infos.get(&caller.file_path)
+            && let Some(import) = file.imports.iter().find(|import| {
+                import.alias.as_deref() == Some(qualifier)
+                    || (import.alias.is_none() && import.package_hint == qualifier)
+            })
+        {
+            matches.extend(index.symbols.iter().filter(|symbol| {
+                symbol.name == call.target_text
+                    && (symbol.package == import.package_hint
+                        || package_path_matches(&symbol.file_path, &import.path))
+            }));
+        }
+
+        dedupe_symbols(matches)
+    } else {
+        matches.extend(
+            index.symbols.iter().filter(|symbol| {
+                symbol.name == call.target_text && symbol.package == caller.package
+            }),
+        );
+        if matches.is_empty() {
+            matches.extend(index.symbols.iter().filter(|symbol| {
+                symbol.name == call.target_text && symbol.file_path == caller.file_path
+            }));
+        }
+        if matches.is_empty() {
+            matches.extend(
+                index
+                    .symbols
+                    .iter()
+                    .filter(|symbol| symbol.name == call.target_text),
+            );
+        }
+        dedupe_symbols(matches)
+    }
+}
+
+fn package_path_matches(file_path: &str, import_path: &str) -> bool {
+    let package_dir = import_path.rsplit('/').next().unwrap_or(import_path);
+    file_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.ends_with(package_dir))
+        .unwrap_or(false)
+}
+
+fn dedupe_symbols(symbols: Vec<&GoSymbol>) -> Vec<&GoSymbol> {
+    let mut seen = BTreeSet::new();
+    symbols
+        .into_iter()
+        .filter(|symbol| seen.insert(symbol.id.clone()))
+        .collect()
+}
+
+fn suggestion_reason(caller: &GoSymbol, matched: &GoSymbol) -> &'static str {
+    if caller.package == matched.package {
+        if caller.receiver_type.is_some() && caller.receiver_type == matched.receiver_type {
+            "receiver_method_call"
+        } else {
+            "same_package_call"
+        }
+    } else {
+        "imported_package_call"
+    }
 }
 
 fn load_or_build(root: &Path) -> Result<GoIndex> {
@@ -661,14 +989,6 @@ fn symbol_id(file_path: &str, name: &str, line: usize, receiver: Option<&str>) -
     } else {
         format!("go:{file_path}:{receiver}.{name}:{line}")
     }
-}
-
-fn strip_line_comment(line: &str) -> String {
-    line.split("//").next().unwrap_or(line).to_string()
-}
-
-fn parens_balanced(value: &str) -> bool {
-    value.chars().filter(|ch| *ch == '(').count() == value.chars().filter(|ch| *ch == ')').count()
 }
 
 fn now_unix() -> u64 {
@@ -782,7 +1102,7 @@ func SaveWorkflow(topic string) error {
                 .any(|callee| callee.target_text == "SaveWorkflow")
         );
         assert!(read.suggested_reads.iter().any(|suggestion| {
-            suggestion.reason == "direct_callee" && suggestion.symbol.name == "SaveWorkflow"
+            suggestion.reason == "same_package_call" && suggestion.symbol.name == "SaveWorkflow"
         }));
         let save = search
             .matches
@@ -805,6 +1125,122 @@ func SaveWorkflow(topic string) error {
                 .any(|caller| caller.name == "CreatePPT")
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_import_alias_calls() {
+        let root = temp_workspace("import_alias");
+        fs::create_dir_all(root.join("handler")).unwrap();
+        fs::write(
+            root.join("service").join("workflow.go"),
+            r#"package service
+
+func SaveWorkflow(topic string) error {
+    return nil
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("handler").join("handler.go"),
+            r#"package handler
+
+import svc "demo/service"
+
+func Run() {
+    _ = svc.SaveWorkflow("demo")
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+        let run = search_symbols(
+            &root,
+            SearchGoSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "Run".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "Run")
+        .unwrap();
+        let read = read_symbol(
+            &root,
+            ReadGoSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: run.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+
+        assert!(read.callees.iter().any(|callee| {
+            callee.target_text == "SaveWorkflow" && !callee.matched_symbol_ids.is_empty()
+        }));
+        assert!(read.suggested_reads.iter().any(|suggestion| {
+            suggestion.reason == "imported_package_call" && suggestion.symbol.name == "SaveWorkflow"
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_receiver_method_calls_and_multiline_signature() {
+        let root = temp_workspace("receiver");
+        fs::write(
+            root.join("service").join("ppt.go"),
+            r#"package service
+
+type PptService struct{}
+
+func (s *PptService) Create(
+    topic string,
+) error {
+    return s.Save(topic)
+}
+
+func (s *PptService) Save(topic string) error {
+    return nil
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+        let create = search_symbols(
+            &root,
+            SearchGoSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "Create".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "Create")
+        .unwrap();
+        assert!(create.signature.contains("topic string"));
+
+        let read = read_symbol(
+            &root,
+            ReadGoSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: create.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+        assert!(read.callees.iter().any(|callee| {
+            callee.target_text == "Save" && !callee.matched_symbol_ids.is_empty()
+        }));
+        assert!(read.suggested_reads.iter().any(|suggestion| {
+            suggestion.reason == "receiver_method_call" && suggestion.symbol.name == "Save"
+        }));
         let _ = fs::remove_dir_all(root);
     }
 

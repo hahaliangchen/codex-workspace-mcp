@@ -50,6 +50,8 @@ pub struct TsIndex {
     pub generated_at_unix: u64,
     pub files_indexed: usize,
     pub symbols: Vec<TsSymbol>,
+    #[serde(default)]
+    pub re_exports: Vec<TsReExport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +65,11 @@ pub struct TsSymbol {
     pub signature: String,
     pub docstring: String,
     pub export: bool,
+    #[serde(default)]
+    pub export_names: Vec<String>,
     pub calls: Vec<TsCall>,
+    #[serde(default)]
+    pub import_bindings: Vec<TsImport>,
     pub imports: Vec<String>,
 }
 
@@ -83,9 +89,39 @@ pub enum TsSymbolKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TsCall {
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub target_text: String,
     pub line: usize,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsReExport {
+    pub file_path: String,
+    pub source: String,
+    pub local_name: String,
+    pub exported_name: String,
+    pub kind: TsImportKind,
+    pub type_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TsImportKind {
+    Named,
+    Default,
+    Namespace,
+    SideEffect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsImport {
+    pub source: String,
+    pub local_name: String,
+    pub imported_name: String,
+    pub kind: TsImportKind,
+    pub type_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +187,7 @@ pub struct ReadTsSymbolResponse {
     pub content: String,
     pub callees: Vec<TsCallee>,
     pub callers: Vec<TsCaller>,
+    pub resolved_imports: Vec<TsResolvedImport>,
     pub suggested_reads: Vec<TsSuggestedRead>,
 }
 
@@ -182,6 +219,27 @@ pub struct TsCaller {
     pub file_path: String,
     pub line: usize,
     pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TsResolvedImport {
+    pub source: String,
+    pub local_name: String,
+    pub imported_name: String,
+    pub kind: TsImportKind,
+    pub target_file_path: Option<String>,
+    pub matched_symbol_ids: Vec<String>,
+    pub re_export_chain: Vec<TsExportChainStep>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TsExportChainStep {
+    pub file_path: String,
+    pub source: String,
+    pub imported_name: String,
+    pub local_name: String,
+    pub kind: TsImportKind,
+    pub target_file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,22 +376,24 @@ pub fn read_symbol(root: &Path, request: ReadTsSymbolRequest) -> Result<ReadTsSy
     let content = fs::read_to_string(path)?;
     let lines: Vec<_> = content.lines().collect();
     let content = lines[(symbol.start_line - 1)..symbol.end_line.min(lines.len())].join("\n");
-    let (callees, callers, suggested_reads) = if request.include_context {
+    let (callees, callers, resolved_imports, suggested_reads) = if request.include_context {
         build_context(&index, &symbol)
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
     Ok(ReadTsSymbolResponse {
         symbol,
         content,
         callees,
         callers,
+        resolved_imports,
         suggested_reads,
     })
 }
 
 fn build_index(root: &Path) -> Result<TsIndex> {
     let mut symbols = Vec::new();
+    let mut re_exports = Vec::new();
     let mut files_indexed = 0;
     for entry in walk_source_files(root) {
         let path = entry?;
@@ -351,7 +411,9 @@ fn build_index(root: &Path) -> Result<TsIndex> {
                 Err(_) => continue,
             };
             files_indexed += 1;
-            symbols.extend(parse_ts_file(root, &path, &content));
+            let parsed = parse_ts_file(root, &path, &content);
+            symbols.extend(parsed.symbols);
+            re_exports.extend(parsed.re_exports);
         }
     }
     Ok(TsIndex {
@@ -359,10 +421,16 @@ fn build_index(root: &Path) -> Result<TsIndex> {
         generated_at_unix: now_unix(),
         files_indexed,
         symbols,
+        re_exports,
     })
 }
 
-fn parse_ts_file(root: &Path, path: &Path, content: &str) -> Vec<TsSymbol> {
+struct ParsedTsFile {
+    symbols: Vec<TsSymbol>,
+    re_exports: Vec<TsReExport>,
+}
+
+fn parse_ts_file(root: &Path, path: &Path, content: &str) -> ParsedTsFile {
     let relative_path = relative_display(root, path);
     let comments = SingleThreadedComments::default();
     let cm: Lrc<SourceMap> = Default::default();
@@ -387,11 +455,19 @@ fn parse_ts_file(root: &Path, path: &Path, content: &str) -> Vec<TsSymbol> {
     let mut parser = Parser::new_from(lexer);
     let module = match parser.parse_module() {
         Ok(module) => module,
-        Err(_) => return Vec::new(),
+        Err(_) => {
+            return ParsedTsFile {
+                symbols: Vec::new(),
+                re_exports: Vec::new(),
+            };
+        }
     };
     let mut collector = TsCollector::new(relative_path, content, cm);
     collector.collect(&module);
-    collector.symbols
+    ParsedTsFile {
+        symbols: collector.symbols,
+        re_exports: collector.re_exports,
+    }
 }
 
 struct TsCollector {
@@ -399,6 +475,8 @@ struct TsCollector {
     content: String,
     cm: Lrc<SourceMap>,
     symbols: Vec<TsSymbol>,
+    re_exports: Vec<TsReExport>,
+    import_bindings: Vec<TsImport>,
     imports: Vec<String>,
     index_by_name: BTreeMap<String, Vec<String>>,
 }
@@ -410,6 +488,8 @@ impl TsCollector {
             content: content.to_string(),
             cm,
             symbols: Vec::new(),
+            re_exports: Vec::new(),
+            import_bindings: Vec::new(),
             imports: Vec::new(),
             index_by_name: BTreeMap::new(),
         }
@@ -419,9 +499,9 @@ impl TsCollector {
         for item in &module.body {
             match item {
                 ModuleItem::ModuleDecl(ModuleDecl::Import(import)) => {
-                    self.imports.push(format!("{:?}", import.src.value));
+                    self.collect_import(import);
                 }
-                ModuleItem::Stmt(Stmt::Decl(decl)) => self.collect_decl(decl, true),
+                ModuleItem::Stmt(Stmt::Decl(decl)) => self.collect_decl(decl, false),
                 ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => match &export.decl {
                     Decl::Fn(func) => self.collect_fn(&func, true),
                     Decl::Class(class) => self.collect_class(&class, true),
@@ -442,7 +522,146 @@ impl TsCollector {
                         self.collect_arrow(arrow, true, "defaultExport");
                     }
                 }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
+                    self.collect_named_export(export);
+                }
+                ModuleItem::ModuleDecl(ModuleDecl::ExportAll(export)) => {
+                    let source = export.src.value.to_string_lossy().to_string();
+                    self.imports.push(source.clone());
+                    self.re_exports.push(TsReExport {
+                        file_path: self.file_path.clone(),
+                        source,
+                        local_name: "*".to_string(),
+                        exported_name: "*".to_string(),
+                        kind: TsImportKind::Namespace,
+                        type_only: export.type_only,
+                    });
+                }
                 _ => {}
+            }
+        }
+    }
+
+    fn collect_import(&mut self, import: &ImportDecl) {
+        let source = import.src.value.to_string_lossy().to_string();
+        self.imports.push(source.clone());
+        if import.specifiers.is_empty() {
+            self.import_bindings.push(TsImport {
+                source,
+                local_name: String::new(),
+                imported_name: String::new(),
+                kind: TsImportKind::SideEffect,
+                type_only: import.type_only,
+            });
+            return;
+        }
+
+        for specifier in &import.specifiers {
+            match specifier {
+                ImportSpecifier::Named(named) => {
+                    let local_name = named.local.sym.to_string();
+                    let imported_name = named
+                        .imported
+                        .as_ref()
+                        .map(module_export_name)
+                        .unwrap_or_else(|| local_name.clone());
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name,
+                        imported_name,
+                        kind: TsImportKind::Named,
+                        type_only: import.type_only || named.is_type_only,
+                    });
+                }
+                ImportSpecifier::Default(default) => {
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name: default.local.sym.to_string(),
+                        imported_name: "default".to_string(),
+                        kind: TsImportKind::Default,
+                        type_only: import.type_only,
+                    });
+                }
+                ImportSpecifier::Namespace(namespace) => {
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name: namespace.local.sym.to_string(),
+                        imported_name: "*".to_string(),
+                        kind: TsImportKind::Namespace,
+                        type_only: import.type_only,
+                    });
+                }
+            }
+        }
+    }
+
+    fn collect_named_export(&mut self, export: &NamedExport) {
+        let Some(source) = export.src.as_ref() else {
+            return;
+        };
+        let source = source.value.to_string_lossy().to_string();
+        self.imports.push(source.clone());
+        for specifier in &export.specifiers {
+            match specifier {
+                ExportSpecifier::Named(named) => {
+                    let imported_name = module_export_name(&named.orig);
+                    let local_name = named
+                        .exported
+                        .as_ref()
+                        .map(module_export_name)
+                        .unwrap_or_else(|| imported_name.clone());
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name: local_name.clone(),
+                        imported_name: imported_name.clone(),
+                        kind: TsImportKind::Named,
+                        type_only: export.type_only || named.is_type_only,
+                    });
+                    self.re_exports.push(TsReExport {
+                        file_path: self.file_path.clone(),
+                        source: source.clone(),
+                        local_name: imported_name,
+                        exported_name: local_name,
+                        kind: TsImportKind::Named,
+                        type_only: export.type_only || named.is_type_only,
+                    });
+                }
+                ExportSpecifier::Namespace(namespace) => {
+                    let local_name = module_export_name(&namespace.name);
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name: local_name.clone(),
+                        imported_name: "*".to_string(),
+                        kind: TsImportKind::Namespace,
+                        type_only: export.type_only,
+                    });
+                    self.re_exports.push(TsReExport {
+                        file_path: self.file_path.clone(),
+                        source: source.clone(),
+                        local_name: "*".to_string(),
+                        exported_name: local_name,
+                        kind: TsImportKind::Namespace,
+                        type_only: export.type_only,
+                    });
+                }
+                ExportSpecifier::Default(default) => {
+                    let local_name = default.exported.sym.to_string();
+                    self.import_bindings.push(TsImport {
+                        source: source.clone(),
+                        local_name: local_name.clone(),
+                        imported_name: "default".to_string(),
+                        kind: TsImportKind::Default,
+                        type_only: export.type_only,
+                    });
+                    self.re_exports.push(TsReExport {
+                        file_path: self.file_path.clone(),
+                        source: source.clone(),
+                        local_name: "default".to_string(),
+                        exported_name: local_name,
+                        kind: TsImportKind::Default,
+                        type_only: export.type_only,
+                    });
+                }
             }
         }
     }
@@ -473,7 +692,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::Function,
             file_path: self.file_path.clone(),
             start_line,
@@ -481,7 +700,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: export_names(&name, export),
             calls,
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -501,7 +722,7 @@ impl TsCollector {
                 .push(id.clone());
             self.symbols.push(TsSymbol {
                 id,
-                name,
+                name: name.clone(),
                 kind: TsSymbolKind::Function,
                 file_path: self.file_path.clone(),
                 start_line,
@@ -509,7 +730,9 @@ impl TsCollector {
                 signature,
                 docstring,
                 export,
+                export_names: default_export_names(),
                 calls,
+                import_bindings: self.import_bindings.clone(),
                 imports: self.imports.clone(),
             });
         }
@@ -536,7 +759,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: default_export_names(),
             calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
         for member in &class.class.body {
@@ -563,7 +788,7 @@ impl TsCollector {
                 .push(id.clone());
             self.symbols.push(TsSymbol {
                 id,
-                name,
+                name: name.clone(),
                 kind: TsSymbolKind::Method,
                 file_path: self.file_path.clone(),
                 start_line,
@@ -571,7 +796,9 @@ impl TsCollector {
                 signature,
                 docstring,
                 export,
+                export_names: export_names(&name, export),
                 calls,
+                import_bindings: self.import_bindings.clone(),
                 imports: self.imports.clone(),
             });
         }
@@ -600,7 +827,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::Method,
             file_path: self.file_path.clone(),
             start_line,
@@ -608,7 +835,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: export_names(&name, export),
             calls,
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -626,7 +855,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::Interface,
             file_path: self.file_path.clone(),
             start_line,
@@ -634,7 +863,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: export_names(&name, export),
             calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -652,7 +883,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::TypeAlias,
             file_path: self.file_path.clone(),
             start_line,
@@ -660,7 +891,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: export_names(&name, export),
             calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -678,7 +911,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::Enum,
             file_path: self.file_path.clone(),
             start_line,
@@ -686,7 +919,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: export_names(&name, export),
             calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -713,7 +948,7 @@ impl TsCollector {
                             .push(id.clone());
                         self.symbols.push(TsSymbol {
                             id,
-                            name,
+                            name: name.clone(),
                             kind: TsSymbolKind::Const,
                             file_path: self.file_path.clone(),
                             start_line,
@@ -721,7 +956,9 @@ impl TsCollector {
                             signature,
                             docstring,
                             export,
+                            export_names: export_names(&name, export),
                             calls: Vec::new(),
+                            import_bindings: self.import_bindings.clone(),
                             imports: self.imports.clone(),
                         });
                     }
@@ -747,7 +984,7 @@ impl TsCollector {
             .push(id.clone());
         self.symbols.push(TsSymbol {
             id,
-            name,
+            name: name.clone(),
             kind: TsSymbolKind::Class,
             file_path: self.file_path.clone(),
             start_line,
@@ -755,7 +992,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: default_export_names(),
             calls: Vec::new(),
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -785,7 +1024,9 @@ impl TsCollector {
             signature,
             docstring,
             export,
+            export_names: default_export_names(),
             calls,
+            import_bindings: self.import_bindings.clone(),
             imports: self.imports.clone(),
         });
     }
@@ -822,9 +1063,15 @@ impl TsCollector {
 fn build_context(
     index: &TsIndex,
     symbol: &TsSymbol,
-) -> (Vec<TsCallee>, Vec<TsCaller>, Vec<TsSuggestedRead>) {
+) -> (
+    Vec<TsCallee>,
+    Vec<TsCaller>,
+    Vec<TsResolvedImport>,
+    Vec<TsSuggestedRead>,
+) {
     let mut name_to_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut id_to_symbol: BTreeMap<String, &TsSymbol> = BTreeMap::new();
+    let file_export_to_ids = build_file_export_map(index);
     for item in &index.symbols {
         name_to_ids
             .entry(item.name.clone())
@@ -832,6 +1079,47 @@ fn build_context(
             .push(item.id.clone());
         id_to_symbol.insert(item.id.clone(), item);
     }
+
+    let resolved_imports: Vec<_> = symbol
+        .import_bindings
+        .iter()
+        .map(|import| {
+            let target_file_path = resolve_import_source(&symbol.file_path, &import.source, index);
+            let re_export_chain = target_file_path
+                .as_ref()
+                .map(|target_file| {
+                    build_re_export_chain(
+                        index,
+                        target_file,
+                        &import.imported_name,
+                        &file_export_to_ids,
+                    )
+                })
+                .unwrap_or_default();
+            let matched_symbol_ids = target_file_path
+                .as_ref()
+                .map(|target_file| match import.kind {
+                    TsImportKind::Namespace | TsImportKind::SideEffect => {
+                        exported_ids_for_file(target_file, &file_export_to_ids)
+                    }
+                    TsImportKind::Default | TsImportKind::Named => file_export_to_ids
+                        .get(&(target_file.clone(), import.imported_name.clone()))
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .unwrap_or_default();
+            TsResolvedImport {
+                source: import.source.clone(),
+                local_name: import.local_name.clone(),
+                imported_name: import.imported_name.clone(),
+                kind: import.kind.clone(),
+                target_file_path,
+                matched_symbol_ids,
+                re_export_chain,
+            }
+        })
+        .collect();
+
     let callees: Vec<_> = symbol
         .calls
         .iter()
@@ -839,10 +1127,12 @@ fn build_context(
             target_text: call.target_text.clone(),
             line: call.line,
             snippet: call.snippet.clone(),
-            matched_symbol_ids: name_to_ids
-                .get(&call.target_text)
-                .cloned()
-                .unwrap_or_default(),
+            matched_symbol_ids: resolve_call_targets(
+                call,
+                &name_to_ids,
+                &resolved_imports,
+                &file_export_to_ids,
+            ),
         })
         .collect();
     let mut suggested_reads = Vec::new();
@@ -853,11 +1143,35 @@ fn build_context(
                 continue;
             }
             if let Some(matched_symbol) = id_to_symbol.get(matched_id) {
+                let reason = if resolved_imports.iter().any(|import| {
+                    import.local_name == callee.target_text
+                        || callee.snippet.contains(&format!("{}.", import.local_name))
+                }) {
+                    "resolved_import"
+                } else {
+                    "direct_callee"
+                };
                 suggested_reads.push(TsSuggestedRead {
-                    reason: "direct_callee".to_string(),
+                    reason: reason.to_string(),
                     trigger_call: callee.target_text.clone(),
                     trigger_line: callee.line,
                     trigger_snippet: callee.snippet.clone(),
+                    symbol: TsSymbolSummary::from(*matched_symbol),
+                });
+            }
+        }
+    }
+    for import in &resolved_imports {
+        for matched_id in &import.matched_symbol_ids {
+            if matched_id == &symbol.id || !seen.insert(matched_id.clone()) {
+                continue;
+            }
+            if let Some(matched_symbol) = id_to_symbol.get(matched_id) {
+                suggested_reads.push(TsSuggestedRead {
+                    reason: "resolved_import".to_string(),
+                    trigger_call: import.local_name.clone(),
+                    trigger_line: symbol.start_line,
+                    trigger_snippet: format!("import {} from {}", import.local_name, import.source),
                     symbol: TsSymbolSummary::from(*matched_symbol),
                 });
             }
@@ -869,7 +1183,7 @@ fn build_context(
             continue;
         }
         for call in &item.calls {
-            if call.target_text == symbol.name {
+            if call.target_text == symbol.name || imported_call_matches(index, item, call, symbol) {
                 callers.push(TsCaller {
                     symbol_id: item.id.clone(),
                     name: item.name.clone(),
@@ -880,14 +1194,17 @@ fn build_context(
             }
         }
     }
-    (callees, callers, suggested_reads)
+    (callees, callers, resolved_imports, suggested_reads)
 }
 
 fn collect_calls_from_span(content: &str, cm: &Lrc<SourceMap>, span: Span) -> Vec<TsCall> {
     let lines: Vec<&str> = content.lines().collect();
     let start_line = line_of(cm, span.lo);
     let end_line = line_of(cm, span.hi).min(lines.len().max(1));
-    let call_re = Regex::new(r"(?:\.|\b)([A-Za-z_][A-Za-z0-9_]*)\s*\(").unwrap();
+    let call_re = Regex::new(
+        r"(?:(?P<namespace>[A-Za-z_][A-Za-z0-9_]*)\.)?(?P<target>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+    )
+    .unwrap();
     let keywords: BTreeSet<&str> = [
         "if",
         "for",
@@ -910,11 +1227,17 @@ fn collect_calls_from_span(content: &str, cm: &Lrc<SourceMap>, span: Span) -> Ve
     {
         let clean = strip_line_comment(line);
         for captures in call_re.captures_iter(&clean) {
-            let target = captures.get(1).map(|value| value.as_str()).unwrap_or("");
+            let target = captures
+                .name("target")
+                .map(|value| value.as_str())
+                .unwrap_or("");
             if target.is_empty() || keywords.contains(target) {
                 continue;
             }
             calls.push(TsCall {
+                namespace: captures
+                    .name("namespace")
+                    .map(|value| value.as_str().to_string()),
                 target_text: target.to_string(),
                 line: idx + 1,
                 snippet: line.trim().to_string(),
@@ -922,6 +1245,289 @@ fn collect_calls_from_span(content: &str, cm: &Lrc<SourceMap>, span: Span) -> Ve
         }
     }
     calls
+}
+
+fn resolve_call_targets(
+    call: &TsCall,
+    name_to_ids: &BTreeMap<String, Vec<String>>,
+    resolved_imports: &[TsResolvedImport],
+    file_export_to_ids: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<String> {
+    if let Some(namespace) = call.namespace.as_deref()
+        && let Some(import) = resolved_imports
+            .iter()
+            .find(|import| import.local_name == namespace && import.kind == TsImportKind::Namespace)
+        && let Some(target_file) = import.target_file_path.as_ref()
+        && let Some(ids) = file_export_to_ids.get(&(target_file.clone(), call.target_text.clone()))
+    {
+        return ids.clone();
+    }
+
+    if let Some(import) = resolved_imports
+        .iter()
+        .find(|import| import.local_name == call.target_text)
+    {
+        if !import.matched_symbol_ids.is_empty() {
+            return import.matched_symbol_ids.clone();
+        }
+    }
+    name_to_ids
+        .get(&call.target_text)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn imported_call_matches(
+    index: &TsIndex,
+    caller: &TsSymbol,
+    call: &TsCall,
+    target: &TsSymbol,
+) -> bool {
+    let file_export_to_ids = build_file_export_map(index);
+    caller.import_bindings.iter().any(|import| {
+        if call.namespace.as_deref() == Some(import.local_name.as_str())
+            && import.kind == TsImportKind::Namespace
+            && let Some(target_file) =
+                resolve_import_source(&caller.file_path, &import.source, index)
+            && let Some(ids) = file_export_to_ids.get(&(target_file, call.target_text.clone()))
+        {
+            return ids.iter().any(|id| id == &target.id);
+        }
+
+        import.local_name == call.target_text
+            && resolve_import_source(&caller.file_path, &import.source, index).as_deref()
+                == Some(target.file_path.as_str())
+            && exported_names(target)
+                .iter()
+                .any(|export_name| export_name == &import.imported_name)
+    })
+}
+
+fn build_file_export_map(index: &TsIndex) -> BTreeMap<(String, String), Vec<String>> {
+    let mut file_export_to_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for item in &index.symbols {
+        if item.export {
+            for export_name in exported_names(item) {
+                file_export_to_ids
+                    .entry((item.file_path.clone(), export_name))
+                    .or_default()
+                    .push(item.id.clone());
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for re_export in &index.re_exports {
+            let Some(source_file) =
+                resolve_import_source(&re_export.file_path, &re_export.source, index)
+            else {
+                continue;
+            };
+            let source_exports =
+                if re_export.kind == TsImportKind::Namespace && re_export.exported_name == "*" {
+                    exported_names_for_file(&source_file, &file_export_to_ids)
+                } else {
+                    vec![re_export.local_name.clone()]
+                };
+            for source_export in source_exports {
+                let exported_name = if re_export.kind == TsImportKind::Namespace {
+                    source_export.clone()
+                } else {
+                    re_export.exported_name.clone()
+                };
+                let Some(ids) = file_export_to_ids
+                    .get(&(source_file.clone(), source_export))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let entry = file_export_to_ids
+                    .entry((re_export.file_path.clone(), exported_name))
+                    .or_default();
+                for id in ids {
+                    if !entry.contains(&id) {
+                        entry.push(id);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    file_export_to_ids
+}
+
+fn build_re_export_chain(
+    index: &TsIndex,
+    file_path: &str,
+    imported_name: &str,
+    file_export_to_ids: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<TsExportChainStep> {
+    let mut chain = Vec::new();
+    let mut current_file = file_path.to_string();
+    let mut current_name = imported_name.to_string();
+    let mut seen = BTreeSet::new();
+
+    loop {
+        if !seen.insert((current_file.clone(), current_name.clone())) {
+            break;
+        }
+        let Some(re_export) = find_re_export_for_name(index, &current_file, &current_name) else {
+            break;
+        };
+        let Some(target_file) =
+            resolve_import_source(&re_export.file_path, &re_export.source, index)
+        else {
+            break;
+        };
+        let next_name = if re_export.kind == TsImportKind::Namespace {
+            current_name.clone()
+        } else {
+            re_export.local_name.clone()
+        };
+        if !file_export_to_ids.contains_key(&(target_file.clone(), next_name.clone())) {
+            break;
+        }
+        chain.push(TsExportChainStep {
+            file_path: re_export.file_path.clone(),
+            source: re_export.source.clone(),
+            imported_name: next_name.clone(),
+            local_name: re_export.exported_name.clone(),
+            kind: re_export.kind.clone(),
+            target_file_path: Some(target_file.clone()),
+        });
+        current_file = target_file;
+        current_name = next_name;
+    }
+
+    chain
+}
+
+fn find_re_export_for_name<'a>(
+    index: &'a TsIndex,
+    file_path: &str,
+    export_name: &str,
+) -> Option<&'a TsReExport> {
+    index.re_exports.iter().find(|re_export| {
+        re_export.file_path == file_path
+            && (re_export.exported_name == export_name
+                || (re_export.kind == TsImportKind::Namespace && re_export.exported_name == "*"))
+    })
+}
+
+fn exported_names_for_file(
+    file_path: &str,
+    file_export_to_ids: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<String> {
+    let mut names: Vec<_> = file_export_to_ids
+        .keys()
+        .filter_map(|(file, name)| (file == file_path).then_some(name.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn exported_ids_for_file(
+    file_path: &str,
+    file_export_to_ids: &BTreeMap<(String, String), Vec<String>>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (file, _name) in file_export_to_ids.keys() {
+        if file != file_path {
+            continue;
+        }
+        if let Some(values) = file_export_to_ids.get(&(file.clone(), _name.clone())) {
+            for value in values {
+                if !ids.contains(value) {
+                    ids.push(value.clone());
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn resolve_import_source(from_file: &str, source: &str, index: &TsIndex) -> Option<String> {
+    if !source.starts_with('.') {
+        return None;
+    }
+    let from_dir = Path::new(from_file)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let candidate = normalize_workspace_relative_path(&from_dir.join(source).to_string_lossy());
+    let candidates = import_path_candidates(&candidate);
+    candidates.into_iter().find(|candidate| {
+        index
+            .symbols
+            .iter()
+            .any(|symbol| symbol.file_path == *candidate)
+            || index
+                .re_exports
+                .iter()
+                .any(|re_export| re_export.file_path == *candidate)
+    })
+}
+
+fn import_path_candidates(base: &str) -> Vec<String> {
+    let base = normalize_workspace_relative_path(base);
+    let path = Path::new(&base);
+    if path.extension().is_some() {
+        return vec![base];
+    }
+    ["ts", "tsx", "js", "jsx"]
+        .into_iter()
+        .map(|ext| format!("{base}.{ext}"))
+        .chain(
+            ["ts", "tsx", "js", "jsx"]
+                .into_iter()
+                .map(|ext| format!("{base}/index.{ext}")),
+        )
+        .collect()
+}
+
+fn exported_names(symbol: &TsSymbol) -> Vec<String> {
+    if !symbol.export_names.is_empty() {
+        symbol.export_names.clone()
+    } else if symbol.export {
+        export_names(&symbol.name, true)
+    } else {
+        Vec::new()
+    }
+}
+
+fn export_names(name: &str, export: bool) -> Vec<String> {
+    if !export {
+        return Vec::new();
+    }
+    if name == "default" || name == "defaultExport" {
+        vec!["default".to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+fn default_export_names() -> Vec<String> {
+    vec!["default".to_string()]
+}
+
+fn module_export_name(name: &ModuleExportName) -> String {
+    match name {
+        ModuleExportName::Ident(ident) => ident.sym.to_string(),
+        ModuleExportName::Str(value) => value.value.to_string_lossy().to_string(),
+    }
+}
+
+fn normalize_workspace_relative_path(value: &str) -> String {
+    let mut normalized = normalize_slashes(value);
+    while normalized.starts_with("./") {
+        normalized = normalized.trim_start_matches("./").to_string();
+    }
+    while normalized.starts_with(".\\") {
+        normalized = normalized.trim_start_matches(".\\").to_string();
+    }
+    normalized
 }
 
 fn walk_source_files(root: &Path) -> Vec<std::io::Result<PathBuf>> {
@@ -1171,6 +1777,214 @@ function normalize(id: string) {
 
         assert_eq!(search.matches.len(), 1);
         assert!(index_path(&root).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_imported_symbols_in_context() {
+        let root = temp_workspace("imports");
+        fs::write(
+            root.join("provider.ts"),
+            r#"export function createThing(name: string) {
+  return name.trim();
+}
+
+export default function defaultThing() {
+  return createThing('default');
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("consumer.ts"),
+            r#"import defaultThing, { createThing as makeThing } from './provider';
+
+export function run() {
+  makeThing('demo');
+  return defaultThing();
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+        let run = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "run".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "run")
+        .unwrap();
+        let read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: run.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+
+        assert!(read.resolved_imports.iter().any(|import| {
+            import.local_name == "makeThing"
+                && import.target_file_path.as_deref() == Some("provider.ts")
+                && !import.matched_symbol_ids.is_empty()
+        }));
+        assert!(read.suggested_reads.iter().any(|suggestion| {
+            suggestion.reason == "resolved_import" && suggestion.symbol.name == "createThing"
+        }));
+        assert!(read.callees.iter().any(|callee| {
+            callee.target_text == "makeThing" && !callee.matched_symbol_ids.is_empty()
+        }));
+
+        let create = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "createThing".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "createThing")
+        .unwrap();
+        let create_read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: create.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            create_read
+                .callers
+                .iter()
+                .any(|caller| caller.name == "run")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_namespace_import_calls() {
+        let root = temp_workspace("namespace_imports");
+        fs::write(
+            root.join("provider.ts"),
+            "export function createThing(name: string) { return name.trim(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("consumer.ts"),
+            r#"import * as provider from './provider';
+
+export function run() {
+  return provider.createThing('demo');
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+        let run = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "run".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "run")
+        .unwrap();
+        let read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: run.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+
+        assert!(read.callees.iter().any(|callee| {
+            callee.target_text == "createThing" && !callee.matched_symbol_ids.is_empty()
+        }));
+        assert!(read.suggested_reads.iter().any(|suggestion| {
+            suggestion.reason == "resolved_import" && suggestion.symbol.name == "createThing"
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_export_star_barrel_imports() {
+        let root = temp_workspace("barrel_imports");
+        fs::write(
+            root.join("provider.ts"),
+            "export function createThing(name: string) { return name.trim(); }\n",
+        )
+        .unwrap();
+        fs::write(root.join("barrel.ts"), "export * from './provider';\n").unwrap();
+        fs::write(
+            root.join("consumer.ts"),
+            r#"import { createThing } from './barrel';
+
+export function run() {
+  return createThing('demo');
+}
+"#,
+        )
+        .unwrap();
+
+        index_workspace(&root).unwrap();
+        let run = search_symbols(
+            &root,
+            SearchTsSymbolsRequest {
+                workspace_root: root.display().to_string(),
+                query: "run".to_string(),
+                limit: 5,
+            },
+        )
+        .unwrap()
+        .matches
+        .into_iter()
+        .find(|symbol| symbol.name == "run")
+        .unwrap();
+        let read = read_symbol(
+            &root,
+            ReadTsSymbolRequest {
+                workspace_root: root.display().to_string(),
+                symbol_id: run.id,
+                include_context: true,
+            },
+        )
+        .unwrap();
+
+        assert!(read.resolved_imports.iter().any(|import| {
+            import.local_name == "createThing"
+                && import.target_file_path.as_deref() == Some("barrel.ts")
+                && !import.matched_symbol_ids.is_empty()
+                && import.re_export_chain.iter().any(|step| {
+                    step.file_path == "barrel.ts"
+                        && step.target_file_path.as_deref() == Some("provider.ts")
+                })
+        }));
+        assert!(read.suggested_reads.iter().any(|suggestion| {
+            suggestion.reason == "resolved_import" && suggestion.symbol.name == "createThing"
+        }));
+
         let _ = fs::remove_dir_all(root);
     }
 }
