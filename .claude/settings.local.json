@@ -22,7 +22,12 @@
       "Bash(powershell -Command \"Stop-Process -Name codex-workspace-mcp -Force -ErrorAction SilentlyContinue\")",
       "Bash(powershell -Command \"Get-Process codex-workspace-mcp -ErrorAction SilentlyContinue | Select-Object Id, ProcessName\")",
       "Bash(cp \"E:\\\\项目\\\\codex-workspace-mcp\\\\ai_proxy_config.json\" \"E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\\" && cd \"E:\\\\项目\\\\codex-workspace-mcp\" && cargo build --release 2>&1 | tail -3)",
-      "Bash(powershell -Command \"Stop-Process -Name codex-workspace-mcp -Force -ErrorAction SilentlyContinue; Copy-Item 'E:\\\\项目\\\\codex-workspace-mcp\\\\ai_proxy_config.json' 'E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\'\")"
+      "Bash(powershell -Command \"Stop-Process -Name codex-workspace-mcp -Force -ErrorAction SilentlyContinue; Copy-Item 'E:\\\\项目\\\\codex-workspace-mcp\\\\ai_proxy_config.json' 'E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\'\")",
+      "Bash(taskkill /f /im codex-workspace-mcp.exe)",
+      "Bash(tasklist)",
+      "Bash(powershell -Command \"Get-Process -Name 'codex-workspace-mcp' -ErrorAction SilentlyContinue | Select-Object Id, ProcessName\")",
+      "Bash(taskkill /f /pid 23256 /pid 14676)",
+      "Bash(powershell -Command \"Stop-Process -Id 23256, 14676 -Force\")"
     ]
   }
 }

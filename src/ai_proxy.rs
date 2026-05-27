@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::task::Context;
-use std::time::SystemTime;
 
 use axum::{
     body::{Body, Bytes},
@@ -22,6 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
+
+use crate::format_translate;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -118,144 +119,6 @@ fn resolve_model<'a>(
     Ok((provider, upstream))
 }
 
-/// Convert an Anthropic Messages request body to an OpenAI chat/completions body.
-fn anthropic_to_openai(body: &Value) -> Value {
-    let mut openai = json!({});
-
-    // model — kept as-is (will be mapped later)
-    if let Some(m) = body.get("model") {
-        openai["model"] = m.clone();
-    }
-
-    // messages — convert system from top-level to system message
-    let mut messages: Vec<Value> = Vec::new();
-    if let Some(sys) = body.get("system") {
-        if let Some(text) = sys.as_str() {
-            messages.push(json!({"role": "system", "content": text}));
-        } else if let Some(arr) = sys.as_array() {
-            // Anthropic allows system as array of text blocks
-            let combined: String = arr
-                .iter()
-                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if !combined.is_empty() {
-                messages.push(json!({"role": "system", "content": combined}));
-            }
-        }
-    }
-    if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
-        for msg in msgs {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = msg.get("content");
-            messages.push(json!({"role": role, "content": content}));
-        }
-    }
-    openai["messages"] = json!(messages);
-
-    // max_tokens
-    if let Some(v) = body.get("max_tokens") {
-        openai["max_tokens"] = v.clone();
-    }
-
-    // temperature
-    if let Some(v) = body.get("temperature") {
-        openai["temperature"] = v.clone();
-    }
-
-    // stop_sequences → stop
-    if let Some(v) = body.get("stop_sequences") {
-        openai["stop"] = v.clone();
-    }
-
-    // stream
-    if let Some(v) = body.get("stream") {
-        openai["stream"] = v.clone();
-    }
-
-    // top_p
-    if let Some(v) = body.get("top_p") {
-        openai["top_p"] = v.clone();
-    }
-
-    // top_k (OpenAI doesn't have this, but some providers support it)
-    if let Some(v) = body.get("top_k") {
-        openai["top_k"] = v.clone();
-    }
-
-    // tools
-    if let Some(v) = body.get("tools") {
-        openai["tools"] = v.clone();
-    }
-
-    // tool_choice
-    if let Some(v) = body.get("tool_choice") {
-        openai["tool_choice"] = v.clone();
-    }
-
-    openai
-}
-
-/// Convert an OpenAI chat completion response to an Anthropic Messages response.
-fn openai_to_anthropic(openai_body: &Value, model: &str) -> Value {
-    let choice = openai_body
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first());
-
-    let content_text = choice
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    let finish_reason = choice
-        .and_then(|c| c.get("finish_reason"))
-        .and_then(|f| f.as_str())
-        .unwrap_or("stop");
-
-    let usage = openai_body.get("usage");
-    let zero = json!(0);
-    let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).unwrap_or(&zero);
-    let output_tokens = usage
-        .and_then(|u| u.get("completion_tokens"))
-        .unwrap_or(&zero);
-
-    let msg_id = openai_body
-        .get("id")
-        .and_then(|i| i.as_str())
-        .unwrap_or("")
-        .to_owned();
-
-    json!({
-        "id": msg_id,
-        "type": "message",
-        "role": "assistant",
-        "content": [{"type": "text", "text": content_text}],
-        "model": model,
-        "stop_reason": match finish_reason {
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            "tool_calls" => "tool_use",
-            _ => "end_turn",
-        },
-        "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens
-        }
-    })
-}
-
-/// Generate a unique message ID.
-fn gen_msg_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("msg_{:x}", nanos)
-}
-
 /// Truncate body for logging (keep first ~2000 chars).
 fn fmt_body(b: &[u8]) -> String {
     let s = String::from_utf8_lossy(b);
@@ -264,171 +127,6 @@ fn fmt_body(b: &[u8]) -> String {
     } else {
         s.to_string()
     }
-}
-
-// ---------------------------------------------------------------------------
-// SSE stream converter: OpenAI SSE → Anthropic SSE
-// ---------------------------------------------------------------------------
-
-/// Holds accumulated state while converting an OpenAI SSE byte stream into
-/// Anthropic SSE byte chunks.
-struct SseConverter {
-    /// Accumulator for incomplete lines across byte-chunk boundaries.
-    line_buf: Vec<u8>,
-    model: String,
-    msg_id: String,
-    seen_content: bool,
-}
-
-impl SseConverter {
-    fn new(model: String) -> Self {
-        Self {
-            line_buf: Vec::new(),
-            model,
-            msg_id: gen_msg_id(),
-            seen_content: false,
-        }
-    }
-
-    /// Feed raw bytes from upstream; returns Vec of output bytes ready to
-    /// send to the client.  Call repeatedly with each chunk, then call
-    /// `flush()` at the end.
-    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.line_buf.extend_from_slice(chunk);
-
-        // Process complete lines
-        loop {
-            if let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
-                let line_bytes = self.line_buf.drain(..=pos).collect::<Vec<_>>();
-                let line = String::from_utf8_lossy(&line_bytes);
-                let line = line.trim_end_matches('\n').trim_end_matches('\r');
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        // End of stream — emit stop events
-                        if self.seen_content {
-                            self.emit_stop_events(&mut out);
-                        }
-                    } else if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                        self.process_openai_chunk(&chunk, &mut out);
-                    }
-                }
-                // Non-data lines, empty lines, comments — skip
-            } else {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Call after the upstream stream ends.
-    fn flush(&mut self) -> Vec<u8> {
-        // Process any remaining incomplete data in line_buf
-        let mut out = Vec::new();
-        if !self.line_buf.is_empty() {
-            let line = String::from_utf8_lossy(&self.line_buf);
-            let line = line.trim_end();
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data != "[DONE]" {
-                    if let Ok(chunk) = serde_json::from_str::<Value>(data) {
-                        self.process_openai_chunk(&chunk, &mut out);
-                    }
-                }
-            }
-            self.line_buf.clear();
-        }
-        // Always emit stop events at stream end if we started content
-        if self.seen_content {
-            self.emit_stop_events(&mut out);
-        }
-        out
-    }
-
-    fn process_openai_chunk(&mut self, chunk: &Value, out: &mut Vec<u8>) {
-        let choice = chunk
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first());
-
-        let delta_content = choice
-            .and_then(|c| c.get("delta"))
-            .and_then(|d| d.get("content"))
-            .and_then(|c| c.as_str());
-
-        if let Some(text) = delta_content {
-            if !self.seen_content {
-                // First content — emit message_start + content_block_start
-                self.seen_content = true;
-                self.emit_start_events(out);
-            }
-            // Emit content delta
-            let delta = json!({
-                "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text}
-            });
-            write_sse_event(out, "content_block_delta", &delta);
-        }
-
-        // Check if this is the final chunk (has finish_reason)
-        let finish = choice.and_then(|c| c.get("finish_reason")).and_then(|f| f.as_str());
-        if finish.is_some() && finish != Some("null") {
-            if self.seen_content {
-                self.emit_stop_events(out);
-            }
-        }
-    }
-
-    fn emit_start_events(&self, out: &mut Vec<u8>) {
-        let start = json!({
-            "type": "message_start",
-            "message": {
-                "id": self.msg_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": self.model,
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {"input_tokens": 0}
-            }
-        });
-        write_sse_event(out, "message_start", &start);
-
-        let block_start = json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        });
-        write_sse_event(out, "content_block_start", &block_start);
-    }
-
-    fn emit_stop_events(&self, out: &mut Vec<u8>) {
-        let block_stop = json!({
-            "type": "content_block_stop",
-            "index": 0
-        });
-        write_sse_event(out, "content_block_stop", &block_stop);
-
-        let msg_delta = json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-            "usage": {"output_tokens": 0}
-        });
-        write_sse_event(out, "message_delta", &msg_delta);
-
-        let msg_stop = json!({"type": "message_stop"});
-        write_sse_event(out, "message_stop", &msg_stop);
-    }
-}
-
-fn write_sse_event(out: &mut Vec<u8>, event: &str, data: &Value) {
-    out.extend_from_slice(b"event: ");
-    out.extend_from_slice(event.as_bytes());
-    out.extend_from_slice(b"\ndata: ");
-    out.extend_from_slice(serde_json::to_string(data).unwrap_or_default().as_bytes());
-    out.extend_from_slice(b"\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +174,7 @@ async fn forward_to_upstream(
                 // ---- streaming path ----
                 let log2 = log.clone(); // Arc<Mutex<...>> clone for the spawned task
                 let model = client_model.to_owned();
-                let converter = std::sync::Mutex::new(SseConverter::new(model));
+                let converter = std::sync::Mutex::new(format_translate::StreamConverter::new(model));
                 let stream = resp.bytes_stream();
 
                 // Use a channel to bridge spawned task → Stream for Body
@@ -716,7 +414,7 @@ async fn messages(
         (raw_body, provider.url.clone())
     } else {
         // OpenAI-compatible upstream: convert Anthropic → OpenAI.
-        let mut openai_body = anthropic_to_openai(&body);
+        let mut openai_body = format_translate::anthropic_to_openai(&body);
         openai_body["model"] = json!(upstream_model);
         log!(
             &state.log,
@@ -762,7 +460,7 @@ async fn messages(
 
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(openai_resp) => {
-                let anthropic_resp = openai_to_anthropic(&openai_resp, raw_model);
+                let anthropic_resp = format_translate::openai_to_anthropic(&openai_resp, raw_model);
                 log!(
                     &state.log,
                     "   anthropic resp: {}",

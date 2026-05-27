@@ -1,4 +1,5 @@
 mod ai_proxy;
+mod format_translate;
 mod go_index;
 mod mcp;
 mod memory;
