@@ -8,7 +8,21 @@
       "Bash(grep -rn \"fn line\\\\|SourceLocation\\\\|LineIndex\\\\|line_number\\\\|to_source_code\\\\|locate\" \"/c/Users/梁辰/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rustpython-parser-core-0.4.0/src/\" | head -30)",
       "mcp__codex-workspace__search_text",
       "Bash(cargo check *)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Bash(timeout 5 \"E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\codex-workspace-mcp.exe\" --stdio)",
+      "Bash(timeout 3 \"E:/项目/codex-workspace-mcp/target/release/codex-workspace-mcp.exe\" --stdio)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(xxd \"E:/项目/codex-workspace-mcp/tmp_stdout.log\")",
+      "Read(//c/Users/梁辰/.claude/**)",
+      "Read(//c/Users/梁辰/.claude/projects/E-----codex-workspace-mcp/**)",
+      "Bash(echo \"exit code: $?\")",
+      "mcp__codex-workspace__workspace_info",
+      "mcp__codex-workspace__record_work_memory",
+      "Bash(taskkill /F /IM codex-workspace-mcp.exe)",
+      "Bash(powershell -Command \"Stop-Process -Name codex-workspace-mcp -Force -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -Command \"Get-Process codex-workspace-mcp -ErrorAction SilentlyContinue | Select-Object Id, ProcessName\")",
+      "Bash(cp \"E:\\\\项目\\\\codex-workspace-mcp\\\\ai_proxy_config.json\" \"E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\\" && cd \"E:\\\\项目\\\\codex-workspace-mcp\" && cargo build --release 2>&1 | tail -3)",
+      "Bash(powershell -Command \"Stop-Process -Name codex-workspace-mcp -Force -ErrorAction SilentlyContinue; Copy-Item 'E:\\\\项目\\\\codex-workspace-mcp\\\\ai_proxy_config.json' 'E:\\\\项目\\\\codex-workspace-mcp\\\\target\\\\release\\\\'\")"
     ]
   }
 }

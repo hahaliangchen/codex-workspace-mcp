@@ -1,3 +1,4 @@
+mod ai_proxy;
 mod go_index;
 mod mcp;
 mod memory;
@@ -12,7 +13,7 @@ use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
 use crate::{
@@ -79,6 +80,26 @@ async fn main() -> anyhow::Result<()> {
 
     let workspace = Arc::new(Workspace::new(workspace_root)?);
     info!(root = %workspace.root().display(), "workspace initialized");
+
+    // Start AI proxy on port 3001 if config exists alongside the binary
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let ai_config_path = exe_dir.join("ai_proxy_config.json");
+    if ai_config_path.exists() {
+        match TcpListener::bind("127.0.0.1:3001").await {
+            Ok(listener) => {
+                info!(path = %ai_config_path.display(), "AI proxy starting on port 3001");
+                tokio::spawn(async move {
+                    if let Err(e) = ai_proxy::run(listener, &ai_config_path).await {
+                        error!(%e, "AI proxy exited with error");
+                    }
+                });
+            }
+            Err(e) => warn!(%e, "could not start AI proxy on port 3001"),
+        }
+    }
 
     if stdio_mode {
         // Bind to a random port so the proxy can discover it.

@@ -1,0 +1,9 @@
+2026-05-27T11:22:59.706124+08:00  INFO codex_workspace_mcp: workspace initialized root=\\?\E:\项目\codex-workspace-mcp
+2026-05-27T11:22:59.730842+08:00  INFO codex_workspace_mcp: starting server in background addr=127.0.0.1:52302 mode="stdio"
+2026-05-27T11:22:59.731197+08:00  INFO codex_workspace_mcp: starting HTTP server addr=127.0.0.1:52302 root=\\?\E:\项目\codex-workspace-mcp
+2026-05-27T11:22:59.937300+08:00  INFO codex_workspace_mcp::proxy: server healthy addr=127.0.0.1:52302
+2026-05-27T11:22:59.937475+08:00  INFO codex_workspace_mcp::proxy: stdio proxy ready, waiting for JSON-RPC requests from stdin addr=127.0.0.1:52302
+2026-05-27T11:22:59.941537+08:00  INFO codex_workspace_mcp::mcp: mcp POST received body={"id":1,"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"test","version":"1.0"},"protocolVersion":"2024-11-05"}}
+2026-05-27T11:22:59.941741+08:00  INFO codex_workspace_mcp::mcp: mcp json-rpc dispatch id=Some(Number(1)) method=Some("initialize") notification=false
+2026-05-27T11:22:59.941902+08:00  INFO codex_workspace_mcp::mcp: mcp json-rpc success id=Some(Number(1))
+2026-05-27T11:22:59.943131+08:00  INFO codex_workspace_mcp::proxy: stdin closed, shutting down proxy
