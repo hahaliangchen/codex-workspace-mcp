@@ -1039,3 +1039,334 @@ mod tests {
         assert!(s.contains("{\\\"city\\\":"));
     }
 }
+
+// ============================================================================
+// Responses API Streaming: OpenAI ChatCompletion SSE → OpenAI Responses API SSE
+// ============================================================================
+
+pub struct ResponsesStreamConverter {
+    line_buf: Vec<u8>,
+    model: String,
+    msg_id: String,
+    started: bool,
+    text_item_added: bool,
+    text_part_added: bool,
+    accumulated_text: String,
+    accumulated_tool_calls: Vec<Value>,
+    last_finish: Option<String>,
+    usage: Value,
+}
+
+impl ResponsesStreamConverter {
+    pub fn new(model: String) -> Self {
+        Self {
+            line_buf: Vec::new(),
+            model,
+            msg_id: gen_msg_id(),
+            started: false,
+            text_item_added: false,
+            text_part_added: false,
+            accumulated_text: String::new(),
+            accumulated_tool_calls: Vec::new(),
+            last_finish: None,
+            usage: json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }),
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.line_buf.extend_from_slice(chunk);
+
+        loop {
+            let pos = match self.line_buf.iter().position(|&b| b == b'\n') {
+                Some(p) => p,
+                None => break,
+            };
+            let line_bytes = self.line_buf.drain(..=pos).collect::<Vec<_>>();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim_end_matches('\n').trim_end_matches('\r');
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" {
+                    self.emit_completion_events(&mut out);
+                } else if let Ok(chunk_val) = serde_json::from_str::<Value>(data) {
+                    self.process_chunk(&chunk_val, &mut out);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn flush(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if !self.line_buf.is_empty() {
+            let line = String::from_utf8_lossy(&self.line_buf);
+            let line = line.trim_end();
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data != "[DONE]" {
+                    if let Ok(chunk_val) = serde_json::from_str::<Value>(data) {
+                        self.process_chunk(&chunk_val, &mut out);
+                    }
+                }
+            }
+            self.line_buf.clear();
+        }
+        self.emit_completion_events(&mut out);
+        out
+    }
+
+    fn process_chunk(&mut self, chunk: &Value, out: &mut Vec<u8>) {
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                let prompt = u.get("prompt_tokens")
+                    .or_else(|| u.get("input_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let completion = u.get("completion_tokens")
+                    .or_else(|| u.get("output_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let total = u.get("total_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(prompt + completion);
+
+                self.usage = json!({
+                    "input_tokens": prompt,
+                    "output_tokens": completion,
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                    "total_tokens": total
+                });
+            }
+        }
+
+        let choice = chunk
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first());
+
+        let delta = choice.and_then(|c| c.get("delta"));
+
+        if !self.started {
+            self.started = true;
+            let created_event = json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.msg_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.model,
+                }
+            });
+            write_sse_event(out, "response.created", &created_event);
+        }
+
+        if let Some(d) = delta {
+            if let Some(text) = d.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    self.accumulated_text.push_str(text);
+                    self.ensure_text_structures(out);
+                    
+                    let delta_event = json!({
+                        "type": "response.output_text.delta",
+                        "response_id": self.msg_id,
+                        "item_id": format!("item_txt_{}", self.msg_id),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text
+                    });
+                    write_sse_event(out, "response.output_text.delta", &delta_event);
+                }
+            }
+
+            if let Some(tc_deltas) = d.get("tool_calls") {
+                self.process_tool_delta(tc_deltas);
+            }
+        }
+
+        if let Some(finish) = choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+        {
+            if finish != "null" {
+                self.last_finish = Some(finish.to_owned());
+            }
+        }
+    }
+
+    fn ensure_text_structures(&mut self, out: &mut Vec<u8>) {
+        if !self.text_item_added {
+            self.text_item_added = true;
+            let item_added = json!({
+                "type": "response.output_item.added",
+                "response_id": self.msg_id,
+                "output_index": 0,
+                "item": {
+                    "id": format!("item_txt_{}", self.msg_id),
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": []
+                }
+            });
+            write_sse_event(out, "response.output_item.added", &item_added);
+        }
+
+        if !self.text_part_added {
+            self.text_part_added = true;
+            let part_added = json!({
+                "type": "response.content_part.added",
+                "response_id": self.msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {
+                    "type": "text",
+                    "text": ""
+                }
+            });
+            write_sse_event(out, "response.content_part.added", &part_added);
+        }
+    }
+
+    fn process_tool_delta(&mut self, tc_deltas: &Value) {
+        if let Some(arr) = tc_deltas.as_array() {
+            for tc in arr {
+                let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                while self.accumulated_tool_calls.len() <= idx {
+                    self.accumulated_tool_calls.push(json!({
+                        "id": "",
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "arguments": ""
+                        }
+                    }));
+                }
+
+                let target = &mut self.accumulated_tool_calls[idx];
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    target["id"] = json!(id);
+                }
+                if let Some(func) = tc.get("function") {
+                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                        target["function"]["name"] = json!(name);
+                    }
+                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                        let cur = target["function"]["arguments"].as_str().unwrap_or("");
+                        target["function"]["arguments"] = json!(format!("{}{}", cur, args));
+                    }
+                }
+            }
+        }
+    }
+
+    fn emit_completion_events(&mut self, out: &mut Vec<u8>) {
+        if !self.started {
+            return;
+        }
+
+        if self.text_part_added {
+            let text_done = json!({
+                "type": "response.output_text.done",
+                "response_id": self.msg_id,
+                "item_id": format!("item_txt_{}", self.msg_id),
+                "output_index": 0,
+                "content_index": 0,
+                "text": self.accumulated_text
+            });
+            write_sse_event(out, "response.output_text.done", &text_done);
+
+            let part_done = json!({
+                "type": "response.content_part.done",
+                "response_id": self.msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {
+                    "type": "text",
+                    "text": self.accumulated_text
+                }
+            });
+            write_sse_event(out, "response.content_part.done", &part_done);
+        }
+        if self.text_item_added {
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "response_id": self.msg_id,
+                "output_index": 0,
+                "item": {
+                    "id": format!("item_txt_{}", self.msg_id),
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": self.accumulated_text
+                        }
+                    ]
+                }
+            });
+            write_sse_event(out, "response.output_item.done", &item_done);
+        }
+
+        let mut final_output_items = Vec::new();
+        if !self.accumulated_text.is_empty() {
+            final_output_items.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": self.accumulated_text
+                    }
+                ]
+            }));
+        }
+
+        let valid_tool_calls: Vec<Value> = self.accumulated_tool_calls
+            .iter()
+            .filter(|tc| {
+                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                !name.is_empty()
+            })
+            .cloned()
+            .collect();
+
+        if !valid_tool_calls.is_empty() {
+            final_output_items.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "tool_calls": valid_tool_calls
+            }));
+        }
+
+        let completed_event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": self.msg_id,
+                "object": "response",
+                "status": "completed",
+                "model": self.model,
+                "usage": self.usage,
+                "output": final_output_items
+            }
+        });
+        write_sse_event(out, "response.completed", &completed_event);
+
+        out.extend_from_slice(b"data: [DONE]\n\n");
+
+        self.started = false;
+        self.text_item_added = false;
+        self.text_part_added = false;
+        self.accumulated_text.clear();
+        self.accumulated_tool_calls.clear();
+        self.last_finish = None;
+    }
+}
+

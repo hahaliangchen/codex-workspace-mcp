@@ -488,6 +488,242 @@ async fn messages(
     }
 }
 
+/// POST /v1/responses — OpenAI Responses API endpoint for Codex.
+async fn responses(
+    State(state): State<AiProxyState>,
+    Json(body): Json<Value>,
+) -> Response {
+    let client_model = match body.get("model").and_then(|v| v.as_str()) {
+        Some(m) => m.to_owned(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "missing model field"})),
+            )
+                .into_response();
+        }
+    };
+
+    log!(&state.log, "=== /v1/responses received from Codex  model={}", client_model);
+    log!(
+        &state.log,
+        "   Codex Responses body: {}",
+        fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
+    );
+
+
+
+    let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    log!(
+        &state.log,
+        "   resolved: provider={} upstream_model={}",
+        provider.url,
+        upstream_model
+    );
+
+    // Translate Responses format to standard Chat Completions messages
+    let mut messages: Vec<Value> = Vec::new();
+
+    // 1. instructions -> system message
+    if let Some(inst) = body.get("instructions").and_then(|v| v.as_str()) {
+        messages.push(json!({
+            "role": "system",
+            "content": inst
+        }));
+    }
+
+    // 2. Extract existing messages
+    if let Some(msgs) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in msgs {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").unwrap_or(&Value::Null).clone();
+            messages.push(json!({
+                "role": role,
+                "content": content
+            }));
+        }
+    }
+
+    // 3. input -> user message
+    if let Some(input_val) = body.get("input") {
+        if let Some(input_str) = input_val.as_str() {
+            messages.push(json!({
+                "role": "user",
+                "content": input_str
+            }));
+        } else if let Some(input_arr) = input_val.as_array() {
+            for item in input_arr {
+                if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                    for part in content_arr {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            messages.push(json!({
+                                "role": "user",
+                                "content": t
+                            }));
+                        }
+                    }
+                }
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": t
+                    }));
+                }
+            }
+        }
+    }
+
+    // Build downstream Chat Completions body
+    let mut openai_body = json!({
+        "model": upstream_model,
+        "messages": messages,
+        "stream": false, // Force non-streaming for stable translation
+    });
+
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        let filtered_tools: Vec<Value> = tools
+            .iter()
+            .filter(|t| {
+                t.is_object()
+                    && t.get("type").and_then(|v| v.as_str()) == Some("function")
+                    && t.get("function").is_some()
+            })
+            .cloned()
+            .collect();
+
+        if !filtered_tools.is_empty() {
+            openai_body["tools"] = json!(filtered_tools);
+        }
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        openai_body["tool_choice"] = tool_choice.clone();
+    }
+    if let Some(temp) = body.get("temperature") {
+        openai_body["temperature"] = temp.clone();
+    }
+    if let Some(max_t) = body.get("max_tokens") {
+        openai_body["max_tokens"] = max_t.clone();
+    }
+
+    log!(
+        &state.log,
+        "   forwarding ChatCompletions body: {}",
+        fmt_body(serde_json::to_string(&openai_body).unwrap_or_default().as_bytes())
+    );
+
+    let upstream_url = format!("{}/chat/completions", provider.url);
+
+    // Force stream: true for downstream provider
+    openai_body["stream"] = json!(true);
+
+    log!(
+        &state.log,
+        "   forwarding ChatCompletions stream body: {}",
+        fmt_body(serde_json::to_string(&openai_body).unwrap_or_default().as_bytes())
+    );
+
+    let resp = match state.client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", provider.api_key))
+        .json(&openai_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log!(&state.log, "!! CONNECT ERROR  {}", e);
+            error!(%e, "upstream stream request failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("upstream: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        log!(
+            &state.log,
+            "!! UPSTREAM STREAM ERROR RESP  status={}  body={}",
+            status.as_u16(),
+            String::from_utf8_lossy(&body_bytes)
+        );
+        return Response::builder()
+            .status(status)
+            .body(Body::from(body_bytes))
+            .unwrap();
+    }
+
+    // High performance SSE Streaming Relay!
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
+    let stream = resp.bytes_stream();
+    let mut converter = format_translate::ResponsesStreamConverter::new(client_model);
+    let log_clone = state.log.clone();
+
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        futures::pin_mut!(stream);
+
+        log!(&log_clone, ">> SPAWNED responses stream handler");
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(bytes) => {
+                    log!(&log_clone, ">> RECEIVED {} bytes from upstream stream", bytes.len());
+                    let converted = converter.feed(&bytes);
+                    if !converted.is_empty() {
+                        log!(&log_clone, ">> FORWARDING {} bytes to client", converted.len());
+                        let item: Result<Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                            Ok(Bytes::from(converted));
+                        if tx.send(item).await.is_err() {
+                            log!(&log_clone, "!! CLIENT DISCONNECTED during stream");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log!(&log_clone, "!! UPSTREAM STREAM ERROR  {}", e);
+                    let _ = tx
+                        .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        let remaining = converter.flush();
+        if !remaining.is_empty() {
+            log!(&log_clone, ">> FORWARDING final {} bytes to client", remaining.len());
+            let item: Result<Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                Ok(Bytes::from(remaining));
+            let _ = tx.send(item).await;
+        }
+        log!(&log_clone, ">> FINISHED responses stream handler");
+    });
+
+    let mut rx = rx;
+    let rx_stream = poll_fn(move |cx: &mut Context<'_>| {
+        rx.poll_recv(cx)
+    });
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(rx_stream))
+        .unwrap_or_else(|e| {
+            error!(%e, "failed to build Responses stream response");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -532,6 +768,7 @@ pub async fn run(listener: TcpListener, config_path: &Path) -> anyhow::Result<()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
