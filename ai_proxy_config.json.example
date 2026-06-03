@@ -1,0 +1,14 @@
+{
+  "default_provider": "my_upstream_provider",
+  "providers": {
+    "my_upstream_provider": {
+      "url": "https://api.openai.com/v1",
+      "api_key": "YOUR_UPSTREAM_API_KEY_HERE",
+      "api_type": "openai",
+      "model_map": {
+        "gpt-4o": "gpt-4o",
+        "claude-3-5-sonnet": "gpt-4o"
+      }
+    }
+  }
+}

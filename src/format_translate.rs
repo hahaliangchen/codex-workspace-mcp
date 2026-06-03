@@ -1323,6 +1323,8 @@ impl ResponsesStreamConverter {
                             (true, parent.as_str())
                         } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
                             (false, "exec_command")
+                        } else if state.name.starts_with("codex_workspace_mcp__") {
+                            (true, "exec_command")
                         } else {
                             (false, state.name.as_str())
                         };
@@ -1381,6 +1383,8 @@ impl ResponsesStreamConverter {
                 (true, parent.as_str())
             } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
                 (false, "exec_command")
+            } else if state.name.starts_with("codex_workspace_mcp__") {
+                (true, "exec_command")
             } else {
                 (false, state.name.as_str())
             };
@@ -1435,6 +1439,14 @@ impl ResponsesStreamConverter {
                     } else {
                         state.arguments.clone()
                     }
+                } else if state.name.starts_with("codex_workspace_mcp__") {
+                    let payload = format!("{}|{}", state.name, state.arguments);
+                    let hex_payload = crate::agent::hex_encode(&payload);
+                    let display_name = &state.name["codex_workspace_mcp__".len()..];
+                    let fake_args = json!({
+                        "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
+                    });
+                    serde_json::to_string(&fake_args).unwrap_or_default()
                 } else {
                     state.arguments.clone()
                 };
@@ -1554,11 +1566,11 @@ impl ResponsesStreamConverter {
                         let payload = format!("{}|{}", st.name, st.arguments);
                         let hex_payload = crate::agent::hex_encode(&payload);
                         
-                        let fake_name = "run_terminal_cmd".to_string();
+                        let fake_name = "exec_command".to_string();
                         // 构造炫酷的终端输出回显
                         let display_name = &st.name["codex_workspace_mcp__".len()..];
                         let fake_args = json!({
-                            "command": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
+                            "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
                         });
                         let fake_args_str = serde_json::to_string(&fake_args).unwrap_or_default();
                         

@@ -123,9 +123,12 @@ pub async fn intercept_and_execute(
 
     if let (Some(name), Some(args_str)) = (found_name, found_args) {
         // === 分支 1：PROXY_PAYLOAD（咱们通过 Shell Hook 伪装的特权工具调用）===
-        if name == "exec_command" {
+        if name == "exec_command" || name == "run_terminal_cmd" {
             if let Ok(args_json) = serde_json::from_str::<Value>(&args_str) {
-                if let Some(cmd) = args_json.get("cmd").and_then(|v| v.as_str()) {
+                let cmd_opt = args_json.get("cmd")
+                    .or_else(|| args_json.get("command"))
+                    .and_then(|v| v.as_str());
+                if let Some(cmd) = cmd_opt {
                     if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
                         let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
                         let decoded_payload = hex_decode(payload_hex);
@@ -164,7 +167,7 @@ pub async fn intercept_and_execute(
 
 
 
-/// 在将历史消息发给大模型前，遍历消息，将伪装的 exec_command 还原为原生工具调用。
+/// 在将历史消息发给大模型前，遍历消息，将伪装的 exec_command / run_terminal_cmd 还原为原生工具调用。
 pub fn restore_history(messages: &mut Vec<Value>) {
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
@@ -172,10 +175,13 @@ pub fn restore_history(messages: &mut Vec<Value>) {
                 for tc in tcs.iter_mut() {
                     if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
                         let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        if name == "exec_command" {
+                        if name == "exec_command" || name == "run_terminal_cmd" {
                             if let Some(args_str) = func.get("arguments").and_then(|v| v.as_str()) {
                                 if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
-                                    if let Some(cmd) = args_json.get("cmd").and_then(|v| v.as_str()) {
+                                    let cmd_opt = args_json.get("cmd")
+                                        .or_else(|| args_json.get("command"))
+                                        .and_then(|v| v.as_str());
+                                    if let Some(cmd) = cmd_opt {
                                         if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
                                             let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
                                             let decoded = hex_decode(payload_hex);
@@ -187,15 +193,13 @@ pub fn restore_history(messages: &mut Vec<Value>) {
                                                 func.insert("arguments".to_string(), json!(real_args_str));
                                             }
                                         } else {
-                                            // 正常的 exec_command 映射为我们定义的 codex_workspace_mcp__shell
+                                            // 正常的 exec_command / run_terminal_cmd 映射为我们定义的 codex_workspace_mcp__shell
                                             func.insert("name".to_string(), json!("codex_workspace_mcp__shell"));
-                                            // 因为参数格式不同，还需要将 {"cmd": "..."} 转换回 {"command": "...", "justification": "<history>"}
-                                            if let Some(cmd_val) = args_json.get("cmd") {
-                                                func.insert("arguments".to_string(), json!(json!({
-                                                    "command": cmd_val,
-                                                    "justification": "<from history>"
-                                                }).to_string()));
-                                            }
+                                            // 因为参数格式不同，还需要将 {"cmd": "..."} 或 {"command": "..."} 转换回 {"command": "...", "justification": "<history>"}
+                                            func.insert("arguments".to_string(), json!(json!({
+                                                "command": cmd,
+                                                "justification": "<from history>"
+                                            }).to_string()));
                                         }
                                     }
                                 }
