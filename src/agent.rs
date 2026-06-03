@@ -123,11 +123,11 @@ pub async fn intercept_and_execute(
 
     if let (Some(name), Some(args_str)) = (found_name, found_args) {
         // === 分支 1：PROXY_PAYLOAD（咱们通过 Shell Hook 伪装的特权工具调用）===
-        if name == "run_terminal_cmd" {
+        if name == "exec_command" {
             if let Ok(args_json) = serde_json::from_str::<Value>(&args_str) {
-                if let Some(command) = args_json.get("command").and_then(|v| v.as_str()) {
-                    if let Some(idx) = command.find("# PROXY_PAYLOAD: ") {
-                        let payload_hex = command[idx + "# PROXY_PAYLOAD: ".len()..].trim();
+                if let Some(cmd) = args_json.get("cmd").and_then(|v| v.as_str()) {
+                    if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
+                        let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
                         let decoded_payload = hex_decode(payload_hex);
                         if let Some(split_idx) = decoded_payload.find('|') {
                             let real_name = &decoded_payload[..split_idx];
@@ -152,13 +152,6 @@ pub async fn intercept_and_execute(
                                 }
                             }
                         }
-                    } else {
-                        // 正常的 run_terminal_cmd 返回时，记录一下 AI 在调用时留下的自证理由
-                        if let Some(justification) = args_json.get("justification").and_then(|v| v.as_str()) {
-                            crate::ai_proxy::log_write(log, &format!(
-                                "   [AGENT] Native Shell Invoked. AI Justification: {}", justification
-                            ));
-                        }
                     }
                 }
             }
@@ -171,7 +164,7 @@ pub async fn intercept_and_execute(
 
 
 
-/// 在将历史消息发给大模型前，遍历消息，将伪装的 run_terminal_cmd 还原为原生工具调用。
+/// 在将历史消息发给大模型前，遍历消息，将伪装的 exec_command 还原为原生工具调用。
 pub fn restore_history(messages: &mut Vec<Value>) {
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
@@ -179,24 +172,31 @@ pub fn restore_history(messages: &mut Vec<Value>) {
                 for tc in tcs.iter_mut() {
                     if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
                         let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let args_str = func.get("arguments").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        
-                        if name == "run_terminal_cmd" {
-                            if let Ok(args_json) = serde_json::from_str::<Value>(&args_str) {
-                                if let Some(command) = args_json.get("command").and_then(|v| v.as_str()) {
-                                    if let Some(idx) = command.find("# PROXY_PAYLOAD: ") {
-                                        let payload_hex = command[idx + "# PROXY_PAYLOAD: ".len()..].trim();
-                                        let decoded = hex_decode(payload_hex);
-                                        if let Some(split_idx) = decoded.find('|') {
-                                            let real_name = &decoded[..split_idx];
-                                            let real_args_str = &decoded[split_idx + 1..];
-                                            
-                                            func.insert("name".to_string(), json!(real_name));
-                                            func.insert("arguments".to_string(), json!(real_args_str));
+                        if name == "exec_command" {
+                            if let Some(args_str) = func.get("arguments").and_then(|v| v.as_str()) {
+                                if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
+                                    if let Some(cmd) = args_json.get("cmd").and_then(|v| v.as_str()) {
+                                        if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
+                                            let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
+                                            let decoded = hex_decode(payload_hex);
+                                            if let Some(split_idx) = decoded.find('|') {
+                                                let real_name = &decoded[..split_idx];
+                                                let real_args_str = &decoded[split_idx + 1..];
+                                                
+                                                func.insert("name".to_string(), json!(real_name));
+                                                func.insert("arguments".to_string(), json!(real_args_str));
+                                            }
+                                        } else {
+                                            // 正常的 exec_command 映射为我们定义的 codex_workspace_mcp__shell
+                                            func.insert("name".to_string(), json!("codex_workspace_mcp__shell"));
+                                            // 因为参数格式不同，还需要将 {"cmd": "..."} 转换回 {"command": "...", "justification": "<history>"}
+                                            if let Some(cmd_val) = args_json.get("cmd") {
+                                                func.insert("arguments".to_string(), json!(json!({
+                                                    "command": cmd_val,
+                                                    "justification": "<from history>"
+                                                }).to_string()));
+                                            }
                                         }
-                                    } else {
-                                        // 正常的 run_terminal_cmd 映射为我们定义的 codex_workspace_mcp__shell
-                                        func.insert("name".to_string(), json!("codex_workspace_mcp__shell"));
                                     }
                                 }
                             }

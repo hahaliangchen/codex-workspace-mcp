@@ -1322,7 +1322,7 @@ impl ResponsesStreamConverter {
                         let (is_ns_tool, emit_name) = if let Some((parent, _)) = self.tool_route_map.get(&state.name) {
                             (true, parent.as_str())
                         } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
-                            (false, "run_terminal_cmd")
+                            (false, "exec_command")
                         } else {
                             (false, state.name.as_str())
                         };
@@ -1380,7 +1380,7 @@ impl ResponsesStreamConverter {
             let (_, emit_name) = if let Some((parent, _)) = self.tool_route_map.get(&state.name) {
                 (true, parent.as_str())
             } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
-                (false, "run_terminal_cmd")
+                (false, "exec_command")
             } else {
                 (false, state.name.as_str())
             };
@@ -1409,15 +1409,32 @@ impl ResponsesStreamConverter {
                 state.done_emitted = true;
                 let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
 
-                let final_args_str = if let Some((_, real_sub_tool_name)) = self.tool_route_map.get(&state.name) {
+                let final_args_str = if let Some((parent, real_sub_tool_name)) = self.tool_route_map.get(&state.name) {
+                    if parent == &state.name && real_sub_tool_name == &state.name {
+                        state.arguments.clone()
+                    } else {
+                        let parsed_args = serde_json::from_str::<Value>(&state.arguments).unwrap_or(json!({}));
+                        
+                        let repacked = json!({
+                            "name": real_sub_tool_name,
+                            "arguments": parsed_args
+                        });
+                        
+                        serde_json::to_string(&repacked).unwrap_or_default()
+                    }
+                } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
                     let parsed_args = serde_json::from_str::<Value>(&state.arguments).unwrap_or(json!({}));
-                    
-                    let repacked = json!({
-                        "name": real_sub_tool_name,
-                        "arguments": parsed_args
-                    });
-                    
-                    serde_json::to_string(&repacked).unwrap_or_default()
+                    if let Some(justification) = parsed_args.get("justification").and_then(|v| v.as_str()) {
+                        tracing::info!("   [AGENT] AI is using shell! Justification: {}", justification);
+                    }
+                    if let Some(cmd) = parsed_args.get("command") {
+                        let repacked = json!({
+                            "cmd": cmd
+                        });
+                        serde_json::to_string(&repacked).unwrap_or_default()
+                    } else {
+                        state.arguments.clone()
+                    }
                 } else {
                     state.arguments.clone()
                 };

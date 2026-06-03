@@ -858,7 +858,7 @@ async fn responses(
         // 定义需要被屏蔽的 Codex 原生危险工具
         // 注意：我们把 shell 的控制权收归到 codex_workspace_mcp__shell，所以隐藏原生 shell 工具
         let blocked_types: &[&str] = &["shell", "code_execution", "bash", "computer_use"];
-        let blocked_names: &[&str] = &["run_terminal_cmd", "execute_command", "computer_use", "bash"];
+        let blocked_names: &[&str] = &["run_terminal_cmd", "execute_command", "exec_command", "computer_use", "bash"];
 
         for t in tools {
             if !t.is_object() {
