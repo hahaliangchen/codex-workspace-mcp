@@ -1,16 +1,12 @@
 use std::{
-    collections::hash_map::DefaultHasher,
-    fs::{self, OpenOptions},
-    hash::{Hash, Hasher},
-    io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-const MEMORY_DIR: &str = "memory";
-const MEMORY_FILE: &str = "memories.jsonl";
+use crate::database::init_db;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
@@ -18,6 +14,8 @@ pub enum MemoryError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;
@@ -82,11 +80,38 @@ pub struct SearchWorkMemoryResponse {
 }
 
 pub fn record(
-    server_root: &Path,
+    _server_root: &Path,
     request: RecordWorkMemoryRequest,
 ) -> Result<RecordWorkMemoryResponse> {
+    let workspace_root_path = Path::new(&request.workspace_root);
+    let conn = init_db(workspace_root_path)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+
+    let files_json = serde_json::to_string(&request.files_changed)?;
+
+    conn.execute(
+        "INSERT INTO memories (time_unix, workspace_root, summary, implementation, tests, risks, files_changed)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![
+            now as i64,
+            request.workspace_root,
+            request.summary,
+            request.implementation,
+            request.tests,
+            request.risks,
+            files_json
+        ],
+    )?;
+
+    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let display_path = db_path.to_string_lossy().replace('\\', "/");
+
     let memory = WorkMemory {
-        time_unix: now_unix(),
+        time_unix: now,
         workspace_root: request.workspace_root,
         summary: request.summary,
         files_changed: request.files_changed,
@@ -94,127 +119,131 @@ pub fn record(
         tests: request.tests,
         risks: request.risks,
     };
-    let path = memory_path(server_root, &memory.workspace_root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(file, "{}", serde_json::to_string(&memory)?)?;
+
     Ok(RecordWorkMemoryResponse {
-        memory_path: relative_display(server_root, &path),
+        memory_path: display_path,
         recorded: memory,
     })
 }
 
-pub fn list(server_root: &Path, request: ListWorkMemoryRequest) -> Result<ListWorkMemoryResponse> {
-    let path = memory_path(server_root, &request.workspace_root);
-    let mut memories = read_memories(&path)?;
-    memories.reverse();
-    memories.truncate(request.limit.max(1));
+pub fn list(_server_root: &Path, request: ListWorkMemoryRequest) -> Result<ListWorkMemoryResponse> {
+    let workspace_root_path = Path::new(&request.workspace_root);
+    let conn = init_db(workspace_root_path)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT time_unix, workspace_root, summary, implementation, tests, risks, files_changed
+         FROM memories
+         WHERE workspace_root = ?
+         ORDER BY time_unix DESC
+         LIMIT ?"
+    )?;
+
+    let rows = stmt.query_map(params![request.workspace_root, request.limit as i64], |row| {
+        let time_unix: i64 = row.get(0)?;
+        let workspace_root: String = row.get(1)?;
+        let summary: String = row.get(2)?;
+        let implementation: String = row.get(3)?;
+        let tests: String = row.get(4)?;
+        let risks: String = row.get(5)?;
+        let files_json: String = row.get(6)?;
+
+        let files_changed: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
+
+        Ok(WorkMemory {
+            time_unix: time_unix as u64,
+            workspace_root,
+            summary,
+            files_changed,
+            implementation,
+            tests,
+            risks,
+        })
+    })?;
+
+    let mut memories = Vec::new();
+    for row in rows {
+        memories.push(row?);
+    }
+
+    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let display_path = db_path.to_string_lossy().replace('\\', "/");
+
     Ok(ListWorkMemoryResponse {
-        memory_path: relative_display(server_root, &path),
+        memory_path: display_path,
         memories,
     })
 }
 
 pub fn search(
-    server_root: &Path,
+    _server_root: &Path,
     request: SearchWorkMemoryRequest,
 ) -> Result<SearchWorkMemoryResponse> {
-    let path = memory_path(server_root, &request.workspace_root);
-    let needle = request.query.to_lowercase();
-    let mut matches: Vec<_> = read_memories(&path)?
-        .into_iter()
-        .rev()
-        .filter(|memory| memory_text(memory).to_lowercase().contains(&needle))
-        .take(request.limit.max(1))
-        .collect();
-    matches.shrink_to_fit();
+    let workspace_root_path = Path::new(&request.workspace_root);
+    let conn = init_db(workspace_root_path)?;
+
+    let needle = format!("%{}%", request.query.to_lowercase());
+
+    let mut stmt = conn.prepare(
+        "SELECT time_unix, workspace_root, summary, implementation, tests, risks, files_changed
+         FROM memories
+         WHERE workspace_root = ?
+           AND (
+             LOWER(summary) LIKE ? OR
+             LOWER(implementation) LIKE ? OR
+             LOWER(tests) LIKE ? OR
+             LOWER(risks) LIKE ? OR
+             LOWER(files_changed) LIKE ?
+           )
+         ORDER BY time_unix DESC
+         LIMIT ?"
+    )?;
+
+    let rows = stmt.query_map(
+        params![
+            request.workspace_root,
+            needle,
+            needle,
+            needle,
+            needle,
+            needle,
+            request.limit as i64
+        ],
+        |row| {
+            let time_unix: i64 = row.get(0)?;
+            let workspace_root: String = row.get(1)?;
+            let summary: String = row.get(2)?;
+            let implementation: String = row.get(3)?;
+            let tests: String = row.get(4)?;
+            let risks: String = row.get(5)?;
+            let files_json: String = row.get(6)?;
+
+            let files_changed: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
+
+            Ok(WorkMemory {
+                time_unix: time_unix as u64,
+                workspace_root,
+                summary,
+                files_changed,
+                implementation,
+                tests,
+                risks,
+            })
+        }
+    )?;
+
+    let mut matches = Vec::new();
+    for row in rows {
+        matches.push(row?);
+    }
+
+    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let display_path = db_path.to_string_lossy().replace('\\', "/");
+
     Ok(SearchWorkMemoryResponse {
-        memory_path: relative_display(server_root, &path),
+        memory_path: display_path,
         query: request.query,
         matches,
     })
-}
-
-fn read_memories(path: &Path) -> Result<Vec<WorkMemory>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(path)?;
-    let mut memories = Vec::new();
-    for line in content.lines().filter(|line| !line.trim().is_empty()) {
-        memories.push(serde_json::from_str(line)?);
-    }
-    Ok(memories)
-}
-
-fn memory_path(server_root: &Path, workspace_root: &str) -> PathBuf {
-    server_root
-        .join(MEMORY_DIR)
-        .join(workspace_key(workspace_root))
-        .join(MEMORY_FILE)
-}
-
-fn workspace_key(workspace_root: &str) -> String {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    for ch in workspace_root.chars() {
-        if ch.is_ascii_alphanumeric() {
-            current.push(ch);
-        } else if !current.is_empty() {
-            parts.push(to_pascal_case(&current));
-            current.clear();
-        }
-    }
-    if !current.is_empty() {
-        parts.push(to_pascal_case(&current));
-    }
-    let readable = if parts.is_empty() {
-        "Workspace".to_string()
-    } else {
-        parts.join("")
-    };
-    format!("{readable}_{:08x}", short_hash(workspace_root))
-}
-
-fn to_pascal_case(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
-}
-
-fn short_hash(value: &str) -> u32 {
-    let mut hasher = DefaultHasher::new();
-    value.to_lowercase().hash(&mut hasher);
-    hasher.finish() as u32
-}
-
-fn memory_text(memory: &WorkMemory) -> String {
-    [
-        memory.summary.as_str(),
-        memory.implementation.as_str(),
-        memory.tests.as_str(),
-        memory.risks.as_str(),
-        &memory.files_changed.join("\n"),
-    ]
-    .join("\n")
-}
-
-fn relative_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or_default()
 }
 
 fn default_limit() -> usize {
@@ -225,8 +254,8 @@ fn default_limit() -> usize {
 mod tests {
     use super::*;
 
-    fn temp_root(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("codex_memory_{name}_{}", std::process::id()));
+    fn temp_workspace(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("codex_workspace_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
@@ -234,12 +263,13 @@ mod tests {
 
     #[test]
     fn records_lists_and_searches_memory() {
-        let root = temp_root("basic");
-        let workspace = r"D:\enterpriseProject\ai-ppt-server".to_string();
+        let ws = temp_workspace("basic");
+        let ws_str = ws.to_string_lossy().into_owned();
+
         record(
-            &root,
+            &ws,
             RecordWorkMemoryRequest {
-                workspace_root: workspace.clone(),
+                workspace_root: ws_str.clone(),
                 summary: "Added Go symbol index".to_string(),
                 files_changed: vec!["src/go_index.rs".to_string()],
                 implementation: "Indexed methods and docstrings".to_string(),
@@ -250,20 +280,19 @@ mod tests {
         .unwrap();
 
         let listed = list(
-            &root,
+            &ws,
             ListWorkMemoryRequest {
-                workspace_root: workspace.clone(),
+                workspace_root: ws_str.clone(),
                 limit: 5,
             },
         )
         .unwrap();
         assert_eq!(listed.memories.len(), 1);
-        assert!(listed.memory_path.contains("DEnterpriseProjectAiPptServer"));
 
         let searched = search(
-            &root,
+            &ws,
             SearchWorkMemoryRequest {
-                workspace_root: workspace,
+                workspace_root: ws_str,
                 query: "docstrings".to_string(),
                 limit: 5,
             },
@@ -271,6 +300,6 @@ mod tests {
         .unwrap();
         assert_eq!(searched.matches.len(), 1);
 
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(ws);
     }
 }

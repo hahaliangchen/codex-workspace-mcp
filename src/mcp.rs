@@ -696,30 +696,8 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "index_go_workspace",
-            "description": "Build or rebuild the Go code navigation index. Prefer running this before structural Go investigations so search_go_symbols/read_go_symbol can provide symbols, code positions, callers, and callees.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
-            "name": "go_index_status",
-            "description": "Check whether the Go symbol index exists for the selected workspace. Call this before any Go code investigation — if the index is missing, run index_go_workspace first so symbol tools are available.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
             "name": "list_go_symbols",
-            "description": "List indexed Go symbols with code positions. Prefer this over raw text search when browsing Go file structure, functions, methods, structs, interfaces, or types.",
+            "description": "List indexed Go symbols with code positions. Note: Go index is automatically built and updated by the server. Prefer this over raw text search when browsing Go file structure, functions, methods, structs, interfaces, or types.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -732,7 +710,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_go_symbols",
-            "description": "Search indexed Go symbols by name, signature, docstring, package, or file path. Prefer this before search_text when investigating Go code structure or locating definitions.",
+            "description": "Search indexed Go symbols by name, signature, docstring, package, or file path. Note: Go index is automatically built and updated by the server. Prefer this before search_text when investigating Go code structure or locating definitions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -745,7 +723,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_go_symbol",
-            "description": "Read an indexed Go symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
+            "description": "Read an indexed Go symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Go index is automatically built by the server.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],
@@ -757,30 +735,8 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "index_rust_workspace",
-            "description": "Build or rebuild the Rust code navigation index. Prefer running this before structural Rust investigations so search_rust_symbols/read_rust_symbol can provide symbols, code positions, callers, and callees.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
-            "name": "rust_index_status",
-            "description": "Check whether the Rust symbol index exists for the selected workspace. Call this before any Rust code investigation — if the index is missing, run index_rust_workspace first so symbol tools are available.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
             "name": "list_rust_symbols",
-            "description": "List indexed Rust symbols with code positions. Prefer this over raw text search when browsing Rust modules, functions, methods, structs, enums, traits, aliases, consts, or statics.",
+            "description": "List indexed Rust symbols with code positions. Note: Rust index is automatically built and updated by the server. Prefer this over raw text search when browsing Rust modules, functions, methods, structs, enums, traits, aliases, consts, or statics.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -793,7 +749,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_rust_symbols",
-            "description": "Search indexed Rust symbols by name, signature, docstring, module, impl type, or file path. Prefer this before search_text when investigating Rust code structure or locating definitions.",
+            "description": "Search indexed Rust symbols by name, signature, docstring, module, impl type, or file path. Note: Rust index is automatically built and updated by the server. Prefer this before search_text when investigating Rust code structure or locating definitions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -806,7 +762,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_rust_symbol",
-            "description": "Read an indexed Rust symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
+            "description": "Read an indexed Rust symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Rust index is automatically built by the server.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],
@@ -818,30 +774,8 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "index_ts_workspace",
-            "description": "Build or rebuild the TS/JS code navigation index. Prefer running this before structural TS/JS investigations so search_ts_symbols/read_ts_symbol can provide symbols, code positions, imports, callers, and callees.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
-            "name": "ts_index_status",
-            "description": "Check whether the TS/JS symbol index exists for the selected workspace. Call this before any TS/JS code investigation — if the index is missing, run index_ts_workspace first so symbol tools are available.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
             "name": "list_ts_symbols",
-            "description": "List indexed TS/JS symbols with code positions. Prefer this over raw text search when browsing TS/JS file structure, functions, components, classes, methods, interfaces, types, enums, or consts.",
+            "description": "List indexed TS/JS symbols with code positions. Note: TS/JS index is automatically built and updated by the server. Prefer this over raw text search when browsing TS/JS file structure, functions, components, classes, methods, interfaces, types, enums, or consts.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -854,7 +788,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_ts_symbols",
-            "description": "Search indexed TS/JS symbols by name, signature, docstring, imports, exports, or file path. Prefer this before search_text when investigating TS/JS code structure, locating definitions, or following component/function dependencies.",
+            "description": "Search indexed TS/JS symbols by name, signature, docstring, imports, exports, or file path. Note: TS/JS index is automatically built and updated by the server. Prefer this before search_text when investigating TS/JS code structure, locating definitions, or following component/function dependencies.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -867,7 +801,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_ts_symbol",
-            "description": "Read an indexed TS/JS symbol's exact code range. Set include_context=true when you need dependency edges, imports, callers, callees, and suggested related symbols.",
+            "description": "Read an indexed TS/JS symbol's exact code range. Set include_context=true when you need dependency edges, imports, callers, callees, and suggested related symbols. Note: TS/JS index is automatically built by the server.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],
@@ -879,30 +813,8 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "index_python_workspace",
-            "description": "Build or rebuild the Python code navigation index. Prefer running this before structural Python investigations so search_python_symbols/read_python_symbol can provide symbols, code positions, callers, and callees.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
-            "name": "python_index_status",
-            "description": "Check whether the Python symbol index exists for the selected workspace. Call this before any Python code investigation — if the index is missing, run index_python_workspace first so symbol tools are available.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." }
-                }
-            }
-        },
-        {
             "name": "list_python_symbols",
-            "description": "List indexed Python symbols with code positions. Prefer this over raw text search when browsing Python file structure, functions, methods, or classes.",
+            "description": "List indexed Python symbols with code positions. Note: Python index is automatically built and updated by the server. Prefer this over raw text search when browsing Python file structure, functions, methods, or classes.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -915,7 +827,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_python_symbols",
-            "description": "Search indexed Python symbols by name, signature, docstring, decorator, class name, or file path. Prefer this before search_text when investigating Python code structure or locating definitions.",
+            "description": "Search indexed Python symbols by name, signature, docstring, decorator, class name, or file path. Note: Python index is automatically built and updated by the server. Prefer this before search_text when investigating Python code structure or locating definitions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -928,7 +840,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_python_symbol",
-            "description": "Read an indexed Python symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols.",
+            "description": "Read an indexed Python symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Python index is automatically built by the server.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id"],

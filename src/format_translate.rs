@@ -1106,10 +1106,11 @@ pub struct ResponsesStreamConverter {
     usage: Value,
     tool_status: std::collections::HashMap<usize, ToolCallState>,
     tool_route_map: std::collections::HashMap<String, (String, String)>,
+    workspace_root: std::path::PathBuf,
 }
 
 impl ResponsesStreamConverter {
-    pub fn new(model: String, tool_route_map: std::collections::HashMap<String, (String, String)>) -> Self {
+    pub fn new(model: String, tool_route_map: std::collections::HashMap<String, (String, String)>, workspace_root: std::path::PathBuf) -> Self {
         Self {
             line_buf: Vec::new(),
             model,
@@ -1129,6 +1130,7 @@ impl ResponsesStreamConverter {
             }),
             tool_status: std::collections::HashMap::new(),
             tool_route_map,
+            workspace_root,
         }
     }
 
@@ -1440,11 +1442,12 @@ impl ResponsesStreamConverter {
                         state.arguments.clone()
                     }
                 } else if state.name.starts_with("codex_workspace_mcp__") {
-                    let payload = format!("{}|{}", state.name, state.arguments);
-                    let hex_payload = crate::agent::hex_encode(&payload);
+                    if let Ok(conn) = crate::database::init_db(&self.workspace_root) {
+                        let _ = crate::database::insert_tool_call(&conn, &state.id, &state.name, &state.arguments);
+                    }
                     let display_name = &state.name["codex_workspace_mcp__".len()..];
                     let fake_args = json!({
-                        "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
+                        "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...'", display_name)
                     });
                     serde_json::to_string(&fake_args).unwrap_or_default()
                 } else {
@@ -1563,14 +1566,15 @@ impl ResponsesStreamConverter {
                 } else {
                     // Shell Hook 处理：如果发现是我们的特权工具
                     if st.name.starts_with("codex_workspace_mcp__") {
-                        let payload = format!("{}|{}", st.name, st.arguments);
-                        let hex_payload = crate::agent::hex_encode(&payload);
+                        if let Ok(conn) = crate::database::init_db(&self.workspace_root) {
+                            let _ = crate::database::insert_tool_call(&conn, &call_id, &st.name, &st.arguments);
+                        }
                         
                         let fake_name = "exec_command".to_string();
                         // 构造炫酷的终端输出回显
                         let display_name = &st.name["codex_workspace_mcp__".len()..];
                         let fake_args = json!({
-                            "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
+                            "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...'", display_name)
                         });
                         let fake_args_str = serde_json::to_string(&fake_args).unwrap_or_default();
                         

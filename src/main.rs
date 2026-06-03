@@ -1,4 +1,5 @@
 mod agent;
+mod database;
 mod ai_proxy;
 mod format_translate;
 mod go_index;
@@ -83,6 +84,60 @@ async fn main() -> anyhow::Result<()> {
 
     let workspace = Arc::new(Workspace::new(workspace_root)?);
     info!(root = %workspace.root().display(), "workspace initialized");
+
+    // Spawns a background task to automatically index the workspace on startup.
+    let workspace_for_indexing = workspace.clone();
+    tokio::spawn(async move {
+        // Give the HTTP server a moment to bind and start up
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        
+        let root = workspace_for_indexing.root().to_path_buf();
+        let root_str = root.display().to_string();
+        
+        // 1. Rust Project Auto-indexing
+        if root.join("Cargo.toml").exists() {
+            info!("Auto-indexer: Rust project detected, building symbol index in background...");
+            match workspace_for_indexing.index_rust_workspace(crate::rust_index::IndexRustWorkspaceRequest {
+                workspace_root: root_str.clone(),
+            }) {
+                Ok(res) => info!(files = res.files_indexed, symbols = res.symbols_indexed, "Auto-indexer: Rust index built successfully"),
+                Err(e) => warn!(error = %e, "Auto-indexer: Rust indexing failed"),
+            }
+        }
+        
+        // 2. TypeScript / JavaScript Project Auto-indexing
+        if root.join("package.json").exists() {
+            info!("Auto-indexer: TS/JS project detected, building symbol index in background...");
+            match workspace_for_indexing.index_ts_workspace(crate::ts_index::IndexTsWorkspaceRequest {
+                workspace_root: root_str.clone(),
+            }) {
+                Ok(res) => info!(files = res.files_indexed, symbols = res.symbols_indexed, "Auto-indexer: TS/JS index built successfully"),
+                Err(e) => warn!(error = %e, "Auto-indexer: TS/JS indexing failed"),
+            }
+        }
+        
+        // 3. Go Project Auto-indexing
+        if root.join("go.mod").exists() {
+            info!("Auto-indexer: Go project detected, building symbol index in background...");
+            match workspace_for_indexing.index_go_workspace(crate::go_index::IndexGoWorkspaceRequest {
+                workspace_root: root_str.clone(),
+            }) {
+                Ok(res) => info!(files = res.files_indexed, symbols = res.symbols_indexed, "Auto-indexer: Go index built successfully"),
+                Err(e) => warn!(error = %e, "Auto-indexer: Go indexing failed"),
+            }
+        }
+        
+        // 4. Python Project Auto-indexing
+        if root.join("requirements.txt").exists() || root.join("pyproject.toml").exists() || root.join("setup.py").exists() {
+            info!("Auto-indexer: Python project detected, building symbol index in background...");
+            match workspace_for_indexing.index_python_workspace(crate::python_index::IndexPythonWorkspaceRequest {
+                workspace_root: root_str.clone(),
+            }) {
+                Ok(res) => info!(files = res.files_indexed, symbols = res.symbols_indexed, "Auto-indexer: Python index built successfully"),
+                Err(e) => warn!(error = %e, "Auto-indexer: Python indexing failed"),
+            }
+        }
+    });
 
     // Start AI proxy on port 3001 if config exists alongside the binary
     let exe_dir = env::current_exe()

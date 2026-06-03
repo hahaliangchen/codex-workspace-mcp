@@ -28,3 +28,4 @@ syn = { version = "2.0.117", features = ["full", "visit", "extra-traits"] }
 proc-macro2 = { version = "1.0.106", features = ["span-locations"] }
 quote = "1.0.45"
 rustpython-parser = { version = "0.4.0", default-features = false, features = ["num-bigint"] }
+rusqlite = { version = "0.33.0", features = ["bundled"] }

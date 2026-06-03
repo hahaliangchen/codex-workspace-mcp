@@ -763,7 +763,7 @@ async fn responses(
             "content": unified_system
         }));
     }
-    crate::agent::restore_history(&mut normal_messages);
+    crate::agent::restore_history(&mut normal_messages, state.workspace.root());
     final_messages.extend(normal_messages);
 
     // Build downstream Chat Completions body
@@ -972,7 +972,11 @@ async fn responses(
     // High performance SSE Streaming Relay!
     let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
     let stream = resp.bytes_stream();
-    let mut converter = format_translate::ResponsesStreamConverter::new(client_model, tool_route_map);
+    let mut converter = format_translate::ResponsesStreamConverter::new(
+        client_model,
+        tool_route_map,
+        state.workspace.root().to_path_buf(),
+    );
     let log_clone = state.log.clone();
 
     tokio::spawn(async move {
