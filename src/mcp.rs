@@ -159,7 +159,8 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
-                    "tools": {}
+                    "tools": {},
+                    "resources": {}
                 }
             }))
         }
@@ -169,9 +170,214 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
         "tools/call" => call_tool(workspace, request.params).await,
         "notifications/initialized" => Ok(json!({})),
         "ping" => Ok(json!({})),
-        "resources/list" => Ok(json!({
-            "resources": []
-        })),
+        "resources/list" => {
+            let w_root = workspace.root().display().to_string();
+            let mut resources = vec![
+                json!({
+                    "uri": "mcp://codex-workspace-mcp/notice",
+                    "name": "Notice: Workspace AST Code Index Info",
+                    "mimeType": "text/plain",
+                    "description": "Notice and instructions for AST code navigation. For code symbol lookups prefer AST index tools."
+                }),
+                json!({
+                    "uri": "mcp://codex-workspace-mcp/ast/status",
+                    "name": "AST Indexing Status Summary",
+                    "mimeType": "text/plain",
+                    "description": "Check the status of Rust, TS, Python, and Go AST code indexing files in the current project workspace."
+                })
+            ];
+
+            // If Rust index exists, expose it as a resource
+            if let Ok(st) = workspace.rust_index_status(IndexRustWorkspaceRequest { workspace_root: w_root.clone() }) {
+                if st.exists {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/ast/rust/symbols",
+                        "name": "Rust AST Symbols Index",
+                        "mimeType": "text/plain",
+                        "description": "Read all parsed Rust symbols, struct definitions, functions, and method signatures in this project."
+                    }));
+                }
+            }
+
+            // If TS index exists, expose it
+            if let Ok(st) = workspace.ts_index_status(IndexTsWorkspaceRequest { workspace_root: w_root.clone() }) {
+                if st.exists {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/ast/ts/symbols",
+                        "name": "TS/JS AST Symbols Index",
+                        "mimeType": "text/plain",
+                        "description": "Read all parsed TS/JS symbols, class definitions, interfaces, functions, and signatures in this project."
+                    }));
+                }
+            }
+
+            // If Python index exists, expose it
+            if let Ok(st) = workspace.python_index_status(IndexPythonWorkspaceRequest { workspace_root: w_root.clone() }) {
+                if st.exists {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/ast/python/symbols",
+                        "name": "Python AST Symbols Index",
+                        "mimeType": "text/plain",
+                        "description": "Read all parsed Python symbols, class definitions, function signatures, and docstrings in this project."
+                    }));
+                }
+            }
+
+            // If Go index exists, expose it
+            if let Ok(st) = workspace.go_index_status(IndexGoWorkspaceRequest { workspace_root: w_root.clone() }) {
+                if st.exists {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/ast/go/symbols",
+                        "name": "Go AST Symbols Index",
+                        "mimeType": "text/plain",
+                        "description": "Read all parsed Go symbols, struct definitions, interface types, and functions in this project."
+                    }));
+                }
+            }
+
+            // If work memory has records, expose it as a timeline resource
+            if let Ok(st) = workspace.list_work_memory(ListWorkMemoryRequest { workspace_root: w_root.clone(), limit: 100 }) {
+                if !st.memories.is_empty() {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/work-memory",
+                        "name": "Developer Work Memory Timeline",
+                        "mimeType": "text/plain",
+                        "description": "Read the timeline of recorded memories, changes, test logs, and risks in this project workspace."
+                    }));
+                }
+            }
+
+            Ok(json!({
+                "resources": resources
+            }))
+        }
+        "resources/read" => {
+            let uri = request
+                .params
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("resources/read requires params.uri"))?;
+
+            let w_root = workspace.root().display().to_string();
+
+            let text_content = match uri {
+                "mcp://codex-workspace-mcp/notice" => {
+                    "NOTICE TO AI: This MCP server provides powerful AST-based semantic code indexing tools for Rust, TypeScript/JavaScript, Python, and Go.\n\
+                     You can query classes, functions, calls, definitions, and outlines across the workspace.\n\
+                     If you need to analyze code, check mcp://codex-workspace-mcp/ast/status first to see which languages are indexed.\n\
+                     If a language index is missing, you can run index_<lang>_workspace to build it."
+                        .to_string()
+                }
+                "mcp://codex-workspace-mcp/ast/status" => {
+                    let mut md = String::from("# AST Code Indexing Status Summary\n\n");
+                    md.push_str("| Language | Index Exists | Files Indexed | Symbols Indexed | Last Generated |\n");
+                    md.push_str("| --- | --- | --- | --- | --- |\n");
+
+                    // Rust
+                    if let Ok(st) = workspace.rust_index_status(IndexRustWorkspaceRequest { workspace_root: w_root.clone() }) {
+                        let gen_time = st.generated_at_unix.map(|u| format!("{}", u)).unwrap_or_else(|| "-".to_string());
+                        md.push_str(&format!("| Rust | {} | {} | {} | {} |\n", st.exists, st.files_indexed.unwrap_or(0), st.symbols_indexed.unwrap_or(0), gen_time));
+                    }
+                    // TS
+                    if let Ok(st) = workspace.ts_index_status(IndexTsWorkspaceRequest { workspace_root: w_root.clone() }) {
+                        let gen_time = st.generated_at_unix.map(|u| format!("{}", u)).unwrap_or_else(|| "-".to_string());
+                        md.push_str(&format!("| TypeScript/JavaScript | {} | {} | {} | {} |\n", st.exists, st.files_indexed.unwrap_or(0), st.symbols_indexed.unwrap_or(0), gen_time));
+                    }
+                    // Python
+                    if let Ok(st) = workspace.python_index_status(IndexPythonWorkspaceRequest { workspace_root: w_root.clone() }) {
+                        let gen_time = st.generated_at_unix.map(|u| format!("{}", u)).unwrap_or_else(|| "-".to_string());
+                        md.push_str(&format!("| Python | {} | {} | {} | {} |\n", st.exists, st.files_indexed.unwrap_or(0), st.symbols_indexed.unwrap_or(0), gen_time));
+                    }
+                    // Go
+                    if let Ok(st) = workspace.go_index_status(IndexGoWorkspaceRequest { workspace_root: w_root.clone() }) {
+                        let gen_time = st.generated_at_unix.map(|u| format!("{}", u)).unwrap_or_else(|| "-".to_string());
+                        md.push_str(&format!("| Go | {} | {} | {} | {} |\n", st.exists, st.files_indexed.unwrap_or(0), st.symbols_indexed.unwrap_or(0), gen_time));
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/ast/rust/symbols" => {
+                    let st = workspace.list_rust_symbols(ListRustSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let mut md = String::from("# Rust AST Symbols Index\n\n");
+                    for sym in st.symbols {
+                        let impl_str = sym.impl_type.map(|t| format!(" (impl {})", t)).unwrap_or_default();
+                        md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{}){}\n  > {}\n", 
+                            sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, impl_str, sym.docstring.trim().replace("\n", "\n  > ")));
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/ast/ts/symbols" => {
+                    let st = workspace.list_ts_symbols(ListTsSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let mut md = String::from("# TS/JS AST Symbols Index\n\n");
+                    for sym in st.symbols {
+                        md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
+                            sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/ast/python/symbols" => {
+                    let st = workspace.list_python_symbols(ListPythonSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let mut md = String::from("# Python AST Symbols Index\n\n");
+                    for sym in st.symbols {
+                        md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
+                            sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/ast/go/symbols" => {
+                    let st = workspace.list_go_symbols(ListGoSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let mut md = String::from("# Go AST Symbols Index\n\n");
+                    for sym in st.symbols {
+                        md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
+                            sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/work-memory" => {
+                    let st = workspace.list_work_memory(ListWorkMemoryRequest {
+                        workspace_root: w_root.clone(),
+                        limit: 100,
+                    })?;
+                    let mut md = String::from("# Developer Work Memory Timeline\n\n");
+                    if st.memories.is_empty() {
+                        md.push_str("No memories have been recorded in this workspace yet. You can use the `record_work_memory` tool to log your work progress, files changed, and risks.\n");
+                    } else {
+                        for (idx, mem) in st.memories.iter().enumerate() {
+                            let local_time = chrono::DateTime::from_timestamp(mem.time_unix as i64, 0)
+                                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| format!("Unix Epoch {}", mem.time_unix));
+
+                            md.push_str(&format!("### Memory #{}: {}\n", st.memories.len() - idx, mem.summary));
+                            md.push_str(&format!("- **Recorded Time**: {}\n", local_time));
+                            if !mem.files_changed.is_empty() {
+                                md.push_str(&format!("- **Files Changed**:\n  - {}\n", mem.files_changed.join("\n  - ")));
+                            }
+                            if !mem.implementation.is_empty() {
+                                md.push_str(&format!("- **Implementation Details**:\n  > {}\n", mem.implementation.replace("\n", "\n  > ")));
+                            }
+                            if !mem.tests.is_empty() {
+                                md.push_str(&format!("- **Tests Run**:\n  > {}\n", mem.tests.replace("\n", "\n  > ")));
+                            }
+                            if !mem.risks.is_empty() {
+                                md.push_str(&format!("- **Potential Risks & Blockers**:\n  > {}\n", mem.risks.replace("\n", "\n  > ")));
+                            }
+                            md.push_str("\n---\n\n");
+                        }
+                    }
+                    md
+                }
+                _ => anyhow::bail!("unknown resource: {}", uri),
+            };
+
+            Ok(json!({
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": "text/plain",
+                        "text": text_content
+                    }
+                ]
+            }))
+        }
         "resources/templates/list" => Ok(json!({
             "resourceTemplates": []
         })),
@@ -195,11 +401,25 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
     .into_response()
 }
 
-async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value> {
-    let name = params
+pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value> {
+    let mut name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tools/call requires params.name"))?;
+    
+    // 智能前缀剥离，确保带前缀和不带前缀的工具名都能 100% 成功执行
+    if name.starts_with("codex_workspace_mcp__") {
+        name = &name["codex_workspace_mcp__".len()..];
+    } else if name.starts_with("mcp__codex_workspace_mcp__") {
+        name = &name["mcp__codex_workspace_mcp__".len()..];
+    } else if name.starts_with("mcp__codex-workspace-mcp__") {
+        name = &name["mcp__codex-workspace-mcp__".len()..];
+    } else if name.starts_with("mcp__codex_workspace__") {
+        name = &name["mcp__codex_workspace__".len()..];
+    } else if name.starts_with("mcp__codex-workspace__") {
+        name = &name["mcp__codex-workspace__".len()..];
+    }
+
     let arguments = params
         .get("arguments")
         .cloned()
@@ -330,6 +550,17 @@ async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value
                 SearchWorkMemoryRequest,
             >(arguments)?)?)?
         }
+        // Skills 按需懒加载：列出所有可用技能（名称+一句话描述）
+        "list_skills" => {
+            let skills = crate::skills::list_skills();
+            serde_json::to_value(skills)?
+        }
+        // Skills 按需懒加载：读取指定技能的完整 SKILL.md 内容
+        "read_skill" => {
+            let skill_name = arguments.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let content = crate::skills::read_skill(skill_name)?;
+            json!({ "skill": skill_name, "content": content })
+        }
         _ => anyhow::bail!("unknown tool: {name}"),
     };
 
@@ -344,7 +575,7 @@ async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value
     }))
 }
 
-fn tool_definitions() -> Value {
+pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "workspace_info",
@@ -746,6 +977,46 @@ fn tool_definitions() -> Value {
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "query": { "type": "string" },
                     "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "list_skills",
+            "description": "List all available Codex skills with their names and one-line descriptions. Call this first before specialized tasks (presentations, documents, spreadsheets, images) to discover if a matching skill exists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "read_skill",
+            "description": "Read the full SKILL.md content for a specific skill by name. Use after list_skills to get the complete instructions for a skill before executing it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The skill name as returned by list_skills (e.g. 'presentations', 'imagegen', 'documents')."
+                    }
+                }
+            }
+        },
+        {
+            "name": "shell",
+            "description": "Execute a shell command. ONLY use this as a LAST RESORT for git operations, npm/cargo builds, running scripts, or system commands. Do NOT use this for reading files, listing directories, or searching code.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["justification", "command"],
+                "properties": {
+                    "justification": {
+                        "type": "string",
+                        "description": "You MUST answer this question first: 'Are there alternative native tools (like list_dir / read_file / search_text) for this task?'. If yes, you must explain why you are ignoring them. If no, explain why you MUST use shell."
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute."
+                    }
                 }
             }
         }

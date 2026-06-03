@@ -975,11 +975,18 @@ fn collect_docstring(lines: &[&str], decl_idx: usize) -> String {
         idx -= 1;
         let line = lines[idx].trim();
         if line.is_empty() {
-            break;
+            continue;
+        }
+        if line.starts_with("#[") || line.starts_with("# !") {
+            // 智能跳过 Rust 宏与属性标注，确保不被阻断
+            continue;
         }
         if let Some(comment) = line.strip_prefix("///") {
             docs.push(comment.trim().to_string());
         } else if let Some(comment) = line.strip_prefix("//!") {
+            docs.push(comment.trim().to_string());
+        } else if let Some(comment) = line.strip_prefix("//") {
+            // 兼容普通的双斜杠注释
             docs.push(comment.trim().to_string());
         } else {
             break;

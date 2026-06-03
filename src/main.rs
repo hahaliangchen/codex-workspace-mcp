@@ -1,3 +1,4 @@
+mod agent;
 mod ai_proxy;
 mod format_translate;
 mod go_index;
@@ -6,6 +7,7 @@ mod memory;
 mod proxy;
 mod python_index;
 mod rust_index;
+mod skills;
 mod tools;
 mod ts_index;
 
@@ -92,8 +94,9 @@ async fn main() -> anyhow::Result<()> {
         match TcpListener::bind("127.0.0.1:3001").await {
             Ok(listener) => {
                 info!(path = %ai_config_path.display(), "AI proxy starting on port 3001");
+                let workspace_for_proxy = workspace.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = ai_proxy::run(listener, &ai_config_path).await {
+                    if let Err(e) = ai_proxy::run(listener, &ai_config_path, workspace_for_proxy).await {
                         error!(%e, "AI proxy exited with error");
                     }
                 });

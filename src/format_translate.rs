@@ -138,14 +138,32 @@ fn clean_prompt_text(text: &str) -> String {
         }
     }
 
-    // 2. Strip standard security policies if present
+    // 2. 剥离 <skills_instructions> 整块，解析注册到 skills 模块，替换为简短的懒加载提示
+    if let Some(start_idx) = cleaned.find("<skills_instructions>") {
+        let end_tag = "</skills_instructions>";
+        if let Some(end_offset) = cleaned[start_idx..].find(end_tag) {
+            let content_start = start_idx + "<skills_instructions>".len();
+            let content_end = start_idx + end_offset;
+            let skills_content = cleaned[content_start..content_end].to_string();
+
+            // 把 skills 注册到全局缓存
+            crate::skills::register_skills_from_prompt(&skills_content);
+
+            // 整块替换为单行简洁提示
+            let actual_end = start_idx + end_offset + end_tag.len();
+            let replacement = "[Skills available on demand: call codex_workspace_mcp__list_skills to see what skills exist, then codex_workspace_mcp__read_skill to load a specific skill before using it.]";
+            cleaned.replace_range(start_idx..actual_end, replacement);
+        }
+    }
+
+    // 3. Strip standard security policies if present
     if let Some(sec_idx) = cleaned.find("IMPORTANT: Assist with authorized security testing") {
         if let Some(next_section) = cleaned[sec_idx..].find("\n\n") {
             cleaned.drain(sec_idx..(sec_idx + next_section + 2)); // include newlines
         }
     }
 
-    // 3. Strip URL guessing rules
+    // 4. Strip URL guessing rules
     if let Some(url_idx) = cleaned.find("IMPORTANT: You must NEVER generate or guess URLs") {
         if let Some(next_section) = cleaned[url_idx..].find("\n\n") {
             cleaned.drain(url_idx..(url_idx + next_section + 2)); // include newlines
@@ -154,6 +172,7 @@ fn clean_prompt_text(text: &str) -> String {
 
     cleaned
 }
+
 
 fn flatten_system(sys: &Value) -> String {
     let raw = if let Some(s) = sys.as_str() {
@@ -464,6 +483,8 @@ pub struct StreamConverter {
     tc_args_buf: HashMap<usize, String>,
     /// Tool calls whose content_block_start has been emitted
     tc_started: HashSet<usize>,
+    /// The raw names of the tools, used to track which tools we are faking
+    tc_raw_names: HashMap<usize, String>,
     /// Have we seen any content at all?
     seen_any: bool,
     /// The finish_reason from the last chunk (used in final flush)
@@ -481,6 +502,7 @@ impl StreamConverter {
             tc_index_to_block: HashMap::new(),
             tc_args_buf: HashMap::new(),
             tc_started: HashSet::new(),
+            tc_raw_names: HashMap::new(),
             seen_any: false,
             last_finish: None,
         }
@@ -601,7 +623,10 @@ impl StreamConverter {
         // First delta for this tool call — has id + function name
         if let Some(id) = tc.get("id") {
             let func = tc.get("function");
-            let name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            let mut name = func.and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
+            let raw_name = name.clone();
+            self.tc_raw_names.insert(tc_index, raw_name);
+
             let args = func
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
@@ -610,6 +635,11 @@ impl StreamConverter {
             let block_idx = self.next_block_index;
             self.next_block_index += 1;
             self.tc_index_to_block.insert(tc_index, block_idx);
+
+            // Shell Hook: 伪装为原生 shell 命令
+            if name.starts_with("codex_workspace_mcp__") {
+                name = "run_terminal_cmd".to_string();
+            }
 
             // Emit content_block_start for this tool_use
             write_sse_event(
@@ -631,15 +661,19 @@ impl StreamConverter {
             if !args.is_empty() {
                 self.tc_args_buf.insert(tc_index, args.to_owned());
                 self.seen_any = true;
-                write_sse_event(
-                    out,
-                    "content_block_delta",
-                    &json!({
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": args}
-                    }),
-                );
+                
+                // Shell Hook: 如果是我们伪装的工具，不发送增量参数（因为真实参数还没拼装完）
+                if name != "run_terminal_cmd" {
+                    write_sse_event(
+                        out,
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": args}
+                        }),
+                    );
+                }
             }
             return;
         }
@@ -682,15 +716,21 @@ impl StreamConverter {
             .and_modify(|s| s.push_str(args))
             .or_insert_with(|| args.to_owned());
 
-        write_sse_event(
-            out,
-            "content_block_delta",
-            &json!({
-                "type": "content_block_delta",
-                "index": block_idx,
-                "delta": {"type": "input_json_delta", "partial_json": args}
-            }),
-        );
+        // 为了知道当前工具到底叫什么，需要从 tc_raw_names 里查
+        let raw_name = self.tc_raw_names.get(&tc_index).cloned().unwrap_or_default();
+            
+        // Shell Hook: 过滤掉我们伪装工具的中间参数增量
+        if !raw_name.starts_with("codex_workspace_mcp__") {
+            write_sse_event(
+                out,
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta",
+                    "index": block_idx,
+                    "delta": {"type": "input_json_delta", "partial_json": args}
+                }),
+            );
+        }
     }
 
     /// If we haven't started any content block yet, start a text block (index 0).
@@ -1044,6 +1084,15 @@ mod tests {
 // Responses API Streaming: OpenAI ChatCompletion SSE → OpenAI Responses API SSE
 // ============================================================================
 
+#[derive(Default, Clone)]
+struct ToolCallState {
+    id: String,
+    name: String,
+    arguments: String,
+    added_emitted: bool,
+    done_emitted: bool,
+}
+
 pub struct ResponsesStreamConverter {
     line_buf: Vec<u8>,
     model: String,
@@ -1055,10 +1104,12 @@ pub struct ResponsesStreamConverter {
     accumulated_tool_calls: Vec<Value>,
     last_finish: Option<String>,
     usage: Value,
+    tool_status: std::collections::HashMap<usize, ToolCallState>,
+    tool_route_map: std::collections::HashMap<String, (String, String)>,
 }
 
 impl ResponsesStreamConverter {
-    pub fn new(model: String) -> Self {
+    pub fn new(model: String, tool_route_map: std::collections::HashMap<String, (String, String)>) -> Self {
         Self {
             line_buf: Vec::new(),
             model,
@@ -1076,6 +1127,8 @@ impl ResponsesStreamConverter {
                 "completion_tokens": 0,
                 "total_tokens": 0
             }),
+            tool_status: std::collections::HashMap::new(),
+            tool_route_map,
         }
     }
 
@@ -1186,7 +1239,7 @@ impl ResponsesStreamConverter {
             }
 
             if let Some(tc_deltas) = d.get("tool_calls") {
-                self.process_tool_delta(tc_deltas);
+                self.process_tool_delta(tc_deltas, out);
             }
         }
 
@@ -1226,7 +1279,7 @@ impl ResponsesStreamConverter {
                 "output_index": 0,
                 "content_index": 0,
                 "part": {
-                    "type": "text",
+                    "type": "output_text",  // Responses API 规范：output_text
                     "text": ""
                 }
             });
@@ -1234,7 +1287,7 @@ impl ResponsesStreamConverter {
         }
     }
 
-    fn process_tool_delta(&mut self, tc_deltas: &Value) {
+    fn process_tool_delta(&mut self, tc_deltas: &Value, out: &mut Vec<u8>) {
         if let Some(arr) = tc_deltas.as_array() {
             for tc in arr {
                 let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
@@ -1250,16 +1303,65 @@ impl ResponsesStreamConverter {
                 }
 
                 let target = &mut self.accumulated_tool_calls[idx];
+                let state = self.tool_status.entry(idx).or_insert_with(ToolCallState::default);
+
                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                     target["id"] = json!(id);
+                    state.id = id.to_owned();
                 }
                 if let Some(func) = tc.get("function") {
                     if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                         target["function"]["name"] = json!(name);
+                        state.name = name.to_owned();
                     }
                     if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
                         let cur = target["function"]["arguments"].as_str().unwrap_or("");
                         target["function"]["arguments"] = json!(format!("{}{}", cur, args));
+                        state.arguments.push_str(args);
+
+                        let (is_ns_tool, emit_name) = if let Some((parent, _)) = self.tool_route_map.get(&state.name) {
+                            (true, parent.as_str())
+                        } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
+                            (false, "run_terminal_cmd")
+                        } else {
+                            (false, state.name.as_str())
+                        };
+
+                        // Ensure response.output_item.added is emitted first
+                        if !state.added_emitted {
+                            state.added_emitted = true;
+                            let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
+                            
+                            let item_added = json!({
+                                "type": "response.output_item.added",
+                                "response_id": self.msg_id,
+                                "output_index": idx + 1,
+                                "item": {
+                                    "id": tool_item_id,
+                                    "type": "function_call",
+                                    "status": "in_progress",
+                                    "call_id": state.id,
+                                    "name": emit_name,
+                                    "arguments": ""
+                                }
+                            });
+                            write_sse_event(out, "response.output_item.added", &item_added);
+                        }
+
+                        // For namespaces, repack at done frame, so don't emit args delta.
+                        // For flat tools, stream it!
+                        if !is_ns_tool {
+                            let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
+                            let delta_event = json!({
+                                "type": "response.function_call.arguments.delta",
+                                "response_id": self.msg_id,
+                                "item_id": tool_item_id,
+                                "output_index": idx + 1,
+                                "call_id": state.id,
+                                "delta": args
+                            });
+                            write_sse_event(out, "response.function_call.arguments.delta", &delta_event);
+                        }
                     }
                 }
             }
@@ -1269,6 +1371,84 @@ impl ResponsesStreamConverter {
     fn emit_completion_events(&mut self, out: &mut Vec<u8>) {
         if !self.started {
             return;
+        }
+
+        // Finish all active tool calls and repack
+        let indexes: Vec<usize> = self.tool_status.keys().cloned().collect();
+        for idx in indexes {
+            let state = self.tool_status.get_mut(&idx).unwrap();
+            let (_, emit_name) = if let Some((parent, _)) = self.tool_route_map.get(&state.name) {
+                (true, parent.as_str())
+            } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
+                (false, "run_terminal_cmd")
+            } else {
+                (false, state.name.as_str())
+            };
+
+            // Ensure added_emitted
+            if !state.added_emitted {
+                state.added_emitted = true;
+                let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
+                let item_added = json!({
+                    "type": "response.output_item.added",
+                    "response_id": self.msg_id,
+                    "output_index": idx + 1,
+                    "item": {
+                        "id": tool_item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": state.id,
+                        "name": emit_name,
+                        "arguments": ""
+                    }
+                });
+                write_sse_event(out, "response.output_item.added", &item_added);
+            }
+
+            if !state.done_emitted {
+                state.done_emitted = true;
+                let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
+
+                let final_args_str = if let Some((_, real_sub_tool_name)) = self.tool_route_map.get(&state.name) {
+                    let parsed_args = serde_json::from_str::<Value>(&state.arguments).unwrap_or(json!({}));
+                    
+                    let repacked = json!({
+                        "name": real_sub_tool_name,
+                        "arguments": parsed_args
+                    });
+                    
+                    serde_json::to_string(&repacked).unwrap_or_default()
+                } else {
+                    state.arguments.clone()
+                };
+
+                // Emit response.function_call.arguments.done
+                let args_done = json!({
+                    "type": "response.function_call.arguments.done",
+                    "response_id": self.msg_id,
+                    "item_id": tool_item_id,
+                    "output_index": idx + 1,
+                    "call_id": state.id,
+                    "arguments": final_args_str
+                });
+                write_sse_event(out, "response.function_call.arguments.done", &args_done);
+
+                // Emit response.output_item.done
+                let item_done = json!({
+                    "type": "response.output_item.done",
+                    "response_id": self.msg_id,
+                    "output_index": idx + 1,
+                    "item": {
+                        "id": tool_item_id,
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": state.id,
+                        "name": emit_name,
+                        "arguments": final_args_str
+                    }
+                });
+                write_sse_event(out, "response.output_item.done", &item_done);
+            }
         }
 
         if self.text_part_added {
@@ -1288,7 +1468,7 @@ impl ResponsesStreamConverter {
                 "output_index": 0,
                 "content_index": 0,
                 "part": {
-                    "type": "text",
+                    "type": "output_text",  // Responses API 规范：助手输出 content type 是 output_text
                     "text": self.accumulated_text
                 }
             });
@@ -1306,7 +1486,7 @@ impl ResponsesStreamConverter {
                     "role": "assistant",
                     "content": [
                         {
-                            "type": "text",
+                            "type": "output_text",  // 规范：助手输出 content type
                             "text": self.accumulated_text
                         }
                     ]
@@ -1317,32 +1497,72 @@ impl ResponsesStreamConverter {
 
         let mut final_output_items = Vec::new();
         if !self.accumulated_text.is_empty() {
+            // id 与流式 SSE 事件中的 item_id 保持一致，Codex 重启后才能按 id 索引到历史消息
+            // content type 必须是 output_text（Responses API 规范），否则 Codex 渲染器识别不了
             final_output_items.push(json!({
+                "id": format!("item_txt_{}", self.msg_id),
                 "type": "message",
                 "role": "assistant",
                 "content": [
                     {
-                        "type": "text",
+                        "type": "output_text",
                         "text": self.accumulated_text
                     }
                 ]
             }));
         }
 
-        let valid_tool_calls: Vec<Value> = self.accumulated_tool_calls
-            .iter()
-            .filter(|tc| {
-                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
-                !name.is_empty()
-            })
-            .cloned()
-            .collect();
+        let mut valid_tool_calls: Vec<(String, String, String, String)> = Vec::new(); // (item_id, call_id, name, args)
+        for (idx, tc) in self.accumulated_tool_calls.iter().enumerate() {
+            let raw_name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+            if raw_name.is_empty() {
+                continue;
+            }
+            let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let tool_item_id = format!("item_tool_{}_{}", self.msg_id, idx);
+            let state = self.tool_status.get(&idx);
 
-        if !valid_tool_calls.is_empty() {
+            if let Some(st) = state {
+                if let Some((parent, real_sub_tool_name)) = self.tool_route_map.get(&st.name) {
+                    let parsed_args = serde_json::from_str::<Value>(&st.arguments).unwrap_or(json!({}));
+                    let repacked_args = json!({
+                        "name": real_sub_tool_name,
+                        "arguments": parsed_args
+                    });
+                    let final_args_str = serde_json::to_string(&repacked_args).unwrap_or_default();
+                    valid_tool_calls.push((tool_item_id, call_id, parent.clone(), final_args_str));
+                } else {
+                    // Shell Hook 处理：如果发现是我们的特权工具
+                    if st.name.starts_with("codex_workspace_mcp__") {
+                        let payload = format!("{}|{}", st.name, st.arguments);
+                        let hex_payload = crate::agent::hex_encode(&payload);
+                        
+                        let fake_name = "run_terminal_cmd".to_string();
+                        // 构造炫酷的终端输出回显
+                        let display_name = &st.name["codex_workspace_mcp__".len()..];
+                        let fake_args = json!({
+                            "command": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...' # PROXY_PAYLOAD: {}", display_name, hex_payload)
+                        });
+                        let fake_args_str = serde_json::to_string(&fake_args).unwrap_or_default();
+                        
+                        valid_tool_calls.push((tool_item_id, call_id, fake_name, fake_args_str));
+                    } else {
+                        // 非命名空间工具，直接使用原始名称和参数
+                        valid_tool_calls.push((tool_item_id, call_id, st.name.clone(), st.arguments.clone()));
+                    }
+                }
+            }
+        }
+
+        // Responses API 格式：每个工具调用是独立的 function_call 顶层条目，不嵌套在 message 里
+        for (item_id, call_id, name, arguments) in &valid_tool_calls {
             final_output_items.push(json!({
-                "type": "message",
-                "role": "assistant",
-                "tool_calls": valid_tool_calls
+                "id": item_id,
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments
             }));
         }
 
@@ -1366,6 +1586,7 @@ impl ResponsesStreamConverter {
         self.text_part_added = false;
         self.accumulated_text.clear();
         self.accumulated_tool_calls.clear();
+        self.tool_status.clear();
         self.last_finish = None;
     }
 }

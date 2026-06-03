@@ -62,6 +62,9 @@ struct AiProxyState {
     log: Arc<Mutex<std::fs::File>>,
     #[allow(dead_code)]
     log_path: Arc<PathBuf>,
+    /// 系统提示词专用日志，每次请求完整记录 developer/system 内容
+    sys_log: Arc<Mutex<std::fs::File>>,
+    workspace: Arc<crate::tools::Workspace>,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +82,7 @@ fn now_china() -> String {
 
 /// Write a line to the shared log file.  Panics are caught — logging is
 /// best-effort and must never crash the proxy.
-fn log_write(log: &Mutex<std::fs::File>, msg: &str) {
+pub fn log_write(log: &Mutex<std::fs::File>, msg: &str) {
     let ts = now_china();
     let line = format!("[{}] {}\n", ts, msg);
     if let Ok(mut f) = log.lock() {
@@ -505,13 +508,37 @@ async fn responses(
     };
 
     log!(&state.log, "=== /v1/responses received from Codex  model={}", client_model);
-    log!(
-        &state.log,
-        "   Codex Responses body: {}",
-        fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
-    );
-
-
+    // Codex Responses body 在主日志只打顶层字段，省略 input 内容（input 中系统提示词见 system_prompt.log）
+    {
+        let mut body_brief = body.clone();
+        if let Some(obj) = body_brief.as_object_mut() {
+            if let Some(input_arr) = obj.get_mut("input") {
+                if let Some(arr) = input_arr.as_array() {
+                    let count = arr.len();
+                    // 先把系统提示词写入 sys_log，再在主日志用占位
+                    let ts = now_china();
+                    let sep = format!("\n{} ===== /v1/responses model={} =====\n", ts, client_model);
+                    if let Ok(mut sf) = state.sys_log.lock() {
+                        let _ = sf.write_all(sep.as_bytes());
+                        for (idx, item) in arr.iter().enumerate() {
+                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("-");
+                            let item_str = serde_json::to_string_pretty(item).unwrap_or_default();
+                            let line = format!("--- input[{}] role={} ---\n{}\n", idx, role, item_str);
+                            let _ = sf.write_all(line.as_bytes());
+                        }
+                        let _ = sf.flush();
+                    }
+                    // 主日志只保留条目数量占位
+                    *input_arr = Value::String(format!("[{} items → see system_prompt.log]", count));
+                }
+            }
+        }
+        log!(
+            &state.log,
+            "   Codex Responses body: {}",
+            fmt_body(serde_json::to_string(&body_brief).unwrap_or_default().as_bytes())
+        );
+    }
 
     let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
@@ -525,15 +552,62 @@ async fn responses(
         upstream_model
     );
 
-    // Translate Responses format to standard Chat Completions messages
-    let mut messages: Vec<Value> = Vec::new();
+    log!(
+        &state.log,
+        "   Codex raw messages: {}",
+        body.get("messages").map(|m| serde_json::to_string(m).unwrap_or_default()).unwrap_or_default()
+    );
+    // input 详细内容见 system_prompt.log，主日志只打条目数量
+    {
+        let count = body.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        log!(&state.log, "   Codex raw input: [{} items → see system_prompt.log]", count);
+    }
 
-    // 1. instructions -> system message
+    // === 诊断日志：不截断，精准打关键字段 ===
+    {
+        let prev_id = body.get("previous_response_id").and_then(|v| v.as_str()).unwrap_or("<none>");
+        log!(&state.log, "   [DIAG] previous_response_id={}", prev_id);
+
+        // 统计 input 里各 type 的数量（不截断）
+        if let Some(input_arr) = body.get("input").and_then(|v| v.as_array()) {
+            let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut role_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for item in input_arr {
+                let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                let r = item.get("role").and_then(|v| v.as_str()).unwrap_or("-").to_string();
+                *type_counts.entry(t).or_insert(0) += 1;
+                *role_counts.entry(r).or_insert(0) += 1;
+            }
+            log!(&state.log, "   [DIAG] input total={} type_counts={:?} role_counts={:?}",
+                input_arr.len(), type_counts, role_counts);
+
+            // 打出所有非系统类条目（type != message 的或 role == assistant 的）
+            for (idx, item) in input_arr.iter().enumerate() {
+                let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let r = item.get("role").and_then(|v| v.as_str()).unwrap_or("-");
+                if t == "function_call" || t == "function_call_output" || r == "assistant" {
+                    let brief = serde_json::to_string(item).unwrap_or_default();
+                    let brief_safe = brief.chars().take(300).collect::<String>();
+                    log!(&state.log, "   [DIAG] input[{}] type={} role={} : {}",
+                        idx, t, r, brief_safe);
+                }
+            }
+        }
+        // 也看看 messages 字段
+        let msgs_exist = body.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        log!(&state.log, "   [DIAG] messages field count={}", msgs_exist);
+    }
+
+
+    // Translate Responses format to standard Chat Completions messages
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut normal_messages: Vec<Value> = Vec::new();
+
+    // 1. instructions -> system message part
     if let Some(inst) = body.get("instructions").and_then(|v| v.as_str()) {
-        messages.push(json!({
-            "role": "system",
-            "content": inst
-        }));
+        if !inst.is_empty() {
+            system_parts.push(inst.to_owned());
+        }
     }
 
     // 2. Extract existing messages
@@ -541,62 +615,297 @@ async fn responses(
         for msg in msgs {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = msg.get("content").unwrap_or(&Value::Null).clone();
-            messages.push(json!({
-                "role": role,
-                "content": content
-            }));
-        }
-    }
-
-    // 3. input -> user message
-    if let Some(input_val) = body.get("input") {
-        if let Some(input_str) = input_val.as_str() {
-            messages.push(json!({
-                "role": "user",
-                "content": input_str
-            }));
-        } else if let Some(input_arr) = input_val.as_array() {
-            for item in input_arr {
-                if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
-                    for part in content_arr {
+            
+            // 如果历史上下文中有 system 角色，我们也把它归并到 system_parts 中以保兼容
+            if role == "system" {
+                if let Some(s) = content.as_str() {
+                    system_parts.push(s.to_owned());
+                } else if let Some(arr) = content.as_array() {
+                    for part in arr {
                         if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            messages.push(json!({
-                                "role": "user",
-                                "content": t
-                            }));
+                            system_parts.push(t.to_owned());
                         }
                     }
                 }
-                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    messages.push(json!({
-                        "role": "user",
-                        "content": t
+            } else {
+                let mut new_msg = json!({
+                    "role": role,
+                    "content": content
+                });
+
+                // 重点：如果是工具调用结果 (role == "tool")，我们需要把工具调用 ID 属性传下去！
+                if role == "tool" {
+                    if let Some(call_id) = msg.get("call_id") {
+                        new_msg["tool_call_id"] = call_id.clone();
+                    } else if let Some(tool_call_id) = msg.get("tool_call_id") {
+                        new_msg["tool_call_id"] = tool_call_id.clone();
+                    } else if let Some(id) = msg.get("id") {
+                        new_msg["tool_call_id"] = id.clone();
+                    }
+                }
+
+                // 重点：如果是 assistant 产生的工具调用定义 (assistant 消息里的 tool_calls)
+                //      我们也必须原封不动地传回给下游，否则大模型会产生上下文断裂！
+                if role == "assistant" {
+                    if let Some(tcs) = msg.get("tool_calls") {
+                        new_msg["tool_calls"] = tcs.clone();
+                    }
+                }
+
+                normal_messages.push(new_msg);
+            }
+        }
+    }
+
+    // 3. input -> system part or normal user messages
+    if let Some(input_val) = body.get("input") {
+        macro_rules! handle_text {
+            ($t:expr, $role:expr) => {
+                let t_str = $t;
+                let r_str = $role;
+                if t_str.contains("<permissions instructions>")
+                    || t_str.contains("<skills_instructions>")
+                    || t_str.contains("<app-context>")
+                    || t_str.contains("<system-reminder>")
+                {
+                    system_parts.push(t_str.to_owned());
+                } else {
+                    let downstream_role = match r_str {
+                        "developer" => "system",
+                        "system" => "system",
+                        "assistant" => "assistant",
+                        _ => "user",
+                    };
+                    normal_messages.push(json!({
+                        "role": downstream_role,
+                        "content": t_str
                     }));
+                }
+            };
+        }
+
+        if let Some(input_str) = input_val.as_str() {
+            handle_text!(input_str, "user");
+        } else if let Some(input_arr) = input_val.as_array() {
+            for item in input_arr {
+                let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let item_role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                
+                if item_type == "function_call" {
+                    // 大模型在历史上发起的工具调用
+                    if let Some(call_id) = item.get("call_id") {
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                        
+                        normal_messages.push(json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [
+                                {
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": arguments
+                                    }
+                                }
+                            ]
+                        }));
+                    }
+                } else if item_type == "function_call_output" {
+                    // 工具执行结果的返回
+                    if let Some(call_id) = item.get("call_id") {
+                        let mut output = item.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        
+                        if let Some(call_id_str) = call_id.as_str() {
+                            output = crate::agent::intercept_and_execute(
+                                call_id_str,
+                                output,
+                                &normal_messages,
+                                &state.workspace,
+                                &state.log
+                            ).await;
+                        }
+
+                        normal_messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": output
+                        }));
+                    }
+                } else {
+                    // 常规文本或多层嵌套文本
+                    if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                        for part in content_arr {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                handle_text!(t, item_role);
+                            }
+                        }
+                    }
+                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                        handle_text!(t, item_role);
+                    }
                 }
             }
         }
     }
 
+    // 4. Assemble final unified messages list
+    let mut final_messages: Vec<Value> = Vec::new();
+    
+    // 追加我们强制要求的代理约束提示词
+    system_parts.push(crate::agent::generate_agent_constraints());
+    
+    if !system_parts.is_empty() {
+        let unified_system = system_parts.join("\n\n");
+        final_messages.push(json!({
+            "role": "system",
+            "content": unified_system
+        }));
+    }
+    crate::agent::restore_history(&mut normal_messages);
+    final_messages.extend(normal_messages);
+
     // Build downstream Chat Completions body
     let mut openai_body = json!({
         "model": upstream_model,
-        "messages": messages,
+        "messages": final_messages,
         "stream": false, // Force non-streaming for stable translation
     });
 
-    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
-        let filtered_tools: Vec<Value> = tools
-            .iter()
-            .filter(|t| {
-                t.is_object()
-                    && t.get("type").and_then(|v| v.as_str()) == Some("function")
-                    && t.get("function").is_some()
-            })
-            .cloned()
-            .collect();
+    let mut tool_route_map = std::collections::HashMap::new();
 
-        if !filtered_tools.is_empty() {
-            openai_body["tools"] = json!(filtered_tools);
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        log!(
+            &state.log,
+            "   Codex raw tools: {}",
+            serde_json::to_string(tools).unwrap_or_default()
+        );
+
+        let mut converted_tools = Vec::new();
+        
+        // 辅助闭包：处理单个工具对象，将其转换并安全推入 converted_tools 中，支持加上前缀
+        let mut push_converted_tool = |t: &Value, prefix: Option<&str>, route_map: &mut std::collections::HashMap<String, (String, String)>| {
+            if !t.is_object() {
+                return;
+            }
+
+            // 提取工具原始名称并智能注入前缀
+            let mut name_val = t.get("name").cloned().unwrap_or(Value::Null);
+            if let Some(prefix_str) = prefix {
+                if let Some(n) = name_val.as_str() {
+                    let alias = format!("{}__{}", prefix_str, n);
+                    route_map.insert(alias.clone(), (prefix_str.to_string(), n.to_string()));
+                    name_val = json!(alias);
+                }
+            }
+
+            // 1. 如果它已经是标准的 OpenAI Chat Completions 嵌套格式且 type 是 function
+            if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("function").is_some() {
+                let mut tool_clone = t.clone();
+                if prefix.is_some() {
+                    tool_clone["function"]["name"] = name_val;
+                }
+                converted_tools.push(tool_clone);
+            } 
+            // 2. 如果是平铺的 function 格式 (如 OpenAI Responses/Realtime API 的工具定义)
+            else if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("name").is_some() {
+                converted_tools.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name_val,
+                        "description": t.get("description"),
+                        "parameters": t.get("parameters")
+                    }
+                }));
+            }
+            // 3. 如果是 Anthropic 格式的平铺定义 (有 name 且无 type，或者无 function)
+            else if t.get("name").is_some() && t.get("type").is_none() {
+                converted_tools.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name_val,
+                        "description": t.get("description"),
+                        "parameters": t.get("input_schema").or_else(|| t.get("parameters"))
+                    }
+                }));
+            }
+            // 4. Codex 特殊工具，例如 type: "tool_search", type: "web_search"
+            else if let Some(type_str) = t.get("type").and_then(|v| v.as_str()) {
+                if type_str != "function" && type_str != "namespace" {
+                    // 这类工具没有 name 字段，用 type_str 作为 name，绝不能传 null
+                    let effective_name = if name_val.is_null() {
+                        json!(type_str)
+                    } else {
+                        name_val.clone()
+                    };
+                    converted_tools.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": effective_name,
+                            "description": t.get("description").unwrap_or(&json!("")),
+                            "parameters": t.get("parameters").unwrap_or(&json!({
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": false
+                            }))
+                        }
+                    }));
+                }
+            }
+        };
+
+        // 定义需要被屏蔽的 Codex 原生危险工具
+        // 注意：我们把 shell 的控制权收归到 codex_workspace_mcp__shell，所以隐藏原生 shell 工具
+        let blocked_types: &[&str] = &["shell", "code_execution", "bash", "computer_use"];
+        let blocked_names: &[&str] = &["run_terminal_cmd", "execute_command", "computer_use", "bash"];
+
+        for t in tools {
+            if !t.is_object() {
+                continue;
+            }
+
+            // 按 type 过滤掉危险工具
+            let tool_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if blocked_types.contains(&tool_type) {
+                log!(&state.log, "   [AGENT] Blocked Codex tool by type: '{}'", tool_type);
+                continue;
+            }
+            // 按 name 过滤掉危险工具
+            let tool_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let func_name = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+            if blocked_names.contains(&tool_name) || blocked_names.contains(&func_name) {
+                log!(&state.log, "   [AGENT] Blocked Codex tool by name: '{}'", tool_name);
+                continue;
+            }
+
+            // A. 如果是命名空间工具，展开子工具
+            if let Some(sub_tools) = t.get("tools").and_then(|v| v.as_array()) {
+                let ns_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                for sub_t in sub_tools {
+                    push_converted_tool(sub_t, Some(ns_name), &mut tool_route_map);
+                }
+            } 
+            // B. 常规独立工具
+            else {
+                push_converted_tool(t, None, &mut tool_route_map);
+            }
+        }
+
+        // 将咱们的 Workspace 特权工具插入到列表头部（最高优先级，大模型最先看到）
+        let mut priority_tools = Vec::new();
+        crate::agent::inject_workspace_tools(&mut priority_tools);
+        priority_tools.extend(converted_tools);
+        let converted_tools = priority_tools;
+
+        if !converted_tools.is_empty() {
+            openai_body["tools"] = json!(converted_tools);
+        }
+    } else {
+        let mut converted_tools = Vec::new();
+        crate::agent::inject_workspace_tools(&mut converted_tools);
+        if !converted_tools.is_empty() {
+            openai_body["tools"] = json!(converted_tools);
         }
     }
     if let Some(tool_choice) = body.get("tool_choice") {
@@ -663,7 +972,7 @@ async fn responses(
     // High performance SSE Streaming Relay!
     let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
     let stream = resp.bytes_stream();
-    let mut converter = format_translate::ResponsesStreamConverter::new(client_model);
+    let mut converter = format_translate::ResponsesStreamConverter::new(client_model, tool_route_map);
     let log_clone = state.log.clone();
 
     tokio::spawn(async move {
@@ -728,7 +1037,7 @@ async fn responses(
 // Server
 // ---------------------------------------------------------------------------
 
-pub async fn run(listener: TcpListener, config_path: &Path) -> anyhow::Result<()> {
+pub async fn run(listener: TcpListener, config_path: &Path, workspace: Arc<crate::tools::Workspace>) -> anyhow::Result<()> {
     let config: AiProxyConfig =
         serde_json::from_str(&tokio::fs::read_to_string(config_path).await?)?;
 
@@ -739,7 +1048,15 @@ pub async fn run(listener: TcpListener, config_path: &Path) -> anyhow::Result<()
         .append(true)
         .open(&log_path)?;
 
+    // 系统提示词专用日志（完整无截断）
+    let sys_log_path = config_path.with_file_name("system_prompt.log");
+    let sys_log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&sys_log_path)?;
+
     let log = Arc::new(Mutex::new(log_file));
+    let sys_log = Arc::new(Mutex::new(sys_log_file));
     let log_path = Arc::new(log_path);
 
     let total_maps: usize = config.providers.values().map(|p| p.model_map.len()).sum();
@@ -762,6 +1079,8 @@ pub async fn run(listener: TcpListener, config_path: &Path) -> anyhow::Result<()
         client,
         log,
         log_path,
+        sys_log,
+        workspace,
     };
 
     let app = Router::new()

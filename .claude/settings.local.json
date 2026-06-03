@@ -1,6 +1,20 @@
 {
   "permissions": {
     "allow": [
+      "mcp__codex_workspace_mcp",
+      "mcp__codex-workspace-mcp",
+      "mcp__codex_workspace_mcp__list_dir",
+      "mcp__codex_workspace_mcp__read_file",
+      "mcp__codex_workspace_mcp__write_file",
+      "mcp__codex_workspace_mcp__search_text",
+      "mcp__codex_workspace_mcp__workspace_info",
+      "mcp__codex_workspace_mcp__record_work_memory",
+      "mcp__codex-workspace-mcp__list_dir",
+      "mcp__codex-workspace-mcp__read_file",
+      "mcp__codex-workspace-mcp__write_file",
+      "mcp__codex-workspace-mcp__search_text",
+      "mcp__codex-workspace-mcp__workspace_info",
+      "mcp__codex-workspace-mcp__record_work_memory",
       "mcp__codex-workspace__list_dir",
       "Bash(cd /d E:\\\\项目\\\\codex-workspace-mcp)",
       "Bash(cargo build *)",
