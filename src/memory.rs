@@ -253,6 +253,7 @@ fn default_limit() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf};
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("codex_workspace_{name}_{}", std::process::id()));

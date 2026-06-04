@@ -931,6 +931,42 @@ pub fn tool_definitions() -> Value {
                     }
                 }
             }
+        },
+        {
+            "name": "spawn_subagent",
+            "description": "Spawn a specialized sub-agent with its own clean context in the background to handle a specific code analysis or search sub-task. Use this to save token context size of the main agent.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["role", "task"],
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "The job description / role of the sub-agent (e.g. 'Rust File Parser', 'CSS Style Fixer')."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The specific task instructions for the sub-agent to fulfill."
+                    }
+                }
+            }
+        },
+        {
+            "name": "query_logs",
+            "description": "Query the structured API and tool execution logs in SQLite from the past 24 hours. Helpful for diagnosing redundant tool calls or connection errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "default": 50,
+                        "description": "Max log rows to return."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional SQLite WHERE clause filter (e.g. 'action = \"ERROR\"' or 'message LIKE \"%search%\"')."
+                    }
+                }
+            }
         }
     ])
 }

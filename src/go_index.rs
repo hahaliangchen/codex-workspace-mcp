@@ -38,6 +38,8 @@ pub enum GoIndexError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, GoIndexError>;
@@ -72,6 +74,8 @@ pub struct GoImport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoSymbol {
     pub id: String,
+    #[serde(default)]
+    pub file_imports: Vec<GoImport>,
     pub name: String,
     pub kind: GoSymbolKind,
     pub package: String,
@@ -216,36 +220,45 @@ pub struct GoSuggestedRead {
 }
 
 pub fn index_workspace(root: &Path) -> Result<IndexGoWorkspaceResponse> {
-    let index = build_index(root)?;
-    let index_path = index_path(root);
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
+    let (files_indexed, symbols_indexed) = build_index(root)?;
     Ok(IndexGoWorkspaceResponse {
-        index_path: relative_display(root, &index_path),
-        files_indexed: index.files_indexed,
-        symbols_indexed: index.symbols.len(),
-        generated_at_unix: index.generated_at_unix,
+        index_path: "SQLite".to_string(),
+        files_indexed,
+        symbols_indexed,
+        generated_at_unix: now_unix(),
     })
 }
 
 pub fn status(root: &Path) -> GoIndexStatus {
-    let index_path = index_path(root);
-    if let Ok(content) = fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<GoIndex>(&content)
-    {
+    let conn = crate::database::init_db(root).unwrap();
+    // Bug3: 读取元数据中记录的真实索引创建时间
+    let generated_at = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "go",
+    );
+    if generated_at.is_some() {
+        let symbols_indexed: i64 = conn.query_row(
+            "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        let files_indexed: i64 = conn.query_row(
+            "SELECT count(DISTINCT file_path) FROM go_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
         return GoIndexStatus {
-            index_path: relative_display(root, &index_path),
+            index_path: "SQLite".to_string(),
             exists: true,
             workspace_root: root.display().to_string(),
-            generated_at_unix: Some(index.generated_at_unix),
-            files_indexed: Some(index.files_indexed),
-            symbols_indexed: Some(index.symbols.len()),
+            generated_at_unix: generated_at,
+            files_indexed: Some(files_indexed as usize),
+            symbols_indexed: Some(symbols_indexed as usize),
         };
     }
     GoIndexStatus {
-        index_path: relative_display(root, &index_path),
+        index_path: "SQLite".to_string(),
         exists: false,
         workspace_root: root.display().to_string(),
         generated_at_unix: None,
@@ -261,16 +274,21 @@ pub fn maybe_reindex_after_write(
     if changed_path.extension().and_then(|value| value.to_str()) != Some("go") {
         return Ok(None);
     }
-    if !index_path(root).exists() {
+    let conn = crate::database::init_db(root).unwrap();
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+        |row| row.get(0)
+    ).unwrap_or(0);
+    if count == 0 {
         return Ok(None);
     }
     index_workspace(root).map(Some)
 }
 
 pub fn list_symbols(root: &Path, request: ListGoSymbolsRequest) -> Result<ListGoSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
-    let symbols = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbols = index_symbols
         .iter()
         .filter(|symbol| {
             request
@@ -295,10 +313,9 @@ pub fn search_symbols(
     root: &Path,
     request: SearchGoSymbolsRequest,
 ) -> Result<SearchGoSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
     let needle = request.query.to_lowercase();
-    let mut matches: Vec<_> = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let mut matches: Vec<_> = index_symbols
         .iter()
         .filter(|symbol| {
             [
@@ -327,9 +344,8 @@ pub fn search_symbols(
 }
 
 pub fn read_symbol(root: &Path, request: ReadGoSymbolRequest) -> Result<ReadGoSymbolResponse> {
-    let index = load_or_build(root)?;
-    let symbol = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbol = index_symbols
         .iter()
         .find(|symbol| symbol.id == request.symbol_id)
         .cloned()
@@ -340,7 +356,7 @@ pub fn read_symbol(root: &Path, request: ReadGoSymbolRequest) -> Result<ReadGoSy
     let content = lines[(symbol.start_line - 1)..symbol.end_line.min(lines.len())].join("\n");
 
     let (callers, callees, suggested_reads) = if request.include_context {
-        build_context(&index, &symbol)
+        build_context(&index_symbols, &symbol)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
@@ -354,11 +370,10 @@ pub fn read_symbol(root: &Path, request: ReadGoSymbolRequest) -> Result<ReadGoSy
     })
 }
 
-fn build_index(root: &Path) -> Result<GoIndex> {
-    let mut symbols = Vec::new();
-    let mut files = Vec::new();
+fn build_index(root: &Path) -> Result<(usize, usize)> {
     let mut files_indexed = 0;
-    let mut builder = WalkBuilder::new(root);
+    let mut symbols_indexed = 0;
+    let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -372,6 +387,10 @@ fn build_index(root: &Path) -> Result<GoIndex> {
                 .unwrap_or(true)
         });
 
+    let mut conn = crate::database::init_db(root).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("DELETE FROM go_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
+
     for item in builder.build() {
         let entry = match item {
             Ok(entry) => entry,
@@ -384,35 +403,45 @@ fn build_index(root: &Path) -> Result<GoIndex> {
         if path.extension().and_then(|value| value.to_str()) != Some("go") {
             continue;
         }
-        if path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("")
-            .ends_with("_test.go")
-        {
-            continue;
-        }
-        let metadata = fs::metadata(path)?;
+        let metadata = std::fs::metadata(path)?;
         if metadata.len() > MAX_GO_FILE_BYTES {
             continue;
         }
-        let content = match fs::read_to_string(path) {
+        let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
             Err(_) => continue,
         };
-        files_indexed += 1;
         let parsed = parse_go_file(root, path, &content);
-        files.push(parsed.file);
-        symbols.extend(parsed.symbols);
+        files_indexed += 1;
+        for sym in parsed.symbols {
+            let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
+            let file_imports_json = serde_json::to_string(&parsed.file.imports).unwrap_or_default();
+            let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+            tx.execute(
+                "INSERT INTO go_symbols (
+                    id, workspace_root, name, kind, package_name, file_path, start_line, end_line,
+                    signature, docstring, receiver, receiver_name, receiver_type, calls_json, file_imports_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    sym.id, root.to_string_lossy(), sym.name, kind, sym.package, sym.file_path,
+                    sym.start_line, sym.end_line, sym.signature, sym.docstring,
+                    sym.receiver, sym.receiver_name, sym.receiver_type, calls_json, file_imports_json
+                ]
+            ).unwrap();
+            symbols_indexed += 1;
+        }
     }
-
-    Ok(GoIndex {
-        workspace_root: root.display().to_string(),
-        generated_at_unix: now_unix(),
-        files_indexed,
-        files,
-        symbols,
-    })
+    tx.commit().unwrap();
+    // Bug3: 记录本次索引的实际时间戳
+    let ts = now_unix();
+    let meta_conn = crate::database::init_db(root).unwrap();
+    crate::database::upsert_index_metadata(
+        &meta_conn,
+        &root.to_string_lossy(),
+        "go",
+        ts,
+    ).unwrap();
+    Ok((files_indexed, symbols_indexed))
 }
 
 struct ParsedGoFile {
@@ -589,6 +618,7 @@ fn parse_function_symbol(
         receiver_name: None,
         receiver_type: None,
         calls: collect_calls_ast(node, content, lines),
+        file_imports: Vec::new(),
     })
 }
 
@@ -620,6 +650,7 @@ fn parse_method_symbol(
         receiver_name,
         receiver_type,
         calls: collect_calls_ast(node, content, lines),
+        file_imports: Vec::new(),
     })
 }
 
@@ -655,6 +686,7 @@ fn parse_type_symbol(
         receiver_name: None,
         receiver_type: None,
         calls: Vec::new(),
+        file_imports: Vec::new(),
     })
 }
 
@@ -796,19 +828,23 @@ fn collect_docstring(lines: &[&str], decl_idx: usize) -> String {
 }
 
 fn build_context(
-    index: &GoIndex,
+    index_symbols: &[GoSymbol],
     symbol: &GoSymbol,
 ) -> (Vec<GoCaller>, Vec<GoCallee>, Vec<GoSuggestedRead>) {
-    let mut id_to_symbol: BTreeMap<String, &GoSymbol> = BTreeMap::new();
-    for item in &index.symbols {
+    let mut id_to_symbol = std::collections::BTreeMap::new();
+    for item in index_symbols {
         id_to_symbol.insert(item.id.clone(), item);
     }
-    let file_infos: BTreeMap<String, &GoFileInfo> = index
-        .files
-        .iter()
-        .map(|file| (file.file_path.clone(), file))
-        .collect();
-
+    
+    let mut file_infos = std::collections::BTreeMap::new();
+    for sym in index_symbols {
+        file_infos.entry(sym.file_path.clone()).or_insert_with(|| GoFileInfo {
+            file_path: sym.file_path.clone(),
+            package: sym.package.clone(),
+            imports: sym.file_imports.clone(),
+        });
+    }
+    
     let callees: Vec<_> = symbol
         .calls
         .iter()
@@ -816,14 +852,15 @@ fn build_context(
             target_text: call.target_text.clone(),
             line: call.line,
             snippet: call.snippet.clone(),
-            matched_symbol_ids: resolve_call(index, &file_infos, symbol, call)
+            matched_symbol_ids: resolve_call(index_symbols, &file_infos, symbol, call)
                 .into_iter()
-                .map(|symbol| symbol.id.clone())
+                .map(|s| s.id.clone())
                 .collect(),
         })
         .collect();
+
     let mut suggested_reads = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
     for callee in &callees {
         for matched_id in &callee.matched_symbol_ids {
             if matched_id == &symbol.id || !seen.insert(matched_id.clone()) {
@@ -842,14 +879,14 @@ fn build_context(
     }
 
     let mut callers = Vec::new();
-    for item in &index.symbols {
+    for item in index_symbols {
         if item.id == symbol.id {
             continue;
         }
         for call in &item.calls {
-            let matched = resolve_call(index, &file_infos, item, call)
+            let matched = resolve_call(index_symbols, &file_infos, item, call)
                 .into_iter()
-                .any(|matched| matched.id == symbol.id);
+                .any(|m| m.id == symbol.id);
             if matched {
                 callers.push(GoCaller {
                     symbol_id: item.id.clone(),
@@ -861,12 +898,13 @@ fn build_context(
             }
         }
     }
+
     (callers, callees, suggested_reads)
 }
 
 fn resolve_call<'a>(
-    index: &'a GoIndex,
-    file_infos: &BTreeMap<String, &GoFileInfo>,
+    index_symbols: &'a [GoSymbol],
+    file_infos: &std::collections::BTreeMap<String, GoFileInfo>,
     caller: &GoSymbol,
     call: &GoCall,
 ) -> Vec<&'a GoSymbol> {
@@ -875,7 +913,7 @@ fn resolve_call<'a>(
         if caller.receiver_name.as_deref() == Some(qualifier)
             && let Some(receiver_type) = caller.receiver_type.as_deref()
         {
-            matches.extend(index.symbols.iter().filter(|symbol| {
+            matches.extend(index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text
                     && symbol.receiver_type.as_deref() == Some(receiver_type)
                     && symbol.package == caller.package
@@ -888,7 +926,7 @@ fn resolve_call<'a>(
                     || (import.alias.is_none() && import.package_hint == qualifier)
             })
         {
-            matches.extend(index.symbols.iter().filter(|symbol| {
+            matches.extend(index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text
                     && (symbol.package == import.package_hint
                         || package_path_matches(&symbol.file_path, &import.path))
@@ -898,19 +936,18 @@ fn resolve_call<'a>(
         dedupe_symbols(matches)
     } else {
         matches.extend(
-            index.symbols.iter().filter(|symbol| {
+            index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text && symbol.package == caller.package
             }),
         );
         if matches.is_empty() {
-            matches.extend(index.symbols.iter().filter(|symbol| {
+            matches.extend(index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text && symbol.file_path == caller.file_path
             }));
         }
         if matches.is_empty() {
             matches.extend(
-                index
-                    .symbols
+                index_symbols
                     .iter()
                     .filter(|symbol| symbol.name == call.target_text),
             );
@@ -947,24 +984,51 @@ fn suggestion_reason(caller: &GoSymbol, matched: &GoSymbol) -> &'static str {
     }
 }
 
-fn load_or_build(root: &Path) -> Result<GoIndex> {
-    let path = index_path(root);
-    if !path.exists() {
-        return Err(GoIndexError::MissingIndex);
+fn load_all_symbols(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
+    let conn = crate::database::init_db(root).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+    let mut stmt = conn.prepare("SELECT id, name, kind, package_name, file_path, start_line, end_line, signature, docstring, receiver, receiver_name, receiver_type, calls_json, file_imports_json FROM go_symbols WHERE workspace_root = ?").map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
+        Ok(GoSymbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(GoSymbolKind::Function),
+            package: row.get(3)?,
+            file_path: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            signature: row.get(7)?,
+            docstring: row.get(8)?,
+            receiver: row.get(9)?,
+            receiver_name: row.get(10)?,
+            receiver_type: row.get(11)?,
+            calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+            file_imports: serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
+        })
+    }).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+
+    let mut symbols = Vec::new();
+    for sym in symbol_iter {
+        if let Ok(s) = sym {
+            symbols.push(s);
+        }
     }
-    let content = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    Ok(symbols)
 }
 
-fn load_or_build_or_create(root: &Path) -> Result<GoIndex> {
-    match load_or_build(root) {
-        Ok(index) => Ok(index),
-        Err(GoIndexError::MissingIndex) => {
-            index_workspace(root)?;
-            load_or_build(root)
-        }
-        Err(error) => Err(error),
+fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
+    // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
+    let conn = crate::database::init_db(root).unwrap();
+    let already_indexed = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "go",
+    ).is_some();
+    let symbols = load_all_symbols(root)?;
+    if !already_indexed {
+        index_workspace(root)?;
+        return load_all_symbols(root);
     }
+    Ok(symbols)
 }
 
 fn index_path(root: &Path) -> PathBuf {
@@ -991,7 +1055,7 @@ fn symbol_id(file_path: &str, name: &str, line: usize, receiver: Option<&str>) -
     }
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
@@ -1264,7 +1328,16 @@ func (s *PptService) Save(topic string) error {
         .unwrap();
 
         assert_eq!(search.matches.len(), 1);
-        assert!(index_path(&root).exists());
+        // Bug2: 已迁移到 SQLite，不再生成 JSON 文件，改为验证元数据表中确实有索引记录
+        {
+            let conn = crate::database::init_db(&root).unwrap();
+            let ts = crate::database::get_index_generated_at(
+                &conn,
+                &root.to_string_lossy(),
+                "go",
+            );
+            assert!(ts.is_some(), "index metadata should be recorded after auto-build");
+        }
         let _ = fs::remove_dir_all(root);
     }
 }

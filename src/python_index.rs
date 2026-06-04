@@ -38,6 +38,8 @@ pub enum PythonIndexError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, PythonIndexError>;
@@ -70,6 +72,8 @@ pub struct PythonImport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PythonSymbol {
     pub id: String,
+    #[serde(default)]
+    pub file_imports: Vec<PythonImport>,
     pub name: String,
     pub kind: PythonSymbolKind,
     pub file_path: String,
@@ -209,36 +213,45 @@ pub struct PythonSuggestedRead {
 }
 
 pub fn index_workspace(root: &Path) -> Result<IndexPythonWorkspaceResponse> {
-    let index = build_index(root)?;
-    let index_path = index_path(root);
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
+    let (files_indexed, symbols_indexed) = build_index(root)?;
     Ok(IndexPythonWorkspaceResponse {
-        index_path: relative_display(root, &index_path),
-        files_indexed: index.files_indexed,
-        symbols_indexed: index.symbols.len(),
-        generated_at_unix: index.generated_at_unix,
+        index_path: "SQLite".to_string(),
+        files_indexed,
+        symbols_indexed,
+        generated_at_unix: crate::rust_index::now_unix(),
     })
 }
 
 pub fn status(root: &Path) -> PythonIndexStatus {
-    let index_path = index_path(root);
-    if let Ok(content) = fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<PythonIndex>(&content)
-    {
+    let conn = crate::database::init_db(root).unwrap();
+    // Bug3: 读取元数据中记录的真实索引创建时间
+    let generated_at = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "python",
+    );
+    if generated_at.is_some() {
+        let symbols_indexed: i64 = conn.query_row(
+            "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        let files_indexed: i64 = conn.query_row(
+            "SELECT count(DISTINCT file_path) FROM python_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
         return PythonIndexStatus {
-            index_path: relative_display(root, &index_path),
+            index_path: "SQLite".to_string(),
             exists: true,
             workspace_root: root.display().to_string(),
-            generated_at_unix: Some(index.generated_at_unix),
-            files_indexed: Some(index.files_indexed),
-            symbols_indexed: Some(index.symbols.len()),
+            generated_at_unix: generated_at,
+            files_indexed: Some(files_indexed as usize),
+            symbols_indexed: Some(symbols_indexed as usize),
         };
     }
     PythonIndexStatus {
-        index_path: relative_display(root, &index_path),
+        index_path: "SQLite".to_string(),
         exists: false,
         workspace_root: root.display().to_string(),
         generated_at_unix: None,
@@ -251,10 +264,16 @@ pub fn maybe_reindex_after_write(
     root: &Path,
     changed_path: &Path,
 ) -> Result<Option<IndexPythonWorkspaceResponse>> {
-    if changed_path.extension().and_then(|v| v.to_str()) != Some("py") {
+    if changed_path.extension().and_then(|value| value.to_str()) != Some("py") {
         return Ok(None);
     }
-    if !index_path(root).exists() {
+    let conn = crate::database::init_db(root).unwrap();
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+        |row| row.get(0)
+    ).unwrap_or(0);
+    if count == 0 {
         return Ok(None);
     }
     index_workspace(root).map(Some)
@@ -264,9 +283,8 @@ pub fn list_symbols(
     root: &Path,
     request: ListPythonSymbolsRequest,
 ) -> Result<ListPythonSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
-    let symbols = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbols = index_symbols
         .iter()
         .filter(|s| {
             request
@@ -291,10 +309,9 @@ pub fn search_symbols(
     root: &Path,
     request: SearchPythonSymbolsRequest,
 ) -> Result<SearchPythonSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
+    let index_symbols = load_or_build_or_create(root)?;
     let needle = request.query.to_lowercase();
-    let mut matches: Vec<_> = index
-        .symbols
+    let mut matches: Vec<_> = index_symbols
         .iter()
         .filter(|s| {
             [
@@ -324,9 +341,8 @@ pub fn search_symbols(
 }
 
 pub fn read_symbol(root: &Path, request: ReadPythonSymbolRequest) -> Result<ReadPythonSymbolResponse> {
-    let index = load_or_build(root)?;
-    let symbol = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbol = index_symbols
         .iter()
         .find(|s| s.id == request.symbol_id)
         .cloned()
@@ -337,7 +353,7 @@ pub fn read_symbol(root: &Path, request: ReadPythonSymbolRequest) -> Result<Read
     let content = lines[(symbol.start_line - 1)..symbol.end_line.min(lines.len())].join("\n");
 
     let (callers, callees, suggested_reads) = if request.include_context {
-        build_context(&index, &symbol)
+        build_context(&index_symbols, &symbol)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
@@ -351,12 +367,15 @@ pub fn read_symbol(root: &Path, request: ReadPythonSymbolRequest) -> Result<Read
     })
 }
 
-fn build_index(root: &Path) -> Result<PythonIndex> {
-    let mut files = Vec::new();
-    let mut symbols = Vec::new();
+fn build_index(root: &Path) -> Result<(usize, usize)> {
     let mut files_indexed = 0;
+    let mut symbols_indexed = 0;
+    
+    let mut conn = crate::database::init_db(root).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("DELETE FROM python_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
 
-    let mut builder = WalkBuilder::new(root);
+    let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -379,37 +398,54 @@ fn build_index(root: &Path) -> Result<PythonIndex> {
             continue;
         }
         let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) != Some("py") {
+        if path.extension().and_then(|value| value.to_str()) != Some("py") {
             continue;
         }
-        let metadata = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let metadata = std::fs::metadata(path)?;
         if metadata.len() > MAX_PYTHON_FILE_BYTES {
             continue;
         }
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let parsed = match ast::Suite::parse(&content, "<embedded>") {
-            Ok(p) => p,
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
             Err(_) => continue,
         };
         files_indexed += 1;
-        let result = parse_python_file(root, path, &content, &parsed);
-        files.push(result.file);
-        symbols.extend(result.symbols);
+        let ast = match ast::Suite::parse(&content, "<embedded>") {
+            Ok(ast) => ast,
+            Err(_) => continue,
+        };
+        let parsed = parse_python_file(root, path, &content, &ast);
+        
+        for sym in parsed.symbols {
+            let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+            let decorators_json = serde_json::to_string(&sym.decorators).unwrap_or_default();
+            let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
+            let file_imports_json = serde_json::to_string(&parsed.file.imports).unwrap_or_default();
+            
+            tx.execute(
+                "INSERT INTO python_symbols (
+                    id, workspace_root, name, kind, file_path, class_name, start_line, end_line,
+                    signature, docstring, decorators_json, calls_json, file_imports_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    sym.id, root.to_string_lossy(), sym.name, kind, sym.file_path, sym.class_name,
+                    sym.start_line, sym.end_line, sym.signature, sym.docstring, decorators_json, calls_json, file_imports_json
+                ]
+            ).unwrap();
+            symbols_indexed += 1;
+        }
     }
-
-    Ok(PythonIndex {
-        workspace_root: root.display().to_string(),
-        generated_at_unix: now_unix(),
-        files_indexed,
-        files,
-        symbols,
-    })
+    tx.commit().unwrap();
+    // Bug3: 记录本次索引的实际时间戳
+    let ts = crate::rust_index::now_unix();
+    let meta_conn = crate::database::init_db(root).unwrap();
+    crate::database::upsert_index_metadata(
+        &meta_conn,
+        &root.to_string_lossy(),
+        "python",
+        ts,
+    ).unwrap();
+    Ok((files_indexed, symbols_indexed))
 }
 
 struct ParsedPythonFile {
@@ -506,49 +542,49 @@ fn collect_stmts(
                 let docstring = extract_docstring(&node.body);
                 let calls = collect_calls(&node.body, lines, line_map);
                 symbols.push(PythonSymbol {
-                    id: symbol_id(file_path, class_name, &name, start_line),
+                    id: format!("{file_path}:{name}"),
                     name,
                     kind,
                     file_path: file_path.to_string(),
-                    class_name: class_name.map(str::to_string),
+                    class_name: class_name.map(String::from),
                     start_line,
                     end_line,
                     signature,
                     docstring,
                     decorators,
                     calls,
+                    file_imports: Vec::new(),
                 });
             }
-            Stmt::ClassDef(node) => {
-                let start_line = line_map.line(node.range.start());
-                let end_line = line_map.line(node.range.end());
-                let name = node.name.to_string();
-                let decorators: Vec<String> = node
+            Stmt::ClassDef(cls) => {
+                let name = cls.name.to_string();
+                let decorators: Vec<String> = cls
                     .decorator_list
                     .iter()
                     .map(|d| expr_text(d))
                     .collect();
-                let bases: Vec<String> = node.bases.iter().map(|b| expr_text(b)).collect();
+                let bases: Vec<String> = cls.bases.iter().map(|b| expr_text(b)).collect();
                 let signature = if bases.is_empty() {
                     format!("class {name}")
                 } else {
                     format!("class {name}({})", bases.join(", "))
                 };
-                let docstring = extract_docstring(&node.body);
+                let docstring = extract_docstring(&cls.body);
                 symbols.push(PythonSymbol {
-                    id: symbol_id(file_path, None, &name, start_line),
+                    id: format!("{file_path}:{name}"),
                     name: name.clone(),
                     kind: PythonSymbolKind::Class,
                     file_path: file_path.to_string(),
                     class_name: None,
-                    start_line,
-                    end_line,
+                    start_line: line_map.line(cls.range.start()),
+                    end_line: line_map.line(cls.range.end()),
                     signature,
                     docstring,
                     decorators,
                     calls: Vec::new(),
+                    file_imports: Vec::new(),
                 });
-                collect_stmts(&node.body, file_path, lines, line_map, Some(&name), imports, symbols);
+                collect_stmts(&cls.body, file_path, lines, line_map, Some(&name), imports, symbols);
             }
             _ => {}
         }
@@ -747,11 +783,13 @@ fn expr_text(expr: &Expr) -> String {
 }
 
 fn build_context(
-    index: &PythonIndex,
+    index_symbols: &[PythonSymbol],
     symbol: &PythonSymbol,
 ) -> (Vec<PythonCaller>, Vec<PythonCallee>, Vec<PythonSuggestedRead>) {
-    let id_to_symbol: BTreeMap<String, &PythonSymbol> =
-        index.symbols.iter().map(|s| (s.id.clone(), s)).collect();
+    let mut id_to_symbol = std::collections::BTreeMap::new();
+    for item in index_symbols {
+        id_to_symbol.insert(item.id.clone(), item);
+    }
 
     let callees: Vec<_> = symbol
         .calls
@@ -760,7 +798,7 @@ fn build_context(
             target_text: call.target_text.clone(),
             line: call.line,
             snippet: call.snippet.clone(),
-            matched_symbol_ids: resolve_call(index, symbol, call)
+            matched_symbol_ids: resolve_call(index_symbols, symbol, call)
                 .into_iter()
                 .map(|s| s.id.clone())
                 .collect(),
@@ -768,34 +806,34 @@ fn build_context(
         .collect();
 
     let mut suggested_reads = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
     for callee in &callees {
         for matched_id in &callee.matched_symbol_ids {
             if matched_id == &symbol.id || !seen.insert(matched_id.clone()) {
                 continue;
             }
-            if let Some(matched) = id_to_symbol.get(matched_id) {
+            if let Some(matched_symbol) = id_to_symbol.get(matched_id) {
                 suggested_reads.push(PythonSuggestedRead {
-                    reason: suggestion_reason(symbol, matched).to_string(),
+                    reason: suggestion_reason(symbol, matched_symbol).to_string(),
                     trigger_call: callee.target_text.clone(),
                     trigger_line: callee.line,
                     trigger_snippet: callee.snippet.clone(),
-                    symbol: PythonSymbolSummary::from(*matched),
+                    symbol: PythonSymbolSummary::from(*matched_symbol),
                 });
             }
         }
     }
 
     let mut callers = Vec::new();
-    for item in &index.symbols {
+    for item in index_symbols {
         if item.id == symbol.id {
             continue;
         }
         for call in &item.calls {
-            if resolve_call(index, item, call)
+            let matched = resolve_call(index_symbols, item, call)
                 .into_iter()
-                .any(|m| m.id == symbol.id)
-            {
+                .any(|m| m.id == symbol.id);
+            if matched {
                 callers.push(PythonCaller {
                     symbol_id: item.id.clone(),
                     name: item.name.clone(),
@@ -811,7 +849,7 @@ fn build_context(
 }
 
 fn resolve_call<'a>(
-    index: &'a PythonIndex,
+    index_symbols: &'a [PythonSymbol],
     caller: &PythonSymbol,
     call: &PythonCall,
 ) -> Vec<&'a PythonSymbol> {
@@ -821,7 +859,7 @@ fn resolve_call<'a>(
         // self.method() — look for methods on same class
         if qualifier == "self" || qualifier == "cls" {
             if let Some(class_name) = caller.class_name.as_deref() {
-                matches.extend(index.symbols.iter().filter(|s| {
+                matches.extend(index_symbols.iter().filter(|s| {
                     s.name == call.target_text
                         && s.class_name.as_deref() == Some(class_name)
                         && s.file_path == caller.file_path
@@ -830,19 +868,19 @@ fn resolve_call<'a>(
         }
         // Qualified.name() — qualifier tail matches class name
         let qualifier_tail = qualifier.rsplit('.').next().unwrap_or(qualifier);
-        matches.extend(index.symbols.iter().filter(|s| {
+        matches.extend(index_symbols.iter().filter(|s| {
             s.name == call.target_text
                 && s.class_name.as_deref() == Some(qualifier_tail)
         }));
     } else {
         // Bare call — same file first, then workspace-wide
-        matches.extend(index.symbols.iter().filter(|s| {
+        matches.extend(index_symbols.iter().filter(|s| {
             s.name == call.target_text
                 && s.file_path == caller.file_path
                 && matches!(s.kind, PythonSymbolKind::Function | PythonSymbolKind::Class)
         }));
         if matches.is_empty() {
-            matches.extend(index.symbols.iter().filter(|s| {
+            matches.extend(index_symbols.iter().filter(|s| {
                 s.name == call.target_text
                     && matches!(s.kind, PythonSymbolKind::Function | PythonSymbolKind::Class)
             }));
@@ -870,24 +908,57 @@ fn suggestion_reason(caller: &PythonSymbol, matched: &PythonSymbol) -> &'static 
     }
 }
 
-fn load_or_build(root: &Path) -> Result<PythonIndex> {
-    let path = index_path(root);
-    if !path.exists() {
-        return Err(PythonIndexError::MissingIndex);
+fn load_all_symbols(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
+    let conn = crate::database::init_db(root).map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
+    let mut stmt = conn.prepare("SELECT id, name, kind, file_path, class_name, start_line, end_line, signature, docstring, decorators_json, calls_json, file_imports_json FROM python_symbols WHERE workspace_root = ?").map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
+    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
+        Ok(PythonSymbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(PythonSymbolKind::Function),
+            file_path: row.get(3)?,
+            class_name: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            signature: row.get(7)?,
+            docstring: row.get(8)?,
+            decorators: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+            calls: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+            file_imports: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+        })
+    }).map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
+
+    let mut symbols = Vec::new();
+    for sym in symbol_iter {
+        if let Ok(s) = sym {
+            symbols.push(s);
+        }
     }
-    let content = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    Ok(symbols)
 }
 
-fn load_or_build_or_create(root: &Path) -> Result<PythonIndex> {
-    match load_or_build(root) {
-        Ok(index) => Ok(index),
-        Err(PythonIndexError::MissingIndex) => {
-            index_workspace(root)?;
-            load_or_build(root)
-        }
-        Err(error) => Err(error),
+fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
+    // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
+    let conn = crate::database::init_db(root).unwrap();
+    let already_indexed = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "python",
+    ).is_some();
+    let symbols = load_all_symbols(root)?;
+    if !already_indexed {
+        index_workspace(root)?;
+        return load_all_symbols(root);
     }
+    Ok(symbols)
+}
+
+fn load_or_build(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
+    let symbols = load_all_symbols(root)?;
+    if symbols.is_empty() {
+        return Err(PythonIndexError::MissingIndex);
+    }
+    Ok(symbols)
 }
 
 fn index_path(root: &Path) -> PathBuf {
@@ -1032,17 +1103,17 @@ def validate(topic: str) -> bool:
         let root = temp_workspace("imports");
         fs::write(
             root.join("app.py"),
-            "import os\nfrom pathlib import Path, PurePath\n",
+            "import os\nfrom pathlib import Path, PurePath\ndef dummy(): pass\n",
         )
         .unwrap();
         let resp = index_workspace(&root).unwrap();
-        let file = resp.index_path;
-        assert!(!file.is_empty());
+        assert!(!resp.index_path.is_empty());
 
-        let index = load_or_build(&root).unwrap();
-        let f = &index.files[0];
-        assert!(f.imports.iter().any(|i| i.module == "os"));
-        assert!(f.imports.iter().any(|i| i.name.as_deref() == Some("Path")));
+        // \u5df2\u8fc1\u79fb\u5230 SQLite\uff0c\u5bfc\u5165\u4fe1\u606f\u5b58\u5728\u4e8e\u6bcf\u4e2a symbol \u7684 file_imports \u5b57\u6bb5\u4e2d
+        let symbols = load_all_symbols(&root).unwrap();
+        let dummy = symbols.iter().find(|s| s.name == "dummy").expect("dummy symbol should exist");
+        assert!(dummy.file_imports.iter().any(|i| i.module == "os"));
+        assert!(dummy.file_imports.iter().any(|i| i.name.as_deref() == Some("Path")));
 
         let _ = fs::remove_dir_all(root);
     }

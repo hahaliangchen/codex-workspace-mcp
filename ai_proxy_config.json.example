@@ -9,6 +9,11 @@
         "gpt-4o": "gpt-4o",
         "claude-3-5-sonnet": "gpt-4o"
       }
+    },
+    "my_raw_codex_provider": {
+      "url": "https://api.your-codex-relay.com/v1",
+      "api_key": "YOUR_UPSTREAM_API_KEY_HERE",
+      "raw_codex": true
     }
   }
 }

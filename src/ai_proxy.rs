@@ -38,6 +38,8 @@ struct ProviderConfig {
     /// raw pass-through — no request/response format conversion.
     #[serde(default = "default_api_type")]
     api_type: String,
+    #[serde(default)]
+    raw_codex: bool,
 }
 
 fn default_api_type() -> String {
@@ -65,14 +67,16 @@ struct AiProxyState {
     /// 系统提示词专用日志，每次请求完整记录 developer/system 内容
     sys_log: Arc<Mutex<std::fs::File>>,
     workspace: Arc<crate::tools::Workspace>,
+    db: Arc<Mutex<rusqlite::Connection>>,
 }
+
 
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
 
 /// Current time in China timezone (UTC+8).
-fn now_china() -> String {
+pub fn now_china() -> String {
     let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
     chrono::Utc::now()
         .with_timezone(&offset)
@@ -80,22 +84,66 @@ fn now_china() -> String {
         .to_string()
 }
 
-/// Write a line to the shared log file.  Panics are caught — logging is
-/// best-effort and must never crash the proxy.
-pub fn log_write(log: &Mutex<std::fs::File>, msg: &str) {
+/// Write a line to the shared log file and optionally SQLite database. Panics are caught.
+pub fn log_write(
+    log: &Mutex<std::fs::File>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    action: Option<&str>,
+    role: Option<&str>,
+    msg: &str,
+) {
     let ts = now_china();
     let line = format!("[{}] {}\n", ts, msg);
     if let Ok(mut f) = log.lock() {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
     }
+
+    if let Some(db_lock) = db {
+        let action_str = action.unwrap_or("INFO");
+        let role_str = role.unwrap_or("proxy");
+
+        // Filter out system messages and huge system-level templates to keep DB lightweight
+        if role_str == "system" 
+            || msg.contains("You are Codex") 
+            || msg.contains("<permissions instructions>")
+            || msg.contains("<skills_instructions>")
+        {
+            return;
+        }
+
+        if let Ok(conn) = db_lock.lock() {
+            let (short_msg, detail_opt) = if msg.len() > 300 {
+                let truncated = msg.chars().take(300).collect::<String>();
+                (truncated + " ... [TRUNCATED]", Some(msg))
+            } else {
+                (msg.to_owned(), None)
+            };
+
+            let _ = crate::database::insert_detailed_api_log(
+                &conn,
+                &ts,
+                action_str,
+                role_str,
+                &short_msg,
+                detail_opt,
+            );
+        }
+    }
 }
 
 macro_rules! log {
     ($log:expr, $($arg:tt)*) => {
-        log_write(&*$log, &format!($($arg)*))
+        log_write(&*$log, None, None, None, &format!($($arg)*))
     };
 }
+
+macro_rules! log_db {
+    ($state:expr, $action:expr, $role:expr, $($arg:tt)*) => {
+        log_write(&*$state.log, Some(&*$state.db), Some($action), Some($role), &format!($($arg)*))
+    };
+}
+
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -491,6 +539,68 @@ async fn messages(
     }
 }
 
+fn normalize_message_content(content: &Value) -> Value {
+    if let Some(arr) = content.as_array() {
+        let mut normalized_arr = Vec::new();
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                
+                // 判断是否是图片类型
+                if item_type == "input_image" || item_type == "image_url" || obj.contains_key("image_url") {
+                    // 如果已经是标准格式： { "type": "image_url", "image_url": { "url": "..." } }
+                    if item_type == "image_url" && obj.get("image_url").map_or(false, |v| v.is_object()) {
+                        normalized_arr.push(item.clone());
+                    } else {
+                        // 提取 url，优先从 image_url 字段提取（可能是字符串），或者从 url 字段
+                        let url_str = obj.get("image_url")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| obj.get("url").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        
+                        let detail = obj.get("detail").and_then(|v| v.as_str()).unwrap_or("auto");
+                        
+                        normalized_arr.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": url_str,
+                                "detail": detail
+                            }
+                        }));
+                    }
+                } else if item_type == "image" {
+                    // 支持 Anthropic 格式的 image 片段转换
+                    if let Some(source) = obj.get("source") {
+                        if let (Some(media_type), Some(data)) = (
+                            source.get("media_type").and_then(|v| v.as_str()),
+                            source.get("data").and_then(|v| v.as_str())
+                        ) {
+                            normalized_arr.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", media_type, data)
+                                }
+                            }));
+                        } else {
+                            normalized_arr.push(item.clone());
+                        }
+                    } else {
+                        normalized_arr.push(item.clone());
+                    }
+                } else {
+                    // text 或其他普通类型，保持原样
+                    normalized_arr.push(item.clone());
+                }
+            } else {
+                normalized_arr.push(item.clone());
+            }
+        }
+        Value::Array(normalized_arr)
+    } else {
+        content.clone()
+    }
+}
+
 /// POST /v1/responses — OpenAI Responses API endpoint for Codex.
 async fn responses(
     State(state): State<AiProxyState>,
@@ -507,7 +617,7 @@ async fn responses(
         }
     };
 
-    log!(&state.log, "=== /v1/responses received from Codex  model={}", client_model);
+    log_db!(&state, "REQ_IN", "user", "=== /v1/responses received from Codex  model={}", client_model);
     // Codex Responses body 在主日志只打顶层字段，省略 input 内容（input 中系统提示词见 system_prompt.log）
     {
         let mut body_brief = body.clone();
@@ -533,8 +643,10 @@ async fn responses(
                 }
             }
         }
-        log!(
-            &state.log,
+        log_db!(
+            &state,
+            "REQ_IN",
+            "user",
             "   Codex Responses body: {}",
             fmt_body(serde_json::to_string(&body_brief).unwrap_or_default().as_bytes())
         );
@@ -545,12 +657,169 @@ async fn responses(
         Err(resp) => return resp,
     };
 
-    log!(
-        &state.log,
+    log_db!(
+        &state,
+        "PROXY",
+        "proxy",
         "   resolved: provider={} upstream_model={}",
         provider.url,
         upstream_model
     );
+
+    if provider.raw_codex {
+        let mut forward_body = body.clone();
+        forward_body["model"] = json!(upstream_model);
+
+        let upstream_url = format!("{}/responses", provider.url);
+        let is_stream = body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        log_db!(
+            &state,
+            "REQ_OUT",
+            "user",
+            ">> RAW CODEX UPSTREAM REQ  model={}  url={}  stream={}  body={}",
+            client_model,
+            upstream_url,
+            is_stream,
+            fmt_body(serde_json::to_string(&forward_body).unwrap_or_default().as_bytes())
+        );
+
+        match state.client
+            .post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", provider.api_key))
+            .json(&forward_body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                log_db!(
+                    &state,
+                    "RESP_IN",
+                    "assistant",
+                    "<< RAW CODEX UPSTREAM RESP  status={}  model={}",
+                    status.as_u16(),
+                    client_model
+                );
+
+                if !status.is_success() {
+                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    log_db!(
+                        &state,
+                        "ERROR",
+                        "proxy",
+                        "!! RAW CODEX UPSTREAM ERROR RESP  status={}  body={}",
+                        status.as_u16(),
+                        String::from_utf8_lossy(&body_bytes)
+                    );
+                    return Response::builder()
+                        .status(status)
+                        .body(Body::from(body_bytes))
+                        .unwrap();
+                }
+
+                if is_stream {
+                    let stream = resp.bytes_stream();
+                    let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
+                    let log_clone = state.log.clone();
+                    let db_clone = state.db.clone();
+
+                    tokio::spawn(async move {
+                        use futures::StreamExt;
+                        futures::pin_mut!(stream);
+
+                        log_write(&*log_clone, Some(&*db_clone), Some("STREAM_START"), Some("proxy"), ">> SPAWNED raw responses stream handler");
+
+                        while let Some(result) = stream.next().await {
+                            match result {
+                                Ok(bytes) => {
+                                    let item: Result<Bytes, Box<dyn std::error::Error + Send + Sync>> = Ok(bytes);
+                                    if tx.send(item).await.is_err() {
+                                        log_write(&*log_clone, Some(&*db_clone), Some("ERROR"), Some("proxy"), "!! CLIENT DISCONNECTED during raw stream");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    log_write(&*log_clone, Some(&*db_clone), Some("ERROR"), Some("proxy"), &format!("!! RAW UPSTREAM STREAM ERROR  {}", e));
+                                    let _ = tx
+                                        .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
+                        log_write(&*log_clone, Some(&*db_clone), Some("STREAM_FINISHED"), Some("proxy"), ">> FINISHED raw responses stream handler");
+                    });
+
+                    let mut rx = rx;
+                    let rx_stream = poll_fn(move |cx: &mut Context<'_>| {
+                        rx.poll_recv(cx)
+                    });
+
+                    return Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("x-accel-buffering", "no")
+                        .body(Body::from_stream(rx_stream))
+                        .unwrap_or_else(|e| {
+                            error!(%e, "failed to build raw Responses stream response");
+                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        });
+                } else {
+                    let content_type = resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("application/json")
+                        .to_owned();
+
+                    match resp.bytes().await {
+                        Ok(body_bytes) => {
+                            log_db!(
+                                &state,
+                                "RESP_IN",
+                                "assistant",
+                                "<< RAW CODEX UPSTREAM BODY  {} bytes",
+                                body_bytes.len()
+                            );
+                            return Response::builder()
+                                .status(status)
+                                .header("content-type", content_type)
+                                .body(Body::from(body_bytes))
+                                .unwrap_or_else(|e| {
+                                    error!(%e, "failed to build raw response");
+                                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                });
+                        }
+                        Err(e) => {
+                            log_db!(&state, "ERROR", "proxy", "!! RAW READ ERROR  {}", e);
+                            error!(%e, "failed to read raw upstream body");
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                [("content-type", "application/json")],
+                                Json(json!({"error": format!("upstream read: {e}")})),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log_db!(&state, "ERROR", "proxy", "!! RAW CONNECT ERROR  {}", e);
+                error!(%e, "raw upstream request failed");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    [("content-type", "application/json")],
+                    Json(json!({"error": format!("upstream: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     log!(
         &state.log,
@@ -566,7 +835,7 @@ async fn responses(
     // === 诊断日志：不截断，精准打关键字段 ===
     {
         let prev_id = body.get("previous_response_id").and_then(|v| v.as_str()).unwrap_or("<none>");
-        log!(&state.log, "   [DIAG] previous_response_id={}", prev_id);
+        log_db!(&state, "DIAG", "proxy", "   [DIAG] previous_response_id={}", prev_id);
 
         // 统计 input 里各 type 的数量（不截断）
         if let Some(input_arr) = body.get("input").and_then(|v| v.as_array()) {
@@ -578,7 +847,7 @@ async fn responses(
                 *type_counts.entry(t).or_insert(0) += 1;
                 *role_counts.entry(r).or_insert(0) += 1;
             }
-            log!(&state.log, "   [DIAG] input total={} type_counts={:?} role_counts={:?}",
+            log_db!(&state, "DIAG", "proxy", "   [DIAG] input total={} type_counts={:?} role_counts={:?}",
                 input_arr.len(), type_counts, role_counts);
 
             // 打出所有非系统类条目（type != message 的或 role == assistant 的）
@@ -588,15 +857,16 @@ async fn responses(
                 if t == "function_call" || t == "function_call_output" || r == "assistant" {
                     let brief = serde_json::to_string(item).unwrap_or_default();
                     let brief_safe = brief.chars().take(300).collect::<String>();
-                    log!(&state.log, "   [DIAG] input[{}] type={} role={} : {}",
+                    log_db!(&state, "TOOL_MATCH", r, "   [DIAG] input[{}] type={} role={} : {}",
                         idx, t, r, brief_safe);
                 }
             }
         }
         // 也看看 messages 字段
         let msgs_exist = body.get("messages").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-        log!(&state.log, "   [DIAG] messages field count={}", msgs_exist);
+        log_db!(&state, "DIAG", "proxy", "   [DIAG] messages field count={}", msgs_exist);
     }
+
 
 
     // Translate Responses format to standard Chat Completions messages
@@ -630,7 +900,7 @@ async fn responses(
             } else {
                 let mut new_msg = json!({
                     "role": role,
-                    "content": content
+                    "content": normalize_message_content(&content)
                 });
 
                 // 重点：如果是工具调用结果 (role == "tool")，我们需要把工具调用 ID 属性传下去！
@@ -658,34 +928,38 @@ async fn responses(
     }
 
     // 3. input -> system part or normal user messages
-    if let Some(input_val) = body.get("input") {
-        macro_rules! handle_text {
-            ($t:expr, $role:expr) => {
-                let t_str = $t;
-                let r_str = $role;
-                if t_str.contains("<permissions instructions>")
-                    || t_str.contains("<skills_instructions>")
-                    || t_str.contains("<app-context>")
-                    || t_str.contains("<system-reminder>")
-                {
-                    system_parts.push(t_str.to_owned());
-                } else {
-                    let downstream_role = match r_str {
-                        "developer" => "system",
-                        "system" => "system",
-                        "assistant" => "assistant",
-                        _ => "user",
-                    };
-                    normal_messages.push(json!({
-                        "role": downstream_role,
-                        "content": t_str
-                    }));
-                }
-            };
-        }
+    enum TempItem {
+        Normal(Value),
+        ToolOutput {
+            call_id: Value,
+            call_id_str: String,
+            initial_output: String,
+            messages_snapshot: Vec<Value>,
+        },
+        None,
+    }
 
+    let mut temp_items = Vec::new();
+    let mut current_normal_messages = normal_messages.clone();
+
+    if let Some(input_val) = body.get("input") {
         if let Some(input_str) = input_val.as_str() {
-            handle_text!(input_str, "user");
+            // 平铺文本，直接按照 user 处理
+            if input_str.contains("<permissions instructions>")
+                || input_str.contains("<skills_instructions>")
+                || input_str.contains("<app-context>")
+                || input_str.contains("<system-reminder>")
+            {
+                system_parts.push(input_str.to_owned());
+                temp_items.push(TempItem::None);
+            } else {
+                let val = json!({
+                    "role": "user",
+                    "content": input_str
+                });
+                current_normal_messages.push(val.clone());
+                temp_items.push(TempItem::Normal(val));
+            }
         } else if let Some(input_arr) = input_val.as_array() {
             for item in input_arr {
                 let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -697,7 +971,7 @@ async fn responses(
                         let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let arguments = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
                         
-                        normal_messages.push(json!({
+                        let val = json!({
                             "role": "assistant",
                             "content": null,
                             "tool_calls": [
@@ -710,45 +984,173 @@ async fn responses(
                                     }
                                 }
                             ]
-                        }));
+                        });
+                        current_normal_messages.push(val.clone());
+                        temp_items.push(TempItem::Normal(val));
+                    } else {
+                        temp_items.push(TempItem::None);
                     }
                 } else if item_type == "function_call_output" {
                     // 工具执行结果的返回
                     if let Some(call_id) = item.get("call_id") {
-                        let mut output = item.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let output = item.get("output").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let call_id_str = call_id.as_str().unwrap_or("").to_string();
                         
-                        if let Some(call_id_str) = call_id.as_str() {
-                            output = crate::agent::intercept_and_execute(
-                                call_id_str,
-                                output,
-                                &normal_messages,
-                                &state.workspace,
-                                &state.log
-                            ).await;
-                        }
-
-                        normal_messages.push(json!({
+                        // 记录需要并发执行的工具返回，并保存当前 normal_messages 快照
+                        temp_items.push(TempItem::ToolOutput {
+                            call_id: call_id.clone(),
+                            call_id_str,
+                            initial_output: output,
+                            messages_snapshot: current_normal_messages.clone(),
+                        });
+                        
+                        // 预先占位，后面更新
+                        current_normal_messages.push(json!({
                             "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": output
+                            "tool_call_id": call_id.clone(),
+                            "content": ""
                         }));
+                    } else {
+                        temp_items.push(TempItem::None);
                     }
                 } else {
-                    // 常规文本或多层嵌套文本
+                    // 常规文本或多层嵌套文本 (可能带有图片)
+                    let downstream_role = match item_role {
+                        "developer" => "system",
+                        "system" => "system",
+                        "assistant" => "assistant",
+                        _ => "user",
+                    };
+
+                    let mut pushed_any = false;
+
                     if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
+                        let mut openai_content_parts = Vec::new();
+                        
                         for part in content_arr {
-                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                                handle_text!(t, item_role);
+                            // 1. 处理 text 片段
+                            if let Some(t_str) = part.get("text").and_then(|t| t.as_str()) {
+                                if t_str.contains("<permissions instructions>")
+                                    || t_str.contains("<skills_instructions>")
+                                    || t_str.contains("<app-context>")
+                                    || t_str.contains("<system-reminder>")
+                                {
+                                    system_parts.push(t_str.to_owned());
+                                } else if downstream_role == "system" {
+                                    system_parts.push(t_str.to_owned());
+                                } else {
+                                    openai_content_parts.push(json!({
+                                        "type": "text",
+                                        "text": t_str
+                                    }));
+                                }
+                            }
+                            // 2. 处理 image_url 片段
+                            else if part.get("image_url").is_some() || part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                                openai_content_parts.push(part.clone());
+                            }
+                            // 3. 支持 Anthropic 格式的 image 片段作为 fallback 转换
+                            else if part.get("type").and_then(|t| t.as_str()) == Some("image") {
+                                if let Some(source) = part.get("source") {
+                                    if let (Some(media_type), Some(data)) = (
+                                        source.get("media_type").and_then(|v| v.as_str()),
+                                        source.get("data").and_then(|v| v.as_str())
+                                    ) {
+                                        openai_content_parts.push(json!({
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": format!("data:{};base64,{}", media_type, data)
+                                            }
+                                        }));
+                                    }
+                                }
                             }
                         }
+
+                        if !openai_content_parts.is_empty() && downstream_role != "system" {
+                            let val = json!({
+                                "role": downstream_role,
+                                "content": normalize_message_content(&json!(openai_content_parts))
+                            });
+                            current_normal_messages.push(val.clone());
+                            temp_items.push(TempItem::Normal(val));
+                            pushed_any = true;
+                        }
                     }
-                    if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                        handle_text!(t, item_role);
+
+                    // 4. 处理平铺的 text 字段
+                    if let Some(t_str) = item.get("text").and_then(|t| t.as_str()) {
+                        if t_str.contains("<permissions instructions>")
+                            || t_str.contains("<skills_instructions>")
+                            || t_str.contains("<app-context>")
+                            || t_str.contains("<system-reminder>")
+                        {
+                            system_parts.push(t_str.to_owned());
+                        } else {
+                            let val = json!({
+                                "role": downstream_role,
+                                "content": t_str
+                            });
+                            current_normal_messages.push(val.clone());
+                            temp_items.push(TempItem::Normal(val));
+                            pushed_any = true;
+                        }
+                    }
+
+                    if !pushed_any {
+                        temp_items.push(TempItem::None);
                     }
                 }
             }
         }
     }
+
+    // 并发执行所有的工具调用拦截拦截逻辑
+    let mut futures = Vec::new();
+    for (idx, item) in temp_items.iter().enumerate() {
+        if let TempItem::ToolOutput { call_id_str, initial_output, messages_snapshot, .. } = item {
+            let call_id_str = call_id_str.clone();
+            let initial_output = initial_output.clone();
+            let messages_snapshot = messages_snapshot.clone();
+            let workspace = state.workspace.clone();
+            let log = state.log.clone();
+            futures.push(async move {
+                let final_output = crate::agent::intercept_and_execute(
+                    &call_id_str,
+                    initial_output,
+                    &messages_snapshot,
+                    &workspace,
+                    &log
+                ).await;
+                (idx, final_output)
+            });
+        }
+    }
+
+    let results = futures::future::join_all(futures).await;
+    let mut final_outputs = std::collections::HashMap::new();
+    for (idx, final_output) in results {
+        final_outputs.insert(idx, final_output);
+    }
+
+    // 将 temp_items 重新构建回 normal_messages
+    for (idx, item) in temp_items.into_iter().enumerate() {
+        match item {
+            TempItem::Normal(val) => {
+                normal_messages.push(val);
+            }
+            TempItem::ToolOutput { call_id, .. } => {
+                let output = final_outputs.remove(&idx).unwrap_or_default();
+                normal_messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output
+                }));
+            }
+            TempItem::None => {}
+        }
+    }
+
 
     // 4. Assemble final unified messages list
     let mut final_messages: Vec<Value> = Vec::new();
@@ -858,7 +1260,7 @@ async fn responses(
         // 定义需要被屏蔽的 Codex 原生危险工具
         // 注意：我们把 shell 的控制权收归到 codex_workspace_mcp__shell，所以隐藏原生 shell 工具
         let blocked_types: &[&str] = &["shell", "code_execution", "bash", "computer_use"];
-        let blocked_names: &[&str] = &["run_terminal_cmd", "execute_command", "exec_command", "computer_use", "bash"];
+        let blocked_names: &[&str] = &["run_terminal_cmd", "execute_command", "exec_command", "computer_use", "bash", "mcp__codex_workspace_mcp"];
 
         for t in tools {
             if !t.is_object() {
@@ -868,14 +1270,14 @@ async fn responses(
             // 按 type 过滤掉危险工具
             let tool_type = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
             if blocked_types.contains(&tool_type) {
-                log!(&state.log, "   [AGENT] Blocked Codex tool by type: '{}'", tool_type);
+                log_db!(&state, "TOOL_BLOCKED", "proxy", "   [AGENT] Blocked Codex tool by type: '{}'", tool_type);
                 continue;
             }
             // 按 name 过滤掉危险工具
             let tool_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let func_name = t.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
             if blocked_names.contains(&tool_name) || blocked_names.contains(&func_name) {
-                log!(&state.log, "   [AGENT] Blocked Codex tool by name: '{}'", tool_name);
+                log_db!(&state, "TOOL_BLOCKED", "proxy", "   [AGENT] Blocked Codex tool by name: '{}'", tool_name);
                 continue;
             }
 
@@ -918,8 +1320,10 @@ async fn responses(
         openai_body["max_tokens"] = max_t.clone();
     }
 
-    log!(
-        &state.log,
+    log_db!(
+        &state,
+        "REQ_OUT",
+        "proxy",
         "   forwarding ChatCompletions body: {}",
         fmt_body(serde_json::to_string(&openai_body).unwrap_or_default().as_bytes())
     );
@@ -929,8 +1333,10 @@ async fn responses(
     // Force stream: true for downstream provider
     openai_body["stream"] = json!(true);
 
-    log!(
-        &state.log,
+    log_db!(
+        &state,
+        "REQ_OUT",
+        "proxy",
         "   forwarding ChatCompletions stream body: {}",
         fmt_body(serde_json::to_string(&openai_body).unwrap_or_default().as_bytes())
     );
@@ -944,7 +1350,7 @@ async fn responses(
     {
         Ok(r) => r,
         Err(e) => {
-            log!(&state.log, "!! CONNECT ERROR  {}", e);
+            log_db!(&state, "ERROR", "proxy", "!! CONNECT ERROR  {}", e);
             error!(%e, "upstream stream request failed");
             return (
                 StatusCode::BAD_GATEWAY,
@@ -957,8 +1363,10 @@ async fn responses(
     let status = resp.status();
     if !status.is_success() {
         let body_bytes = resp.bytes().await.unwrap_or_default();
-        log!(
-            &state.log,
+        log_db!(
+            &state,
+            "ERROR",
+            "proxy",
             "!! UPSTREAM STREAM ERROR RESP  status={}  body={}",
             status.as_u16(),
             String::from_utf8_lossy(&body_bytes)
@@ -978,30 +1386,31 @@ async fn responses(
         state.workspace.root().to_path_buf(),
     );
     let log_clone = state.log.clone();
+    let db_clone = state.db.clone();
 
     tokio::spawn(async move {
         use futures::StreamExt;
         futures::pin_mut!(stream);
 
-        log!(&log_clone, ">> SPAWNED responses stream handler");
+        log_write(&*log_clone, Some(&*db_clone), Some("STREAM_START"), Some("proxy"), ">> SPAWNED responses stream handler");
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(bytes) => {
-                    log!(&log_clone, ">> RECEIVED {} bytes from upstream stream", bytes.len());
+                    log_write(&*log_clone, None, None, None, &format!(">> RECEIVED {} bytes from upstream stream", bytes.len()));
                     let converted = converter.feed(&bytes);
                     if !converted.is_empty() {
-                        log!(&log_clone, ">> FORWARDING {} bytes to client", converted.len());
+                        log_write(&*log_clone, None, None, None, &format!(">> FORWARDING {} bytes to client", converted.len()));
                         let item: Result<Bytes, Box<dyn std::error::Error + Send + Sync>> =
                             Ok(Bytes::from(converted));
                         if tx.send(item).await.is_err() {
-                            log!(&log_clone, "!! CLIENT DISCONNECTED during stream");
+                            log_write(&*log_clone, Some(&*db_clone), Some("ERROR"), Some("proxy"), "!! CLIENT DISCONNECTED during stream");
                             break;
                         }
                     }
                 }
                 Err(e) => {
-                    log!(&log_clone, "!! UPSTREAM STREAM ERROR  {}", e);
+                    log_write(&*log_clone, Some(&*db_clone), Some("ERROR"), Some("proxy"), &format!("!! UPSTREAM STREAM ERROR  {}", e));
                     let _ = tx
                         .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
                         .await;
@@ -1012,12 +1421,12 @@ async fn responses(
 
         let remaining = converter.flush();
         if !remaining.is_empty() {
-            log!(&log_clone, ">> FORWARDING final {} bytes to client", remaining.len());
+            log_write(&*log_clone, None, None, None, &format!(">> FORWARDING final {} bytes to client", remaining.len()));
             let item: Result<Bytes, Box<dyn std::error::Error + Send + Sync>> =
                 Ok(Bytes::from(remaining));
             let _ = tx.send(item).await;
         }
-        log!(&log_clone, ">> FINISHED responses stream handler");
+        log_write(&*log_clone, Some(&*db_clone), Some("STREAM_FINISHED"), Some("proxy"), ">> FINISHED responses stream handler");
     });
 
     let mut rx = rx;
@@ -1078,6 +1487,9 @@ pub async fn run(listener: TcpListener, config_path: &Path, workspace: Arc<crate
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
+    let conn = crate::database::init_db(workspace.root())?;
+    let db = Arc::new(Mutex::new(conn));
+
     let state = AiProxyState {
         config,
         client,
@@ -1085,7 +1497,9 @@ pub async fn run(listener: TcpListener, config_path: &Path, workspace: Arc<crate
         log_path,
         sys_log,
         workspace,
+        db,
     };
+
 
     let app = Router::new()
         .route("/v1/models", get(list_models))

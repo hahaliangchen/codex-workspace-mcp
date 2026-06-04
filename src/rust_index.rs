@@ -5,7 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ignore::WalkBuilder;
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
 use syn::{
@@ -42,19 +41,11 @@ pub enum RustIndexError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, RustIndexError>;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RustIndex {
-    pub workspace_root: String,
-    pub generated_at_unix: u64,
-    pub files_indexed: usize,
-    #[serde(default)]
-    pub files: Vec<RustFileInfo>,
-    pub symbols: Vec<RustSymbol>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustFileInfo {
@@ -67,10 +58,11 @@ pub struct RustFileInfo {
 pub struct RustUse {
     pub path: String,
     pub local_name: String,
-    #[serde(default)]
     pub alias: Option<String>,
     pub line: usize,
 }
+
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustSymbol {
@@ -224,36 +216,45 @@ pub struct RustSuggestedRead {
 }
 
 pub fn index_workspace(root: &Path) -> Result<IndexRustWorkspaceResponse> {
-    let index = build_index(root)?;
-    let index_path = index_path(root);
-    if let Some(parent) = index_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
+    let (files_indexed, symbols_indexed) = build_index(root)?;
     Ok(IndexRustWorkspaceResponse {
-        index_path: relative_display(root, &index_path),
-        files_indexed: index.files_indexed,
-        symbols_indexed: index.symbols.len(),
-        generated_at_unix: index.generated_at_unix,
+        index_path: "SQLite".to_string(),
+        files_indexed,
+        symbols_indexed,
+        generated_at_unix: crate::rust_index::now_unix(),
     })
 }
 
 pub fn status(root: &Path) -> RustIndexStatus {
-    let index_path = index_path(root);
-    if let Ok(content) = fs::read_to_string(&index_path)
-        && let Ok(index) = serde_json::from_str::<RustIndex>(&content)
-    {
+    let conn = crate::database::init_db(root).unwrap();
+    // Bug3: 读取元数据中记录的真实索引创建时间
+    let generated_at = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "rust",
+    );
+    if generated_at.is_some() {
+        let symbols_indexed: i64 = conn.query_row(
+            "SELECT count(*) FROM rust_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
+        let files_indexed: i64 = conn.query_row(
+            "SELECT count(DISTINCT file_path) FROM rust_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0)
+        ).unwrap_or(0);
         return RustIndexStatus {
-            index_path: relative_display(root, &index_path),
+            index_path: "SQLite".to_string(),
             exists: true,
             workspace_root: root.display().to_string(),
-            generated_at_unix: Some(index.generated_at_unix),
-            files_indexed: Some(index.files_indexed),
-            symbols_indexed: Some(index.symbols.len()),
+            generated_at_unix: generated_at,
+            files_indexed: Some(files_indexed as usize),
+            symbols_indexed: Some(symbols_indexed as usize),
         };
     }
     RustIndexStatus {
-        index_path: relative_display(root, &index_path),
+        index_path: "SQLite".to_string(),
         exists: false,
         workspace_root: root.display().to_string(),
         generated_at_unix: None,
@@ -269,7 +270,13 @@ pub fn maybe_reindex_after_write(
     if changed_path.extension().and_then(|value| value.to_str()) != Some("rs") {
         return Ok(None);
     }
-    if !index_path(root).exists() {
+    let conn = crate::database::init_db(root).unwrap();
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM rust_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+        |row| row.get(0)
+    ).unwrap_or(0);
+    if count == 0 {
         return Ok(None);
     }
     index_workspace(root).map(Some)
@@ -279,9 +286,8 @@ pub fn list_symbols(
     root: &Path,
     request: ListRustSymbolsRequest,
 ) -> Result<ListRustSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
-    let symbols = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbols = index_symbols
         .iter()
         .filter(|symbol| {
             request
@@ -306,10 +312,9 @@ pub fn search_symbols(
     root: &Path,
     request: SearchRustSymbolsRequest,
 ) -> Result<SearchRustSymbolsResponse> {
-    let index = load_or_build_or_create(root)?;
     let needle = request.query.to_lowercase();
-    let mut matches: Vec<_> = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let mut matches: Vec<_> = index_symbols
         .iter()
         .filter(|symbol| {
             [
@@ -339,9 +344,8 @@ pub fn search_symbols(
 }
 
 pub fn read_symbol(root: &Path, request: ReadRustSymbolRequest) -> Result<ReadRustSymbolResponse> {
-    let index = load_or_build(root)?;
-    let symbol = index
-        .symbols
+    let index_symbols = load_or_build_or_create(root)?;
+    let symbol = index_symbols
         .iter()
         .find(|symbol| symbol.id == request.symbol_id)
         .cloned()
@@ -352,7 +356,7 @@ pub fn read_symbol(root: &Path, request: ReadRustSymbolRequest) -> Result<ReadRu
     let content = lines[(symbol.start_line - 1)..symbol.end_line.min(lines.len())].join("\n");
 
     let (callers, callees, suggested_reads) = if request.include_context {
-        build_context(&index, &symbol)
+        build_context(&index_symbols, &symbol)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
@@ -366,11 +370,10 @@ pub fn read_symbol(root: &Path, request: ReadRustSymbolRequest) -> Result<ReadRu
     })
 }
 
-fn build_index(root: &Path) -> Result<RustIndex> {
-    let mut files = Vec::new();
-    let mut symbols = Vec::new();
+fn build_index(root: &Path) -> Result<(usize, usize)> {
     let mut files_indexed = 0;
-    let mut builder = WalkBuilder::new(root);
+    let mut symbols_indexed = 0;
+    let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)
         .git_ignore(true)
@@ -383,6 +386,10 @@ fn build_index(root: &Path) -> Result<RustIndex> {
                 .map(|name| !NOISE_DIRS.contains(&name))
                 .unwrap_or(true)
         });
+
+    let mut conn = crate::database::init_db(root).unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("DELETE FROM rust_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
 
     for item in builder.build() {
         let entry = match item {
@@ -409,18 +416,35 @@ fn build_index(root: &Path) -> Result<RustIndex> {
             Err(_) => continue,
         };
         files_indexed += 1;
-        let parsed = parse_rust_file(root, path, &content, &parsed);
-        files.push(parsed.file);
-        symbols.extend(parsed.symbols);
+        let parsed_file = parse_rust_file(root, path, &content, &parsed);
+        for sym in parsed_file.symbols {
+            let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
+            let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+            tx.execute(
+                "INSERT INTO rust_symbols (
+                    id, workspace_root, name, kind, file_path, module_path, start_line, end_line,
+                    signature, docstring, visibility, impl_type, trait_name, calls_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    sym.id, root.to_string_lossy(), sym.name, kind, sym.file_path, sym.module_path,
+                    sym.start_line, sym.end_line, sym.signature, sym.docstring,
+                    sym.visibility, sym.impl_type, sym.trait_name, calls_json
+                ]
+            ).unwrap();
+            symbols_indexed += 1;
+        }
     }
-
-    Ok(RustIndex {
-        workspace_root: root.display().to_string(),
-        generated_at_unix: now_unix(),
-        files_indexed,
-        files,
-        symbols,
-    })
+    tx.commit().unwrap();
+    // Bug3: 记录本次索引的实际时间戳
+    let ts = now_unix();
+    let meta_conn = crate::database::init_db(root).unwrap();
+    crate::database::upsert_index_metadata(
+        &meta_conn,
+        &root.to_string_lossy(),
+        "rust",
+        ts,
+    ).unwrap();
+    Ok((files_indexed, symbols_indexed))
 }
 
 struct ParsedRustFile {
@@ -754,11 +778,11 @@ fn collect_use_tree(tree: &UseTree, mut prefix: Vec<String>, line: usize, uses: 
 }
 
 fn build_context(
-    index: &RustIndex,
+    index_symbols: &[RustSymbol],
     symbol: &RustSymbol,
 ) -> (Vec<RustCaller>, Vec<RustCallee>, Vec<RustSuggestedRead>) {
     let mut id_to_symbol: BTreeMap<String, &RustSymbol> = BTreeMap::new();
-    for item in &index.symbols {
+    for item in index_symbols {
         id_to_symbol.insert(item.id.clone(), item);
     }
 
@@ -769,7 +793,7 @@ fn build_context(
             target_text: call.target_text.clone(),
             line: call.line,
             snippet: call.snippet.clone(),
-            matched_symbol_ids: resolve_call(index, symbol, call)
+            matched_symbol_ids: resolve_call(index_symbols, symbol, call)
                 .into_iter()
                 .map(|symbol| symbol.id.clone())
                 .collect(),
@@ -777,31 +801,31 @@ fn build_context(
         .collect();
 
     let mut suggested_reads = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = std::collections::BTreeSet::new();
     for callee in &callees {
         for matched_id in &callee.matched_symbol_ids {
             if matched_id == &symbol.id || !seen.insert(matched_id.clone()) {
                 continue;
             }
-            if let Some(matched_symbol) = id_to_symbol.get(matched_id) {
+            if let Some(matched_symbol) = index_symbols.iter().find(|s| &s.id == matched_id) {
                 suggested_reads.push(RustSuggestedRead {
                     reason: suggestion_reason(symbol, matched_symbol).to_string(),
                     trigger_call: callee.target_text.clone(),
                     trigger_line: callee.line,
                     trigger_snippet: callee.snippet.clone(),
-                    symbol: RustSymbolSummary::from(*matched_symbol),
+                    symbol: RustSymbolSummary::from(matched_symbol),
                 });
             }
         }
     }
 
     let mut callers = Vec::new();
-    for item in &index.symbols {
+    for item in index_symbols {
         if item.id == symbol.id {
             continue;
         }
         for call in &item.calls {
-            let matched = resolve_call(index, item, call)
+            let matched = resolve_call(index_symbols, item, call)
                 .into_iter()
                 .any(|matched| matched.id == symbol.id);
             if matched {
@@ -820,7 +844,7 @@ fn build_context(
 }
 
 fn resolve_call<'a>(
-    index: &'a RustIndex,
+    index_symbols: &'a [RustSymbol],
     caller: &RustSymbol,
     call: &RustCall,
 ) -> Vec<&'a RustSymbol> {
@@ -829,7 +853,7 @@ fn resolve_call<'a>(
         if matches_self_receiver(qualifier)
             && let Some(impl_type) = caller.impl_type.as_deref()
         {
-            matches.extend(index.symbols.iter().filter(|symbol| {
+            matches.extend(index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text
                     && symbol.impl_type.as_deref() == Some(impl_type)
                     && symbol.module_path == caller.module_path
@@ -837,27 +861,29 @@ fn resolve_call<'a>(
         }
 
         let qualifier_tail = qualifier.rsplit("::").next().unwrap_or(qualifier);
-        matches.extend(index.symbols.iter().filter(|symbol| {
-            symbol.name == call.target_text
+        matches.extend(
+            index_symbols
+                .iter()
+                .filter(|symbol| {
+                    symbol.name == call.target_text
                 && (symbol.impl_type.as_deref() == Some(qualifier_tail)
                     || symbol.module_path.ends_with(qualifier)
                     || symbol.name == qualifier_tail)
         }));
     } else {
-        matches.extend(index.symbols.iter().filter(|symbol| {
+        matches.extend(index_symbols.iter().filter(|symbol| {
             symbol.name == call.target_text
                 && symbol.module_path == caller.module_path
                 && matches!(symbol.kind, RustSymbolKind::Function)
         }));
         if matches.is_empty() {
-            matches.extend(index.symbols.iter().filter(|symbol| {
+            matches.extend(index_symbols.iter().filter(|symbol| {
                 symbol.name == call.target_text && symbol.file_path == caller.file_path
             }));
         }
         if matches.is_empty() {
             matches.extend(
-                index
-                    .symbols
+                index_symbols
                     .iter()
                     .filter(|symbol| symbol.name == call.target_text),
             );
@@ -888,24 +914,50 @@ fn suggestion_reason(caller: &RustSymbol, matched: &RustSymbol) -> &'static str 
     }
 }
 
-fn load_or_build(root: &Path) -> Result<RustIndex> {
-    let path = index_path(root);
-    if !path.exists() {
-        return Err(RustIndexError::MissingIndex);
+fn load_all_symbols(root: &std::path::Path) -> Result<Vec<RustSymbol>> {
+    let conn = crate::database::init_db(root).map_err(|e| RustIndexError::SymbolNotFound(e.to_string()))?;
+    let mut stmt = conn.prepare("SELECT id, name, kind, file_path, module_path, start_line, end_line, signature, docstring, visibility, impl_type, trait_name, calls_json FROM rust_symbols WHERE workspace_root = ?").map_err(|e| RustIndexError::SymbolNotFound(e.to_string()))?;
+    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
+        Ok(RustSymbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(RustSymbolKind::Function),
+            file_path: row.get(3)?,
+            module_path: row.get(4)?,
+            start_line: row.get(5)?,
+            end_line: row.get(6)?,
+            signature: row.get(7)?,
+            docstring: row.get(8)?,
+            visibility: row.get(9)?,
+            impl_type: row.get(10)?,
+            trait_name: row.get(11)?,
+            calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+        })
+    }).map_err(|e| RustIndexError::SymbolNotFound(e.to_string()))?;
+
+    let mut symbols = Vec::new();
+    for sym in symbol_iter {
+        if let Ok(s) = sym {
+            symbols.push(s);
+        }
     }
-    let content = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    Ok(symbols)
 }
 
-fn load_or_build_or_create(root: &Path) -> Result<RustIndex> {
-    match load_or_build(root) {
-        Ok(index) => Ok(index),
-        Err(RustIndexError::MissingIndex) => {
-            index_workspace(root)?;
-            load_or_build(root)
-        }
-        Err(error) => Err(error),
+fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<RustSymbol>> {
+    // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
+    let conn = crate::database::init_db(root).unwrap();
+    let already_indexed = crate::database::get_index_generated_at(
+        &conn,
+        &root.to_string_lossy(),
+        "rust",
+    ).is_some();
+    let symbols = load_all_symbols(root)?;
+    if !already_indexed {
+        index_workspace(root)?;
+        return load_all_symbols(root);
     }
+    Ok(symbols)
 }
 
 fn index_path(root: &Path) -> PathBuf {
@@ -1017,7 +1069,7 @@ fn expr_text(expr: &Expr) -> String {
         .replace("& ", "&")
 }
 
-fn now_unix() -> u64 {
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_secs())
@@ -1147,7 +1199,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(search.matches.len(), 1);
-        assert!(index_path(&root).exists());
+        // Bug2: 已迁移到 SQLite，不再生成 JSON 文件，改为验证元数据表中确实有索引记录
+        {
+            let conn = crate::database::init_db(&root).unwrap();
+            let ts = crate::database::get_index_generated_at(
+                &conn,
+                &root.to_string_lossy(),
+                "rust",
+            );
+            assert!(ts.is_some(), "index metadata should be recorded after auto-build");
+        }
         let _ = fs::remove_dir_all(root);
     }
 }
