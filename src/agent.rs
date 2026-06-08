@@ -73,7 +73,12 @@ pub fn generate_agent_constraints() -> String {
          ## Rule 4: AST Search & Documentation (Bilingual/Chinese Comments & Memory)\n\
          - **Language-Aware Symbol Search**: Code symbol indexes are built automatically. Do NOT build indexes yourself. FIRST, briefly analyze what programming language the current project uses (e.g., Rust, Go, TS/JS, Python). THEN, strictly use the corresponding language's tools (e.g., `search_rust_symbols` for Rust, `search_go_symbols` for Go) to navigate code.\n\
          - **Detailed Chinese Comments**: When adding or updating code (structs, functions, modules), write clear, detailed docstrings/comments in Chinese (or bilingual). These comments are fully indexed and will help you or future agents find these features via keyword symbol searches later.\n\
-         - **Detailed Chinese Memory Summaries**: When completing any task, you MUST call `record_work_memory` and write a detailed description of the technical implementation, design choices, and business logic in Chinese. This ensures subsequent agents can quickly retrieve and understand the project context using memory searches.\n"
+         - **Detailed Chinese Memory Summaries**: When completing any task, you MUST call `record_work_memory` and write a detailed description of the technical implementation, design choices, and business logic in Chinese. This ensures subsequent agents can quickly retrieve and understand the project context using memory searches.\n\
+         \n\
+         ## Rule 5: Image Analysis (Mandatory analyze_image tool usage)\n\
+         - You will see image placeholders like `[图片 Key: img_xxxxxx]` in the conversation history.\n\
+         - Whenever the user asks you a question about the image, or points out a flaw in your visual understanding (e.g., 'you missed the details on the right', 're-examine the screenshot'), you MUST call the `codex_workspace_mcp__analyze_image` tool with the corresponding `image_key` and optional `focus_instruction` describing what the user wants you to look at.\n\
+         - Do NOT guess or hallucinate image details without calling the tool when visual feedback is given.\n"
     );
 
     constraints
@@ -108,26 +113,26 @@ pub async fn intercept_and_execute(
 
     let conn = crate::database::init_db(workspace.root()).ok();
 
-    // 1. 优先尝试从本地 SQLite 数据库中恢复原始工具参数
-    if let Some(ref c) = conn {
-        if let Ok(Some((name, args))) = crate::database::get_tool_call(c, call_id) {
-            crate::ai_proxy::log_write(log, None, None, None, &format!(
-                "   [AGENT] SQLite Registry Match: ID '{}' -> tool '{}'", call_id, name
-            ));
+    // 1. 优先尝试从内存注册表中恢复原始工具参数
+    if let Some((name, args)) = crate::ai_proxy::get_tool_call_mem(call_id) {
+        crate::ai_proxy::log_write(log, None, None, None, &format!(
+            "   [AGENT] In-Memory Registry Match: ID '{}' -> tool '{}'", call_id, name
+        ));
+        if let Some(ref c) = conn {
             let ts = crate::ai_proxy::now_china();
             let _ = crate::database::insert_detailed_api_log(
                 c,
                 &ts,
                 "TOOL_MATCH",
                 "proxy",
-                &format!("SQLite Registry Match: ID '{}' -> tool '{}'", call_id, name),
+                &format!("In-Memory Registry Match: ID '{}' -> tool '{}'", call_id, name),
                 None
             );
-            found_name = Some(name);
-            found_args = Some(args);
-            // 消费后删除，保持表干净
-            let _ = crate::database::delete_tool_call(c, call_id);
         }
+        found_name = Some(name);
+        found_args = Some(args);
+        // 消费后立刻从内存中删除，保持表干净
+        crate::ai_proxy::delete_tool_call_mem(call_id);
     }
 
     // 2. 如果数据库中没有（例如 Proxy 重启或旧 Payload），降级回从历史消息中解码 hex 密文
@@ -294,9 +299,7 @@ pub async fn intercept_and_execute(
 
 
 /// 在将历史消息发给大模型前，遍历消息，将伪装的 exec_command / run_terminal_cmd 还原为原生工具调用。
-pub fn restore_history(messages: &mut Vec<Value>, workspace_root: &std::path::Path) {
-    let conn = crate::database::init_db(workspace_root).ok();
-
+pub fn restore_history(messages: &mut Vec<Value>, _workspace_root: &std::path::Path) {
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
             if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
@@ -304,20 +307,18 @@ pub fn restore_history(messages: &mut Vec<Value>, workspace_root: &std::path::Pa
                     let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let mut restored = false;
 
-                    // 1. 优先从 SQLite 中恢复
+                    // 1. 优先从内存中恢复
                     if !tc_id.is_empty() {
-                        if let Some(ref c) = conn {
-                            if let Ok(Some((real_name, real_args))) = crate::database::get_tool_call(c, &tc_id) {
-                                if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
-                                    func.insert("name".to_string(), json!(real_name));
-                                    func.insert("arguments".to_string(), json!(real_args));
-                                    restored = true;
-                                }
+                        if let Some((real_name, real_args)) = crate::ai_proxy::get_tool_call_mem(&tc_id) {
+                            if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
+                                func.insert("name".to_string(), json!(real_name));
+                                func.insert("arguments".to_string(), json!(real_args));
+                                restored = true;
                             }
                         }
                     }
 
-                    // 2. 数据库中未找到，从消息的命令行 hex 字段中解码恢复 (Fallback)
+                    // 2. 内存中未找到，从消息的命令行 hex 字段中解码恢复 (Fallback)
                     if !restored {
                         if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
                             let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -337,32 +338,8 @@ pub fn restore_history(messages: &mut Vec<Value>, workspace_root: &std::path::Pa
                                                     
                                                     func.insert("name".to_string(), json!(real_name));
                                                     func.insert("arguments".to_string(), json!(real_args_str));
-                                                    restored = true;
                                                 }
                                             }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 3. 如果依然未被恢复，但它是一个标准的 exec_command，直接按逻辑还原为 shell 桥接工具
-                    if !restored {
-                        if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
-                            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            if name == "exec_command" || name == "run_terminal_cmd" {
-                                if let Some(args_str) = func.get("arguments").and_then(|v| v.as_str()) {
-                                    if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
-                                        let cmd_opt = args_json.get("cmd")
-                                            .or_else(|| args_json.get("command"))
-                                            .and_then(|v| v.as_str());
-                                        if let Some(cmd) = cmd_opt {
-                                            func.insert("name".to_string(), json!("codex_workspace_mcp__shell"));
-                                            func.insert("arguments".to_string(), json!(json!({
-                                                "command": cmd,
-                                                "justification": "<from history>"
-                                            }).to_string()));
                                         }
                                     }
                                 }
@@ -426,6 +403,90 @@ fn get_subagent_provider() -> anyhow::Result<SubagentProvider> {
     
     Ok(SubagentProvider { url, api_key, model })
 }
+
+pub async fn analyze_image_via_vision_agent(
+    image_url: &str,
+    focus_instruction: Option<&str>,
+) -> anyhow::Result<String> {
+    let provider_info = get_subagent_provider()?;
+    
+    // Determine the vision model. If the provider URL is xiaomimimo.com, we use mimo-v2.5.
+    let model = if provider_info.url.contains("xiaomimimo.com") {
+        "mimo-v2.5".to_string()
+    } else {
+        provider_info.model
+    };
+    
+    let client = reqwest::Client::new();
+    let upstream_url = format!("{}/chat/completions", provider_info.url);
+    
+    let system_prompt = "You are a highly precise visual analysis agent. \
+                         Your task is to analyze the provided image in detail. \
+                         If the image is a screenshot containing code, error messages, or logs, perform high-fidelity OCR and transcribe the text/code exactly. \
+                         If it is a diagram or UI layout, describe the structure, elements, and labels clearly. \
+                         Focus on technical details.";
+                         
+    let mut text_instruction = "Analyze this image and describe/transcribe its contents in detail:".to_string();
+    if let Some(focus) = focus_instruction {
+        text_instruction = format!("Re-examine this image based on user's feedback and focus on: {}", focus);
+    }
+                         
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": system_prompt
+        }),
+        json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": text_instruction
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_url
+                    }
+                }
+            ]
+        })
+    ];
+    
+    let request_body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false
+    });
+    
+    let response = client.post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", provider_info.api_key))
+        .json(&request_body)
+        .send()
+        .await?;
+        
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Vision agent API request failed (status {}): {}", status, body_text);
+    }
+    
+    let response_json: Value = response.json().await?;
+    let choice = response_json.get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .ok_or_else(|| anyhow::anyhow!("Vision agent: invalid response choices"))?;
+        
+    let message = choice.get("message")
+        .ok_or_else(|| anyhow::anyhow!("Vision agent: missing message"))?;
+        
+    let content = message.get("content")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Vision agent: missing content"))?;
+        
+    Ok(content.to_string())
+}
+
 
 fn execute_query_logs(
     conn: Option<&rusqlite::Connection>,

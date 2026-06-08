@@ -1,0 +1,5 @@
+[2m2026-06-05T14:16:00.178507+08:00[0m [32m INFO[0m [2mcodex_workspace_mcp[0m[2m:[0m workspace initialized [3mroot[0m[2m=[0m\\?\E:\项目\codex-workspace-mcp
+[2m2026-06-05T14:16:00.183188+08:00[0m [32m INFO[0m [2mcodex_workspace_mcp[0m[2m:[0m AI proxy starting on port 3001 [3mpath[0m[2m=[0mE:\项目\codex-workspace-mcp\target\release\ai_proxy_config.json
+[2m2026-06-05T14:16:00.183837+08:00[0m [32m INFO[0m [2mcodex_workspace_mcp[0m[2m:[0m listening [3maddr[0m[2m=[0m127.0.0.1:3000 [3mmode[0m[2m=[0m"http"
+[2m2026-06-05T14:16:00.184169+08:00[0m [32m INFO[0m [2mcodex_workspace_mcp[0m[2m:[0m starting HTTP server [3maddr[0m[2m=[0m127.0.0.1:3000 [3mroot[0m[2m=[0m\\?\E:\项目\codex-workspace-mcp
+[2m2026-06-05T14:16:00.186431+08:00[0m [32m INFO[0m [2mcodex_workspace_mcp::ai_proxy[0m[2m:[0m AI proxy starting [3maddr[0m[2m=[0m127.0.0.1:3001

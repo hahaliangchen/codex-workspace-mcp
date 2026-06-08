@@ -561,6 +561,25 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             let content = crate::skills::read_skill(skill_name)?;
             json!({ "skill": skill_name, "content": content })
         }
+        "analyze_image" => {
+            let image_key = arguments.get("image_key").and_then(|v| v.as_str()).unwrap_or("");
+            let focus_instruction = arguments.get("focus_instruction").and_then(|v| v.as_str());
+            
+            let raw_data = crate::ai_proxy::get_registered_image(image_key)
+                .ok_or_else(|| anyhow::anyhow!("Image not found in in-memory registry for key: {}", image_key))?;
+                
+            let result = crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
+            
+            // Calculate hash and update the in-memory description cache with this refined description
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::Hasher;
+            hasher.write(raw_data.as_bytes());
+            let hash_val = hasher.finish();
+            let hash_str = format!("{:016x}", hash_val);
+            crate::ai_proxy::insert_cached_description(&hash_str, &result);
+
+            serde_json::to_value(result)?
+        }
         _ => anyhow::bail!("unknown tool: {name}"),
     };
 
@@ -964,6 +983,24 @@ pub fn tool_definitions() -> Value {
                     "query": {
                         "type": "string",
                         "description": "Optional SQLite WHERE clause filter (e.g. 'action = \"ERROR\"' or 'message LIKE \"%search%\"')."
+                    }
+                }
+            }
+        },
+        {
+            "name": "analyze_image",
+            "description": "Analyze an image stored in the registry. If you need to re-examine or focus on a specific area based on user feedback (e.g. 'you missed something on the right'), provide the focus_instruction parameter.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["image_key"],
+                "properties": {
+                    "image_key": {
+                        "type": "string",
+                        "description": "The unique key of the image, e.g. 'img_a7f9c2' from the history."
+                    },
+                    "focus_instruction": {
+                        "type": "string",
+                        "description": "Optional instructions to tell the vision agent what to focus on or re-examine (e.g., 'focus on the bottom-right text')."
                     }
                 }
             }

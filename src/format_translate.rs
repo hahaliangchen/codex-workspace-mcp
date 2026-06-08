@@ -1107,10 +1107,16 @@ pub struct ResponsesStreamConverter {
     tool_status: std::collections::HashMap<usize, ToolCallState>,
     tool_route_map: std::collections::HashMap<String, (String, String)>,
     workspace_root: std::path::PathBuf,
+    stream_prefix: Option<String>,
 }
 
 impl ResponsesStreamConverter {
-    pub fn new(model: String, tool_route_map: std::collections::HashMap<String, (String, String)>, workspace_root: std::path::PathBuf) -> Self {
+    pub fn new(
+        model: String,
+        tool_route_map: std::collections::HashMap<String, (String, String)>,
+        workspace_root: std::path::PathBuf,
+        stream_prefix: Option<String>,
+    ) -> Self {
         Self {
             line_buf: Vec::new(),
             model,
@@ -1131,6 +1137,7 @@ impl ResponsesStreamConverter {
             tool_status: std::collections::HashMap::new(),
             tool_route_map,
             workspace_root,
+            stream_prefix,
         }
     }
 
@@ -1225,7 +1232,12 @@ impl ResponsesStreamConverter {
         if let Some(d) = delta {
             if let Some(text) = d.get("content").and_then(|c| c.as_str()) {
                 if !text.is_empty() {
-                    self.accumulated_text.push_str(text);
+                    let mut text_to_emit = text.to_owned();
+                    if let Some(prefix) = self.stream_prefix.take() {
+                        text_to_emit = format!("{}{}", prefix, text_to_emit);
+                    }
+                    
+                    self.accumulated_text.push_str(&text_to_emit);
                     self.ensure_text_structures(out);
                     
                     let delta_event = json!({
@@ -1234,7 +1246,7 @@ impl ResponsesStreamConverter {
                         "item_id": format!("item_txt_{}", self.msg_id),
                         "output_index": 0,
                         "content_index": 0,
-                        "delta": text
+                        "delta": text_to_emit
                     });
                     write_sse_event(out, "response.output_text.delta", &delta_event);
                 }
@@ -1384,9 +1396,9 @@ impl ResponsesStreamConverter {
             let (_, emit_name) = if let Some((parent, _)) = self.tool_route_map.get(&state.name) {
                 (true, parent.as_str())
             } else if state.name == "codex_workspace_mcp__shell" || state.name == "shell" {
-                (false, "exec_command")
+                (false, "run_terminal_cmd")
             } else if state.name.starts_with("codex_workspace_mcp__") {
-                (true, "exec_command")
+                (true, "run_terminal_cmd")
             } else {
                 (false, state.name.as_str())
             };
@@ -1442,9 +1454,7 @@ impl ResponsesStreamConverter {
                         state.arguments.clone()
                     }
                 } else if state.name.starts_with("codex_workspace_mcp__") {
-                    if let Ok(conn) = crate::database::init_db(&self.workspace_root) {
-                        let _ = crate::database::insert_tool_call(&conn, &state.id, &state.name, &state.arguments);
-                    }
+                    crate::ai_proxy::insert_tool_call_mem(&state.id, &state.name, &state.arguments);
                     let display_name = &state.name["codex_workspace_mcp__".len()..];
                     let fake_args = json!({
                         "cmd": format!("echo '🤖 Agent 正在调用底层分析工具: {} ...'", display_name)
@@ -1566,11 +1576,8 @@ impl ResponsesStreamConverter {
                 } else {
                     // Shell Hook 处理：如果发现是我们的特权工具
                     if st.name.starts_with("codex_workspace_mcp__") {
-                        if let Ok(conn) = crate::database::init_db(&self.workspace_root) {
-                            let _ = crate::database::insert_tool_call(&conn, &call_id, &st.name, &st.arguments);
-                        }
-                        
-                        let fake_name = "exec_command".to_string();
+                        crate::ai_proxy::insert_tool_call_mem(&call_id, &st.name, &st.arguments);
+                        let fake_name = "run_terminal_cmd".to_string();
                         // 构造炫酷的终端输出回显
                         let display_name = &st.name["codex_workspace_mcp__".len()..];
                         let fake_args = json!({

@@ -404,64 +404,198 @@ impl Workspace {
         let workspace = self.with_root(request.workspace_root.as_deref())?;
         let root = workspace.resolve_existing(&request.path)?;
         let max_matches = request.max_matches.max(1);
-        let needle = if request.case_sensitive {
-            request.query.clone()
-        } else {
-            request.query.to_lowercase()
-        };
         let mut matches = Vec::new();
         let mut truncated = false;
+        let mut seen_symbols = std::collections::HashSet::new();
 
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .hidden(false)
-            .git_ignore(true)
-            .git_exclude(true)
-            .parents(true)
-            .filter_entry(|entry| {
-                entry
-                    .file_name()
-                    .to_str()
-                    .map(|name| !NOISE_DIRS.contains(&name))
-                    .unwrap_or(true)
-            });
-
-        'outer: for item in builder.build() {
-            let entry = match item {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let path = entry.path();
-            let metadata = fs::metadata(path)?;
-            if metadata.len() > DEFAULT_SEARCH_FILE_LIMIT_BYTES {
-                continue;
-            }
-            let content = match fs::read_to_string(path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-
-            for (line_index, line) in content.lines().enumerate() {
-                let haystack = if request.case_sensitive {
-                    line.to_string()
-                } else {
-                    line.to_lowercase()
-                };
-                if let Some(byte_index) = haystack.find(&needle) {
-                    if matches.len() >= max_matches {
-                        truncated = true;
-                        break 'outer;
+        // 1. 优先尝试从 SQLite 符号索引库中查找精确匹配的符号定义
+        if let Ok(conn) = crate::database::init_db(&workspace.root) {
+            let root_str = workspace.root.to_string_lossy().to_string();
+            let query_name = request.query.trim();
+            
+            let has_rust = crate::database::get_index_generated_at(&conn, &root_str, "rust").is_some();
+            let has_go = crate::database::get_index_generated_at(&conn, &root_str, "go").is_some();
+            let has_ts = crate::database::get_index_generated_at(&conn, &root_str, "ts").is_some();
+            let has_py = crate::database::get_index_generated_at(&conn, &root_str, "python").is_some();
+            
+            // A. Rust Symbols
+            if has_rust {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT kind, file_path, start_line, signature FROM rust_symbols WHERE name = ? AND workspace_root = ?"
+                ) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let kind: String = row.get(0).unwrap_or_default();
+                            let file_path: String = row.get(1).unwrap_or_default();
+                            let start_line: usize = row.get(2).unwrap_or(0);
+                            let signature: String = row.get(3).unwrap_or_default();
+                            
+                            if matches.len() >= max_matches {
+                                truncated = true;
+                                break;
+                            }
+                            matches.push(TextMatch {
+                                path: file_path.clone(),
+                                line: start_line,
+                                column: 1,
+                                text: format!("[Symbol Definition (rust {})] {}", kind, signature),
+                            });
+                            seen_symbols.insert((file_path, start_line));
+                        }
                     }
-                    let column = line[..byte_index.min(line.len())].chars().count() + 1;
-                    matches.push(TextMatch {
-                        path: workspace.relative_display(path)?,
-                        line: line_index + 1,
-                        column,
-                        text: line.to_string(),
-                    });
+                }
+            }
+
+            // B. Go Symbols
+            // B. Go Symbols
+            if has_go && !truncated {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT kind, file_path, start_line, signature FROM go_symbols WHERE name = ? AND workspace_root = ?"
+                ) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let kind: String = row.get(0).unwrap_or_default();
+                            let file_path: String = row.get(1).unwrap_or_default();
+                            let start_line: usize = row.get(2).unwrap_or(0);
+                            let signature: String = row.get(3).unwrap_or_default();
+                            
+                            if matches.len() >= max_matches {
+                                truncated = true;
+                                break;
+                            }
+                            matches.push(TextMatch {
+                                path: file_path.clone(),
+                                line: start_line,
+                                column: 1,
+                                text: format!("[Symbol Definition (go {})] {}", kind, signature),
+                            });
+                            seen_symbols.insert((file_path, start_line));
+                        }
+                    }
+                }
+            }
+
+            // C. TS/JS Symbols
+            if has_ts && !truncated {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT kind, file_path, start_line, signature FROM ts_symbols WHERE name = ? AND workspace_root = ?"
+                ) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let kind: String = row.get(0).unwrap_or_default();
+                            let file_path: String = row.get(1).unwrap_or_default();
+                            let start_line: usize = row.get(2).unwrap_or(0);
+                            let signature: String = row.get(3).unwrap_or_default();
+                            
+                            if matches.len() >= max_matches {
+                                truncated = true;
+                                break;
+                            }
+                            matches.push(TextMatch {
+                                path: file_path.clone(),
+                                line: start_line,
+                                column: 1,
+                                text: format!("[Symbol Definition (ts {})] {}", kind, signature),
+                            });
+                            seen_symbols.insert((file_path, start_line));
+                        }
+                    }
+                }
+            }
+
+            // D. Python Symbols
+            if has_py && !truncated {
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT kind, file_path, start_line, signature FROM python_symbols WHERE name = ? AND workspace_root = ?"
+                ) {
+                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
+                        while let Ok(Some(row)) = rows.next() {
+                            let kind: String = row.get(0).unwrap_or_default();
+                            let file_path: String = row.get(1).unwrap_or_default();
+                            let start_line: usize = row.get(2).unwrap_or(0);
+                            let signature: String = row.get(3).unwrap_or_default();
+                            
+                            if matches.len() >= max_matches {
+                                truncated = true;
+                                break;
+                            }
+                            matches.push(TextMatch {
+                                path: file_path.clone(),
+                                line: start_line,
+                                column: 1,
+                                text: format!("[Symbol Definition (python {})] {}", kind, signature),
+                            });
+                            seen_symbols.insert((file_path, start_line));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 如果置顶的符号匹配项未把配额占满，继续进行常规全文 Walk 扫描匹配
+        if !truncated {
+            let needle = if request.case_sensitive {
+                request.query.clone()
+            } else {
+                request.query.to_lowercase()
+            };
+
+            let mut builder = WalkBuilder::new(root);
+            builder
+                .hidden(false)
+                .git_ignore(true)
+                .git_exclude(true)
+                .parents(true)
+                .filter_entry(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| !NOISE_DIRS.contains(&name))
+                        .unwrap_or(true)
+                });
+
+            'outer: for item in builder.build() {
+                let entry = match item {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let path = entry.path();
+                let metadata = fs::metadata(path)?;
+                if metadata.len() > DEFAULT_SEARCH_FILE_LIMIT_BYTES {
+                    continue;
+                }
+                let content = match fs::read_to_string(path) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                };
+
+                for (line_index, line) in content.lines().enumerate() {
+                    let haystack = if request.case_sensitive {
+                        line.to_string()
+                    } else {
+                        line.to_lowercase()
+                    };
+                    if let Some(byte_index) = haystack.find(&needle) {
+                        let rel_path = workspace.relative_display(path)?;
+                        let line_no = line_index + 1;
+                        if seen_symbols.contains(&(rel_path.clone(), line_no)) {
+                            continue;
+                        }
+                        if matches.len() >= max_matches {
+                            truncated = true;
+                            break 'outer;
+                        }
+                        let column = line[..byte_index.min(line.len())].chars().count() + 1;
+                        matches.push(TextMatch {
+                            path: rel_path,
+                            line: line_no,
+                            column,
+                            text: line.to_string(),
+                        });
+                    }
                 }
             }
         }

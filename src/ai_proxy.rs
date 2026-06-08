@@ -23,6 +23,64 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 use crate::format_translate;
+use std::sync::OnceLock;
+
+static IMAGE_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static IMAGE_REGISTRY: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+pub fn get_cached_description(hash: &str) -> Option<String> {
+    IMAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(hash)
+        .cloned()
+}
+
+pub fn insert_cached_description(hash: &str, description: &str) {
+    IMAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(hash.to_string(), description.to_string());
+}
+
+pub fn get_registered_image(key: &str) -> Option<String> {
+    IMAGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(key)
+        .cloned()
+}
+
+pub fn insert_registered_image(key: &str, raw_data: &str) {
+    IMAGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(key.to_string(), raw_data.to_string());
+}
+
+static TOOL_CALL_REGISTRY: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+
+pub fn insert_tool_call_mem(id: &str, name: &str, arguments: &str) {
+    TOOL_CALL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), (name.to_string(), arguments.to_string()));
+}
+
+pub fn get_tool_call_mem(id: &str) -> Option<(String, String)> {
+    TOOL_CALL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(id)
+        .cloned()
+}
+
+pub fn delete_tool_call_mem(id: &str) {
+    TOOL_CALL_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .remove(id);
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -148,6 +206,150 @@ macro_rules! log_db {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+fn has_image_input(val: &Value) -> bool {
+    match val {
+        Value::Object(map) => {
+            if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
+                if t == "image_url" || t == "input_image" || t == "image" {
+                    return true;
+                }
+            }
+            if map.contains_key("image_url") {
+                return true;
+            }
+            for v in map.values() {
+                if has_image_input(v) {
+                    return true;
+                }
+            }
+            false
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                if has_image_input(v) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn adjust_model_for_vision(upstream_model: &str) -> String {
+    if upstream_model.starts_with("mimo-v2.5-") {
+        return "mimo-v2.5".to_string();
+    }
+    upstream_model.to_string()
+}
+
+fn process_and_replace_images<'a>(
+    val: &'a mut Value,
+    log: &'a Arc<Mutex<std::fs::File>>,
+    db: Option<&'a Mutex<rusqlite::Connection>>,
+    images_processed: &'a mut usize,
+) -> futures::future::BoxFuture<'a, ()> {
+    use futures::FutureExt;
+    async move {
+        match val {
+            Value::Object(map) => {
+                let mut found_image_url = None;
+                if let Some(t) = map.get("type").and_then(|v| v.as_str()) {
+                    if t == "image_url" || t == "input_image" {
+                        if let Some(img_url) = map.get("image_url") {
+                            if let Some(url_str) = img_url.as_str() {
+                                found_image_url = Some(url_str.to_string());
+                            } else if let Some(url_str) = img_url.get("url").and_then(|v| v.as_str()) {
+                                found_image_url = Some(url_str.to_string());
+                            }
+                        } else if let Some(url) = map.get("url").and_then(|v| v.as_str()) {
+                            found_image_url = Some(url.to_string());
+                        }
+                    } else if t == "image" {
+                        if let Some(source) = map.get("source") {
+                            if let (Some(media_type), Some(data)) = (
+                                source.get("media_type").and_then(|v| v.as_str()),
+                                source.get("data").and_then(|v| v.as_str())
+                            ) {
+                                found_image_url = Some(format!("data:{};base64,{}", media_type, data));
+                            }
+                        }
+                    }
+                } else if map.contains_key("image_url") {
+                    if let Some(img_url) = map.get("image_url") {
+                        if let Some(url_str) = img_url.as_str() {
+                            found_image_url = Some(url_str.to_string());
+                        } else if let Some(url_str) = img_url.get("url").and_then(|v| v.as_str()) {
+                            found_image_url = Some(url_str.to_string());
+                        }
+                    }
+                }
+
+                if let Some(url) = found_image_url {
+                    // Calculate image hash to check cache
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    use std::hash::Hasher;
+                    hasher.write(url.as_bytes());
+                    let hash_val = hasher.finish();
+                    let hash_str = format!("{:016x}", hash_val);
+                    let image_key = format!("img_{}", &hash_str[..12]);
+
+                    // Automatically register image raw data (Base64) to in-memory registry
+                    insert_registered_image(&image_key, &url);
+
+                    let cached_desc = get_cached_description(&hash_str);
+
+                    if let Some(description) = cached_desc {
+                        log_write(&**log, db, Some("VISION_CACHE_HIT"), Some("proxy"), &format!(">> Image hash {} found in in-memory cache. Using cached description.", hash_str));
+                        *val = json!({
+                            "type": "text",
+                            "text": format!("\n[图像分析报告:\n{}\n]\n[图片 Key: {}]\n", description, image_key)
+                        });
+                        return;
+                    }
+
+                    log_write(&**log, db, Some("VISION_AGENT"), Some("proxy"), &format!(">> Image detected. Spawning vision agent to analyze... Hash: {}, Key: {}, URL length: {}", hash_str, image_key, url.len()));
+                    match crate::agent::analyze_image_via_vision_agent(&url, None).await {
+                        Ok(description) => {
+                            log_write(&**log, db, Some("VISION_AGENT_SUCCESS"), Some("proxy"), &format!(">> Vision agent analysis complete. Description len: {}", description.len()));
+                            
+                            // Insert to in-memory description cache
+                            insert_cached_description(&hash_str, &description);
+                            
+                            *images_processed += 1;
+                            *val = json!({
+                                "type": "text",
+                                "text": format!("\n[图像分析报告:\n{}\n]\n[图片 Key: {}]\n", description, image_key)
+                            });
+                            return;
+                        }
+                        Err(e) => {
+                            log_write(&**log, db, Some("ERROR"), Some("proxy"), &format!("!! Vision agent analysis failed: {}", e));
+                            *val = json!({
+                                "type": "text",
+                                "text": format!("\n[图像分析失败: 无法解析图片。错误: {}]\n[图片 Key: {}]\n", e, image_key)
+                            });
+                            return;
+                        }
+                    }
+                }
+
+                for v in map.values_mut() {
+                    process_and_replace_images(v, log, db, images_processed).await;
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    process_and_replace_images(v, log, db, images_processed).await;
+                }
+            }
+            _ => {}
+        }
+    }
+    .boxed()
+}
+
 
 /// Resolve a client-visible model name → (provider config, upstream model name).
 /// Looks up the model in the default provider's model_map; if not found,
@@ -372,6 +574,8 @@ async fn chat_completions(
     State(state): State<AiProxyState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let mut images_processed = 0;
+    process_and_replace_images(&mut body, &state.log, Some(&state.db), &mut images_processed).await;
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -385,10 +589,14 @@ async fn chat_completions(
 
     log!(&state.log, "=== /v1/chat/completions  model={}", client_model);
 
-    let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
+    let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    if has_image_input(&body) {
+        upstream_model = adjust_model_for_vision(&upstream_model);
+    }
 
     log!(
         &state.log,
@@ -420,8 +628,10 @@ async fn chat_completions(
 /// POST /v1/messages — Anthropic Messages API endpoint.
 async fn messages(
     State(state): State<AiProxyState>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    let mut images_processed = 0;
+    process_and_replace_images(&mut body, &state.log, Some(&state.db), &mut images_processed).await;
     let raw_model = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -434,10 +644,14 @@ async fn messages(
         fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
     );
 
-    let (provider, upstream_model) = match resolve_model(&state.config, raw_model) {
+    let (provider, mut upstream_model) = match resolve_model(&state.config, raw_model) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    if has_image_input(&body) {
+        upstream_model = adjust_model_for_vision(&upstream_model);
+    }
 
     log!(
         &state.log,
@@ -604,8 +818,10 @@ fn normalize_message_content(content: &Value) -> Value {
 /// POST /v1/responses — OpenAI Responses API endpoint for Codex.
 async fn responses(
     State(state): State<AiProxyState>,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Response {
+    let mut images_processed = 0;
+    process_and_replace_images(&mut body, &state.log, Some(&state.db), &mut images_processed).await;
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -652,10 +868,25 @@ async fn responses(
         );
     }
 
-    let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
+    let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    if has_image_input(&body) {
+        let old_model = upstream_model.clone();
+        upstream_model = adjust_model_for_vision(&upstream_model);
+        if old_model != upstream_model {
+            log_db!(
+                &state,
+                "PROXY",
+                "proxy",
+                "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
+                old_model,
+                upstream_model
+            );
+        }
+    }
 
     log_db!(
         &state,
@@ -1380,10 +1611,16 @@ async fn responses(
     // High performance SSE Streaming Relay!
     let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
     let stream = resp.bytes_stream();
+    let stream_prefix = if images_processed > 0 {
+        Some("🤖 **[AI Proxy: 已唤醒 mimo-v2.5 视觉子代理完成图片预处理，解析出的文本已合并至上下文]**\n\n".to_string())
+    } else {
+        None
+    };
     let mut converter = format_translate::ResponsesStreamConverter::new(
         client_model,
         tool_route_map,
         state.workspace.root().to_path_buf(),
+        stream_prefix,
     );
     let log_clone = state.log.clone();
     let db_clone = state.db.clone();
