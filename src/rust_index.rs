@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -12,8 +12,6 @@ use syn::{
     spanned::Spanned, visit::Visit,
 };
 
-const INDEX_DIR: &str = ".codex-workspace-mcp";
-const INDEX_FILE: &str = "rust_index.json";
 const MAX_RUST_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const NOISE_DIRS: &[&str] = &[
     ".git",
@@ -34,6 +32,7 @@ const NOISE_DIRS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum RustIndexError {
     #[error("rust index not found; call index_rust_workspace first")]
+    #[allow(dead_code)]
     MissingIndex,
     #[error("symbol not found: {0}")]
     SymbolNotFound(String),
@@ -48,6 +47,7 @@ pub enum RustIndexError {
 pub type Result<T> = std::result::Result<T, RustIndexError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct RustFileInfo {
     pub file_path: String,
     #[serde(default)]
@@ -448,7 +448,6 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
 }
 
 struct ParsedRustFile {
-    file: RustFileInfo,
     symbols: Vec<RustSymbol>,
 }
 
@@ -469,10 +468,6 @@ fn parse_rust_file(root: &Path, path: &Path, content: &str, file: &File) -> Pars
     }
 
     ParsedRustFile {
-        file: RustFileInfo {
-            file_path,
-            uses: collector.uses,
-        },
         symbols: collector.symbols,
     }
 }
@@ -960,10 +955,6 @@ fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<RustSymbol>> {
     Ok(symbols)
 }
 
-fn index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(INDEX_FILE)
-}
-
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -1100,6 +1091,7 @@ impl From<&RustSymbol> for RustSymbolSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path =

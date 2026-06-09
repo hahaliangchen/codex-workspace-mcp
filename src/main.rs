@@ -6,10 +6,17 @@ mod go_index;
 mod mcp;
 mod memory;
 mod python_index;
+mod proxy_log;
+mod responses;
 mod rust_index;
 mod skills;
+mod tool_call_registry;
+mod tool_display;
+mod tool_prepare;
 mod tools;
 mod ts_index;
+mod upstream;
+mod vision_preprocess;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 

@@ -1,10 +1,8 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 use crate::ts_index::*;
-
-use super::*;
 
 fn temp_workspace(name: &str) -> PathBuf {
     let path =

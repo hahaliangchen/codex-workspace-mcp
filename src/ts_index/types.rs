@@ -1,18 +1,5 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
-
 use serde::{Deserialize, Serialize};
-use swc_common::{FileName, SourceMap, Span, comments::SingleThreadedComments, sync::Lrc};
-use swc_ecma_ast::*;
-use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
-use swc_ecma_visit::{Visit, VisitWith};
 
-pub(crate) const INDEX_DIR: &str = ".codex-workspace-mcp";
-pub(crate) const INDEX_FILE: &str = "ts_index.json";
 pub(crate) const MAX_TS_FILE_BYTES: u64 = 2 * 1024 * 1024;
 pub(crate) const NOISE_DIRS: &[&str] = &[
     ".git",
@@ -33,6 +20,7 @@ pub(crate) const NOISE_DIRS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum TsIndexError {
     #[error("ts index not found; call index_ts_workspace first")]
+    #[allow(dead_code)]
     MissingIndex,
     #[error("symbol not found: {0}")]
     SymbolNotFound(String),
@@ -47,6 +35,7 @@ pub enum TsIndexError {
 pub type Result<T> = std::result::Result<T, TsIndexError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TsIndex {
     pub workspace_root: String,
     pub generated_at_unix: u64,

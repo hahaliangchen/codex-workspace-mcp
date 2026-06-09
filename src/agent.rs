@@ -114,7 +114,7 @@ pub async fn intercept_and_execute(
     let conn = crate::database::init_db(workspace.root()).ok();
 
     // 1. 优先尝试从内存注册表中恢复原始工具参数
-    if let Some((name, args)) = crate::ai_proxy::get_tool_call_mem(call_id) {
+    if let Some((name, args)) = crate::tool_call_registry::take(call_id) {
         crate::ai_proxy::log_write(log, None, None, None, &format!(
             "   [AGENT] In-Memory Registry Match: ID '{}' -> tool '{}'", call_id, name
         ));
@@ -131,8 +131,6 @@ pub async fn intercept_and_execute(
         }
         found_name = Some(name);
         found_args = Some(args);
-        // 消费后立刻从内存中删除，保持表干净
-        crate::ai_proxy::delete_tool_call_mem(call_id);
     }
 
     // 2. 如果数据库中没有（例如 Proxy 重启或旧 Payload），降级回从历史消息中解码 hex 密文
@@ -309,7 +307,7 @@ pub fn restore_history(messages: &mut Vec<Value>, _workspace_root: &std::path::P
 
                     // 1. 优先从内存中恢复
                     if !tc_id.is_empty() {
-                        if let Some((real_name, real_args)) = crate::ai_proxy::get_tool_call_mem(&tc_id) {
+                        if let Some((real_name, real_args)) = crate::tool_call_registry::get(&tc_id) {
                             if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
                                 func.insert("name".to_string(), json!(real_name));
                                 func.insert("arguments".to_string(), json!(real_args));

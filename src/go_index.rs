@@ -1,16 +1,13 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
-const INDEX_DIR: &str = ".codex-workspace-mcp";
-const INDEX_FILE: &str = "go_index.json";
 const MAX_GO_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const NOISE_DIRS: &[&str] = &[
     ".git",
@@ -31,6 +28,7 @@ const NOISE_DIRS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum GoIndexError {
     #[error("go index not found; call index_go_workspace first")]
+    #[allow(dead_code)]
     MissingIndex,
     #[error("symbol not found: {0}")]
     SymbolNotFound(String),
@@ -45,6 +43,7 @@ pub enum GoIndexError {
 pub type Result<T> = std::result::Result<T, GoIndexError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct GoIndex {
     pub workspace_root: String,
     pub generated_at_unix: u64,
@@ -1031,10 +1030,6 @@ fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
     Ok(symbols)
 }
 
-fn index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(INDEX_FILE)
-}
-
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -1086,6 +1081,7 @@ impl From<&GoSymbol> for GoSymbolSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path =

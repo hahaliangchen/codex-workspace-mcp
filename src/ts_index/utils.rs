@@ -1,15 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use swc_common::{FileName, SourceMap, Span, comments::SingleThreadedComments, sync::Lrc};
+use swc_common::{SourceMap, Span, sync::Lrc};
 use swc_ecma_ast::*;
-use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};
-use swc_ecma_visit::{Visit, VisitWith};
 
 use crate::ts_index::*;
 
@@ -136,18 +128,6 @@ pub(crate) fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<TsSy
     Ok(symbols)
 }
 
-pub(crate) fn load_or_build(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
-    let symbols = load_all_symbols(root)?;
-    if symbols.is_empty() {
-        return Err(TsIndexError::MissingIndex);
-    }
-    Ok(symbols)
-}
-
-pub(crate) fn index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(INDEX_FILE)
-}
-
 pub(crate) fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -177,15 +157,6 @@ pub(crate) fn snippet(content: &str, cm: &Lrc<SourceMap>, span: Span, max_lines:
 pub(crate) fn line_of(cm: &Lrc<SourceMap>, pos: swc_common::BytePos) -> usize {
     cm.lookup_char_pos(pos).line
 }
-
-pub(crate) fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or_default()
-}
-
-
 
 pub(crate) fn looks_like_component(name: &str) -> bool {
     name.chars()

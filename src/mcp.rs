@@ -565,7 +565,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             let image_key = arguments.get("image_key").and_then(|v| v.as_str()).unwrap_or("");
             let focus_instruction = arguments.get("focus_instruction").and_then(|v| v.as_str());
             
-            let raw_data = crate::ai_proxy::get_registered_image(image_key)
+            let raw_data = crate::vision_preprocess::get_registered_image(image_key)
                 .ok_or_else(|| anyhow::anyhow!("Image not found in in-memory registry for key: {}", image_key))?;
                 
             let result = crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
@@ -576,7 +576,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             hasher.write(raw_data.as_bytes());
             let hash_val = hasher.finish();
             let hash_str = format!("{:016x}", hash_val);
-            crate::ai_proxy::insert_cached_description(&hash_str, &result);
+            crate::vision_preprocess::insert_cached_description(&hash_str, &result);
 
             serde_json::to_value(result)?
         }

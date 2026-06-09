@@ -1,11 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
 };
 
-use serde::{Deserialize, Serialize};
 use swc_common::{FileName, SourceMap, Span, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast::*;
 use swc_ecma_parser::{Parser, StringInput, Syntax, TsSyntax, lexer::Lexer};

@@ -1,16 +1,12 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
 };
 
-use ignore::WalkBuilder;
 use rustpython_parser::{Parse, ast::{self, Constant, Stmt, Expr, ExprCall}, text_size::TextSize};
 use serde::{Deserialize, Serialize};
 
-const INDEX_DIR: &str = ".codex-workspace-mcp";
-const INDEX_FILE: &str = "python_index.json";
 const MAX_PYTHON_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const NOISE_DIRS: &[&str] = &[
     ".git",
@@ -31,6 +27,7 @@ const NOISE_DIRS: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum PythonIndexError {
     #[error("python index not found; call index_python_workspace first")]
+    #[allow(dead_code)]
     MissingIndex,
     #[error("symbol not found: {0}")]
     SymbolNotFound(String),
@@ -45,6 +42,7 @@ pub enum PythonIndexError {
 pub type Result<T> = std::result::Result<T, PythonIndexError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct PythonIndex {
     pub workspace_root: String,
     pub generated_at_unix: u64,
@@ -953,18 +951,6 @@ fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<PythonSymbol>> 
     Ok(symbols)
 }
 
-fn load_or_build(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
-    let symbols = load_all_symbols(root)?;
-    if symbols.is_empty() {
-        return Err(PythonIndexError::MissingIndex);
-    }
-    Ok(symbols)
-}
-
-fn index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(INDEX_FILE)
-}
-
 fn relative_display(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -976,25 +962,10 @@ fn normalize_slashes(value: &str) -> String {
     value.replace('\\', "/")
 }
 
-fn symbol_id(file_path: &str, class_name: Option<&str>, name: &str, line: usize) -> String {
-    if let Some(class) = class_name {
-        format!("python:{file_path}:{class}::{name}:{line}")
-    } else {
-        format!("python:{file_path}:{name}:{line}")
-    }
-}
-
 fn line_snippet(lines: &[&str], line: usize) -> String {
     lines
         .get(line.saturating_sub(1))
         .map(|l| l.trim().to_string())
-        .unwrap_or_default()
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
         .unwrap_or_default()
 }
 
@@ -1022,6 +993,7 @@ impl From<&PythonSymbol> for PythonSymbolSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir()
