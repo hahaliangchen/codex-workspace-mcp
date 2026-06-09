@@ -13,10 +13,14 @@ use crate::ts_index::*;
 pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
     let mut files_indexed = 0;
     let mut symbols_indexed = 0;
-    
+
     let mut conn = crate::database::init_db(root).unwrap();
     let tx = conn.transaction().unwrap();
-    tx.execute("DELETE FROM ts_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
+    tx.execute(
+        "DELETE FROM ts_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+    )
+    .unwrap();
 
     for entry in walk_source_files(root) {
         let path = match entry {
@@ -63,13 +67,18 @@ pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
             }
             for mut sym in symbols_to_insert {
                 sym.re_exports = parsed.re_exports.clone(); // Attach re_exports to symbol
-                let export_names_json = serde_json::to_string(&sym.export_names).unwrap_or_default();
+                let export_names_json =
+                    serde_json::to_string(&sym.export_names).unwrap_or_default();
                 let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
-                let import_bindings_json = serde_json::to_string(&sym.import_bindings).unwrap_or_default();
+                let import_bindings_json =
+                    serde_json::to_string(&sym.import_bindings).unwrap_or_default();
                 let imports_json = serde_json::to_string(&sym.imports).unwrap_or_default();
-                let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+                let kind = serde_json::to_string(&sym.kind)
+                    .unwrap_or_default()
+                    .trim_matches('"')
+                    .to_string();
                 let re_exports_json = serde_json::to_string(&sym.re_exports).unwrap_or_default();
-                
+
                 tx.execute(
                     "INSERT INTO ts_symbols (
                         id, workspace_root, name, kind, file_path, scope_path, parent_id, start_line, end_line,
@@ -89,12 +98,7 @@ pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
     // Bug3: 记录本次索引的实际时间戳
     let ts = crate::rust_index::now_unix();
     let meta_conn = crate::database::init_db(root).unwrap();
-    crate::database::upsert_index_metadata(
-        &meta_conn,
-        &root.to_string_lossy(),
-        "ts",
-        ts,
-    ).unwrap();
+    crate::database::upsert_index_metadata(&meta_conn, &root.to_string_lossy(), "ts", ts).unwrap();
     Ok((files_indexed, symbols_indexed))
 }
 
@@ -828,4 +832,3 @@ pub(crate) fn expr_to_text(expr: &Expr) -> Option<String> {
         _ => None,
     }
 }
-

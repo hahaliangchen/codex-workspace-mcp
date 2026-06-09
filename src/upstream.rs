@@ -2,14 +2,14 @@ use std::sync::{Arc, Mutex};
 use std::task::Context;
 
 use axum::{
+    Json,
     body::{Body, Bytes},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use futures::stream::poll_fn;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -403,13 +403,7 @@ async fn forward_non_streaming_body(
                 })
         }
         Err(e) => {
-            crate::ai_proxy::log_write(
-                &*log,
-                None,
-                None,
-                None,
-                &format!("!! READ ERROR  {}", e),
-            );
+            crate::ai_proxy::log_write(&*log, None, None, None, &format!("!! READ ERROR  {}", e));
             error!(%e, "failed to read upstream body");
             (
                 StatusCode::BAD_GATEWAY,

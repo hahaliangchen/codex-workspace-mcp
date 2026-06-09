@@ -26,10 +26,7 @@ pub fn log_request_body(
             if let Some(arr) = input_arr.as_array() {
                 let count = arr.len();
                 write_system_prompt_log(sys_log, arr, client_model);
-                *input_arr = Value::String(format!(
-                    "[{} items -> see system_prompt.log]",
-                    count
-                ));
+                *input_arr = Value::String(format!("[{} items -> see system_prompt.log]", count));
             }
         }
     }
@@ -56,7 +53,10 @@ fn write_system_prompt_log(
     client_model: &str,
 ) {
     let ts = crate::ai_proxy::now_china();
-    let sep = format!("\n{} ===== /v1/responses model={} =====\n", ts, client_model);
+    let sep = format!(
+        "\n{} ===== /v1/responses model={} =====\n",
+        ts, client_model
+    );
     if let Ok(mut sf) = sys_log.lock() {
         let _ = sf.write_all(sep.as_bytes());
         for (idx, item) in input_items.iter().enumerate() {
@@ -69,11 +69,7 @@ fn write_system_prompt_log(
     }
 }
 
-pub fn log_diagnostics(
-    log: &Mutex<std::fs::File>,
-    db: &Mutex<rusqlite::Connection>,
-    body: &Value,
-) {
+pub fn log_diagnostics(log: &Mutex<std::fs::File>, db: &Mutex<rusqlite::Connection>, body: &Value) {
     let prev_id = body
         .get("previous_response_id")
         .and_then(|v| v.as_str())

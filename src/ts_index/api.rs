@@ -15,22 +15,23 @@ pub fn index_workspace(root: &Path) -> Result<IndexTsWorkspaceResponse> {
 pub fn status(root: &Path) -> TsIndexStatus {
     let conn = crate::database::init_db(root).unwrap();
     // Bug3: 读取元数据中记录的真实索引创建时间
-    let generated_at = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "ts",
-    );
+    let generated_at =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "ts");
     if generated_at.is_some() {
-        let symbols_indexed: i64 = conn.query_row(
-            "SELECT count(*) FROM ts_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
-        let files_indexed: i64 = conn.query_row(
-            "SELECT count(DISTINCT file_path) FROM ts_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
+        let symbols_indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ts_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let files_indexed: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT file_path) FROM ts_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         return TsIndexStatus {
             index_path: "SQLite".to_string(),
             exists: true,
@@ -61,11 +62,13 @@ pub fn maybe_reindex_after_write(
         return Ok(None);
     }
     let conn = crate::database::init_db(root).unwrap();
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM ts_symbols WHERE workspace_root = ?",
-        rusqlite::params![root.to_string_lossy()],
-        |row| row.get(0)
-    ).unwrap_or(0);
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM ts_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     if count == 0 {
         return Ok(None);
     }
@@ -154,4 +157,3 @@ pub fn read_symbol(root: &Path, request: ReadTsSymbolRequest) -> Result<ReadTsSy
         suggested_reads,
     })
 }
-

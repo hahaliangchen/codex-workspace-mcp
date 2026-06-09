@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 const MCP_TOOL_PREFIX: &str = "codex_workspace_mcp__";
 const CODEX_STREAMING_TERMINAL_TOOL: &str = "exec_command";
-const CODEX_COMPLETED_TERMINAL_TOOL: &str = "run_terminal_cmd";
+const CODEX_COMPLETED_TERMINAL_TOOL: &str = "exec_command";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDisplayPhase {
@@ -18,8 +18,11 @@ pub struct ToolDisplay {
 }
 
 // Codex only knows a limited set of tool names in the Responses stream.
-// Unknown MCP tools are displayed as terminal commands, while the real tool
-// name and arguments stay in the backend registry for execution.
+// Unknown MCP tools are disguised as an echo terminal command so the UI can
+// show which proxy tool is running without trying to execute unsupported names
+// like read_file_lines/search_text. Keep both streaming and completed events on
+// exec_command; using run_terminal_cmd in completed history can produce
+// "unsupported call" records that poison the next Chat Completions request.
 pub fn display_for_tool(
     tool_name: &str,
     route_map: &HashMap<String, (String, String)>,
@@ -82,7 +85,10 @@ pub fn final_arguments(
     if tool_name == "codex_workspace_mcp__shell" || tool_name == "shell" {
         let parsed_args = serde_json::from_str::<Value>(arguments).unwrap_or(json!({}));
         if let Some(justification) = parsed_args.get("justification").and_then(|v| v.as_str()) {
-            tracing::info!("   [AGENT] AI is using shell! Justification: {}", justification);
+            tracing::info!(
+                "   [AGENT] AI is using shell! Justification: {}",
+                justification
+            );
         }
         if let Some(cmd) = parsed_args.get("command") {
             let repacked = json!({
@@ -159,7 +165,7 @@ mod tests {
             ToolDisplayPhase::Completed,
         );
 
-        assert_eq!(display.name, "run_terminal_cmd");
+        assert_eq!(display.name, "exec_command");
         assert!(display.suppress_argument_delta);
     }
 
@@ -173,7 +179,7 @@ mod tests {
 
         let (name, args) = completed_output_tool(call_id, tool_name, real_args, &routes);
 
-        assert_eq!(name, "run_terminal_cmd");
+        assert_eq!(name, "exec_command");
         let parsed: Value = serde_json::from_str(&args).unwrap();
         assert!(parsed["cmd"].as_str().unwrap().contains("analyze_image"));
 
@@ -205,7 +211,10 @@ mod tests {
         let mut routes = HashMap::new();
         routes.insert(
             "codex_workspace_mcp__analyze_image".to_string(),
-            ("mcp__codex_workspace_mcp".to_string(), "analyze_image".to_string()),
+            (
+                "mcp__codex_workspace_mcp".to_string(),
+                "analyze_image".to_string(),
+            ),
         );
 
         let args = final_arguments(
@@ -223,12 +232,8 @@ mod tests {
     #[test]
     fn completed_output_keeps_plain_shell_raw() {
         let routes = HashMap::new();
-        let (name, args) = completed_output_tool(
-            "call_1",
-            "shell",
-            r#"{"command":"dir"}"#,
-            &routes,
-        );
+        let (name, args) =
+            completed_output_tool("call_1", "shell", r#"{"command":"dir"}"#, &routes);
 
         assert_eq!(name, "shell");
         assert_eq!(args, r#"{"command":"dir"}"#);

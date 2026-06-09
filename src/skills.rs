@@ -1,5 +1,5 @@
-use std::sync::{OnceLock, RwLock};
 use anyhow::Result;
+use std::sync::{OnceLock, RwLock};
 
 /// 技能的元数据（轻量索引，不含 SKILL.md 全文）
 #[derive(Clone, Debug, serde::Serialize)]
@@ -36,24 +36,30 @@ pub fn register_skills_from_prompt(skills_text: &str) {
             continue;
         }
         let content = &line[2..]; // 去掉 "- "
-        
+
         // 分割 name: description (file: path)
         if let Some(colon_pos) = content.find(": ") {
             let name = content[..colon_pos].trim().to_string();
             let rest = &content[colon_pos + 2..];
-            
+
             // 提取 file 路径
             let (description, file_path) = if let Some(file_idx) = rest.rfind(" (file: ") {
                 let desc = rest[..file_idx].trim().to_string();
                 let file_end = rest.rfind(')').unwrap_or(rest.len());
-                let path = rest["(file: ".len() + file_idx..file_end].trim().to_string();
+                let path = rest["(file: ".len() + file_idx..file_end]
+                    .trim()
+                    .to_string();
                 (desc, path)
             } else {
                 (rest.to_string(), String::new())
             };
 
             if !name.is_empty() {
-                skills.push(SkillMeta { name, description, file_path });
+                skills.push(SkillMeta {
+                    name,
+                    description,
+                    file_path,
+                });
             }
         }
     }
@@ -72,17 +78,20 @@ pub fn list_skills() -> Vec<SkillMeta> {
 /// 根据技能名读取完整 SKILL.md 内容（给 read_skill 工具调用）
 pub fn read_skill(name: &str) -> Result<String> {
     let registry = registry().read().unwrap();
-    
+
     // 支持精确匹配和去前缀匹配（如 "documents:documents" -> "documents"）
     let meta = registry.iter().find(|s| {
         s.name == name
             || s.name.split(':').last() == Some(name)
             || s.name.to_lowercase() == name.to_lowercase()
     });
-    
-    let meta = meta.ok_or_else(|| anyhow::anyhow!(
-        "Skill '{}' not found. Call list_skills to see available skills.", name
-    ))?;
+
+    let meta = meta.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Skill '{}' not found. Call list_skills to see available skills.",
+            name
+        )
+    })?;
 
     if meta.file_path.is_empty() {
         anyhow::bail!("Skill '{}' has no file path recorded.", name);
@@ -90,6 +99,6 @@ pub fn read_skill(name: &str) -> Result<String> {
 
     let content = std::fs::read_to_string(&meta.file_path)
         .map_err(|e| anyhow::anyhow!("Failed to read SKILL.md at '{}': {}", meta.file_path, e))?;
-    
+
     Ok(content)
 }

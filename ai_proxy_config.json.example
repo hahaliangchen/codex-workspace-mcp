@@ -1,13 +1,43 @@
 {
   "default_provider": "my_upstream_provider",
+  "vision_provider": "my_vision_provider",
   "providers": {
     "my_upstream_provider": {
       "url": "https://api.openai.com/v1",
       "api_key": "YOUR_UPSTREAM_API_KEY_HERE",
       "api_type": "openai",
+      "supports_vision": true,
       "model_map": {
         "gpt-4o": "gpt-4o",
         "claude-3-5-sonnet": "gpt-4o"
+      }
+    },
+    "my_deepseek_text_provider": {
+      "url": "https://api.deepseek.com/v1",
+      "api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
+      "api_type": "openai",
+      "supports_vision": false,
+      "model_map": {
+        "gpt-5-codex": "deepseek-chat",
+        "gpt-4o": "deepseek-chat"
+      }
+    },
+    "my_mimo_text_provider": {
+      "url": "https://api.xiaomimimo.com/v1",
+      "api_key": "YOUR_MIMO_API_KEY_HERE",
+      "api_type": "openai",
+      "supports_vision": false,
+      "model_map": {
+        "gpt-5-codex": "mimo-2.5-pro"
+      }
+    },
+    "my_vision_provider": {
+      "url": "https://api.openai.com/v1",
+      "api_key": "YOUR_VISION_API_KEY_HERE",
+      "api_type": "openai",
+      "supports_vision": true,
+      "model_map": {
+        "gpt-4o-mini": "gpt-4o-mini"
       }
     },
     "my_raw_codex_provider": {

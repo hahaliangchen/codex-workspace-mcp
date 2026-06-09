@@ -412,12 +412,14 @@ impl Workspace {
         if let Ok(conn) = crate::database::init_db(&workspace.root) {
             let root_str = workspace.root.to_string_lossy().to_string();
             let query_name = request.query.trim();
-            
-            let has_rust = crate::database::get_index_generated_at(&conn, &root_str, "rust").is_some();
+
+            let has_rust =
+                crate::database::get_index_generated_at(&conn, &root_str, "rust").is_some();
             let has_go = crate::database::get_index_generated_at(&conn, &root_str, "go").is_some();
             let has_ts = crate::database::get_index_generated_at(&conn, &root_str, "ts").is_some();
-            let has_py = crate::database::get_index_generated_at(&conn, &root_str, "python").is_some();
-            
+            let has_py =
+                crate::database::get_index_generated_at(&conn, &root_str, "python").is_some();
+
             // A. Rust Symbols
             if has_rust {
                 if let Ok(mut stmt) = conn.prepare(

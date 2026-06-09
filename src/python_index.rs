@@ -1,10 +1,10 @@
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::Path,
-};
+use std::{collections::BTreeSet, fs, path::Path};
 
-use rustpython_parser::{Parse, ast::{self, Constant, Stmt, Expr, ExprCall}, text_size::TextSize};
+use rustpython_parser::{
+    Parse,
+    ast::{self, Constant, Expr, ExprCall, Stmt},
+    text_size::TextSize,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_PYTHON_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -223,22 +223,23 @@ pub fn index_workspace(root: &Path) -> Result<IndexPythonWorkspaceResponse> {
 pub fn status(root: &Path) -> PythonIndexStatus {
     let conn = crate::database::init_db(root).unwrap();
     // Bug3: 读取元数据中记录的真实索引创建时间
-    let generated_at = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "python",
-    );
+    let generated_at =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "python");
     if generated_at.is_some() {
-        let symbols_indexed: i64 = conn.query_row(
-            "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
-        let files_indexed: i64 = conn.query_row(
-            "SELECT count(DISTINCT file_path) FROM python_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
+        let symbols_indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let files_indexed: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT file_path) FROM python_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         return PythonIndexStatus {
             index_path: "SQLite".to_string(),
             exists: true,
@@ -266,11 +267,13 @@ pub fn maybe_reindex_after_write(
         return Ok(None);
     }
     let conn = crate::database::init_db(root).unwrap();
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
-        rusqlite::params![root.to_string_lossy()],
-        |row| row.get(0)
-    ).unwrap_or(0);
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM python_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     if count == 0 {
         return Ok(None);
     }
@@ -291,13 +294,7 @@ pub fn list_symbols(
                 .map(|f| s.file_path == normalize_slashes(f))
                 .unwrap_or(true)
         })
-        .filter(|s| {
-            request
-                .kind
-                .as_ref()
-                .map(|k| &s.kind == k)
-                .unwrap_or(true)
-        })
+        .filter(|s| request.kind.as_ref().map(|k| &s.kind == k).unwrap_or(true))
         .map(PythonSymbolSummary::from)
         .collect();
     Ok(ListPythonSymbolsResponse { symbols })
@@ -338,7 +335,10 @@ pub fn search_symbols(
     })
 }
 
-pub fn read_symbol(root: &Path, request: ReadPythonSymbolRequest) -> Result<ReadPythonSymbolResponse> {
+pub fn read_symbol(
+    root: &Path,
+    request: ReadPythonSymbolRequest,
+) -> Result<ReadPythonSymbolResponse> {
     let index_symbols = load_or_build_or_create(root)?;
     let symbol = index_symbols
         .iter()
@@ -368,10 +368,14 @@ pub fn read_symbol(root: &Path, request: ReadPythonSymbolRequest) -> Result<Read
 fn build_index(root: &Path) -> Result<(usize, usize)> {
     let mut files_indexed = 0;
     let mut symbols_indexed = 0;
-    
+
     let mut conn = crate::database::init_db(root).unwrap();
     let tx = conn.transaction().unwrap();
-    tx.execute("DELETE FROM python_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
+    tx.execute(
+        "DELETE FROM python_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+    )
+    .unwrap();
 
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -413,23 +417,38 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
             Err(_) => continue,
         };
         let parsed = parse_python_file(root, path, &content, &ast);
-        
+
         for sym in parsed.symbols {
-            let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+            let kind = serde_json::to_string(&sym.kind)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
             let decorators_json = serde_json::to_string(&sym.decorators).unwrap_or_default();
             let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
             let file_imports_json = serde_json::to_string(&parsed.file.imports).unwrap_or_default();
-            
+
             tx.execute(
                 "INSERT INTO python_symbols (
                     id, workspace_root, name, kind, file_path, class_name, start_line, end_line,
                     signature, docstring, decorators_json, calls_json, file_imports_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
-                    sym.id, root.to_string_lossy(), sym.name, kind, sym.file_path, sym.class_name,
-                    sym.start_line, sym.end_line, sym.signature, sym.docstring, decorators_json, calls_json, file_imports_json
-                ]
-            ).unwrap();
+                    sym.id,
+                    root.to_string_lossy(),
+                    sym.name,
+                    kind,
+                    sym.file_path,
+                    sym.class_name,
+                    sym.start_line,
+                    sym.end_line,
+                    sym.signature,
+                    sym.docstring,
+                    decorators_json,
+                    calls_json,
+                    file_imports_json
+                ],
+            )
+            .unwrap();
             symbols_indexed += 1;
         }
     }
@@ -437,12 +456,8 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
     // Bug3: 记录本次索引的实际时间戳
     let ts = crate::rust_index::now_unix();
     let meta_conn = crate::database::init_db(root).unwrap();
-    crate::database::upsert_index_metadata(
-        &meta_conn,
-        &root.to_string_lossy(),
-        "python",
-        ts,
-    ).unwrap();
+    crate::database::upsert_index_metadata(&meta_conn, &root.to_string_lossy(), "python", ts)
+        .unwrap();
     Ok((files_indexed, symbols_indexed))
 }
 
@@ -482,7 +497,15 @@ fn parse_python_file(root: &Path, path: &Path, content: &str, stmts: &[Stmt]) ->
     let mut imports = Vec::new();
     let mut symbols = Vec::new();
 
-    collect_stmts(stmts, &file_path, &lines, &line_map, None, &mut imports, &mut symbols);
+    collect_stmts(
+        stmts,
+        &file_path,
+        &lines,
+        &line_map,
+        None,
+        &mut imports,
+        &mut symbols,
+    );
 
     ParsedPythonFile {
         file: PythonFileInfo { file_path, imports },
@@ -512,7 +535,11 @@ fn collect_stmts(
                 }
             }
             Stmt::ImportFrom(node) => {
-                let module = node.module.as_ref().map(|m| m.to_string()).unwrap_or_default();
+                let module = node
+                    .module
+                    .as_ref()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
                 for alias in &node.names {
                     imports.push(PythonImport {
                         module: module.clone(),
@@ -526,11 +553,8 @@ fn collect_stmts(
                 let start_line = line_map.line(node.range.start());
                 let end_line = line_map.line(node.range.end());
                 let name = node.name.to_string();
-                let decorators: Vec<String> = node
-                    .decorator_list
-                    .iter()
-                    .map(|d| expr_text(d))
-                    .collect();
+                let decorators: Vec<String> =
+                    node.decorator_list.iter().map(|d| expr_text(d)).collect();
                 let kind = if class_name.is_some() {
                     PythonSymbolKind::Method
                 } else {
@@ -556,11 +580,8 @@ fn collect_stmts(
             }
             Stmt::ClassDef(cls) => {
                 let name = cls.name.to_string();
-                let decorators: Vec<String> = cls
-                    .decorator_list
-                    .iter()
-                    .map(|d| expr_text(d))
-                    .collect();
+                let decorators: Vec<String> =
+                    cls.decorator_list.iter().map(|d| expr_text(d)).collect();
                 let bases: Vec<String> = cls.bases.iter().map(|b| expr_text(b)).collect();
                 let signature = if bases.is_empty() {
                     format!("class {name}")
@@ -582,7 +603,15 @@ fn collect_stmts(
                     calls: Vec::new(),
                     file_imports: Vec::new(),
                 });
-                collect_stmts(&cls.body, file_path, lines, line_map, Some(&name), imports, symbols);
+                collect_stmts(
+                    &cls.body,
+                    file_path,
+                    lines,
+                    line_map,
+                    Some(&name),
+                    imports,
+                    symbols,
+                );
             }
             _ => {}
         }
@@ -628,13 +657,23 @@ fn collect_calls(body: &[Stmt], lines: &[&str], line_map: &LineMap) -> Vec<Pytho
     calls
 }
 
-fn collect_calls_from_stmts(stmts: &[Stmt], lines: &[&str], line_map: &LineMap, calls: &mut Vec<PythonCall>) {
+fn collect_calls_from_stmts(
+    stmts: &[Stmt],
+    lines: &[&str],
+    line_map: &LineMap,
+    calls: &mut Vec<PythonCall>,
+) {
     for stmt in stmts {
         collect_calls_from_stmt(stmt, lines, line_map, calls);
     }
 }
 
-fn collect_calls_from_stmt(stmt: &Stmt, lines: &[&str], line_map: &LineMap, calls: &mut Vec<PythonCall>) {
+fn collect_calls_from_stmt(
+    stmt: &Stmt,
+    lines: &[&str],
+    line_map: &LineMap,
+    calls: &mut Vec<PythonCall>,
+) {
     match stmt {
         Stmt::Expr(node) => collect_calls_from_expr(&node.value, lines, line_map, calls),
         Stmt::Assign(node) => {
@@ -686,7 +725,12 @@ fn collect_calls_from_stmt(stmt: &Stmt, lines: &[&str], line_map: &LineMap, call
     }
 }
 
-fn collect_calls_from_expr(expr: &Expr, lines: &[&str], line_map: &LineMap, calls: &mut Vec<PythonCall>) {
+fn collect_calls_from_expr(
+    expr: &Expr,
+    lines: &[&str],
+    line_map: &LineMap,
+    calls: &mut Vec<PythonCall>,
+) {
     match expr {
         Expr::Call(call) => {
             let line = line_map.line(call.range.start());
@@ -783,7 +827,11 @@ fn expr_text(expr: &Expr) -> String {
 fn build_context(
     index_symbols: &[PythonSymbol],
     symbol: &PythonSymbol,
-) -> (Vec<PythonCaller>, Vec<PythonCallee>, Vec<PythonSuggestedRead>) {
+) -> (
+    Vec<PythonCaller>,
+    Vec<PythonCallee>,
+    Vec<PythonSuggestedRead>,
+) {
     let mut id_to_symbol = std::collections::BTreeMap::new();
     for item in index_symbols {
         id_to_symbol.insert(item.id.clone(), item);
@@ -867,8 +915,7 @@ fn resolve_call<'a>(
         // Qualified.name() — qualifier tail matches class name
         let qualifier_tail = qualifier.rsplit('.').next().unwrap_or(qualifier);
         matches.extend(index_symbols.iter().filter(|s| {
-            s.name == call.target_text
-                && s.class_name.as_deref() == Some(qualifier_tail)
+            s.name == call.target_text && s.class_name.as_deref() == Some(qualifier_tail)
         }));
     } else {
         // Bare call — same file first, then workspace-wide
@@ -907,24 +954,28 @@ fn suggestion_reason(caller: &PythonSymbol, matched: &PythonSymbol) -> &'static 
 }
 
 fn load_all_symbols(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
-    let conn = crate::database::init_db(root).map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
+    let conn = crate::database::init_db(root)
+        .map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
     let mut stmt = conn.prepare("SELECT id, name, kind, file_path, class_name, start_line, end_line, signature, docstring, decorators_json, calls_json, file_imports_json FROM python_symbols WHERE workspace_root = ?").map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
-    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
-        Ok(PythonSymbol {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(PythonSymbolKind::Function),
-            file_path: row.get(3)?,
-            class_name: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            signature: row.get(7)?,
-            docstring: row.get(8)?,
-            decorators: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
-            calls: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
-            file_imports: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+    let symbol_iter = stmt
+        .query_map(rusqlite::params![root.to_string_lossy()], |row| {
+            Ok(PythonSymbol {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?))
+                    .unwrap_or(PythonSymbolKind::Function),
+                file_path: row.get(3)?,
+                class_name: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                signature: row.get(7)?,
+                docstring: row.get(8)?,
+                decorators: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+                calls: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+                file_imports: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+            })
         })
-    }).map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
+        .map_err(|e| PythonIndexError::SymbolNotFound(e.to_string()))?;
 
     let mut symbols = Vec::new();
     for sym in symbol_iter {
@@ -938,11 +989,8 @@ fn load_all_symbols(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
 fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<PythonSymbol>> {
     // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
     let conn = crate::database::init_db(root).unwrap();
-    let already_indexed = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "python",
-    ).is_some();
+    let already_indexed =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "python").is_some();
     let symbols = load_all_symbols(root)?;
     if !already_indexed {
         index_workspace(root)?;
@@ -996,8 +1044,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_workspace(name: &str) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("codex_python_index_{name}_{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("codex_python_index_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
@@ -1062,10 +1110,11 @@ def validate(topic: str) -> bool:
         .unwrap();
         assert!(read.content.contains("def create"));
         assert!(read.callees.iter().any(|c| c.target_text == "_render"));
-        assert!(read
-            .suggested_reads
-            .iter()
-            .any(|s| s.symbol.name == "_render"));
+        assert!(
+            read.suggested_reads
+                .iter()
+                .any(|s| s.symbol.name == "_render")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1083,9 +1132,17 @@ def validate(topic: str) -> bool:
 
         // \u5df2\u8fc1\u79fb\u5230 SQLite\uff0c\u5bfc\u5165\u4fe1\u606f\u5b58\u5728\u4e8e\u6bcf\u4e2a symbol \u7684 file_imports \u5b57\u6bb5\u4e2d
         let symbols = load_all_symbols(&root).unwrap();
-        let dummy = symbols.iter().find(|s| s.name == "dummy").expect("dummy symbol should exist");
+        let dummy = symbols
+            .iter()
+            .find(|s| s.name == "dummy")
+            .expect("dummy symbol should exist");
         assert!(dummy.file_imports.iter().any(|i| i.module == "os"));
-        assert!(dummy.file_imports.iter().any(|i| i.name.as_deref() == Some("Path")));
+        assert!(
+            dummy
+                .file_imports
+                .iter()
+                .any(|i| i.name.as_deref() == Some("Path"))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

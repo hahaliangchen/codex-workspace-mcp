@@ -29,7 +29,8 @@ pub(crate) fn build_context(
         .import_bindings
         .iter()
         .map(|import| {
-            let target_file_path = resolve_import_source(&symbol.file_path, &import.source, index_symbols);
+            let target_file_path =
+                resolve_import_source(&symbol.file_path, &import.source, index_symbols);
             let re_export_chain = target_file_path
                 .as_ref()
                 .map(|target_file| {
@@ -128,7 +129,9 @@ pub(crate) fn build_context(
             continue;
         }
         for call in &item.calls {
-            if call.target_text == symbol.name || imported_call_matches(index_symbols, item, call, symbol) {
+            if call.target_text == symbol.name
+                || imported_call_matches(index_symbols, item, call, symbol)
+            {
                 callers.push(TsCaller {
                     symbol_id: item.id.clone(),
                     name: item.name.clone(),
@@ -198,7 +201,9 @@ pub(crate) fn imported_call_matches(
     })
 }
 
-pub(crate) fn build_file_export_map(index_symbols: &[TsSymbol]) -> BTreeMap<(String, String), Vec<String>> {
+pub(crate) fn build_file_export_map(
+    index_symbols: &[TsSymbol],
+) -> BTreeMap<(String, String), Vec<String>> {
     let mut file_export_to_ids: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for item in index_symbols {
         if item.export {
@@ -268,7 +273,8 @@ pub(crate) fn build_re_export_chain(
         if !seen.insert((current_file.clone(), current_name.clone())) {
             break;
         }
-        let Some(re_export) = find_re_export_for_name(index_symbols, &current_file, &current_name) else {
+        let Some(re_export) = find_re_export_for_name(index_symbols, &current_file, &current_name)
+        else {
             break;
         };
         let Some(target_file) =
@@ -304,11 +310,15 @@ pub(crate) fn find_re_export_for_name<'a>(
     file_path: &str,
     export_name: &str,
 ) -> Option<&'a TsReExport> {
-    index_symbols.iter().flat_map(|s| &s.re_exports).find(|re_export| {
-        re_export.file_path == file_path
-            && (re_export.exported_name == export_name
-                || (re_export.kind == TsImportKind::Namespace && re_export.exported_name == "*"))
-    })
+    index_symbols
+        .iter()
+        .flat_map(|s| &s.re_exports)
+        .find(|re_export| {
+            re_export.file_path == file_path
+                && (re_export.exported_name == export_name
+                    || (re_export.kind == TsImportKind::Namespace
+                        && re_export.exported_name == "*"))
+        })
 }
 
 pub(crate) fn exported_names_for_file(
@@ -344,7 +354,11 @@ pub(crate) fn exported_ids_for_file(
     ids
 }
 
-pub(crate) fn resolve_import_source(from_file: &str, source: &str, index_symbols: &[TsSymbol]) -> Option<String> {
+pub(crate) fn resolve_import_source(
+    from_file: &str,
+    source: &str,
+    index_symbols: &[TsSymbol],
+) -> Option<String> {
     if !source.starts_with('.') {
         return None;
     }
@@ -381,4 +395,3 @@ pub(crate) fn import_path_candidates(base: &str) -> Vec<String> {
         )
         .collect()
 }
-

@@ -1,6 +1,6 @@
+use rusqlite::{Connection, Result, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use rusqlite::{params, Connection, Result};
 
 pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     let index_dir = workspace_root.join(".codex-workspace-mcp");
@@ -124,10 +124,22 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     )?;
 
     // Indexes for fast searching
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_rust_name ON rust_symbols(name)", [])?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_go_name ON go_symbols(name)", [])?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_name ON ts_symbols(name)", [])?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_py_name ON python_symbols(name)", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rust_name ON rust_symbols(name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_go_name ON go_symbols(name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ts_name ON ts_symbols(name)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_py_name ON python_symbols(name)",
+        [],
+    )?;
 
     // Create api_logs table for detailed structural logs
     conn.execute(
@@ -142,7 +154,10 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         )",
         [],
     )?;
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_logs(timestamp)", [])?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_logs(timestamp)",
+        [],
+    )?;
 
     Ok(conn)
 }
@@ -170,8 +185,6 @@ pub fn insert_detailed_api_log(
     Ok(())
 }
 
-
-
 /// Record (or update) the timestamp at which a language index was last fully built.
 pub fn upsert_index_metadata(
     conn: &Connection,
@@ -188,11 +201,7 @@ pub fn upsert_index_metadata(
 }
 
 /// Return the stored `generated_at_unix` for a language index, or `None` if it has never been built.
-pub fn get_index_generated_at(
-    conn: &Connection,
-    workspace_root: &str,
-    lang: &str,
-) -> Option<u64> {
+pub fn get_index_generated_at(conn: &Connection, workspace_root: &str, lang: &str) -> Option<u64> {
     conn.query_row(
         "SELECT generated_at_unix FROM index_metadata WHERE workspace_root = ? AND lang = ?",
         params![workspace_root, lang],

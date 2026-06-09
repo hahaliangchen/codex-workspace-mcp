@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
-use std::sync::Arc;
-use crate::tools::Workspace;
 use crate::mcp;
+use crate::tools::Workspace;
+use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// 将 Workspace 内置的 MCP 工具注入到提供给大模型的 tools 列表中
 /// 这样大模型无需通过 tool_search 即可直接“知道”并调用这些最高优先级的原生工具。
@@ -11,11 +11,13 @@ pub fn inject_workspace_tools(converted_tools: &mut Vec<Value>) {
         for t in arr {
             let original_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let description = t.get("description").cloned().unwrap_or_else(|| json!(""));
-            let parameters = t.get("inputSchema").cloned().unwrap_or_else(|| json!({
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }));
+            let parameters = t.get("inputSchema").cloned().unwrap_or_else(|| {
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                })
+            });
 
             // 添加前缀 codex_workspace_mcp__ 避免冲突并标识特权工具
             let new_name = format!("codex_workspace_mcp__{}", original_name);
@@ -40,7 +42,7 @@ pub fn generate_agent_constraints() -> String {
          ## Rule 1: Workspace Tools (HIGHEST PRIORITY)\n\
          For ALL file reading, code search, directory listing, AST analysis tasks — \
          you MUST use the following native proxy tools. \
-         Do NOT use shell commands, do NOT use resources/read:\n\n"
+         Do NOT use shell commands, do NOT use resources/read:\n\n",
     );
 
     let definitions = mcp::tool_definitions();
@@ -54,7 +56,10 @@ pub fn generate_agent_constraints() -> String {
             let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
             // 只显示前80字节的描述，保持精简
             let short_desc: String = desc.chars().take(80).collect();
-            constraints.push_str(&format!("- codex_workspace_mcp__{}: {}\n", original_name, short_desc));
+            constraints.push_str(&format!(
+                "- codex_workspace_mcp__{}: {}\n",
+                original_name, short_desc
+            ));
         }
     }
 
@@ -75,10 +80,14 @@ pub fn generate_agent_constraints() -> String {
          - **Detailed Chinese Comments**: When adding or updating code (structs, functions, modules), write clear, detailed docstrings/comments in Chinese (or bilingual). These comments are fully indexed and will help you or future agents find these features via keyword symbol searches later.\n\
          - **Detailed Chinese Memory Summaries**: When completing any task, you MUST call `record_work_memory` and write a detailed description of the technical implementation, design choices, and business logic in Chinese. This ensures subsequent agents can quickly retrieve and understand the project context using memory searches.\n\
          \n\
-         ## Rule 5: Image Analysis (Mandatory analyze_image tool usage)\n\
-         - You will see image placeholders like `[图片 Key: img_xxxxxx]` in the conversation history.\n\
-         - Whenever the user asks you a question about the image, or points out a flaw in your visual understanding (e.g., 'you missed the details on the right', 're-examine the screenshot'), you MUST call the `codex_workspace_mcp__analyze_image` tool with the corresponding `image_key` and optional `focus_instruction` describing what the user wants you to look at.\n\
-         - Do NOT guess or hallucinate image details without calling the tool when visual feedback is given.\n"
+         ## Rule 5: Image Analysis (On-demand analyze_image tool usage)\n\
+         - You may see `[图像分析报告: ...]` text that was produced from prior image preprocessing.\n\
+         - Reuse an existing image analysis report when it answers the current question; do NOT re-analyze by default.\n\
+         - Call `codex_workspace_mcp__analyze_image` only when the current user request explicitly asks about an image/screenshot, asks you to re-check visual details, or cannot be answered without fresh visual inspection.\n\
+         - The tool can only analyze original images still visible in the current request context. Use `image_ref=\"latest\"` by default, or a 1-based index like `\"1\"` for a specific visible image.\n\
+         - If `analyze_image` says no original image is visible, ask the user to upload the image again.\n\
+         - If an existing `[图像分析报告: ...]` already answers the current question, reuse it and do not re-analyze the image.\n\
+         - Do NOT guess or hallucinate image details when the user asks for new visual inspection; use the tool with optional `image_ref` and `focus_instruction`.\n"
     );
 
     constraints
@@ -115,9 +124,16 @@ pub async fn intercept_and_execute(
 
     // 1. 优先尝试从内存注册表中恢复原始工具参数
     if let Some((name, args)) = crate::tool_call_registry::take(call_id) {
-        crate::ai_proxy::log_write(log, None, None, None, &format!(
-            "   [AGENT] In-Memory Registry Match: ID '{}' -> tool '{}'", call_id, name
-        ));
+        crate::ai_proxy::log_write(
+            log,
+            None,
+            None,
+            None,
+            &format!(
+                "   [AGENT] In-Memory Registry Match: ID '{}' -> tool '{}'",
+                call_id, name
+            ),
+        );
         if let Some(ref c) = conn {
             let ts = crate::ai_proxy::now_china();
             let _ = crate::database::insert_detailed_api_log(
@@ -125,8 +141,11 @@ pub async fn intercept_and_execute(
                 &ts,
                 "TOOL_MATCH",
                 "proxy",
-                &format!("In-Memory Registry Match: ID '{}' -> tool '{}'", call_id, name),
-                None
+                &format!(
+                    "In-Memory Registry Match: ID '{}' -> tool '{}'",
+                    call_id, name
+                ),
+                None,
             );
         }
         found_name = Some(name);
@@ -140,21 +159,39 @@ pub async fn intercept_and_execute(
                 if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
                         if tc.get("id") == Some(&json!(call_id)) {
-                            let name_str = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                            let name_str = tc
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
                             if name_str == "exec_command" || name_str == "run_terminal_cmd" {
-                                if let Some(args_str) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                                if let Some(args_str) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                {
                                     if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
-                                        let cmd_opt = args_json.get("cmd")
+                                        let cmd_opt = args_json
+                                            .get("cmd")
                                             .or_else(|| args_json.get("command"))
                                             .and_then(|v| v.as_str());
                                         if let Some(cmd) = cmd_opt {
                                             if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
-                                                let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
+                                                let payload_hex =
+                                                    cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
                                                 let decoded_payload = hex_decode(payload_hex);
                                                 if let Some(split_idx) = decoded_payload.find('|') {
-                                                    crate::ai_proxy::log_write(log, None, None, None, &format!(
-                                                        "   [AGENT] Hex Fallback Match: ID '{}' -> tool '{}'", call_id, &decoded_payload[..split_idx]
-                                                    ));
+                                                    crate::ai_proxy::log_write(
+                                                        log,
+                                                        None,
+                                                        None,
+                                                        None,
+                                                        &format!(
+                                                            "   [AGENT] Hex Fallback Match: ID '{}' -> tool '{}'",
+                                                            call_id,
+                                                            &decoded_payload[..split_idx]
+                                                        ),
+                                                    );
                                                     if let Some(ref c) = conn {
                                                         let ts = crate::ai_proxy::now_china();
                                                         let _ = crate::database::insert_detailed_api_log(
@@ -166,8 +203,13 @@ pub async fn intercept_and_execute(
                                                             None
                                                         );
                                                     }
-                                                    found_name = Some(decoded_payload[..split_idx].to_string());
-                                                    found_args = Some(decoded_payload[split_idx + 1..].to_string());
+                                                    found_name = Some(
+                                                        decoded_payload[..split_idx].to_string(),
+                                                    );
+                                                    found_args = Some(
+                                                        decoded_payload[split_idx + 1..]
+                                                            .to_string(),
+                                                    );
                                                 }
                                             }
                                         }
@@ -186,9 +228,13 @@ pub async fn intercept_and_execute(
         if name.starts_with("codex_workspace_mcp__") {
             name = name["codex_workspace_mcp__".len()..].to_string();
         }
-        crate::ai_proxy::log_write(log, None, None, None, &format!(
-            "   [AGENT] Executing tool natively: {}", name
-        ));
+        crate::ai_proxy::log_write(
+            log,
+            None,
+            None,
+            None,
+            &format!("   [AGENT] Executing tool natively: {}", name),
+        );
         if let Some(ref c) = conn {
             let ts = crate::ai_proxy::now_china();
             let _ = crate::database::insert_detailed_api_log(
@@ -197,7 +243,7 @@ pub async fn intercept_and_execute(
                 "TOOL_EXEC",
                 "proxy",
                 &format!("Executing tool natively: {}", name),
-                Some(&args_str)
+                Some(&args_str),
             );
         }
         let arguments = serde_json::from_str(&args_str).unwrap_or_else(|_| json!({}));
@@ -215,9 +261,16 @@ pub async fn intercept_and_execute(
             match res_val {
                 Ok(val) => {
                     output = val;
-                    crate::ai_proxy::log_write(log, None, None, None, &format!(
-                        "   [AGENT] Custom execution succeeded (internal). len={}", output.len()
-                    ));
+                    crate::ai_proxy::log_write(
+                        log,
+                        None,
+                        None,
+                        None,
+                        &format!(
+                            "   [AGENT] Custom execution succeeded (internal). len={}",
+                            output.len()
+                        ),
+                    );
                     if let Some(ref c) = conn {
                         let ts = crate::ai_proxy::now_china();
                         let _ = crate::database::insert_detailed_api_log(
@@ -225,16 +278,23 @@ pub async fn intercept_and_execute(
                             &ts,
                             "TOOL_EXEC",
                             "proxy",
-                            &format!("Custom execution succeeded (internal). len={}", output.len()),
-                            Some(&output)
+                            &format!(
+                                "Custom execution succeeded (internal). len={}",
+                                output.len()
+                            ),
+                            Some(&output),
                         );
                     }
                 }
                 Err(e) => {
                     output = format!("Agent execution failed (internal): {}", e);
-                    crate::ai_proxy::log_write(log, None, None, None, &format!(
-                        "   [AGENT] Custom execution failed (internal). error={}", e
-                    ));
+                    crate::ai_proxy::log_write(
+                        log,
+                        None,
+                        None,
+                        None,
+                        &format!("   [AGENT] Custom execution failed (internal). error={}", e),
+                    );
                     if let Some(ref c) = conn {
                         let ts = crate::ai_proxy::now_china();
                         let _ = crate::database::insert_detailed_api_log(
@@ -243,7 +303,7 @@ pub async fn intercept_and_execute(
                             "ERROR",
                             "proxy",
                             &format!("Custom execution failed (internal) for tool '{}'", name),
-                            Some(&output)
+                            Some(&output),
                         );
                     }
                 }
@@ -256,9 +316,16 @@ pub async fn intercept_and_execute(
                         Some(s) => s.to_string(),
                         None => serde_json::to_string(&res).unwrap_or_else(|_| res.to_string()),
                     };
-                    crate::ai_proxy::log_write(log, None, None, None, &format!(
-                        "   [AGENT] Custom execution succeeded. len={}", output.len()
-                    ));
+                    crate::ai_proxy::log_write(
+                        log,
+                        None,
+                        None,
+                        None,
+                        &format!(
+                            "   [AGENT] Custom execution succeeded. len={}",
+                            output.len()
+                        ),
+                    );
                     if let Some(ref c) = conn {
                         let ts = crate::ai_proxy::now_china();
                         let _ = crate::database::insert_detailed_api_log(
@@ -267,15 +334,19 @@ pub async fn intercept_and_execute(
                             "TOOL_EXEC",
                             "proxy",
                             &format!("Custom execution succeeded. len={}", output.len()),
-                            Some(&output)
+                            Some(&output),
                         );
                     }
                 }
                 Err(e) => {
                     output = format!("Agent execution failed: {}", e);
-                    crate::ai_proxy::log_write(log, None, None, None, &format!(
-                        "   [AGENT] Custom execution failed. error={}", e
-                    ));
+                    crate::ai_proxy::log_write(
+                        log,
+                        None,
+                        None,
+                        None,
+                        &format!("   [AGENT] Custom execution failed. error={}", e),
+                    );
                     if let Some(ref c) = conn {
                         let ts = crate::ai_proxy::now_china();
                         let _ = crate::database::insert_detailed_api_log(
@@ -284,7 +355,7 @@ pub async fn intercept_and_execute(
                             "ERROR",
                             "proxy",
                             &format!("Custom execution failed for tool '{}'", name),
-                            Some(&output)
+                            Some(&output),
                         );
                     }
                 }
@@ -295,20 +366,26 @@ pub async fn intercept_and_execute(
     output
 }
 
-
 /// 在将历史消息发给大模型前，遍历消息，将伪装的 exec_command / run_terminal_cmd 还原为原生工具调用。
 pub fn restore_history(messages: &mut Vec<Value>, _workspace_root: &std::path::Path) {
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
             if let Some(tcs) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
                 for tc in tcs.iter_mut() {
-                    let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let tc_id = tc
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let mut restored = false;
 
                     // 1. 优先从内存中恢复
                     if !tc_id.is_empty() {
-                        if let Some((real_name, real_args)) = crate::tool_call_registry::get(&tc_id) {
-                            if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
+                        if let Some((real_name, real_args)) = crate::tool_call_registry::get(&tc_id)
+                        {
+                            if let Some(func) =
+                                tc.get_mut("function").and_then(|v| v.as_object_mut())
+                            {
                                 func.insert("name".to_string(), json!(real_name));
                                 func.insert("arguments".to_string(), json!(real_args));
                                 restored = true;
@@ -319,23 +396,37 @@ pub fn restore_history(messages: &mut Vec<Value>, _workspace_root: &std::path::P
                     // 2. 内存中未找到，从消息的命令行 hex 字段中解码恢复 (Fallback)
                     if !restored {
                         if let Some(func) = tc.get_mut("function").and_then(|v| v.as_object_mut()) {
-                            let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let name = func
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if name == "exec_command" || name == "run_terminal_cmd" {
-                                if let Some(args_str) = func.get("arguments").and_then(|v| v.as_str()) {
+                                if let Some(args_str) =
+                                    func.get("arguments").and_then(|v| v.as_str())
+                                {
                                     if let Ok(args_json) = serde_json::from_str::<Value>(args_str) {
-                                        let cmd_opt = args_json.get("cmd")
+                                        let cmd_opt = args_json
+                                            .get("cmd")
                                             .or_else(|| args_json.get("command"))
                                             .and_then(|v| v.as_str());
                                         if let Some(cmd) = cmd_opt {
                                             if let Some(idx) = cmd.find("# PROXY_PAYLOAD: ") {
-                                                let payload_hex = cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
+                                                let payload_hex =
+                                                    cmd[idx + "# PROXY_PAYLOAD: ".len()..].trim();
                                                 let decoded = hex_decode(payload_hex);
                                                 if let Some(split_idx) = decoded.find('|') {
                                                     let real_name = &decoded[..split_idx];
                                                     let real_args_str = &decoded[split_idx + 1..];
-                                                    
-                                                    func.insert("name".to_string(), json!(real_name));
-                                                    func.insert("arguments".to_string(), json!(real_args_str));
+
+                                                    func.insert(
+                                                        "name".to_string(),
+                                                        json!(real_name),
+                                                    );
+                                                    func.insert(
+                                                        "arguments".to_string(),
+                                                        json!(real_args_str),
+                                                    );
                                                 }
                                             }
                                         }
@@ -367,39 +458,62 @@ fn get_subagent_provider() -> anyhow::Result<SubagentProvider> {
     }
     let config_content = std::fs::read_to_string(&ai_config_path)?;
     let config: Value = serde_json::from_str(&config_content)?;
-    
-    let default_provider_name = config.get("default_provider")
+
+    let default_provider_name = config
+        .get("default_provider")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing default_provider in config"))?;
-        
-    let providers = config.get("providers")
+
+    let provider_name = config
+        .get("vision_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or(default_provider_name);
+
+    let providers = config
+        .get("providers")
         .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow::anyhow!("missing providers in config"))?;
-        
-    let provider = providers.get(default_provider_name)
-        .ok_or_else(|| anyhow::anyhow!("default provider not found in providers"))?;
-        
-    let url = provider.get("url")
+
+    let provider = providers
+        .get(provider_name)
+        .ok_or_else(|| anyhow::anyhow!("vision/default provider not found in providers"))?;
+
+    if provider.get("supports_vision").and_then(|v| v.as_bool()) == Some(false) {
+        anyhow::bail!(
+            "provider '{}' is marked supports_vision=false; configure vision_provider with a multimodal provider",
+            provider_name
+        );
+    }
+
+    let url = provider
+        .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing url in provider"))?
         .to_string();
-        
-    let api_key = provider.get("api_key")
+
+    let api_key = provider
+        .get("api_key")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing api_key in provider"))?
         .to_string();
-        
-    let model = if let Some(model_map) = provider.get("model_map").and_then(|v| v.as_object()) {
+
+    let model = resolve_provider_default_model(provider)?;
+
+    Ok(SubagentProvider {
+        url,
+        api_key,
+        model,
+    })
+}
+
+fn resolve_provider_default_model(provider: &Value) -> anyhow::Result<String> {
+    if let Some(model_map) = provider.get("model_map").and_then(|v| v.as_object()) {
         if let Some(first_upstream) = model_map.values().next().and_then(|v| v.as_str()) {
-            first_upstream.to_string()
-        } else {
-            "gemini-2.5-pro".to_string()
+            return Ok(first_upstream.to_string());
         }
-    } else {
-        "gemini-2.5-pro".to_string()
-    };
-    
-    Ok(SubagentProvider { url, api_key, model })
+    }
+
+    anyhow::bail!("vision provider model_map is empty")
 }
 
 pub async fn analyze_image_via_vision_agent(
@@ -407,28 +521,25 @@ pub async fn analyze_image_via_vision_agent(
     focus_instruction: Option<&str>,
 ) -> anyhow::Result<String> {
     let provider_info = get_subagent_provider()?;
-    
-    // Determine the vision model. If the provider URL is xiaomimimo.com, we use mimo-v2.5.
-    let model = if provider_info.url.contains("xiaomimimo.com") {
-        "mimo-v2.5".to_string()
-    } else {
-        provider_info.model
-    };
-    
+
     let client = reqwest::Client::new();
     let upstream_url = format!("{}/chat/completions", provider_info.url);
-    
+
     let system_prompt = "You are a highly precise visual analysis agent. \
                          Your task is to analyze the provided image in detail. \
                          If the image is a screenshot containing code, error messages, or logs, perform high-fidelity OCR and transcribe the text/code exactly. \
                          If it is a diagram or UI layout, describe the structure, elements, and labels clearly. \
                          Focus on technical details.";
-                         
-    let mut text_instruction = "Analyze this image and describe/transcribe its contents in detail:".to_string();
+
+    let mut text_instruction =
+        "Analyze this image and describe/transcribe its contents in detail:".to_string();
     if let Some(focus) = focus_instruction {
-        text_instruction = format!("Re-examine this image based on user's feedback and focus on: {}", focus);
+        text_instruction = format!(
+            "Re-examine this image based on user's feedback and focus on: {}",
+            focus
+        );
     }
-                         
+
     let messages = vec![
         json!({
             "role": "system",
@@ -448,50 +559,60 @@ pub async fn analyze_image_via_vision_agent(
                     }
                 }
             ]
-        })
+        }),
     ];
-    
+
     let request_body = json!({
-        "model": model,
+        "model": provider_info.model,
         "messages": messages,
         "stream": false
     });
-    
-    let response = client.post(&upstream_url)
+
+    let response = client
+        .post(&upstream_url)
         .header("Authorization", format!("Bearer {}", provider_info.api_key))
         .json(&request_body)
         .send()
         .await?;
-        
+
     if !response.status().is_success() {
         let status = response.status();
         let body_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Vision agent API request failed (status {}): {}", status, body_text);
+        anyhow::bail!(
+            "Vision agent API request failed (status {}): {}",
+            status,
+            body_text
+        );
     }
-    
+
     let response_json: Value = response.json().await?;
-    let choice = response_json.get("choices")
+    let choice = response_json
+        .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|a| a.first())
         .ok_or_else(|| anyhow::anyhow!("Vision agent: invalid response choices"))?;
-        
-    let message = choice.get("message")
+
+    let message = choice
+        .get("message")
         .ok_or_else(|| anyhow::anyhow!("Vision agent: missing message"))?;
-        
-    let content = message.get("content")
+
+    let content = message
+        .get("content")
         .and_then(|c| c.as_str())
         .ok_or_else(|| anyhow::anyhow!("Vision agent: missing content"))?;
-        
+
     Ok(content.to_string())
 }
-
 
 fn execute_query_logs(
     conn: Option<&rusqlite::Connection>,
     arguments: &Value,
 ) -> anyhow::Result<String> {
     let conn = conn.ok_or_else(|| anyhow::anyhow!("Database connection not available"))?;
-    let limit = arguments.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50);
     let query_filter = arguments.get("query").and_then(|v| v.as_str());
 
     let sql = if let Some(filter) = query_filter {
@@ -541,7 +662,7 @@ async fn execute_local_tool(
     if name.starts_with("codex_workspace_mcp__") {
         name = name["codex_workspace_mcp__".len()..].to_string();
     }
-    
+
     if name == "query_logs" {
         let conn = crate::database::init_db(workspace.root()).ok();
         return execute_query_logs(conn.as_ref(), arguments);
@@ -549,7 +670,7 @@ async fn execute_local_tool(
     if name == "spawn_subagent" {
         return Box::pin(execute_spawn_subagent(workspace, arguments)).await;
     }
-    
+
     let params = json!({ "name": name, "arguments": arguments });
     let res = crate::mcp::call_tool(&**workspace, params).await?;
     let output = match res.as_str() {
@@ -563,12 +684,18 @@ async fn execute_spawn_subagent(
     workspace: &Arc<Workspace>,
     arguments: &Value,
 ) -> anyhow::Result<String> {
-    let role = arguments.get("role").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing role"))?;
-    let task = arguments.get("task").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("missing task"))?;
-    
+    let role = arguments
+        .get("role")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing role"))?;
+    let task = arguments
+        .get("task")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing task"))?;
+
     let provider_info = get_subagent_provider()?;
     let client = reqwest::Client::new();
-    
+
     let mut system_prompt = format!(
         "You are a specialized sub-agent.\n\
          Your Role: {}\n\
@@ -576,10 +703,10 @@ async fn execute_spawn_subagent(
          You can invoke tools. Focus entirely on resolving this specific task and output a concise report/answer when done.",
         role, task
     );
-    
+
     system_prompt.push_str("\n\n");
     system_prompt.push_str(&generate_agent_constraints());
-    
+
     let mut messages = vec![
         json!({
             "role": "system",
@@ -588,57 +715,65 @@ async fn execute_spawn_subagent(
         json!({
             "role": "user",
             "content": format!("Please start executing the task: {}", task)
-        })
+        }),
     ];
-    
+
     let mut tools = Vec::new();
     inject_workspace_tools(&mut tools);
-    
+
     let upstream_url = format!("{}/chat/completions", provider_info.url);
-    
+
     let max_iterations = 12;
     let mut current_iteration = 0;
-    
+
     loop {
         if current_iteration >= max_iterations {
             return Ok(format!(
                 "Sub-agent reached max iteration limit ({}) without finishing. Current context:\n{:?}",
-                max_iterations, messages.last()
+                max_iterations,
+                messages.last()
             ));
         }
         current_iteration += 1;
-        
+
         let request_body = json!({
             "model": provider_info.model,
             "messages": messages,
             "tools": tools,
             "stream": false
         });
-        
-        let response = client.post(&upstream_url)
+
+        let response = client
+            .post(&upstream_url)
             .header("Authorization", format!("Bearer {}", provider_info.api_key))
             .json(&request_body)
             .send()
             .await?;
-            
+
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Sub-agent upstream API request failed (status {}): {}", status, body_text);
+            anyhow::bail!(
+                "Sub-agent upstream API request failed (status {}): {}",
+                status,
+                body_text
+            );
         }
-        
+
         let response_json: Value = response.json().await?;
-        let choice = response_json.get("choices")
+        let choice = response_json
+            .get("choices")
             .and_then(|c| c.as_array())
             .and_then(|a| a.first())
             .ok_or_else(|| anyhow::anyhow!("Sub-agent: invalid upstream response choices"))?;
-            
-        let message = choice.get("message")
+
+        let message = choice
+            .get("message")
             .ok_or_else(|| anyhow::anyhow!("Sub-agent: missing message in response"))?;
-            
+
         let assistant_content = message.get("content").and_then(|c| c.as_str());
         let tool_calls = message.get("tool_calls").and_then(|t| t.as_array());
-        
+
         let mut assistant_message_to_add = json!({
             "role": "assistant"
         });
@@ -651,7 +786,7 @@ async fn execute_spawn_subagent(
             assistant_message_to_add["tool_calls"] = json!(tc);
         }
         messages.push(assistant_message_to_add);
-        
+
         if let Some(tcs) = tool_calls {
             if tcs.is_empty() {
                 if let Some(c) = assistant_content {
@@ -659,23 +794,38 @@ async fn execute_spawn_subagent(
                 }
                 anyhow::bail!("Sub-agent returned empty content and empty tool_calls");
             }
-            
+
             let mut futures = Vec::new();
             for (tc_idx, tc) in tcs.iter().enumerate() {
-                let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let name = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let arguments_str = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}").to_string();
+                let tc_id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let arguments_str = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}")
+                    .to_string();
                 let workspace_clone = workspace.clone();
-                
+
                 futures.push(async move {
-                    let arguments_val: Value = serde_json::from_str(&arguments_str).unwrap_or(json!({}));
+                    let arguments_val: Value =
+                        serde_json::from_str(&arguments_str).unwrap_or(json!({}));
                     let res = execute_local_tool(&workspace_clone, &name, &arguments_val).await;
                     (tc_idx, tc_id, res)
                 });
             }
-            
+
             let tool_results = futures::future::join_all(futures).await;
-            
+
             for (_idx, tc_id, result) in tool_results {
                 let output = match result {
                     Ok(s) => s,

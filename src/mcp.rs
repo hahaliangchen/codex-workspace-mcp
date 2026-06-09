@@ -184,11 +184,13 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     "name": "AST Indexing Status Summary",
                     "mimeType": "text/plain",
                     "description": "Check the status of Rust, TS, Python, and Go AST code indexing files in the current project workspace."
-                })
+                }),
             ];
 
             // If Rust index exists, expose it as a resource
-            if let Ok(st) = workspace.rust_index_status(IndexRustWorkspaceRequest { workspace_root: w_root.clone() }) {
+            if let Ok(st) = workspace.rust_index_status(IndexRustWorkspaceRequest {
+                workspace_root: w_root.clone(),
+            }) {
                 if st.exists {
                     resources.push(json!({
                         "uri": "mcp://codex-workspace-mcp/ast/rust/symbols",
@@ -200,7 +202,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
             }
 
             // If TS index exists, expose it
-            if let Ok(st) = workspace.ts_index_status(IndexTsWorkspaceRequest { workspace_root: w_root.clone() }) {
+            if let Ok(st) = workspace.ts_index_status(IndexTsWorkspaceRequest {
+                workspace_root: w_root.clone(),
+            }) {
                 if st.exists {
                     resources.push(json!({
                         "uri": "mcp://codex-workspace-mcp/ast/ts/symbols",
@@ -212,7 +216,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
             }
 
             // If Python index exists, expose it
-            if let Ok(st) = workspace.python_index_status(IndexPythonWorkspaceRequest { workspace_root: w_root.clone() }) {
+            if let Ok(st) = workspace.python_index_status(IndexPythonWorkspaceRequest {
+                workspace_root: w_root.clone(),
+            }) {
                 if st.exists {
                     resources.push(json!({
                         "uri": "mcp://codex-workspace-mcp/ast/python/symbols",
@@ -224,7 +230,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
             }
 
             // If Go index exists, expose it
-            if let Ok(st) = workspace.go_index_status(IndexGoWorkspaceRequest { workspace_root: w_root.clone() }) {
+            if let Ok(st) = workspace.go_index_status(IndexGoWorkspaceRequest {
+                workspace_root: w_root.clone(),
+            }) {
                 if st.exists {
                     resources.push(json!({
                         "uri": "mcp://codex-workspace-mcp/ast/go/symbols",
@@ -236,7 +244,10 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
             }
 
             // If work memory has records, expose it as a timeline resource
-            if let Ok(st) = workspace.list_work_memory(ListWorkMemoryRequest { workspace_root: w_root.clone(), limit: 100 }) {
+            if let Ok(st) = workspace.list_work_memory(ListWorkMemoryRequest {
+                workspace_root: w_root.clone(),
+                limit: 100,
+            }) {
                 if !st.memories.is_empty() {
                     resources.push(json!({
                         "uri": "mcp://codex-workspace-mcp/work-memory",
@@ -406,7 +417,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tools/call requires params.name"))?;
-    
+
     // 智能前缀剥离，确保带前缀和不带前缀的工具名都能 100% 成功执行
     if name.starts_with("codex_workspace_mcp__") {
         name = &name["codex_workspace_mcp__".len()..];
@@ -523,19 +534,21 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
                 IndexPythonWorkspaceRequest,
             >(arguments)?)?)?
         }
-        "list_python_symbols" => serde_json::to_value(
-            workspace
-                .list_python_symbols(serde_json::from_value::<ListPythonSymbolsRequest>(arguments)?)?,
-        )?,
+        "list_python_symbols" => {
+            serde_json::to_value(workspace.list_python_symbols(serde_json::from_value::<
+                ListPythonSymbolsRequest,
+            >(arguments)?)?)?
+        }
         "search_python_symbols" => {
             serde_json::to_value(workspace.search_python_symbols(serde_json::from_value::<
                 SearchPythonSymbolsRequest,
             >(arguments)?)?)?
         }
-        "read_python_symbol" => serde_json::to_value(
-            workspace
-                .read_python_symbol(serde_json::from_value::<ReadPythonSymbolRequest>(arguments)?)?,
-        )?,
+        "read_python_symbol" => {
+            serde_json::to_value(workspace.read_python_symbol(serde_json::from_value::<
+                ReadPythonSymbolRequest,
+            >(arguments)?)?)?
+        }
         "record_work_memory" => {
             serde_json::to_value(workspace.record_work_memory(serde_json::from_value::<
                 RecordWorkMemoryRequest,
@@ -562,15 +575,24 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             json!({ "skill": skill_name, "content": content })
         }
         "analyze_image" => {
-            let image_key = arguments.get("image_key").and_then(|v| v.as_str()).unwrap_or("");
+            let image_ref = arguments
+                .get("image_ref")
+                .or_else(|| arguments.get("image_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("latest");
             let focus_instruction = arguments.get("focus_instruction").and_then(|v| v.as_str());
-            
-            let raw_data = crate::vision_preprocess::get_registered_image(image_key)
-                .ok_or_else(|| anyhow::anyhow!("Image not found in in-memory registry for key: {}", image_key))?;
-                
-            let result = crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
-            
-            // Calculate hash and update the in-memory description cache with this refined description
+
+            let raw_data = crate::vision_preprocess::resolve_visible_image_ref(Some(image_ref))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "当前可见上下文中找不到可重新分析的原始图片。请基于已有图像分析报告回答；如果用户需要新的视觉检查，请让用户重新上传图片。"
+                    )
+                })?;
+
+            let result =
+                crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
+
+            // 只更新当前进程内的描述缓存，不维护跨轮图片 key -> 原图映射。
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             use std::hash::Hasher;
             hasher.write(raw_data.as_bytes());
@@ -989,14 +1011,13 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "analyze_image",
-            "description": "Analyze an image stored in the registry. If you need to re-examine or focus on a specific area based on user feedback (e.g. 'you missed something on the right'), provide the focus_instruction parameter.",
+            "description": "Analyze an image that is still visible in the current request context. Use this only when the current user explicitly asks to re-check an image/screenshot or needs fresh visual inspection. If no original image is visible, ask the user to upload it again.",
             "inputSchema": {
                 "type": "object",
-                "required": ["image_key"],
                 "properties": {
-                    "image_key": {
+                    "image_ref": {
                         "type": "string",
-                        "description": "The unique key of the image, e.g. 'img_a7f9c2' from the history."
+                        "description": "Optional visible image reference. Use 'latest' by default, or a 1-based index like '1' for the first visible image in the current context."
                     },
                     "focus_instruction": {
                         "type": "string",

@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
@@ -64,7 +64,6 @@ struct AiProxyState {
     db: Arc<Mutex<rusqlite::Connection>>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
@@ -95,7 +94,6 @@ macro_rules! log_db {
     };
 }
 
-
 /// Resolve a client-visible model name → (provider config, upstream model name).
 /// Looks up the model in the default provider's model_map; if not found,
 /// passes the model name through to the default provider as-is.
@@ -113,7 +111,11 @@ fn resolve_model<'a>(
             .into_response()
     })?;
 
-    let upstream = provider.model_map.get(model).cloned().unwrap_or_else(|| model.to_owned());
+    let upstream = provider
+        .model_map
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| model.to_owned());
     Ok((provider, upstream))
 }
 
@@ -166,14 +168,16 @@ async fn chat_completions(
     State(state): State<AiProxyState>,
     Json(mut body): Json<Value>,
 ) -> Response {
-    let had_image_input = crate::vision_preprocess::has_image_input(&body);
+    crate::vision_preprocess::set_visible_images_from_body(&body);
+    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_and_replace_images(
+    crate::vision_preprocess::process_latest_user_images(
         &mut body,
         &state.log,
         Some(&state.db),
         &mut image_stats,
-    ).await;
+    )
+    .await;
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -185,7 +189,11 @@ async fn chat_completions(
         }
     };
 
-    log!(&state.log, "=== /v1/chat/completions  model={}", client_model);
+    log!(
+        &state.log,
+        "=== /v1/chat/completions  model={}",
+        client_model
+    );
 
     let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
@@ -233,22 +241,18 @@ async fn chat_completions(
 }
 
 /// POST /v1/messages — Anthropic Messages API endpoint.
-async fn messages(
-    State(state): State<AiProxyState>,
-    Json(mut body): Json<Value>,
-) -> Response {
-    let had_image_input = crate::vision_preprocess::has_image_input(&body);
+async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>) -> Response {
+    crate::vision_preprocess::set_visible_images_from_body(&body);
+    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_and_replace_images(
+    crate::vision_preprocess::process_latest_user_images(
         &mut body,
         &state.log,
         Some(&state.db),
         &mut image_stats,
-    ).await;
-    let raw_model = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    )
+    .await;
+    let raw_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
     log!(&state.log, "=== /v1/messages  model={}", raw_model);
     log!(
@@ -306,7 +310,11 @@ async fn messages(
         log!(
             &state.log,
             "   openai body: {}",
-            fmt_body(serde_json::to_string(&openai_body).unwrap_or_default().as_bytes())
+            fmt_body(
+                serde_json::to_string(&openai_body)
+                    .unwrap_or_default()
+                    .as_bytes()
+            )
         );
         let url = format!("{}/chat/completions", provider.url);
         (openai_body, url)
@@ -339,11 +347,7 @@ async fn messages(
             }
         };
 
-        log!(
-            &state.log,
-            "   openai resp body: {}",
-            fmt_body(&body_bytes)
-        );
+        log!(&state.log, "   openai resp body: {}", fmt_body(&body_bytes));
 
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(openai_resp) => {
@@ -351,7 +355,11 @@ async fn messages(
                 log!(
                     &state.log,
                     "   anthropic resp: {}",
-                    fmt_body(serde_json::to_string(&anthropic_resp).unwrap_or_default().as_bytes())
+                    fmt_body(
+                        serde_json::to_string(&anthropic_resp)
+                            .unwrap_or_default()
+                            .as_bytes()
+                    )
                 );
                 (
                     status,
@@ -376,18 +384,7 @@ async fn messages(
 }
 
 /// POST /v1/responses — OpenAI Responses API endpoint for Codex.
-async fn responses(
-    State(state): State<AiProxyState>,
-    Json(mut body): Json<Value>,
-) -> Response {
-    let had_image_input = crate::vision_preprocess::has_image_input(&body);
-    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_and_replace_images(
-        &mut body,
-        &state.log,
-        Some(&state.db),
-        &mut image_stats,
-    ).await;
+async fn responses(State(state): State<AiProxyState>, Json(mut body): Json<Value>) -> Response {
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -399,6 +396,49 @@ async fn responses(
         }
     };
 
+    let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    if provider.raw_codex {
+        crate::responses::logging::log_request_body(
+            &state.log,
+            &state.db,
+            &state.sys_log,
+            &body,
+            &client_model,
+        );
+        log_db!(
+            &state,
+            "PROXY",
+            "proxy",
+            "   raw_codex provider detected; skipping proxy image preprocessing"
+        );
+        return crate::responses::raw::forward_raw_codex_responses(
+            &state.client,
+            state.log.clone(),
+            state.db.clone(),
+            &provider.url,
+            &provider.api_key,
+            &body,
+            upstream_model,
+            &client_model,
+        )
+        .await;
+    }
+
+    crate::vision_preprocess::set_visible_images_from_body(&body);
+    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
+    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
+    crate::vision_preprocess::process_latest_user_images(
+        &mut body,
+        &state.log,
+        Some(&state.db),
+        &mut image_stats,
+    )
+    .await;
+
     crate::responses::logging::log_request_body(
         &state.log,
         &state.db,
@@ -406,11 +446,6 @@ async fn responses(
         &body,
         &client_model,
     );
-
-    let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
 
     if had_image_input {
         let old_model = upstream_model.clone();
@@ -446,34 +481,28 @@ async fn responses(
         upstream_model
     );
 
-    if provider.raw_codex {
-        return crate::responses::raw::forward_raw_codex_responses(
-            &state.client,
-            state.log.clone(),
-            state.db.clone(),
-            &provider.url,
-            &provider.api_key,
-            &body,
-            upstream_model,
-            &client_model,
-        )
-        .await;
-    }
-
     log!(
         &state.log,
         "   Codex raw messages: {}",
-        body.get("messages").map(|m| serde_json::to_string(m).unwrap_or_default()).unwrap_or_default()
+        body.get("messages")
+            .map(|m| serde_json::to_string(m).unwrap_or_default())
+            .unwrap_or_default()
     );
     // input 详细内容见 system_prompt.log，主日志只打条目数量
     {
-        let count = body.get("input").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-        log!(&state.log, "   Codex raw input: [{} items → see system_prompt.log]", count);
+        let count = body
+            .get("input")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        log!(
+            &state.log,
+            "   Codex raw input: [{} items → see system_prompt.log]",
+            count
+        );
     }
 
     crate::responses::logging::log_diagnostics(&state.log, &state.db, &body);
-
-
 
     let prepared_chat = crate::responses::chat::prepare_chat_completions_request(
         &body,
@@ -504,7 +533,11 @@ async fn responses(
 // Server
 // ---------------------------------------------------------------------------
 
-pub async fn run(listener: TcpListener, config_path: &Path, workspace: Arc<crate::tools::Workspace>) -> anyhow::Result<()> {
+pub async fn run(
+    listener: TcpListener,
+    config_path: &Path,
+    workspace: Arc<crate::tools::Workspace>,
+) -> anyhow::Result<()> {
     let config: AiProxyConfig =
         serde_json::from_str(&tokio::fs::read_to_string(config_path).await?)?;
 
@@ -553,7 +586,6 @@ pub async fn run(listener: TcpListener, config_path: &Path, workspace: Arc<crate
         workspace,
         db,
     };
-
 
     let app = Router::new()
         .route("/v1/models", get(list_models))

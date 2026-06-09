@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::tools::Workspace;
 
@@ -62,6 +62,7 @@ pub async fn prepare_chat_messages(
 
     let mut temp_items = Vec::new();
     let mut current_normal_messages = normal_messages.clone();
+    let mut pending_tool_calls: Vec<Value> = Vec::new();
 
     if let Some(input_val) = body.get("input") {
         if let Some(input_str) = input_val.as_str() {
@@ -83,8 +84,14 @@ pub async fn prepare_chat_messages(
                     &mut system_parts,
                     &mut current_normal_messages,
                     &mut temp_items,
+                    &mut pending_tool_calls,
                 );
             }
+            flush_pending_tool_calls(
+                &mut pending_tool_calls,
+                &mut current_normal_messages,
+                &mut temp_items,
+            );
         }
     }
 
@@ -150,6 +157,7 @@ pub async fn prepare_chat_messages(
         }));
     }
     crate::agent::restore_history(&mut normal_messages, workspace.root());
+    normal_messages = sanitize_tool_message_pairs(normal_messages);
     final_messages.extend(normal_messages);
     final_messages
 }
@@ -170,6 +178,7 @@ fn push_input_item(
     system_parts: &mut Vec<String>,
     current_normal_messages: &mut Vec<Value>,
     temp_items: &mut Vec<TempItem>,
+    pending_tool_calls: &mut Vec<Value>,
 ) {
     let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let item_role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -182,26 +191,20 @@ fn push_input_item(
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
 
-            let val = json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments
-                        }
-                    }
-                ]
-            });
-            current_normal_messages.push(val.clone());
-            temp_items.push(TempItem::Normal(val));
+            pending_tool_calls.push(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }));
         } else {
             temp_items.push(TempItem::None);
         }
     } else if item_type == "function_call_output" {
+        flush_pending_tool_calls(pending_tool_calls, current_normal_messages, temp_items);
+
         if let Some(call_id) = item.get("call_id") {
             let output = item
                 .get("output")
@@ -226,8 +229,33 @@ fn push_input_item(
             temp_items.push(TempItem::None);
         }
     } else {
-        push_regular_input_item(item, item_role, system_parts, current_normal_messages, temp_items);
+        push_regular_input_item(
+            item,
+            item_role,
+            system_parts,
+            current_normal_messages,
+            temp_items,
+            pending_tool_calls,
+        );
     }
+}
+
+fn flush_pending_tool_calls(
+    pending_tool_calls: &mut Vec<Value>,
+    current_normal_messages: &mut Vec<Value>,
+    temp_items: &mut Vec<TempItem>,
+) {
+    if pending_tool_calls.is_empty() {
+        return;
+    }
+
+    let val = json!({
+        "role": "assistant",
+        "content": null,
+        "tool_calls": std::mem::take(pending_tool_calls)
+    });
+    current_normal_messages.push(val.clone());
+    temp_items.push(TempItem::Normal(val));
 }
 
 fn push_regular_input_item(
@@ -236,6 +264,7 @@ fn push_regular_input_item(
     system_parts: &mut Vec<String>,
     current_normal_messages: &mut Vec<Value>,
     temp_items: &mut Vec<TempItem>,
+    pending_tool_calls: &mut Vec<Value>,
 ) {
     let downstream_role = match item_role {
         "developer" => "system",
@@ -281,6 +310,7 @@ fn push_regular_input_item(
         }
 
         if !openai_content_parts.is_empty() && downstream_role != "system" {
+            flush_pending_tool_calls(pending_tool_calls, current_normal_messages, temp_items);
             let val = json!({
                 "role": downstream_role,
                 "content": normalize_message_content(&json!(openai_content_parts))
@@ -295,6 +325,7 @@ fn push_regular_input_item(
         if is_systemish_text(t_str) {
             system_parts.push(t_str.to_owned());
         } else {
+            flush_pending_tool_calls(pending_tool_calls, current_normal_messages, temp_items);
             let val = json!({
                 "role": downstream_role,
                 "content": t_str
@@ -317,11 +348,17 @@ fn normalize_message_content(content: &Value) -> Value {
             if let Some(obj) = item.as_object() {
                 let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                if item_type == "input_image" || item_type == "image_url" || obj.contains_key("image_url") {
-                    if item_type == "image_url" && obj.get("image_url").map_or(false, |v| v.is_object()) {
+                if item_type == "input_image"
+                    || item_type == "image_url"
+                    || obj.contains_key("image_url")
+                {
+                    if item_type == "image_url"
+                        && obj.get("image_url").map_or(false, |v| v.is_object())
+                    {
                         normalized_arr.push(item.clone());
                     } else {
-                        let url_str = obj.get("image_url")
+                        let url_str = obj
+                            .get("image_url")
                             .and_then(|v| v.as_str())
                             .or_else(|| obj.get("url").and_then(|v| v.as_str()))
                             .unwrap_or("");
@@ -372,4 +409,216 @@ fn is_systemish_text(text: &str) -> bool {
         || text.contains("<skills_instructions>")
         || text.contains("<app-context>")
         || text.contains("<system-reminder>")
+}
+
+fn sanitize_tool_message_pairs(messages: Vec<Value>) -> Vec<Value> {
+    let mut sanitized = Vec::new();
+    let mut idx = 0;
+
+    while idx < messages.len() {
+        let msg = &messages[idx];
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+        if role == "tool" {
+            idx += 1;
+            continue;
+        }
+
+        let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+            sanitized.push(msg.clone());
+            idx += 1;
+            continue;
+        };
+
+        if tool_calls.is_empty() {
+            let mut without_empty_tool_calls = msg.clone();
+            if let Some(obj) = without_empty_tool_calls.as_object_mut() {
+                obj.remove("tool_calls");
+            }
+            sanitized.push(without_empty_tool_calls);
+            idx += 1;
+            continue;
+        }
+
+        let mut tool_messages = Vec::new();
+        let mut cursor = idx + 1;
+        let mut valid_pair = true;
+
+        for tool_call in tool_calls {
+            let expected_id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(next_msg) = messages.get(cursor) else {
+                valid_pair = false;
+                break;
+            };
+            let is_matching_tool = next_msg.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && next_msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    == expected_id;
+            if !is_matching_tool {
+                valid_pair = false;
+                break;
+            }
+            tool_messages.push(next_msg.clone());
+            cursor += 1;
+        }
+
+        if valid_pair {
+            sanitized.push(msg.clone());
+            sanitized.extend(tool_messages);
+            idx = cursor;
+        } else {
+            sanitized.push(tool_calls_summary_message(tool_calls));
+            idx += 1;
+        }
+    }
+
+    sanitized
+}
+
+fn tool_calls_summary_message(tool_calls: &[Value]) -> Value {
+    let mut names = Vec::new();
+    for tool_call in tool_calls {
+        let name = tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .or_else(|| tool_call.get("name").and_then(|v| v.as_str()))
+            .unwrap_or("unknown_tool");
+        names.push(name.to_string());
+    }
+
+    json!({
+        "role": "assistant",
+        "content": format!(
+            "[Proxy sanitized invalid tool-call history: skipped unmatched tool call(s): {}]",
+            names.join(", ")
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batches_tool_calls_across_empty_input_items() {
+        let mut system_parts = Vec::new();
+        let mut current_normal_messages = Vec::new();
+        let mut temp_items = Vec::new();
+        let mut pending_tool_calls = Vec::new();
+
+        let call_a = json!({
+            "type": "function_call",
+            "call_id": "call_a",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"echo a\"}"
+        });
+        let empty_reasoning_placeholder = json!({
+            "type": "reasoning"
+        });
+        let call_b = json!({
+            "type": "function_call",
+            "call_id": "call_b",
+            "name": "exec_command",
+            "arguments": "{\"cmd\":\"echo b\"}"
+        });
+        let output_a = json!({
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "output": "a"
+        });
+
+        for item in [&call_a, &empty_reasoning_placeholder, &call_b, &output_a] {
+            push_input_item(
+                item,
+                &mut system_parts,
+                &mut current_normal_messages,
+                &mut temp_items,
+                &mut pending_tool_calls,
+            );
+        }
+
+        let assistant_calls = current_normal_messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(assistant_calls.len(), 1);
+        assert_eq!(
+            assistant_calls[0]["tool_calls"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(current_normal_messages[1]["role"], "tool");
+        assert_eq!(current_normal_messages[1]["tool_call_id"], "call_a");
+    }
+
+    #[test]
+    fn sanitizes_unmatched_assistant_tool_calls_to_text() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file_lines",
+                        "arguments": "{}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "assistant",
+                "content": "continued"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "orphan",
+                "content": "ignored"
+            }),
+        ];
+
+        let sanitized = sanitize_tool_message_pairs(messages);
+
+        assert_eq!(sanitized.len(), 2);
+        assert!(sanitized[0].get("tool_calls").is_none());
+        assert!(
+            sanitized[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("read_file_lines")
+        );
+        assert_eq!(sanitized[1]["content"], "continued");
+    }
+
+    #[test]
+    fn keeps_valid_assistant_tool_call_pairs() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{}"
+                    }
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_a",
+                "content": "ok"
+            }),
+        ];
+
+        let sanitized = sanitize_tool_message_pairs(messages);
+
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(sanitized[0]["tool_calls"][0]["id"], "call_a");
+        assert_eq!(sanitized[1]["tool_call_id"], "call_a");
+    }
 }

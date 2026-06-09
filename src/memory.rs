@@ -107,7 +107,9 @@ pub fn record(
         ],
     )?;
 
-    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let db_path = workspace_root_path
+        .join(".codex-workspace-mcp")
+        .join("codex_state.db");
     let display_path = db_path.to_string_lossy().replace('\\', "/");
 
     let memory = WorkMemory {
@@ -135,37 +137,42 @@ pub fn list(_server_root: &Path, request: ListWorkMemoryRequest) -> Result<ListW
          FROM memories
          WHERE workspace_root = ?
          ORDER BY time_unix DESC
-         LIMIT ?"
+         LIMIT ?",
     )?;
 
-    let rows = stmt.query_map(params![request.workspace_root, request.limit as i64], |row| {
-        let time_unix: i64 = row.get(0)?;
-        let workspace_root: String = row.get(1)?;
-        let summary: String = row.get(2)?;
-        let implementation: String = row.get(3)?;
-        let tests: String = row.get(4)?;
-        let risks: String = row.get(5)?;
-        let files_json: String = row.get(6)?;
+    let rows = stmt.query_map(
+        params![request.workspace_root, request.limit as i64],
+        |row| {
+            let time_unix: i64 = row.get(0)?;
+            let workspace_root: String = row.get(1)?;
+            let summary: String = row.get(2)?;
+            let implementation: String = row.get(3)?;
+            let tests: String = row.get(4)?;
+            let risks: String = row.get(5)?;
+            let files_json: String = row.get(6)?;
 
-        let files_changed: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
+            let files_changed: Vec<String> = serde_json::from_str(&files_json).unwrap_or_default();
 
-        Ok(WorkMemory {
-            time_unix: time_unix as u64,
-            workspace_root,
-            summary,
-            files_changed,
-            implementation,
-            tests,
-            risks,
-        })
-    })?;
+            Ok(WorkMemory {
+                time_unix: time_unix as u64,
+                workspace_root,
+                summary,
+                files_changed,
+                implementation,
+                tests,
+                risks,
+            })
+        },
+    )?;
 
     let mut memories = Vec::new();
     for row in rows {
         memories.push(row?);
     }
 
-    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let db_path = workspace_root_path
+        .join(".codex-workspace-mcp")
+        .join("codex_state.db");
     let display_path = db_path.to_string_lossy().replace('\\', "/");
 
     Ok(ListWorkMemoryResponse {
@@ -195,7 +202,7 @@ pub fn search(
              LOWER(files_changed) LIKE ?
            )
          ORDER BY time_unix DESC
-         LIMIT ?"
+         LIMIT ?",
     )?;
 
     let rows = stmt.query_map(
@@ -228,7 +235,7 @@ pub fn search(
                 tests,
                 risks,
             })
-        }
+        },
     )?;
 
     let mut matches = Vec::new();
@@ -236,7 +243,9 @@ pub fn search(
         matches.push(row?);
     }
 
-    let db_path = workspace_root_path.join(".codex-workspace-mcp").join("codex_state.db");
+    let db_path = workspace_root_path
+        .join(".codex-workspace-mcp")
+        .join("codex_state.db");
     let display_path = db_path.to_string_lossy().replace('\\', "/");
 
     Ok(SearchWorkMemoryResponse {
@@ -256,7 +265,8 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     fn temp_workspace(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("codex_workspace_{name}_{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("codex_workspace_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path

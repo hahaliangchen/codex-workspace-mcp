@@ -1,7 +1,7 @@
-use super::{gen_msg_id, write_sse_event};
 use super::responses_events::*;
 use super::responses_parse::*;
 use super::responses_tool_state::*;
+use super::{gen_msg_id, write_sse_event};
 use crate::tool_display::{self, ToolDisplayPhase};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -331,12 +331,19 @@ fn emit_tool_completion(
 
     state.done_emitted = true;
     let item_id = tool_item_id(msg_id, idx);
-    let final_args = tool_display::final_arguments(&state.id, &state.name, &state.arguments, route_map);
+    let final_args =
+        tool_display::final_arguments(&state.id, &state.name, &state.arguments, route_map);
 
     let args_done = build_tool_args_done_event(msg_id, &item_id, idx + 1, &state.id, &final_args);
     write_sse_event(out, "response.function_call.arguments.done", &args_done);
 
-    let item_done =
-        build_tool_item_done_event(msg_id, idx + 1, &item_id, &state.id, &display.name, &final_args);
+    let item_done = build_tool_item_done_event(
+        msg_id,
+        idx + 1,
+        &item_id,
+        &state.id,
+        &display.name,
+        &final_args,
+    );
     write_sse_event(out, "response.output_item.done", &item_done);
 }

@@ -1,6 +1,6 @@
 use super::responses_events::{build_completed_tool_output_item, tool_item_id};
 use crate::tool_display;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 #[derive(Default, Clone)]

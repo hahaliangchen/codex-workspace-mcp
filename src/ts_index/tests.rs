@@ -1,12 +1,8 @@
-use std::{
-    fs,
-    path::PathBuf,
-};
 use crate::ts_index::*;
+use std::{fs, path::PathBuf};
 
 fn temp_workspace(name: &str) -> PathBuf {
-    let path =
-        std::env::temp_dir().join(format!("codex_ts_index_{name}_{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("codex_ts_index_{name}_{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path
@@ -130,12 +126,11 @@ fn search_builds_index_when_missing() {
     // Bug2: 已迁移到 SQLite，不再生成 JSON 文件，改为验证元数据表中确实有索引记录
     {
         let conn = crate::database::init_db(&root).unwrap();
-        let ts_meta = crate::database::get_index_generated_at(
-            &conn,
-            &root.to_string_lossy(),
-            "ts",
+        let ts_meta = crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "ts");
+        assert!(
+            ts_meta.is_some(),
+            "index metadata should be recorded after auto-build"
         );
-        assert!(ts_meta.is_some(), "index metadata should be recorded after auto-build");
     }
     let _ = fs::remove_dir_all(root);
 }

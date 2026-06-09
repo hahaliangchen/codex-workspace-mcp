@@ -1,5 +1,4 @@
-use serde_json::{json, Value};
-
+use serde_json::{Value, json};
 
 // ============================================================================
 // Request: Anthropic Messages → OpenAI Chat Completions
@@ -82,9 +81,7 @@ fn convert_messages(body: &Value) -> Vec<Value> {
             "user" => {
                 let (plain_blocks, tool_results) = split_user(content);
                 // Only push user message if there are non-tool-result blocks
-                if !plain_blocks.is_empty()
-                    || plain_blocks.is_empty() && tool_results.is_empty()
-                {
+                if !plain_blocks.is_empty() || plain_blocks.is_empty() && tool_results.is_empty() {
                     messages.push(json!({"role": "user", "content": compact_text(plain_blocks)}));
                 }
                 for tr in tool_results {
@@ -164,7 +161,6 @@ fn clean_prompt_text(text: &str) -> String {
 
     cleaned
 }
-
 
 fn flatten_system(sys: &Value) -> String {
     let raw = if let Some(s) = sys.as_str() {
@@ -380,7 +376,10 @@ pub fn openai_to_anthropic(openai_body: &Value, model: &str) -> Value {
     let mut content_blocks: Vec<Value> = Vec::new();
 
     // text
-    if let Some(text) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+    if let Some(text) = message
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+    {
         if !text.is_empty() {
             content_blocks.push(json!({"type": "text", "text": text}));
         }
@@ -661,4 +660,3 @@ mod tests {
         assert_eq!(anth["stop_reason"], "tool_use");
     }
 }
-

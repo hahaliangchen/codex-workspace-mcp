@@ -231,22 +231,23 @@ pub fn index_workspace(root: &Path) -> Result<IndexGoWorkspaceResponse> {
 pub fn status(root: &Path) -> GoIndexStatus {
     let conn = crate::database::init_db(root).unwrap();
     // Bug3: 读取元数据中记录的真实索引创建时间
-    let generated_at = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "go",
-    );
+    let generated_at =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go");
     if generated_at.is_some() {
-        let symbols_indexed: i64 = conn.query_row(
-            "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
-        let files_indexed: i64 = conn.query_row(
-            "SELECT count(DISTINCT file_path) FROM go_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0)
-        ).unwrap_or(0);
+        let symbols_indexed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let files_indexed: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT file_path) FROM go_symbols WHERE workspace_root = ?",
+                rusqlite::params![root.to_string_lossy()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         return GoIndexStatus {
             index_path: "SQLite".to_string(),
             exists: true,
@@ -274,11 +275,13 @@ pub fn maybe_reindex_after_write(
         return Ok(None);
     }
     let conn = crate::database::init_db(root).unwrap();
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
-        rusqlite::params![root.to_string_lossy()],
-        |row| row.get(0)
-    ).unwrap_or(0);
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
+            rusqlite::params![root.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
     if count == 0 {
         return Ok(None);
     }
@@ -388,7 +391,11 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
 
     let mut conn = crate::database::init_db(root).unwrap();
     let tx = conn.transaction().unwrap();
-    tx.execute("DELETE FROM go_symbols WHERE workspace_root = ?", rusqlite::params![root.to_string_lossy()]).unwrap();
+    tx.execute(
+        "DELETE FROM go_symbols WHERE workspace_root = ?",
+        rusqlite::params![root.to_string_lossy()],
+    )
+    .unwrap();
 
     for item in builder.build() {
         let entry = match item {
@@ -415,7 +422,10 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
         for sym in parsed.symbols {
             let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
             let file_imports_json = serde_json::to_string(&parsed.file.imports).unwrap_or_default();
-            let kind = serde_json::to_string(&sym.kind).unwrap_or_default().trim_matches('"').to_string();
+            let kind = serde_json::to_string(&sym.kind)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
             tx.execute(
                 "INSERT INTO go_symbols (
                     id, workspace_root, name, kind, package_name, file_path, start_line, end_line,
@@ -434,12 +444,7 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
     // Bug3: 记录本次索引的实际时间戳
     let ts = now_unix();
     let meta_conn = crate::database::init_db(root).unwrap();
-    crate::database::upsert_index_metadata(
-        &meta_conn,
-        &root.to_string_lossy(),
-        "go",
-        ts,
-    ).unwrap();
+    crate::database::upsert_index_metadata(&meta_conn, &root.to_string_lossy(), "go", ts).unwrap();
     Ok((files_indexed, symbols_indexed))
 }
 
@@ -834,16 +839,18 @@ fn build_context(
     for item in index_symbols {
         id_to_symbol.insert(item.id.clone(), item);
     }
-    
+
     let mut file_infos = std::collections::BTreeMap::new();
     for sym in index_symbols {
-        file_infos.entry(sym.file_path.clone()).or_insert_with(|| GoFileInfo {
-            file_path: sym.file_path.clone(),
-            package: sym.package.clone(),
-            imports: sym.file_imports.clone(),
-        });
+        file_infos
+            .entry(sym.file_path.clone())
+            .or_insert_with(|| GoFileInfo {
+                file_path: sym.file_path.clone(),
+                package: sym.package.clone(),
+                imports: sym.file_imports.clone(),
+            });
     }
-    
+
     let callees: Vec<_> = symbol
         .calls
         .iter()
@@ -984,26 +991,30 @@ fn suggestion_reason(caller: &GoSymbol, matched: &GoSymbol) -> &'static str {
 }
 
 fn load_all_symbols(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
-    let conn = crate::database::init_db(root).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+    let conn =
+        crate::database::init_db(root).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
     let mut stmt = conn.prepare("SELECT id, name, kind, package_name, file_path, start_line, end_line, signature, docstring, receiver, receiver_name, receiver_type, calls_json, file_imports_json FROM go_symbols WHERE workspace_root = ?").map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
-    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
-        Ok(GoSymbol {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(GoSymbolKind::Function),
-            package: row.get(3)?,
-            file_path: row.get(4)?,
-            start_line: row.get(5)?,
-            end_line: row.get(6)?,
-            signature: row.get(7)?,
-            docstring: row.get(8)?,
-            receiver: row.get(9)?,
-            receiver_name: row.get(10)?,
-            receiver_type: row.get(11)?,
-            calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
-            file_imports: serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
+    let symbol_iter = stmt
+        .query_map(rusqlite::params![root.to_string_lossy()], |row| {
+            Ok(GoSymbol {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?))
+                    .unwrap_or(GoSymbolKind::Function),
+                package: row.get(3)?,
+                file_path: row.get(4)?,
+                start_line: row.get(5)?,
+                end_line: row.get(6)?,
+                signature: row.get(7)?,
+                docstring: row.get(8)?,
+                receiver: row.get(9)?,
+                receiver_name: row.get(10)?,
+                receiver_type: row.get(11)?,
+                calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+                file_imports: serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
+            })
         })
-    }).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+        .map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
 
     let mut symbols = Vec::new();
     for sym in symbol_iter {
@@ -1017,11 +1028,8 @@ fn load_all_symbols(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
 fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
     // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
     let conn = crate::database::init_db(root).unwrap();
-    let already_indexed = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "go",
-    ).is_some();
+    let already_indexed =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go").is_some();
     let symbols = load_all_symbols(root)?;
     if !already_indexed {
         index_workspace(root)?;
@@ -1327,12 +1335,11 @@ func (s *PptService) Save(topic string) error {
         // Bug2: 已迁移到 SQLite，不再生成 JSON 文件，改为验证元数据表中确实有索引记录
         {
             let conn = crate::database::init_db(&root).unwrap();
-            let ts = crate::database::get_index_generated_at(
-                &conn,
-                &root.to_string_lossy(),
-                "go",
+            let ts = crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go");
+            assert!(
+                ts.is_some(),
+                "index metadata should be recorded after auto-build"
             );
-            assert!(ts.is_some(), "index metadata should be recorded after auto-build");
         }
         let _ = fs::remove_dir_all(root);
     }

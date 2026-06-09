@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, PartialEq)]
 pub(super) enum SseData {
@@ -109,7 +109,10 @@ mod tests {
 
         match parsed {
             SseData::Json(value) => {
-                assert_eq!(extract_text_delta(choice_delta(first_choice(&value)).unwrap()), Some("hi"));
+                assert_eq!(
+                    extract_text_delta(choice_delta(first_choice(&value)).unwrap()),
+                    Some("hi")
+                );
             }
             other => panic!("expected json payload, got {:?}", other),
         }

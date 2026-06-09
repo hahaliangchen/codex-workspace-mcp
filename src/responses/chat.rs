@@ -1,12 +1,12 @@
 use axum::{
+    Json,
     body::{Body, Bytes},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use futures::stream::poll_fn;
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::Context;
@@ -25,12 +25,8 @@ pub async fn prepare_chat_completions_request(
     log: Arc<Mutex<std::fs::File>>,
     db: Arc<Mutex<rusqlite::Connection>>,
 ) -> PreparedResponsesChatRequest {
-    let final_messages = crate::responses::messages::prepare_chat_messages(
-        body,
-        workspace,
-        log.clone(),
-    )
-    .await;
+    let final_messages =
+        crate::responses::messages::prepare_chat_messages(body, workspace, log.clone()).await;
 
     let mut openai_body = json!({
         "model": upstream_model,

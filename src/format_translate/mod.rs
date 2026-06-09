@@ -9,8 +9,8 @@ mod responses_parse;
 mod responses_stream;
 mod responses_tool_state;
 
-pub use anthropic_stream::StreamConverter;
 pub use anthropic::{anthropic_to_openai, openai_to_anthropic};
+pub use anthropic_stream::StreamConverter;
 pub use responses_stream::ResponsesStreamConverter;
 use serde_json::Value;
 use std::time::SystemTime;
@@ -34,5 +34,3 @@ fn write_sse_event(out: &mut Vec<u8>, event: &str, data: &Value) {
     out.extend_from_slice(serde_json::to_string(data).unwrap_or_default().as_bytes());
     out.extend_from_slice(b"\n\n");
 }
-
-

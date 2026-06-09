@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ToolFormat {
@@ -194,15 +194,13 @@ fn push_chat_tool(
         }
     }
 
-    if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("function").is_some()
-    {
+    if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("function").is_some() {
         let mut tool_clone = t.clone();
         if prefix.is_some() {
             tool_clone["function"]["name"] = name_val;
         }
         converted_tools.push(tool_clone);
-    } else if t.get("type").and_then(|v| v.as_str()) == Some("function")
-        && t.get("name").is_some()
+    } else if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("name").is_some()
     {
         converted_tools.push(json!({
             "type": "function",

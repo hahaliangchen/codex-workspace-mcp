@@ -1,6 +1,6 @@
 use super::{gen_msg_id, write_sse_event};
 use crate::format_translate::anthropic::map_finish_reason;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 pub struct StreamConverter {
@@ -126,7 +126,9 @@ impl StreamConverter {
         }
 
         // ---- tool calls ----
-        let tc_deltas = delta.and_then(|d| d.get("tool_calls")).and_then(|tc| tc.as_array());
+        let tc_deltas = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|tc| tc.as_array());
         if let Some(tc_deltas) = tc_deltas {
             for tc in tc_deltas {
                 let tc_index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
@@ -253,7 +255,11 @@ impl StreamConverter {
             .or_insert_with(|| args.to_owned());
 
         // 为了知道当前工具到底叫什么，需要从 tc_raw_names 里查
-        let raw_name = self.tc_raw_names.get(&tc_index).cloned().unwrap_or_default();
+        let raw_name = self
+            .tc_raw_names
+            .get(&tc_index)
+            .cloned()
+            .unwrap_or_default();
 
         // Shell Hook: 过滤掉我们伪装工具的中间参数增量
         if !raw_name.starts_with("codex_workspace_mcp__") {

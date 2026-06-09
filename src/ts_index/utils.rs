@@ -80,28 +80,33 @@ pub(crate) fn walk_source_files(root: &Path) -> Vec<std::io::Result<PathBuf>> {
 }
 
 pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
-    let conn = crate::database::init_db(root).map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
+    let conn =
+        crate::database::init_db(root).map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
     let mut stmt = conn.prepare("SELECT id, name, kind, file_path, scope_path, parent_id, start_line, end_line, signature, docstring, export, export_names_json, calls_json, import_bindings_json, imports_json, re_exports_json FROM ts_symbols WHERE workspace_root = ?").map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
-    let symbol_iter = stmt.query_map(rusqlite::params![root.to_string_lossy()], |row| {
-        Ok(TsSymbol {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?)).unwrap_or(TsSymbolKind::Function),
-            file_path: row.get(3)?,
-            scope_path: row.get(4)?,
-            parent_id: row.get(5)?,
-            start_line: row.get(6)?,
-            end_line: row.get(7)?,
-            signature: row.get(8)?,
-            docstring: row.get(9)?,
-            export: row.get::<_, i64>(10)? != 0,
-            export_names: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
-            calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
-            import_bindings: serde_json::from_str(&row.get::<_, String>(13)?).unwrap_or_default(),
-            imports: serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
-            re_exports: serde_json::from_str(&row.get::<_, String>(15)?).unwrap_or_default(),
+    let symbol_iter = stmt
+        .query_map(rusqlite::params![root.to_string_lossy()], |row| {
+            Ok(TsSymbol {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: serde_json::from_str(&format!("\"{}\"", row.get::<_, String>(2)?))
+                    .unwrap_or(TsSymbolKind::Function),
+                file_path: row.get(3)?,
+                scope_path: row.get(4)?,
+                parent_id: row.get(5)?,
+                start_line: row.get(6)?,
+                end_line: row.get(7)?,
+                signature: row.get(8)?,
+                docstring: row.get(9)?,
+                export: row.get::<_, i64>(10)? != 0,
+                export_names: serde_json::from_str(&row.get::<_, String>(11)?).unwrap_or_default(),
+                calls: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
+                import_bindings: serde_json::from_str(&row.get::<_, String>(13)?)
+                    .unwrap_or_default(),
+                imports: serde_json::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
+                re_exports: serde_json::from_str(&row.get::<_, String>(15)?).unwrap_or_default(),
+            })
         })
-    }).map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
+        .map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
 
     let mut symbols = Vec::new();
     for sym in symbol_iter {
@@ -115,11 +120,8 @@ pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<TsSymbol>> 
 pub(crate) fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
     // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
     let conn = crate::database::init_db(root).unwrap();
-    let already_indexed = crate::database::get_index_generated_at(
-        &conn,
-        &root.to_string_lossy(),
-        "ts",
-    ).is_some();
+    let already_indexed =
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "ts").is_some();
     let symbols = load_all_symbols(root)?;
     if !already_indexed {
         index_workspace(root)?;
@@ -164,6 +166,3 @@ pub(crate) fn looks_like_component(name: &str) -> bool {
         .map(|ch| ch.is_uppercase())
         .unwrap_or(false)
 }
-
-
-

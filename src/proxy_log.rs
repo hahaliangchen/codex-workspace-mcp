@@ -39,12 +39,7 @@ pub fn write(
             let (short_msg, detail_opt) = split_db_message(msg);
 
             let _ = crate::database::insert_detailed_api_log(
-                &conn,
-                &ts,
-                action_str,
-                role_str,
-                &short_msg,
-                detail_opt,
+                &conn, &ts, action_str, role_str, &short_msg, detail_opt,
             );
         }
     }
