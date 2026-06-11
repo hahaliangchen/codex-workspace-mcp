@@ -55,7 +55,6 @@ struct AiProxyState {
     client: Client,
     log: Arc<Mutex<std::fs::File>>,
     workspace: Arc<crate::tools::Workspace>,
-    db: Arc<Mutex<rusqlite::Connection>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,23 +63,23 @@ struct AiProxyState {
 
 pub fn log_write(
     log: &Mutex<std::fs::File>,
-    db: Option<&Mutex<rusqlite::Connection>>,
+    write_db: bool,
     action: Option<&str>,
     role: Option<&str>,
     msg: &str,
 ) {
-    crate::proxy_log::write(log, db, action, role, msg);
+    crate::proxy_log::write(log, write_db, action, role, msg);
 }
 
 macro_rules! log {
     ($log:expr, $($arg:tt)*) => {
-        log_write(&*$log, None, None, None, &format!($($arg)*))
+        log_write(&*$log, false, None, None, &format!($($arg)*))
     };
 }
 
 macro_rules! log_db {
     ($state:expr, $action:expr, $role:expr, $($arg:tt)*) => {
-        log_write(&*$state.log, Some(&*$state.db), Some($action), Some($role), &format!($($arg)*))
+        log_write(&*$state.log, true, Some($action), Some($role), &format!($($arg)*))
     };
 }
 
@@ -189,7 +188,7 @@ async fn chat_completions(
     crate::vision_preprocess::process_latest_user_images(
         &mut body,
         &state.log,
-        Some(&state.db),
+        true,
         &mut image_stats,
     )
     .await;
@@ -265,7 +264,7 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
     crate::vision_preprocess::process_latest_user_images(
         &mut body,
         &state.log,
-        Some(&state.db),
+        true,
         &mut image_stats,
     )
     .await;
@@ -420,13 +419,7 @@ async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -
         Err(resp) => return resp,
     };
 
-    crate::responses::logging::log_request_body(
-        &state.log,
-        &state.db,
-        &conversation_id,
-        &body,
-        &client_model,
-    );
+    crate::responses::logging::log_request_body(&state.log, &conversation_id, &body, &client_model);
     log_db!(
         &state,
         "PROXY",
@@ -437,7 +430,6 @@ async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -
         state.client.clone(),
         state.workspace.clone(),
         state.log.clone(),
-        state.db.clone(),
         provider.url.clone(),
         provider.api_key.clone(),
         body,
@@ -466,9 +458,6 @@ pub async fn run(
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
-    let conn = crate::database::init_db(workspace.root())?;
-    let db = Arc::new(Mutex::new(conn));
-
     let log_dir = config_path.with_file_name("logs");
     let log_path = crate::proxy_log::init_async(log_dir, workspace.root().to_path_buf())?;
     let log_file = std::fs::OpenOptions::new()
@@ -491,7 +480,6 @@ pub async fn run(
         client,
         log,
         workspace,
-        db,
     };
 
     let app = Router::new()

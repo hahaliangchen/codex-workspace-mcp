@@ -194,25 +194,25 @@ pub struct ImageProcessStats {
 pub fn process_and_replace_images<'a>(
     val: &'a mut Value,
     log: &'a Arc<Mutex<std::fs::File>>,
-    db: Option<&'a Mutex<rusqlite::Connection>>,
+    write_db: bool,
     image_stats: &'a mut ImageProcessStats,
 ) -> futures::future::BoxFuture<'a, ()> {
     async move {
         if let Some(url) = extract_image_url(val) {
             image_stats.seen += 1;
-            *val = analyze_image_node(url, log, db, image_stats).await;
+            *val = analyze_image_node(url, log, write_db, image_stats).await;
             return;
         }
 
         match val {
             Value::Object(map) => {
                 for v in map.values_mut() {
-                    process_and_replace_images(v, log, db, image_stats).await;
+                    process_and_replace_images(v, log, write_db, image_stats).await;
                 }
             }
             Value::Array(arr) => {
                 for v in arr {
-                    process_and_replace_images(v, log, db, image_stats).await;
+                    process_and_replace_images(v, log, write_db, image_stats).await;
                 }
             }
             _ => {}
@@ -224,27 +224,27 @@ pub fn process_and_replace_images<'a>(
 async fn analyze_image_node(
     url: String,
     log: &Arc<Mutex<std::fs::File>>,
-    db: Option<&Mutex<rusqlite::Connection>>,
+    write_db: bool,
     image_stats: &mut ImageProcessStats,
 ) -> Value {
     let hash_str = image_hash(&url);
     if let Some(description) = get_cached_description(&hash_str) {
         image_stats.cache_hits += 1;
-        log_image_cache_hit(log, db, &hash_str);
+        log_image_cache_hit(log, write_db, &hash_str);
         return image_report_value(&description);
     }
 
-    log_image_analysis_start(log, db, &hash_str, url.len());
+    log_image_analysis_start(log, write_db, &hash_str, url.len());
     match crate::agent::analyze_image_via_vision_agent(&url, None).await {
         Ok(description) => {
             insert_cached_description(&hash_str, &description);
             image_stats.analyzed += 1;
-            log_image_analysis_success(log, db, description.len());
+            log_image_analysis_success(log, write_db, description.len());
             image_report_value(&description)
         }
         Err(e) => {
             image_stats.failed += 1;
-            log_image_analysis_failure(log, db, &e.to_string());
+            log_image_analysis_failure(log, write_db, &e.to_string());
             image_failure_value(&e.to_string())
         }
     }
@@ -271,14 +271,10 @@ fn image_failure_value(error: &str) -> Value {
     })
 }
 
-fn log_image_cache_hit(
-    log: &Arc<Mutex<std::fs::File>>,
-    db: Option<&Mutex<rusqlite::Connection>>,
-    hash: &str,
-) {
+fn log_image_cache_hit(log: &Arc<Mutex<std::fs::File>>, write_db: bool, hash: &str) {
     crate::ai_proxy::log_write(
         &**log,
-        db,
+        write_db,
         Some("VISION_CACHE_HIT"),
         Some("proxy"),
         &format!(
@@ -290,13 +286,13 @@ fn log_image_cache_hit(
 
 fn log_image_analysis_start(
     log: &Arc<Mutex<std::fs::File>>,
-    db: Option<&Mutex<rusqlite::Connection>>,
+    write_db: bool,
     hash: &str,
     url_len: usize,
 ) {
     crate::ai_proxy::log_write(
         &**log,
-        db,
+        write_db,
         Some("VISION_AGENT"),
         Some("proxy"),
         &format!(
@@ -308,12 +304,12 @@ fn log_image_analysis_start(
 
 fn log_image_analysis_success(
     log: &Arc<Mutex<std::fs::File>>,
-    db: Option<&Mutex<rusqlite::Connection>>,
+    write_db: bool,
     description_len: usize,
 ) {
     crate::ai_proxy::log_write(
         &**log,
-        db,
+        write_db,
         Some("VISION_AGENT_SUCCESS"),
         Some("proxy"),
         &format!(
@@ -323,14 +319,10 @@ fn log_image_analysis_success(
     );
 }
 
-fn log_image_analysis_failure(
-    log: &Arc<Mutex<std::fs::File>>,
-    db: Option<&Mutex<rusqlite::Connection>>,
-    error: &str,
-) {
+fn log_image_analysis_failure(log: &Arc<Mutex<std::fs::File>>, write_db: bool, error: &str) {
     crate::ai_proxy::log_write(
         &**log,
-        db,
+        write_db,
         Some("ERROR"),
         Some("proxy"),
         &format!("!! Vision agent analysis failed: {}", error),
@@ -340,7 +332,7 @@ fn log_image_analysis_failure(
 pub fn process_latest_user_images<'a>(
     body: &'a mut Value,
     log: &'a Arc<Mutex<std::fs::File>>,
-    db: Option<&'a Mutex<rusqlite::Connection>>,
+    write_db: bool,
     image_stats: &'a mut ImageProcessStats,
 ) -> futures::future::BoxFuture<'a, ()> {
     async move {
@@ -350,7 +342,7 @@ pub fn process_latest_user_images<'a>(
                 .rev()
                 .find(|item| item.get("role").and_then(|v| v.as_str()) == Some("user"))
             {
-                process_and_replace_images(item, log, db, image_stats).await;
+                process_and_replace_images(item, log, write_db, image_stats).await;
             }
             return;
         }
@@ -361,12 +353,12 @@ pub fn process_latest_user_images<'a>(
                 .rev()
                 .find(|item| item.get("role").and_then(|v| v.as_str()) == Some("user"))
             {
-                process_and_replace_images(item, log, db, image_stats).await;
+                process_and_replace_images(item, log, write_db, image_stats).await;
             }
             return;
         }
 
-        process_and_replace_images(body, log, db, image_stats).await;
+        process_and_replace_images(body, log, write_db, image_stats).await;
     }
     .boxed()
 }

@@ -26,7 +26,7 @@ pub async fn forward_to_upstream(
 ) -> Response {
     crate::ai_proxy::log_write(
         &*log,
-        None,
+        false,
         None,
         None,
         &format!(
@@ -49,7 +49,7 @@ pub async fn forward_to_upstream(
             let status = resp.status();
             crate::ai_proxy::log_write(
                 &*log,
-                None,
+                false,
                 None,
                 None,
                 &format!(
@@ -68,7 +68,7 @@ pub async fn forward_to_upstream(
         Err(e) => {
             crate::ai_proxy::log_write(
                 &*log,
-                None,
+                false,
                 None,
                 None,
                 &format!("!! CONNECT ERROR  {}", e),
@@ -116,7 +116,7 @@ async fn forward_chat_stream(
                 Err(e) => {
                     crate::ai_proxy::log_write(
                         &*log2,
-                        None,
+                        false,
                         None,
                         None,
                         &format!("!! STREAM ERROR  {}", e),
@@ -168,7 +168,7 @@ async fn forward_non_streaming_body(
         Ok(body_bytes) => {
             crate::ai_proxy::log_write(
                 &*log,
-                None,
+                false,
                 None,
                 None,
                 &format!(
@@ -187,7 +187,7 @@ async fn forward_non_streaming_body(
                 })
         }
         Err(e) => {
-            crate::ai_proxy::log_write(&*log, None, None, None, &format!("!! READ ERROR  {}", e));
+            crate::ai_proxy::log_write(&*log, false, None, None, &format!("!! READ ERROR  {}", e));
             error!(%e, "failed to read upstream body");
             (
                 StatusCode::BAD_GATEWAY,

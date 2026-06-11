@@ -18,7 +18,6 @@ pub async fn run_responses_agent(
     client: Client,
     workspace: Arc<crate::tools::Workspace>,
     log: Arc<Mutex<std::fs::File>>,
-    db: Arc<Mutex<rusqlite::Connection>>,
     provider_url: String,
     api_key: String,
     body: Value,
@@ -36,7 +35,6 @@ pub async fn run_responses_agent(
             client,
             workspace,
             log,
-            db,
             provider_url,
             api_key,
             body,
@@ -73,7 +71,6 @@ async fn run_agent_loop(
     client: Client,
     workspace: Arc<crate::tools::Workspace>,
     log: Arc<Mutex<std::fs::File>>,
-    db: Arc<Mutex<rusqlite::Connection>>,
     provider_url: String,
     api_key: String,
     mut body: Value,
@@ -86,7 +83,7 @@ async fn run_agent_loop(
     body["stream"] = json!(false);
 
     let prepared_tools = crate::tool_prepare::prepare_responses_tools(body.get("tools"));
-    log_blocked_tools(&log, &db, &prepared_tools.blocked);
+    log_blocked_tools(&log, &prepared_tools.blocked);
     if !prepared_tools.tools.is_empty() {
         body["tools"] = json!(prepared_tools.tools);
     }
@@ -132,7 +129,7 @@ async fn run_agent_loop(
         let tool_calls = collect_tool_calls(&output_items);
         if tool_calls.is_empty() {
             let text = collect_final_text(&response_json);
-            log_agent_summary(&log, &db, steps_run, total_tool_calls, text.chars().count());
+            log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
             if text.trim().is_empty() {
                 send_text(
                     tx,
@@ -191,7 +188,7 @@ async fn run_agent_loop(
         "\n[agent] 达到最大工具循环次数，已停止。请缩小问题或补充下一步指令。\n",
     )
     .await;
-    log_agent_summary(&log, &db, steps_run, total_tool_calls, 0);
+    log_agent_summary(&log, steps_run, total_tool_calls, 0);
     Ok(())
 }
 
@@ -210,7 +207,6 @@ fn ensure_agent_instructions(body: &mut Value) {
 
 fn log_blocked_tools(
     log: &Mutex<std::fs::File>,
-    db: &Mutex<rusqlite::Connection>,
     blocked_tools: &[crate::tool_prepare::BlockedTool],
 ) {
     for blocked in blocked_tools {
@@ -220,7 +216,7 @@ fn log_blocked_tools(
         };
         crate::proxy_log::write(
             log,
-            Some(db),
+            true,
             Some("TOOL_BLOCKED"),
             Some("proxy"),
             &format!(
@@ -233,14 +229,13 @@ fn log_blocked_tools(
 
 fn log_agent_summary(
     log: &Mutex<std::fs::File>,
-    db: &Mutex<rusqlite::Connection>,
     steps: usize,
     tool_calls: usize,
     final_chars: usize,
 ) {
     crate::proxy_log::write(
         log,
-        Some(db),
+        true,
         Some("AGENT_DONE"),
         Some("proxy"),
         &format!(

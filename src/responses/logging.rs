@@ -6,12 +6,11 @@ const MAX_REQUEST_LOG_CHARS: usize = 1 * 1024;
 
 pub fn log_request_body(
     log: &Mutex<std::fs::File>,
-    db: &Mutex<rusqlite::Connection>,
     conversation_id: &str,
     body: &Value,
     client_model: &str,
 ) {
-    record_conversation_turn(db, conversation_id, body, client_model);
+    record_conversation_turn(conversation_id, body, client_model);
 
     let input_count = body
         .get("input")
@@ -22,7 +21,7 @@ pub fn log_request_body(
 
     crate::ai_proxy::log_write(
         log,
-        Some(db),
+        true,
         Some("REQ_IN"),
         Some("user"),
         &format!(
@@ -34,13 +33,7 @@ pub fn log_request_body(
     );
 }
 
-fn record_conversation_turn(
-    db: &Mutex<rusqlite::Connection>,
-    conversation_id: &str,
-    body: &Value,
-    client_model: &str,
-) {
-    let ts = crate::proxy_log::now_china();
+fn record_conversation_turn(conversation_id: &str, body: &Value, client_model: &str) {
     let input_count = body
         .get("input")
         .and_then(|v| v.as_array())
@@ -60,17 +53,13 @@ fn record_conversation_turn(
         MAX_RECORDED_TURN_CHARS,
     );
 
-    if let Ok(conn) = db.lock() {
-        let _ = crate::database::insert_conversation_message(
-            &conn,
-            conversation_id,
-            &ts,
-            "responses.turn",
-            "user",
-            "ai_dialogue",
-            &content,
-        );
-    }
+    crate::proxy_log::write_conversation_message(
+        conversation_id,
+        "responses.turn",
+        "user",
+        "ai_dialogue",
+        &content,
+    );
 }
 
 fn latest_user_summary(body: &Value) -> String {

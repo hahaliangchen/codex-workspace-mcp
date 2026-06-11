@@ -93,6 +93,27 @@ fn run_async_logger(log_path: PathBuf, workspace_root: PathBuf, rx: mpsc::Receiv
         if event.write_db {
             let action = event.action.as_deref().unwrap_or("INFO");
             let role = event.role.as_deref().unwrap_or("proxy");
+            if action == "CONVERSATION" {
+                if let (Some(conn), Some(conversation_id), Some(detail)) = (
+                    db_conn.as_ref(),
+                    event.conversation_id.as_deref(),
+                    event.detail.as_deref(),
+                ) {
+                    let mut parts = detail.splitn(2, '\n');
+                    let source = parts.next().unwrap_or("responses.turn");
+                    let message_type = parts.next().unwrap_or("ai_dialogue");
+                    let _ = crate::database::insert_conversation_message(
+                        conn,
+                        conversation_id,
+                        &event.ts,
+                        source,
+                        role,
+                        message_type,
+                        &event.msg,
+                    );
+                }
+                continue;
+            }
             if should_skip_db_log(role, &event.msg) {
                 continue;
             }
@@ -131,7 +152,7 @@ fn current_conversation_id() -> Option<String> {
 /// Write a line to the shared log file and optionally SQLite database.
 pub fn write(
     log: &Mutex<std::fs::File>,
-    db: Option<&Mutex<rusqlite::Connection>>,
+    write_db: bool,
     action: Option<&str>,
     role: Option<&str>,
     msg: &str,
@@ -146,7 +167,7 @@ pub fn write(
             action: action.map(ToOwned::to_owned),
             role: role.map(ToOwned::to_owned),
             write_file: true,
-            write_db: db.is_some(),
+            write_db,
         });
         return;
     }
@@ -157,7 +178,7 @@ pub fn write(
         let _ = f.flush();
     }
 
-    if let Some(db_lock) = db {
+    if write_db {
         let action_str = action.unwrap_or("INFO");
         let role_str = role.unwrap_or("proxy");
 
@@ -165,9 +186,10 @@ pub fn write(
             return;
         }
 
-        if let Ok(conn) = db_lock.lock() {
+        let workspace_root =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Ok(conn) = crate::database::init_db(&workspace_root) {
             let (short_msg, detail_opt) = split_db_message(msg);
-
             let _ = crate::database::insert_detailed_api_log_with_conversation(
                 &conn,
                 current_conversation_id().as_deref(),
@@ -178,6 +200,27 @@ pub fn write(
                 detail_opt,
             );
         }
+    }
+}
+
+pub fn write_conversation_message(
+    conversation_id: &str,
+    source: &str,
+    role: &str,
+    message_type: &str,
+    content: &str,
+) {
+    if let Some(sender) = ASYNC_LOGGER.get() {
+        let _ = sender.send(LogEvent {
+            ts: now_china(),
+            conversation_id: Some(conversation_id.to_string()),
+            msg: content.to_string(),
+            detail: Some(format!("{source}\n{message_type}")),
+            action: Some("CONVERSATION".to_string()),
+            role: Some(role.to_string()),
+            write_file: false,
+            write_db: true,
+        });
     }
 }
 
