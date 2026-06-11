@@ -50,8 +50,6 @@ const NOISE_DIRS: &[&str] = &[
 
 #[derive(Debug, Error)]
 pub enum ToolError {
-    #[error("path is outside the workspace: {0}")]
-    OutsideWorkspace(String),
     #[error("absolute paths are not accepted: {0}")]
     AbsolutePath(String),
     #[error("parent traversal is not accepted: {0}")]
@@ -111,7 +109,7 @@ pub struct ListDirRequest {
     pub recursive: bool,
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub respect_gitignore: bool,
 }
 
@@ -184,7 +182,11 @@ pub struct SearchTextRequest {
     #[serde(default = "default_dot")]
     pub path: String,
     #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
     pub case_sensitive: bool,
+    #[serde(default)]
+    pub respect_gitignore: bool,
     #[serde(default = "default_max_matches")]
     pub max_matches: usize,
 }
@@ -299,7 +301,7 @@ impl Workspace {
         Ok(WorkspaceInfo {
             workspace_root: workspace.root.display().to_string(),
             platform: std::env::consts::OS.to_string(),
-            allowed_scope: "read and write paths below workspace_root only".to_string(),
+            allowed_scope: "file tools can read/write absolute paths accessible to the MCP server; relative paths resolve below workspace_root".to_string(),
             default_ignored_dirs: NOISE_DIRS.to_vec(),
         })
     }
@@ -314,6 +316,7 @@ impl Workspace {
         let mut builder = WalkBuilder::new(&root);
         builder
             .hidden(false)
+            .ignore(request.respect_gitignore)
             .git_ignore(request.respect_gitignore)
             .git_exclude(request.respect_gitignore)
             .parents(request.respect_gitignore)
@@ -402,7 +405,8 @@ impl Workspace {
 
     pub fn search_text(&self, request: SearchTextRequest) -> Result<SearchTextResponse> {
         let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let root = workspace.resolve_existing(&request.path)?;
+        let roots = workspace.resolve_search_roots(&request)?;
+        let root_filters = workspace.search_root_filters(&roots)?;
         let max_matches = request.max_matches.max(1);
         let mut matches = Vec::new();
         let mut truncated = false;
@@ -413,191 +417,66 @@ impl Workspace {
             let root_str = workspace.root.to_string_lossy().to_string();
             let query_name = request.query.trim();
 
-            let has_rust =
-                crate::database::get_index_generated_at(&conn, &root_str, "rust").is_some();
-            let has_go = crate::database::get_index_generated_at(&conn, &root_str, "go").is_some();
-            let has_ts = crate::database::get_index_generated_at(&conn, &root_str, "ts").is_some();
-            let has_py =
-                crate::database::get_index_generated_at(&conn, &root_str, "python").is_some();
-
-            // A. Rust Symbols
-            if has_rust {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT kind, file_path, start_line, signature FROM rust_symbols WHERE name = ? AND workspace_root = ?"
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
-                        while let Ok(Some(row)) = rows.next() {
-                            let kind: String = row.get(0).unwrap_or_default();
-                            let file_path: String = row.get(1).unwrap_or_default();
-                            let start_line: usize = row.get(2).unwrap_or(0);
-                            let signature: String = row.get(3).unwrap_or_default();
-                            
-                            if matches.len() >= max_matches {
-                                truncated = true;
-                                break;
-                            }
-                            matches.push(TextMatch {
-                                path: file_path.clone(),
-                                line: start_line,
-                                column: 1,
-                                text: format!("[Symbol Definition (rust {})] {}", kind, signature),
-                            });
-                            seen_symbols.insert((file_path, start_line));
-                        }
-                    }
+            for (lang, table) in [
+                ("rust", "rust_symbols"),
+                ("go", "go_symbols"),
+                ("ts", "ts_symbols"),
+                ("python", "python_symbols"),
+            ] {
+                if truncated {
+                    break;
                 }
-            }
-
-            // B. Go Symbols
-            // B. Go Symbols
-            if has_go && !truncated {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT kind, file_path, start_line, signature FROM go_symbols WHERE name = ? AND workspace_root = ?"
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
-                        while let Ok(Some(row)) = rows.next() {
-                            let kind: String = row.get(0).unwrap_or_default();
-                            let file_path: String = row.get(1).unwrap_or_default();
-                            let start_line: usize = row.get(2).unwrap_or(0);
-                            let signature: String = row.get(3).unwrap_or_default();
-                            
-                            if matches.len() >= max_matches {
-                                truncated = true;
-                                break;
-                            }
-                            matches.push(TextMatch {
-                                path: file_path.clone(),
-                                line: start_line,
-                                column: 1,
-                                text: format!("[Symbol Definition (go {})] {}", kind, signature),
-                            });
-                            seen_symbols.insert((file_path, start_line));
-                        }
-                    }
-                }
-            }
-
-            // C. TS/JS Symbols
-            if has_ts && !truncated {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT kind, file_path, start_line, signature FROM ts_symbols WHERE name = ? AND workspace_root = ?"
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
-                        while let Ok(Some(row)) = rows.next() {
-                            let kind: String = row.get(0).unwrap_or_default();
-                            let file_path: String = row.get(1).unwrap_or_default();
-                            let start_line: usize = row.get(2).unwrap_or(0);
-                            let signature: String = row.get(3).unwrap_or_default();
-                            
-                            if matches.len() >= max_matches {
-                                truncated = true;
-                                break;
-                            }
-                            matches.push(TextMatch {
-                                path: file_path.clone(),
-                                line: start_line,
-                                column: 1,
-                                text: format!("[Symbol Definition (ts {})] {}", kind, signature),
-                            });
-                            seen_symbols.insert((file_path, start_line));
-                        }
-                    }
-                }
-            }
-
-            // D. Python Symbols
-            if has_py && !truncated {
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT kind, file_path, start_line, signature FROM python_symbols WHERE name = ? AND workspace_root = ?"
-                ) {
-                    if let Ok(mut rows) = stmt.query(rusqlite::params![query_name, root_str]) {
-                        while let Ok(Some(row)) = rows.next() {
-                            let kind: String = row.get(0).unwrap_or_default();
-                            let file_path: String = row.get(1).unwrap_or_default();
-                            let start_line: usize = row.get(2).unwrap_or(0);
-                            let signature: String = row.get(3).unwrap_or_default();
-                            
-                            if matches.len() >= max_matches {
-                                truncated = true;
-                                break;
-                            }
-                            matches.push(TextMatch {
-                                path: file_path.clone(),
-                                line: start_line,
-                                column: 1,
-                                text: format!("[Symbol Definition (python {})] {}", kind, signature),
-                            });
-                            seen_symbols.insert((file_path, start_line));
-                        }
-                    }
+                if crate::database::get_index_generated_at(&conn, &root_str, lang).is_some() {
+                    truncated = query_indexed_symbol_table(
+                        &conn,
+                        &root_str,
+                        table,
+                        lang,
+                        query_name,
+                        &root_filters,
+                        max_matches,
+                        &mut matches,
+                        &mut seen_symbols,
+                    );
                 }
             }
         }
 
         // 2. 如果置顶的符号匹配项未把配额占满，继续进行常规全文 Walk 扫描匹配
         if !truncated {
-            let needle = if request.case_sensitive {
-                request.query.clone()
-            } else {
-                request.query.to_lowercase()
-            };
+            let mut handles = Vec::new();
+            for root in roots {
+                let workspace_root = workspace.root.clone();
+                let query = request.query.clone();
+                let case_sensitive = request.case_sensitive;
+                let respect_gitignore = request.respect_gitignore;
+                handles.push(std::thread::spawn(move || {
+                    scan_text_root(
+                        workspace_root,
+                        root,
+                        query,
+                        case_sensitive,
+                        respect_gitignore,
+                        max_matches,
+                    )
+                }));
+            }
 
-            let mut builder = WalkBuilder::new(root);
-            builder
-                .hidden(false)
-                .git_ignore(true)
-                .git_exclude(true)
-                .parents(true)
-                .filter_entry(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .map(|name| !NOISE_DIRS.contains(&name))
-                        .unwrap_or(true)
-                });
-
-            'outer: for item in builder.build() {
-                let entry = match item {
-                    Ok(entry) => entry,
-                    Err(_) => continue,
-                };
-                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            'outer: for handle in handles {
+                let Ok((root_matches, root_truncated)) = handle.join() else {
                     continue;
-                }
-                let path = entry.path();
-                let metadata = fs::metadata(path)?;
-                if metadata.len() > DEFAULT_SEARCH_FILE_LIMIT_BYTES {
-                    continue;
-                }
-                let content = match fs::read_to_string(path) {
-                    Ok(content) => content,
-                    Err(_) => continue,
                 };
-
-                for (line_index, line) in content.lines().enumerate() {
-                    let haystack = if request.case_sensitive {
-                        line.to_string()
-                    } else {
-                        line.to_lowercase()
-                    };
-                    if let Some(byte_index) = haystack.find(&needle) {
-                        let rel_path = workspace.relative_display(path)?;
-                        let line_no = line_index + 1;
-                        if seen_symbols.contains(&(rel_path.clone(), line_no)) {
-                            continue;
-                        }
-                        if matches.len() >= max_matches {
-                            truncated = true;
-                            break 'outer;
-                        }
-                        let column = line[..byte_index.min(line.len())].chars().count() + 1;
-                        matches.push(TextMatch {
-                            path: rel_path,
-                            line: line_no,
-                            column,
-                            text: line.to_string(),
-                        });
+                truncated |= root_truncated;
+                for item in root_matches {
+                    let line_key = (item.path.clone(), item.line);
+                    if seen_symbols.contains(&line_key) {
+                        continue;
                     }
+                    if matches.len() >= max_matches {
+                        truncated = true;
+                        break 'outer;
+                    }
+                    matches.push(item);
                 }
             }
         }
@@ -607,6 +486,48 @@ impl Workspace {
             matches,
             truncated,
         })
+    }
+
+    fn resolve_search_roots(&self, request: &SearchTextRequest) -> Result<Vec<PathBuf>> {
+        let mut requested_paths = if request.paths.is_empty() {
+            vec![request.path.clone()]
+        } else {
+            request.paths.clone()
+        };
+
+        if requested_paths.len() == 1 {
+            let single = requested_paths[0].trim();
+            if self.resolve_existing(single).is_err() {
+                let split_paths: Vec<String> = single
+                    .split_whitespace()
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                if split_paths.len() > 1
+                    && split_paths
+                        .iter()
+                        .all(|path| self.resolve_existing(path).is_ok())
+                {
+                    requested_paths = split_paths;
+                }
+            }
+        }
+
+        requested_paths
+            .iter()
+            .map(|path| self.resolve_existing(path))
+            .collect()
+    }
+
+    fn search_root_filters(&self, roots: &[PathBuf]) -> Result<Vec<String>> {
+        roots
+            .iter()
+            .map(|root| {
+                self.relative_display(root)
+                    .map(|path| normalize_rel_path(&path))
+            })
+            .collect()
     }
 
     pub fn write_file(&self, request: WriteFileRequest) -> Result<WriteFileResponse> {
@@ -969,16 +890,7 @@ impl Workspace {
         if !candidate.exists() {
             return Err(ToolError::NotFound(raw.to_string()));
         }
-        candidate
-            .canonicalize()
-            .map_err(ToolError::from)
-            .and_then(|path| {
-                if path.starts_with(&self.root) {
-                    Ok(path)
-                } else {
-                    Err(ToolError::OutsideWorkspace(raw.to_string()))
-                }
-            })
+        candidate.canonicalize().map_err(ToolError::from)
     }
 
     fn resolve_existing_file(&self, raw: &str) -> Result<PathBuf> {
@@ -990,22 +902,23 @@ impl Workspace {
     }
 
     fn resolve_for_write(&self, raw: &str) -> Result<PathBuf> {
-        let relative = sanitize_relative_path(raw)?;
-        let path = self.root.join(relative);
-        if !path.starts_with(&self.root) {
-            return Err(ToolError::OutsideWorkspace(raw.to_string()));
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            return Ok(path.to_path_buf());
         }
-        Ok(path)
+        let relative = sanitize_relative_path(raw)?;
+        Ok(self.root.join(relative))
     }
 
     fn relative_display(&self, path: &Path) -> Result<String> {
-        let relative = path
-            .strip_prefix(&self.root)
-            .map_err(|_| ToolError::OutsideWorkspace(path.display().to_string()))?;
-        let value = if relative.as_os_str().is_empty() {
-            ".".to_string()
+        let value = if let Ok(relative) = path.strip_prefix(&self.root) {
+            if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            }
         } else {
-            relative.to_string_lossy().replace('\\', "/")
+            path.to_string_lossy().replace('\\', "/")
         };
         Ok(value)
     }
@@ -1115,6 +1028,150 @@ fn map_memory_error(error: memory::MemoryError) -> ToolError {
     ))
 }
 
+fn scan_text_root(
+    workspace_root: PathBuf,
+    root: PathBuf,
+    query: String,
+    case_sensitive: bool,
+    respect_gitignore: bool,
+    max_matches: usize,
+) -> (Vec<TextMatch>, bool) {
+    let needle = if case_sensitive {
+        query
+    } else {
+        query.to_lowercase()
+    };
+    let mut matches = Vec::new();
+    let mut truncated = false;
+
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .ignore(respect_gitignore)
+        .git_ignore(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .parents(respect_gitignore)
+        .filter_entry(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| !NOISE_DIRS.contains(&name))
+                .unwrap_or(true)
+        });
+
+    'outer: for item in builder.build() {
+        let entry = match item {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::metadata(path) else {
+            continue;
+        };
+        if metadata.len() > DEFAULT_SEARCH_FILE_LIMIT_BYTES {
+            continue;
+        }
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        for (line_index, line) in content.lines().enumerate() {
+            let haystack = if case_sensitive {
+                line.to_string()
+            } else {
+                line.to_lowercase()
+            };
+            if let Some(byte_index) = haystack.find(&needle) {
+                if matches.len() >= max_matches {
+                    truncated = true;
+                    break 'outer;
+                }
+                let rel_path = path
+                    .strip_prefix(&workspace_root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                let column = line[..byte_index.min(line.len())].chars().count() + 1;
+                matches.push(TextMatch {
+                    path: rel_path,
+                    line: line_index + 1,
+                    column,
+                    text: line.to_string(),
+                });
+            }
+        }
+    }
+
+    (matches, truncated)
+}
+
+fn query_indexed_symbol_table(
+    conn: &rusqlite::Connection,
+    workspace_root: &str,
+    table: &str,
+    lang: &str,
+    query_name: &str,
+    root_filters: &[String],
+    max_matches: usize,
+    matches: &mut Vec<TextMatch>,
+    seen_symbols: &mut std::collections::HashSet<(String, usize)>,
+) -> bool {
+    let sql = format!(
+        "SELECT kind, file_path, start_line, signature FROM {} WHERE name = ? AND workspace_root = ?",
+        table
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query(rusqlite::params![query_name, workspace_root]) else {
+        return false;
+    };
+
+    while let Ok(Some(row)) = rows.next() {
+        let kind: String = row.get(0).unwrap_or_default();
+        let file_path: String = row.get(1).unwrap_or_default();
+        let start_line: usize = row.get(2).unwrap_or(0);
+        let signature: String = row.get(3).unwrap_or_default();
+
+        if !path_allowed_by_filters(&file_path, root_filters) {
+            continue;
+        }
+        if matches.len() >= max_matches {
+            return true;
+        }
+
+        matches.push(TextMatch {
+            path: file_path.clone(),
+            line: start_line,
+            column: 1,
+            text: format!("[Symbol Definition ({} {})] {}", lang, kind, signature),
+        });
+        seen_symbols.insert((file_path, start_line));
+    }
+
+    false
+}
+
+fn normalize_rel_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty() {
+        ".".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn path_allowed_by_filters(path: &str, filters: &[String]) -> bool {
+    let path = normalize_rel_path(path);
+    filters
+        .iter()
+        .any(|filter| filter == "." || path == *filter || path.starts_with(&format!("{}/", filter)))
+}
+
 fn map_ts_index_error(error: ts_index::TsIndexError) -> ToolError {
     ToolError::Io(std::io::Error::new(
         std::io::ErrorKind::Other,
@@ -1152,6 +1209,28 @@ mod tests {
         });
         assert!(matches!(result, Err(ToolError::ParentTraversal(_))));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_absolute_paths_outside_workspace() {
+        let root = temp_workspace("absolute_root");
+        let workspace = Workspace::new(&root).unwrap();
+        let outside = temp_workspace("absolute_outside");
+        let outside_file = outside.join("log.txt");
+        fs::write(&outside_file, "outside log").unwrap();
+
+        let result = workspace
+            .read_file(ReadFileRequest {
+                workspace_root: None,
+                path: outside_file.display().to_string(),
+                max_bytes: 1024,
+            })
+            .unwrap();
+
+        assert_eq!(result.content, "outside log");
+        assert!(result.path.contains("log.txt"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -1204,13 +1283,123 @@ mod tests {
                 workspace_root: None,
                 query: "beta".to_string(),
                 path: ".".to_string(),
+                paths: Vec::new(),
                 case_sensitive: false,
+                respect_gitignore: false,
                 max_matches: 10,
             })
             .unwrap();
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].line, 2);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_accepts_multiple_paths() {
+        let root = temp_workspace("search_paths");
+        fs::create_dir_all(root.join("one")).unwrap();
+        fs::create_dir_all(root.join("two")).unwrap();
+        fs::write(root.join("one").join("a.txt"), "needle one\n").unwrap();
+        fs::write(root.join("two").join("b.txt"), "needle two\n").unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+
+        let result = workspace
+            .search_text(SearchTextRequest {
+                workspace_root: None,
+                query: "needle".to_string(),
+                path: ".".to_string(),
+                paths: vec!["one".to_string(), "two".to_string()],
+                case_sensitive: false,
+                respect_gitignore: false,
+                max_matches: 10,
+            })
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_splits_space_separated_path_when_all_parts_exist() {
+        let root = temp_workspace("search_split_paths");
+        fs::create_dir_all(root.join("one")).unwrap();
+        fs::create_dir_all(root.join("two")).unwrap();
+        fs::write(root.join("one").join("a.txt"), "needle one\n").unwrap();
+        fs::write(root.join("two").join("b.txt"), "needle two\n").unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+
+        let result = workspace
+            .search_text(SearchTextRequest {
+                workspace_root: None,
+                query: "needle".to_string(),
+                path: "one two".to_string(),
+                paths: Vec::new(),
+                case_sensitive: false,
+                respect_gitignore: false,
+                max_matches: 10,
+            })
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_includes_gitignored_files_by_default() {
+        let root = temp_workspace("search_gitignored_default");
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join(".ignore"), "logs/\n").unwrap();
+        fs::write(root.join("logs").join("run.log"), "needle in ignored log\n").unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+
+        let result = workspace
+            .search_text(SearchTextRequest {
+                workspace_root: None,
+                query: "needle".to_string(),
+                path: ".".to_string(),
+                paths: Vec::new(),
+                case_sensitive: false,
+                respect_gitignore: false,
+                max_matches: 10,
+            })
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_can_respect_gitignore_when_requested() {
+        let root = temp_workspace("search_gitignored_requested");
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::write(root.join(".ignore"), "logs/\n").unwrap();
+        fs::write(root.join("logs").join("run.log"), "needle in ignored log\n").unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+
+        let result = workspace
+            .search_text(SearchTextRequest {
+                workspace_root: None,
+                query: "needle".to_string(),
+                path: ".".to_string(),
+                paths: Vec::new(),
+                case_sensitive: false,
+                respect_gitignore: true,
+                max_matches: 10,
+            })
+            .unwrap();
+
+        assert_eq!(result.matches.len(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn path_filters_match_exact_and_child_paths() {
+        let filters = vec!["src/pages".to_string(), "README.md".to_string()];
+
+        assert!(path_allowed_by_filters("src/pages/index.tsx", &filters));
+        assert!(path_allowed_by_filters("src\\pages\\index.tsx", &filters));
+        assert!(path_allowed_by_filters("README.md", &filters));
+        assert!(!path_allowed_by_filters("src/redux/store.ts", &filters));
     }
 
     #[test]

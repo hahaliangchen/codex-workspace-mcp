@@ -147,6 +147,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
             time_str TEXT NOT NULL,
+            conversation_id TEXT,
             action TEXT NOT NULL,
             role TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -154,16 +155,41 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         )",
         [],
     )?;
+    let _ = conn.execute("ALTER TABLE api_logs ADD COLUMN conversation_id TEXT", []);
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_api_logs_ts ON api_logs(timestamp)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_api_logs_conversation ON api_logs(conversation_id)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS conversation_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            time_str TEXT NOT NULL,
+            source TEXT NOT NULL,
+            role TEXT NOT NULL,
+            message_type TEXT NOT NULL,
+            content TEXT NOT NULL
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conversation_messages_conv_ts
+         ON conversation_messages(conversation_id, timestamp)",
         [],
     )?;
 
     Ok(conn)
 }
 
-pub fn insert_detailed_api_log(
+pub fn insert_detailed_api_log_with_conversation(
     conn: &Connection,
+    conversation_id: Option<&str>,
     time_str: &str,
     action: &str,
     role: &str,
@@ -175,13 +201,57 @@ pub fn insert_detailed_api_log(
         .map(|v| v.as_secs())
         .unwrap_or(0) as i64;
     conn.execute(
-        "INSERT INTO api_logs (timestamp, time_str, action, role, message, detail) VALUES (?, ?, ?, ?, ?, ?)",
-        params![now, time_str, action, role, message, detail],
+        "INSERT INTO api_logs (timestamp, time_str, conversation_id, action, role, message, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![
+            now,
+            time_str,
+            conversation_id,
+            action,
+            role,
+            message,
+            detail
+        ],
     )?;
 
     // Auto cleanup older than 24 hours (86400 seconds)
     let cutoff = now - 24 * 3600;
     conn.execute("DELETE FROM api_logs WHERE timestamp < ?", params![cutoff])?;
+    Ok(())
+}
+
+pub fn insert_conversation_message(
+    conn: &Connection,
+    conversation_id: &str,
+    time_str: &str,
+    source: &str,
+    role: &str,
+    message_type: &str,
+    content: &str,
+) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0) as i64;
+    conn.execute(
+        "INSERT INTO conversation_messages
+         (conversation_id, timestamp, time_str, source, role, message_type, content)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![
+            conversation_id,
+            now,
+            time_str,
+            source,
+            role,
+            message_type,
+            content
+        ],
+    )?;
+    let cutoff = now - 24 * 3600;
+    conn.execute(
+        "DELETE FROM conversation_messages WHERE timestamp < ?",
+        params![cutoff],
+    )?;
     Ok(())
 }
 

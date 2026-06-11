@@ -191,35 +191,6 @@ pub struct ImageProcessStats {
     pub failed: usize,
 }
 
-impl ImageProcessStats {
-    fn has_activity(&self) -> bool {
-        self.seen > 0 || self.analyzed > 0 || self.cache_hits > 0 || self.failed > 0
-    }
-
-    pub fn codex_prefix(&self) -> Option<String> {
-        if !self.has_activity() {
-            return None;
-        }
-
-        let mut parts = Vec::new();
-        parts.push(format!("检测到 {} 张图片", self.seen));
-        if self.analyzed > 0 {
-            parts.push(format!("新分析 {} 张", self.analyzed));
-        }
-        if self.cache_hits > 0 {
-            parts.push(format!("缓存复用 {} 张", self.cache_hits));
-        }
-        if self.failed > 0 {
-            parts.push(format!("失败 {} 张", self.failed));
-        }
-
-        Some(format!(
-            "🤖 **[AI Proxy: 已调用配置的视觉子代理处理图片；{}。图片分析文本已合并至上下文]**\n\n",
-            parts.join("，")
-        ))
-    }
-}
-
 pub fn process_and_replace_images<'a>(
     val: &'a mut Value,
     log: &'a Arc<Mutex<std::fs::File>>,
@@ -227,56 +198,14 @@ pub fn process_and_replace_images<'a>(
     image_stats: &'a mut ImageProcessStats,
 ) -> futures::future::BoxFuture<'a, ()> {
     async move {
-        let current_image_url = extract_image_url(val);
+        if let Some(url) = extract_image_url(val) {
+            image_stats.seen += 1;
+            *val = analyze_image_node(url, log, db, image_stats).await;
+            return;
+        }
+
         match val {
             Value::Object(map) => {
-                if let Some(url) = current_image_url {
-                    image_stats.seen += 1;
-
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    use std::hash::Hasher;
-                    hasher.write(url.as_bytes());
-                    let hash_val = hasher.finish();
-                    let hash_str = format!("{:016x}", hash_val);
-
-                    let cached_desc = get_cached_description(&hash_str);
-
-                    if let Some(description) = cached_desc {
-                        image_stats.cache_hits += 1;
-                        crate::ai_proxy::log_write(&**log, db, Some("VISION_CACHE_HIT"), Some("proxy"), &format!(">> Image hash {} found in in-memory cache. Using cached description.", hash_str));
-                        *val = json!({
-                            "type": "text",
-                            "text": format!("\n[图像分析报告:\n{}\n]\n[说明: 原始图片不会持久保存；如果用户明确要求重新检查图片细节，请调用 analyze_image。若当前上下文已无原图，请让用户重新上传。]\n", description)
-                        });
-                        return;
-                    }
-
-                    crate::ai_proxy::log_write(&**log, db, Some("VISION_AGENT"), Some("proxy"), &format!(">> Image detected. Spawning vision agent to analyze... Hash: {}, URL length: {}", hash_str, url.len()));
-                    match crate::agent::analyze_image_via_vision_agent(&url, None).await {
-                        Ok(description) => {
-                            crate::ai_proxy::log_write(&**log, db, Some("VISION_AGENT_SUCCESS"), Some("proxy"), &format!(">> Vision agent analysis complete. Description len: {}", description.len()));
-
-                            insert_cached_description(&hash_str, &description);
-
-                            image_stats.analyzed += 1;
-                            *val = json!({
-                                "type": "text",
-                                "text": format!("\n[图像分析报告:\n{}\n]\n[说明: 原始图片不会持久保存；如果用户明确要求重新检查图片细节，请调用 analyze_image。若当前上下文已无原图，请让用户重新上传。]\n", description)
-                            });
-                            return;
-                        }
-                        Err(e) => {
-                            image_stats.failed += 1;
-                            crate::ai_proxy::log_write(&**log, db, Some("ERROR"), Some("proxy"), &format!("!! Vision agent analysis failed: {}", e));
-                            *val = json!({
-                                "type": "text",
-                                "text": format!("\n[图像分析失败: 配置的视觉子代理无法解析图片。不要改用 shell/rg/Get-Content 读取图片内容；如果用户要求重试，请调用 analyze_image。若当前上下文已无原图，请让用户重新上传。错误: {}]\n", e)
-                            });
-                            return;
-                        }
-                    }
-                }
-
                 for v in map.values_mut() {
                     process_and_replace_images(v, log, db, image_stats).await;
                 }
@@ -290,6 +219,122 @@ pub fn process_and_replace_images<'a>(
         }
     }
     .boxed()
+}
+
+async fn analyze_image_node(
+    url: String,
+    log: &Arc<Mutex<std::fs::File>>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    image_stats: &mut ImageProcessStats,
+) -> Value {
+    let hash_str = image_hash(&url);
+    if let Some(description) = get_cached_description(&hash_str) {
+        image_stats.cache_hits += 1;
+        log_image_cache_hit(log, db, &hash_str);
+        return image_report_value(&description);
+    }
+
+    log_image_analysis_start(log, db, &hash_str, url.len());
+    match crate::agent::analyze_image_via_vision_agent(&url, None).await {
+        Ok(description) => {
+            insert_cached_description(&hash_str, &description);
+            image_stats.analyzed += 1;
+            log_image_analysis_success(log, db, description.len());
+            image_report_value(&description)
+        }
+        Err(e) => {
+            image_stats.failed += 1;
+            log_image_analysis_failure(log, db, &e.to_string());
+            image_failure_value(&e.to_string())
+        }
+    }
+}
+
+fn image_hash(url: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hasher;
+    hasher.write(url.as_bytes());
+    format!("{:016x}", hasher.finish())
+}
+
+fn image_report_value(description: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": format!("\n[图像分析报告:\n{}\n]\n[说明: 原始图片不会持久保存；如果用户明确要求重新检查图片细节，请调用 analyze_image。若当前上下文已无原图，请让用户重新上传。]\n", description)
+    })
+}
+
+fn image_failure_value(error: &str) -> Value {
+    json!({
+        "type": "text",
+        "text": format!("\n[图像分析失败: 配置的视觉子代理无法解析图片。不要改用 shell/rg/Get-Content 读取图片内容；如果用户要求重试，请调用 analyze_image。若当前上下文已无原图，请让用户重新上传。错误: {}]\n", error)
+    })
+}
+
+fn log_image_cache_hit(
+    log: &Arc<Mutex<std::fs::File>>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    hash: &str,
+) {
+    crate::ai_proxy::log_write(
+        &**log,
+        db,
+        Some("VISION_CACHE_HIT"),
+        Some("proxy"),
+        &format!(
+            ">> Image hash {} found in in-memory cache. Using cached description.",
+            hash
+        ),
+    );
+}
+
+fn log_image_analysis_start(
+    log: &Arc<Mutex<std::fs::File>>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    hash: &str,
+    url_len: usize,
+) {
+    crate::ai_proxy::log_write(
+        &**log,
+        db,
+        Some("VISION_AGENT"),
+        Some("proxy"),
+        &format!(
+            ">> Image detected. Spawning vision agent to analyze... Hash: {}, URL length: {}",
+            hash, url_len
+        ),
+    );
+}
+
+fn log_image_analysis_success(
+    log: &Arc<Mutex<std::fs::File>>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    description_len: usize,
+) {
+    crate::ai_proxy::log_write(
+        &**log,
+        db,
+        Some("VISION_AGENT_SUCCESS"),
+        Some("proxy"),
+        &format!(
+            ">> Vision agent analysis complete. Description len: {}",
+            description_len
+        ),
+    );
+}
+
+fn log_image_analysis_failure(
+    log: &Arc<Mutex<std::fs::File>>,
+    db: Option<&Mutex<rusqlite::Connection>>,
+    error: &str,
+) {
+    crate::ai_proxy::log_write(
+        &**log,
+        db,
+        Some("ERROR"),
+        Some("proxy"),
+        &format!("!! Vision agent analysis failed: {}", error),
+    );
 }
 
 pub fn process_latest_user_images<'a>(

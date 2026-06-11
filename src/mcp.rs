@@ -620,7 +620,7 @@ pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "workspace_info",
-            "description": "Return workspace root, platform, allowed access scope, and ignore summary. Requires workspace_root.",
+            "description": "Return workspace root, platform, file access scope, and ignore summary. Requires workspace_root.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -634,7 +634,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_dir",
-            "description": "List a directory inside the workspace with optional recursion and ignore filtering. Use only to understand project layout or locate files by path — for code symbol lookups prefer the index tools (search_go_symbols, search_ts_symbols, search_rust_symbols).",
+            "description": "List a directory by relative workspace path or absolute filesystem path with optional recursion and filtering. By default this shows the real filesystem view, including gitignored files. Use only to understand project layout or locate files by path — for code symbol lookups prefer the index tools (search_go_symbols, search_ts_symbols, search_rust_symbols).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -645,13 +645,17 @@ pub fn tool_definitions() -> Value {
                     "path": { "type": "string", "default": "." },
                     "recursive": { "type": "boolean", "default": false },
                     "max_depth": { "type": "integer", "default": 1 },
-                    "respect_gitignore": { "type": "boolean", "default": true }
+                    "respect_gitignore": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, hide files ignored by .gitignore/.ignore. Defaults to false so logs and generated files remain visible."
+                    }
                 }
             }
         },
         {
             "name": "read_file",
-            "description": "Read a UTF-8 file inside the workspace with a byte limit. Prefer read_go_symbol / read_ts_symbol / read_rust_symbol when you need a specific function or type — they return only the relevant range and include caller/callee context. Use read_file when you need the full file or when no index exists.",
+            "description": "Read a UTF-8 file by relative workspace path or absolute filesystem path with a byte limit. Prefer read_go_symbol / read_ts_symbol / read_rust_symbol when you need a specific function or type — they return only the relevant range and include caller/callee context. Use read_file when you need the full file or when no index exists.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -684,7 +688,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_text",
-            "description": "Search raw text across workspace files. Best for UI strings, config keys, error messages, literals, or fallback when symbol index tools do not find enough code structure.",
+            "description": "Search raw text across workspace files. By default this searches the real filesystem view, including gitignored files. Best for UI strings, config keys, error messages, literals, or fallback when symbol index tools do not find enough code structure. Use `path` for one file/directory, or `paths` as an array for multiple files/directories; do not put multiple paths in one space-separated string.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -694,15 +698,29 @@ pub fn tool_definitions() -> Value {
                         "description": "Optional absolute project directory to use for this call. Defaults to the server startup directory."
                     },
                     "query": { "type": "string" },
-                    "path": { "type": "string", "default": "." },
+                    "path": {
+                        "type": "string",
+                        "default": ".",
+                        "description": "Single file or directory to search. For multiple targets, use `paths` instead."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional list of files/directories to search. Prefer this over a space-separated `path` string when searching multiple targets."
+                    },
                     "case_sensitive": { "type": "boolean", "default": false },
+                    "respect_gitignore": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, skip files ignored by .gitignore/.ignore. Defaults to false so logs and generated files remain searchable."
+                    },
                     "max_matches": { "type": "integer", "default": 100 }
                 }
             }
         },
         {
             "name": "write_file",
-            "description": "Create or overwrite a UTF-8 file inside the workspace.",
+            "description": "Create or overwrite a UTF-8 file by relative workspace path or absolute filesystem path.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -956,24 +974,6 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "shell",
-            "description": "Execute a shell command. ONLY use this as a LAST RESORT for git operations, npm/cargo builds, running scripts, or system commands. Do NOT use this for reading files, listing directories, or searching code.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["justification", "command"],
-                "properties": {
-                    "justification": {
-                        "type": "string",
-                        "description": "You MUST answer this question first: 'Are there alternative native tools (like list_dir / read_file / search_text) for this task?'. If yes, you must explain why you are ignoring them. If no, explain why you MUST use shell."
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute."
-                    }
-                }
-            }
-        },
-        {
             "name": "spawn_subagent",
             "description": "Spawn a specialized sub-agent with its own clean context in the background to handle a specific code analysis or search sub-task. Use this to save token context size of the main agent.",
             "inputSchema": {
@@ -993,7 +993,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "query_logs",
-            "description": "Query the structured API and tool execution logs in SQLite from the past 24 hours. Helpful for diagnosing redundant tool calls or connection errors.",
+            "description": "Query the structured API and tool execution logs in SQLite from the past 24 hours. Helpful for diagnosing redundant tool calls or connection errors. Results include conversation_id when available.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1004,7 +1004,7 @@ pub fn tool_definitions() -> Value {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Optional SQLite WHERE clause filter (e.g. 'action = \"ERROR\"' or 'message LIKE \"%search%\"')."
+                        "description": "Optional SQLite WHERE clause filter (e.g. 'action = \"ERROR\"', 'conversation_id = \"previous_response_id:abc\"', or 'message LIKE \"%search%\"')."
                     }
                 }
             }

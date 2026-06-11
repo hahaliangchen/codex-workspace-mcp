@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -32,8 +32,6 @@ struct ProviderConfig {
     /// raw pass-through — no request/response format conversion.
     #[serde(default = "default_api_type")]
     api_type: String,
-    #[serde(default)]
-    raw_codex: bool,
 }
 
 fn default_api_type() -> String {
@@ -56,10 +54,6 @@ struct AiProxyState {
     config: Arc<AiProxyConfig>,
     client: Client,
     log: Arc<Mutex<std::fs::File>>,
-    #[allow(dead_code)]
-    log_path: Arc<PathBuf>,
-    /// 系统提示词专用日志，每次请求完整记录 developer/system 内容
-    sys_log: Arc<Mutex<std::fs::File>>,
     workspace: Arc<crate::tools::Workspace>,
     db: Arc<Mutex<rusqlite::Connection>>,
 }
@@ -67,10 +61,6 @@ struct AiProxyState {
 // ---------------------------------------------------------------------------
 // Logging helpers
 // ---------------------------------------------------------------------------
-
-pub fn now_china() -> String {
-    crate::proxy_log::now_china()
-}
 
 pub fn log_write(
     log: &Mutex<std::fs::File>,
@@ -129,6 +119,29 @@ pub(crate) fn fmt_body(b: &[u8]) -> String {
     }
 }
 
+pub(crate) fn conversation_id_from_body(_body: &Value, workspace_root: &Path) -> String {
+    format!(
+        "workspace:{}",
+        sanitize_conversation_id(&workspace_root.to_string_lossy())
+    )
+}
+
+fn sanitize_conversation_id(id: &str) -> String {
+    let mut out = String::new();
+    for ch in id.chars().take(120) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_owned()
+    } else {
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -168,6 +181,8 @@ async fn chat_completions(
     State(state): State<AiProxyState>,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
+    crate::proxy_log::set_conversation_id(Some(conversation_id));
     crate::vision_preprocess::set_visible_images_from_body(&body);
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
@@ -242,6 +257,8 @@ async fn chat_completions(
 
 /// POST /v1/messages — Anthropic Messages API endpoint.
 async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>) -> Response {
+    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
+    crate::proxy_log::set_conversation_id(Some(conversation_id));
     crate::vision_preprocess::set_visible_images_from_body(&body);
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
@@ -384,7 +401,9 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
 }
 
 /// POST /v1/responses — OpenAI Responses API endpoint for Codex.
-async fn responses(State(state): State<AiProxyState>, Json(mut body): Json<Value>) -> Response {
+async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -> Response {
+    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
+    crate::proxy_log::set_conversation_id(Some(conversation_id.clone()));
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -396,135 +415,34 @@ async fn responses(State(state): State<AiProxyState>, Json(mut body): Json<Value
         }
     };
 
-    let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
+    let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
 
-    if provider.raw_codex {
-        crate::responses::logging::log_request_body(
-            &state.log,
-            &state.db,
-            &state.sys_log,
-            &body,
-            &client_model,
-        );
-        log_db!(
-            &state,
-            "PROXY",
-            "proxy",
-            "   raw_codex provider detected; skipping proxy image preprocessing"
-        );
-        return crate::responses::raw::forward_raw_codex_responses(
-            &state.client,
-            state.log.clone(),
-            state.db.clone(),
-            &provider.url,
-            &provider.api_key,
-            &body,
-            upstream_model,
-            &client_model,
-        )
-        .await;
-    }
-
-    crate::vision_preprocess::set_visible_images_from_body(&body);
-    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
-    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_latest_user_images(
-        &mut body,
-        &state.log,
-        Some(&state.db),
-        &mut image_stats,
-    )
-    .await;
-
     crate::responses::logging::log_request_body(
         &state.log,
         &state.db,
-        &state.sys_log,
+        &conversation_id,
         &body,
         &client_model,
     );
-
-    if had_image_input {
-        let old_model = upstream_model.clone();
-        upstream_model = crate::vision_preprocess::adjust_model_for_vision(&upstream_model);
-        if old_model != upstream_model {
-            log_db!(
-                &state,
-                "PROXY",
-                "proxy",
-                "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
-                old_model,
-                upstream_model
-            );
-        }
-        log_db!(
-            &state,
-            "VISION_STATUS",
-            "proxy",
-            "   image preprocessing stats: seen={} analyzed={} cache_hits={} failed={}",
-            image_stats.seen,
-            image_stats.analyzed,
-            image_stats.cache_hits,
-            image_stats.failed
-        );
-    }
-
     log_db!(
         &state,
         "PROXY",
         "proxy",
-        "   resolved: provider={} upstream_model={}",
-        provider.url,
-        upstream_model
+        "   responses request entering local agent runtime"
     );
-
-    log!(
-        &state.log,
-        "   Codex raw messages: {}",
-        body.get("messages")
-            .map(|m| serde_json::to_string(m).unwrap_or_default())
-            .unwrap_or_default()
-    );
-    // input 详细内容见 system_prompt.log，主日志只打条目数量
-    {
-        let count = body
-            .get("input")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        log!(
-            &state.log,
-            "   Codex raw input: [{} items → see system_prompt.log]",
-            count
-        );
-    }
-
-    crate::responses::logging::log_diagnostics(&state.log, &state.db, &body);
-
-    let prepared_chat = crate::responses::chat::prepare_chat_completions_request(
-        &body,
-        upstream_model,
+    crate::agent_runtime::run_responses_agent(
+        state.client.clone(),
         state.workspace.clone(),
         state.log.clone(),
         state.db.clone(),
-    )
-    .await;
-    let openai_body = prepared_chat.body;
-    let tool_route_map = prepared_chat.tool_route_map;
-
-    crate::responses::chat::forward_chat_completions_stream(
-        &state.client,
-        &provider.url,
-        &provider.api_key,
-        &openai_body,
+        provider.url.clone(),
+        provider.api_key.clone(),
+        body,
+        upstream_model,
         client_model,
-        tool_route_map,
-        image_stats.codex_prefix(),
-        state.log.clone(),
-        state.db.clone(),
     )
     .await
 }
@@ -541,33 +459,7 @@ pub async fn run(
     let config: AiProxyConfig =
         serde_json::from_str(&tokio::fs::read_to_string(config_path).await?)?;
 
-    // Open log file next to config
-    let log_path = config_path.with_file_name("ai_proxy.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-
-    // 系统提示词专用日志（完整无截断）
-    let sys_log_path = config_path.with_file_name("system_prompt.log");
-    let sys_log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&sys_log_path)?;
-
-    let log = Arc::new(Mutex::new(log_file));
-    let sys_log = Arc::new(Mutex::new(sys_log_file));
-    let log_path = Arc::new(log_path);
-
     let total_maps: usize = config.providers.values().map(|p| p.model_map.len()).sum();
-    log!(&log, "========== AI Proxy started ==========");
-    log!(
-        &log,
-        "config: {} providers, {} total model mappings, default={:?}",
-        config.providers.len(),
-        total_maps,
-        config.default_provider
-    );
 
     let config = Arc::new(config);
     let client = Client::builder()
@@ -577,12 +469,27 @@ pub async fn run(
     let conn = crate::database::init_db(workspace.root())?;
     let db = Arc::new(Mutex::new(conn));
 
+    let log_dir = config_path.with_file_name("logs");
+    let log_path = crate::proxy_log::init_async(log_dir, workspace.root().to_path_buf())?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log = Arc::new(Mutex::new(log_file));
+
+    log!(&log, "========== AI Proxy started ==========");
+    log!(
+        &log,
+        "config: {} providers, {} total model mappings, default={:?}",
+        config.providers.len(),
+        total_maps,
+        config.default_provider
+    );
+
     let state = AiProxyState {
         config,
         client,
         log,
-        log_path,
-        sys_log,
         workspace,
         db,
     };
@@ -600,4 +507,21 @@ pub async fn run(
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_id_uses_workspace_as_context_boundary() {
+        let body = json!({
+            "conversation": "conv_123",
+            "previous_response_id": "resp_456"
+        });
+
+        let id = conversation_id_from_body(&body, Path::new("D:/workspace"));
+
+        assert_eq!(id, "workspace:D:_workspace");
+    }
 }

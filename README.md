@@ -20,32 +20,49 @@
 
 ### AI Proxy
 
-- `/v1/responses`：Codex Responses API 入口
+- `/v1/responses`：Codex Responses API 入口，默认由本地 Agent Runtime 接管
 - `/v1/chat/completions`：OpenAI Chat Completions 入口
 - `/v1/messages`：Anthropic Messages 入口
 - 模型路由：通过 `default_provider` 和 provider `model_map` 映射上游模型
-- raw Codex 透传：`raw_codex: true` 时不做格式转换，直接交给上游
-- 工具调用修复：把 Codex Responses 的 function_call / function_call_output 转成标准 Chat Completions 工具调用链
-- 历史清洗：遇到异常工具调用历史时，尽量转换或跳过，而不是把坏历史继续发给上游导致报错
-- echo 伪指令：把代理工具调用伪装成 Codex 能显示的终端输出，避免模型不认识代理内部工具名
+- Agent Runtime：本地运行 ReAct 工具循环，直接调用 MCP 文件、搜索、索引、记忆等工具
+- 过程输出：Codex 只看到普通 Responses 文本流，包括 `[agent]`、`[tool]` 过程信息
+- 协议拆分：消息协议转换和工具调用控制分开处理，不再使用 raw Codex 透传、echo 伪装或 call_id 等待下一轮
+
+## 日志策略
+
+AI Proxy 日志统一走 `proxy_log`，外部模块不再自己实现文件日志或数据库日志。统一入口负责决定写文件、写 SQLite，或两者都写。
+
+- 文件日志：启动时创建 `logs/` 目录，并为本次进程启动生成一个 `YYYYMMDD_HHMM.log` 文件；同一分钟内重启发生重名时追加 `_2`、`_3` 后缀，避免覆盖或混写旧日志
+- 数据库日志：结构化记录继续写入 SQLite，便于 `query_logs` 查询
+- 输入诊断：Responses input 只向本次启动日志写入限长摘要；工具输出只记录 call_id/长度，避免完整历史在文件日志中重复膨胀
+- 历史保留：SQLite 原始会话记录按 24 小时清理，单条内容超限会截断
+- 异步写入：当前使用 `std::sync::mpsc` 后台线程落盘和入库，正常运行可避免请求线程阻塞；如果进程突然崩溃，队列尾部少量日志可能来不及写入
+
+## 上下文策略
+
+历史会话和模型上下文分开处理。
+
+- 历史会话：默认按 workspace 作为上下文边界写入 SQLite，同一工作区内多个聊天可以共享项目历史；请求里的 Responses `conversation` / `previous_response_id` 等字段保留在原始历史内容里，不参与默认隔离
+- 模型上下文：只取最近的干净消息片段，默认保留最近 24 个片段
+- 异常工具链：tool_call / tool_output 不配对时，只在模型上下文层降级成短 assistant 文本，不修改原始历史
+- 大段内容：tool output、tool arguments、普通文本超过阈值会截断或摘要
+- 噪声过滤：代理 forwarding body、工具 schema、namespace/tools 大段 JSON 不进入模型上下文，只留日志或历史库
+
+## Agent Runtime
+
+`/v1/responses` 现在只有 agent 代理模式，不再通过配置开关选择旧桥。
+
+代理流程是：
+
+1. Codex 请求进入 `/v1/responses`
+2. 本地 Agent Runtime 把上游模型当作 agent client 调用
+3. 上游模型需要工作区信息时，调用 `codex_workspace_mcp__*` 工具
+4. Runtime 在本地直接执行 MCP 工具，并把 `function_call_output` 继续喂回上游模型
+5. 上游模型给出最终答案时，Runtime 转成普通 Responses SSE 文本流返回给 Codex
+
+这条路径把两层协议拆开：Codex 只和本地 agent server 通信，上游模型只和 agent client 通信。工具调用控制属于 Runtime，不再伪装成 Codex 终端命令。
 
 ## 多模态策略
-
-项目支持两种路径。
-
-### raw provider
-
-如果 provider 配置了：
-
-```json
-{
-  "raw_codex": true
-}
-```
-
-代理会跳过本地图片预处理，直接把 Codex 原始请求透传给上游。适合本身支持 Codex / 多模态格式的模型或中转站。
-
-### 文本 provider
 
 DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 
@@ -92,10 +109,10 @@ DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 
 说明：
 
-- `default_provider` 控制普通请求走哪个 provider
+- `default_provider` 控制请求走哪个 provider
 - `vision_provider` 控制图片解析使用哪个 provider
 - `supports_vision: false` 用来明确 DeepSeek、Mimo 等文本 provider 不支持视觉
-- `raw_codex: true` 的 provider 默认由上游自己处理多模态
+- `/v1/responses` 一律启用本地 Agent Runtime；不再需要 `raw_codex` 或 `agent_mode` 开关
 
 ## 工具一览
 
@@ -146,7 +163,6 @@ DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 2. 后续优先复用文本报告
 3. 只有用户明确要求重新看图时才调用 `analyze_image`
 4. 当前上下文没有原图时，让用户重新上传
-
 ## 启动
 
 ```powershell
@@ -175,4 +191,3 @@ http://127.0.0.1:3000/mcp
 ## 相关文档
 
 - [AI_STATELESS_CONTEXT_DESIGN_LESSON.md](./AI_STATELESS_CONTEXT_DESIGN_LESSON.md)：一次多模态状态设计复盘，记录为什么要移除长期图片映射。
-
