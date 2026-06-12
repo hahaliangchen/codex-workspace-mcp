@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 #[derive(Debug)]
 pub struct PreparedTools {
     pub tools: Vec<Value>,
+    pub delegated_tools: Vec<Value>,
     pub blocked: Vec<BlockedTool>,
 }
 
@@ -20,7 +21,12 @@ pub enum BlockedToolKind {
 
 pub fn prepare_responses_tools(input_tools: Option<&Value>) -> PreparedTools {
     let mut blocked = Vec::new();
-    let mut converted_tools = Vec::new();
+    let local_tools = workspace_tools_for_responses();
+    let local_names = local_tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(|v| v.as_str()))
+        .collect::<std::collections::HashSet<_>>();
+    let mut delegated_tools = Vec::new();
 
     if let Some(tools) = input_tools.and_then(|v| v.as_array()) {
         for t in tools {
@@ -30,25 +36,19 @@ pub fn prepare_responses_tools(input_tools: Option<&Value>) -> PreparedTools {
 
             if let Some(blocked_tool) = blocked_tool(t) {
                 blocked.push(blocked_tool);
-                continue;
-            }
-
-            if let Some(sub_tools) = t.get("tools").and_then(|v| v.as_array()) {
-                let ns_name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                for sub_t in sub_tools {
-                    push_responses_tool(sub_t, Some(ns_name), &mut converted_tools);
+            } else if let Some(sub_tools) = t.get("tools").and_then(|v| v.as_array()) {
+                for sub_tool in sub_tools {
+                    push_delegated_tool(sub_tool, &local_names, &mut delegated_tools);
                 }
             } else {
-                push_responses_tool(t, None, &mut converted_tools);
+                push_delegated_tool(t, &local_names, &mut delegated_tools);
             }
         }
     }
 
-    let mut priority_tools = workspace_tools_for_responses();
-    priority_tools.extend(converted_tools);
-
     PreparedTools {
-        tools: priority_tools,
+        tools: local_tools,
+        delegated_tools,
         blocked,
     }
 }
@@ -69,7 +69,7 @@ fn workspace_tools_for_responses() -> Vec<Value> {
             });
             tools.push(json!({
                 "type": "function",
-                "name": format!("codex_workspace_mcp__{}", original_name),
+                "name": original_name,
                 "description": description,
                 "parameters": parameters
             }));
@@ -119,24 +119,21 @@ fn blocked_tool(t: &Value) -> Option<BlockedTool> {
     None
 }
 
-fn push_responses_tool(t: &Value, prefix: Option<&str>, converted_tools: &mut Vec<Value>) {
-    if !t.is_object() {
-        return;
-    }
-
-    let mut name_val = t
+fn push_delegated_tool(
+    t: &Value,
+    local_names: &std::collections::HashSet<&str>,
+    delegated_tools: &mut Vec<Value>,
+) {
+    let Some(name) = t
         .get("function")
         .and_then(|f| f.get("name"))
-        .cloned()
-        .or_else(|| t.get("name").cloned())
-        .unwrap_or(Value::Null);
-    if let Some(prefix_str) = prefix {
-        if let Some(n) = name_val.as_str() {
-            name_val = json!(format!("{}__{}", prefix_str, n));
-        }
-    }
+        .and_then(|v| v.as_str())
+        .or_else(|| t.get("name").and_then(|v| v.as_str()))
+    else {
+        return;
+    };
 
-    if t.get("type").and_then(|v| v.as_str()) == Some("namespace") {
+    if local_names.contains(name) {
         return;
     }
 
@@ -152,6 +149,7 @@ fn push_responses_tool(t: &Value, prefix: Option<&str>, converted_tools: &mut Ve
         .cloned()
         .or_else(|| t.get("parameters").cloned())
         .or_else(|| t.get("input_schema").cloned())
+        .or_else(|| t.get("parameters").cloned())
         .unwrap_or_else(|| {
             json!({
                 "type": "object",
@@ -160,15 +158,9 @@ fn push_responses_tool(t: &Value, prefix: Option<&str>, converted_tools: &mut Ve
             })
         });
 
-    let effective_name = if name_val.is_null() {
-        t.get("type").cloned().unwrap_or_else(|| json!("tool"))
-    } else {
-        name_val
-    };
-
-    converted_tools.push(json!({
+    delegated_tools.push(json!({
         "type": "function",
-        "name": effective_name,
+        "name": name,
         "description": description,
         "parameters": parameters
     }));

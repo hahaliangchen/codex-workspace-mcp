@@ -62,7 +62,10 @@ fn convert_messages(body: &Value) -> Vec<Value> {
     };
 
     for msg in msgs {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let mut role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        if role == "developer" {
+            role = "system";
+        }
         let content = msg.get("content");
 
         match role {

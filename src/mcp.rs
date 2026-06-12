@@ -413,23 +413,10 @@ fn json_error(id: Option<Value>, code: i64, message: &str) -> Response {
 }
 
 pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<Value> {
-    let mut name = params
+    let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("tools/call requires params.name"))?;
-
-    // 智能前缀剥离，确保带前缀和不带前缀的工具名都能 100% 成功执行
-    if name.starts_with("codex_workspace_mcp__") {
-        name = &name["codex_workspace_mcp__".len()..];
-    } else if name.starts_with("mcp__codex_workspace_mcp__") {
-        name = &name["mcp__codex_workspace_mcp__".len()..];
-    } else if name.starts_with("mcp__codex-workspace-mcp__") {
-        name = &name["mcp__codex-workspace-mcp__".len()..];
-    } else if name.starts_with("mcp__codex_workspace__") {
-        name = &name["mcp__codex_workspace__".len()..];
-    } else if name.starts_with("mcp__codex-workspace__") {
-        name = &name["mcp__codex-workspace__".len()..];
-    }
 
     let arguments = params
         .get("arguments")

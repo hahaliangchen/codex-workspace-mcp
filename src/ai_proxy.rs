@@ -236,10 +236,28 @@ async fn chat_completions(
 
     body["model"] = json!(upstream_model);
 
+    // Normalize role="developer" to "system" for upstream compatibility
+    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        for msg in &mut *messages {
+            if let Some(role) = msg.get_mut("role") {
+                if role.as_str() == Some("developer") {
+                    *role = json!("system");
+                }
+            }
+        }
+        format_translate::clean_unmatched_tool_calls(messages);
+    }
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+
+    log!(
+        &state.log,
+        "   chat completions body: {}",
+        fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
+    );
 
     let upstream_url = format!("{}/chat/completions", provider.url);
     crate::upstream::forward_to_upstream(

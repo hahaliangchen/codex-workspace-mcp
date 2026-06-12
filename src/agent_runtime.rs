@@ -78,34 +78,54 @@ async fn run_agent_loop(
     stream: &mut AgentSseWriter,
     tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
 ) -> anyhow::Result<()> {
-    let upstream_url = format!("{}/responses", provider_url.trim_end_matches('/'));
+    let upstream_url = format!("{}/chat/completions", provider_url.trim_end_matches('/'));
     body["model"] = json!(upstream_model);
     body["stream"] = json!(false);
 
     let prepared_tools = crate::tool_prepare::prepare_responses_tools(body.get("tools"));
     log_blocked_tools(&log, &prepared_tools.blocked);
-    if !prepared_tools.tools.is_empty() {
-        body["tools"] = json!(prepared_tools.tools);
-    }
+    let local_tool_names: std::collections::HashSet<String> = prepared_tools
+        .tools
+        .iter()
+        .filter_map(|tool| {
+            tool.get("name")
+                .and_then(|name| name.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    let delegated_tool_names: std::collections::HashSet<String> = prepared_tools
+        .delegated_tools
+        .iter()
+        .filter_map(|tool| {
+            tool.get("name")
+                .and_then(|name| name.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .collect();
+    let mut all_tools = prepared_tools.tools.clone();
+    all_tools.extend(prepared_tools.delegated_tools.clone());
+    let chat_tools = crate::format_translate::responses_tools_to_openai_chat_tools(&all_tools);
 
     ensure_agent_instructions(&mut body);
-    let mut input_history = body.get("input").cloned().unwrap_or_else(|| json!([]));
-    if !input_history.is_array() {
-        input_history = json!([{"role":"user","content": input_history}]);
-    }
+    let mut chat_messages = crate::format_translate::responses_body_to_openai_chat_messages(&body);
 
-    send_text(tx, stream, "[agent] 已接管本轮请求，开始分析。\n").await;
+    send_text(tx, stream, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
 
     let mut steps_run = 0usize;
     let mut total_tool_calls = 0usize;
     for step in 1..=MAX_AGENT_STEPS {
         steps_run = step;
-        body["input"] = input_history.clone();
+        let request_body = crate::format_translate::build_openai_chat_request(
+            &body,
+            &upstream_model,
+            &chat_messages,
+            &chat_tools,
+        );
 
         let response = client
             .post(&upstream_url)
             .header("Authorization", format!("Bearer {}", api_key))
-            .json(&body)
+            .json(&request_body)
             .send()
             .await?;
 
@@ -120,21 +140,18 @@ async fn run_agent_loop(
         }
 
         let response_json: Value = serde_json::from_str(&response_text)?;
-        let output_items = response_json
-            .get("output")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let tool_calls = collect_tool_calls(&output_items);
+        let assistant_message =
+            crate::format_translate::openai_chat_assistant_message(&response_json);
+        let tool_calls =
+            crate::format_translate::collect_all_tool_calls_from_openai_chat(&assistant_message);
         if tool_calls.is_empty() {
-            let text = collect_final_text(&response_json);
+            let text = crate::format_translate::collect_openai_chat_final_text(&assistant_message);
             log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
             if text.trim().is_empty() {
                 send_text(
                     tx,
                     stream,
-                    "[agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
+                    "⚠️ [agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
                 )
                 .await;
             } else {
@@ -144,14 +161,41 @@ async fn run_agent_loop(
         }
 
         total_tool_calls += tool_calls.len();
-        append_output_items(&mut input_history, output_items);
+        chat_messages.push(assistant_message);
         for tool_call in tool_calls {
-            let display_name = tool_call.name.trim_start_matches("codex_workspace_mcp__");
+            let display_name = &tool_call.name;
+            if delegated_tool_names.contains(&tool_call.name) {
+                send_text(
+                    tx,
+                    stream,
+                    &format!(
+                        "\n↪️ [tool:delegated] {} 需要 Codex 侧执行，已下发。\n",
+                        display_name
+                    ),
+                )
+                .await;
+                let _ = tx
+                    .send(Ok(Bytes::from(stream.delegated_tool_call(&tool_call))))
+                    .await;
+                return Ok(());
+            }
+            if !local_tool_names.contains(&tool_call.name) {
+                send_text(
+                    tx,
+                    stream,
+                    &format!(
+                        "\n⚠️ [tool:unknown] 上游请求了未知工具 {}，本地无法执行，也未由 Codex 注册。\n",
+                        display_name
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
             send_text(
                 tx,
                 stream,
                 &format!(
-                    "\n[tool] 调用 {}\n  参数: {}\n",
+                    "\n🔧 [tool:local] 调用 {}\n   参数: {}\n",
                     display_name,
                     compact_text(&tool_call.arguments, 240)
                 ),
@@ -164,28 +208,25 @@ async fn run_agent_loop(
                 tx,
                 stream,
                 &format!(
-                    "[tool] {} 完成，返回 {} 字符。继续分析...\n",
+                    "✅ [tool:local] {} 完成，返回 {} 字符。继续分析...\n",
                     display_name,
                     bounded.chars().count()
                 ),
             )
             .await;
 
-            push_input_item(
-                &mut input_history,
-                json!({
-                    "type": "function_call_output",
-                    "call_id": tool_call.call_id,
-                    "output": bounded
-                }),
-            );
+            chat_messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call.call_id,
+                "content": bounded
+            }));
         }
     }
 
     send_text(
         tx,
         stream,
-        "\n[agent] 达到最大工具循环次数，已停止。请缩小问题或补充下一步指令。\n",
+        "\n⏹️ [agent] 达到最大工具循环次数，已停止。请缩小问题或补充下一步指令。\n",
     )
     .await;
     log_agent_summary(&log, steps_run, total_tool_calls, 0);
@@ -193,7 +234,7 @@ async fn run_agent_loop(
 }
 
 fn ensure_agent_instructions(body: &mut Value) {
-    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use provided codex_workspace_mcp__ tools whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute these local tools. When you need information, call tools; when enough information is available, answer normally.";
+    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally.";
     let current = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -245,42 +286,9 @@ fn log_agent_summary(
     );
 }
 
-#[derive(Clone, Debug)]
-struct AgentToolCall {
-    call_id: String,
-    name: String,
-    arguments: String,
-}
-
-fn collect_tool_calls(output_items: &[Value]) -> Vec<AgentToolCall> {
-    output_items
-        .iter()
-        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("function_call"))
-        .filter_map(|item| {
-            let name = item.get("name").and_then(|v| v.as_str())?.to_string();
-            if !name.starts_with("codex_workspace_mcp__") {
-                return None;
-            }
-            Some(AgentToolCall {
-                call_id: item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                name,
-                arguments: item
-                    .get("arguments")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("{}")
-                    .to_string(),
-            })
-        })
-        .collect()
-}
-
 async fn execute_local_tool(
     workspace: &Arc<crate::tools::Workspace>,
-    tool_call: &AgentToolCall,
+    tool_call: &crate::format_translate::OpenAiChatToolCall,
 ) -> String {
     let arguments =
         serde_json::from_str::<Value>(&tool_call.arguments).unwrap_or_else(|_| json!({}));
@@ -293,45 +301,6 @@ async fn execute_local_tool(
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
         Err(error) => format!("Agent local tool failed: {}", error),
     }
-}
-
-fn append_output_items(input_history: &mut Value, output_items: Vec<Value>) {
-    for item in output_items {
-        push_input_item(input_history, item);
-    }
-}
-
-fn push_input_item(input_history: &mut Value, item: Value) {
-    if let Some(arr) = input_history.as_array_mut() {
-        arr.push(item);
-    }
-}
-
-fn collect_final_text(response: &Value) -> String {
-    if let Some(text) = response.get("output_text").and_then(|v| v.as_str()) {
-        return text.to_string();
-    }
-
-    let mut parts = Vec::new();
-    if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
-        for item in output {
-            if item.get("type").and_then(|v| v.as_str()) != Some("message") {
-                continue;
-            }
-            if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
-                for part in content {
-                    if let Some(text) = part
-                        .get("text")
-                        .or_else(|| part.get("content"))
-                        .and_then(|v| v.as_str())
-                    {
-                        parts.push(text.to_string());
-                    }
-                }
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 fn bound_tool_output(output: &str) -> String {
@@ -388,6 +357,7 @@ struct AgentSseWriter {
     response_id: String,
     model: String,
     item_id: String,
+    extra_output_items: Vec<Value>,
     started: bool,
     text: String,
 }
@@ -398,6 +368,7 @@ impl AgentSseWriter {
             item_id: format!("msg_{}", response_id),
             response_id,
             model,
+            extra_output_items: Vec::new(),
             started: false,
             text: String::new(),
         }
@@ -444,6 +415,13 @@ impl AgentSseWriter {
     fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         self.ensure_text_started(&mut out);
+        let message_item = json!({
+            "id": self.item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": self.text}]
+        });
         write_sse(
             &mut out,
             "response.output_text.done",
@@ -474,15 +452,11 @@ impl AgentSseWriter {
                 "type": "response.output_item.done",
                 "response_id": self.response_id,
                 "output_index": 0,
-                "item": {
-                    "id": self.item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": self.text}]
-                }
+                "item": message_item
             }),
         );
+        let mut output = vec![message_item];
+        output.extend(self.extra_output_items.clone());
         write_sse(
             &mut out,
             "response.completed",
@@ -493,18 +467,50 @@ impl AgentSseWriter {
                     "object": "response",
                     "status": "completed",
                     "model": self.model,
-                    "output": [{
-                        "id": self.item_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": self.text}]
-                    }],
+                    "output": output,
                     "usage": {"input_tokens":0,"output_tokens":0,"total_tokens":0}
                 }
             }),
         );
         out.extend_from_slice(b"data: [DONE]\n\n");
+        out
+    }
+
+    fn delegated_tool_call(
+        &mut self,
+        tool_call: &crate::format_translate::OpenAiChatToolCall,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        let output_index = self.extra_output_items.len() + 1;
+        let item = json!({
+            "id": format!("fc_{}", sanitize_id(&tool_call.call_id)),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": tool_call.call_id,
+            "name": tool_call.name,
+            "arguments": tool_call.arguments
+        });
+        write_sse(
+            &mut out,
+            "response.output_item.added",
+            json!({
+                "type": "response.output_item.added",
+                "response_id": self.response_id,
+                "output_index": output_index,
+                "item": item
+            }),
+        );
+        write_sse(
+            &mut out,
+            "response.output_item.done",
+            json!({
+                "type": "response.output_item.done",
+                "response_id": self.response_id,
+                "output_index": output_index,
+                "item": item
+            }),
+        );
+        self.extra_output_items.push(item);
         out
     }
 
@@ -549,31 +555,4 @@ fn sanitize_id(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn collects_function_calls_for_mcp_tools_only() {
-        let calls = collect_tool_calls(&[
-            json!({"type":"function_call","call_id":"a","name":"codex_workspace_mcp__read_file","arguments":"{}"}),
-            json!({"type":"function_call","call_id":"b","name":"external","arguments":"{}"}),
-        ]);
-
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].call_id, "a");
-    }
-
-    #[test]
-    fn final_text_reads_output_text_or_message_content() {
-        assert_eq!(collect_final_text(&json!({"output_text":"done"})), "done");
-        assert_eq!(
-            collect_final_text(&json!({
-                "output": [{"type":"message","content":[{"type":"output_text","text":"hello"}]}]
-            })),
-            "hello"
-        );
-    }
 }

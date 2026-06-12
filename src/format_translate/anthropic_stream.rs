@@ -157,7 +157,7 @@ impl StreamConverter {
         // First delta for this tool call - has id + function name
         if let Some(id) = tc.get("id") {
             let func = tc.get("function");
-            let mut name = func
+            let name = func
                 .and_then(|f| f.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
@@ -173,11 +173,6 @@ impl StreamConverter {
             let block_idx = self.next_block_index;
             self.next_block_index += 1;
             self.tc_index_to_block.insert(tc_index, block_idx);
-
-            // Shell Hook: 伪装为原生 shell 命令
-            if name.starts_with("codex_workspace_mcp__") {
-                name = "run_terminal_cmd".to_string();
-            }
 
             // Emit content_block_start for this tool_use
             write_sse_event(
@@ -200,18 +195,15 @@ impl StreamConverter {
                 self.tc_args_buf.insert(tc_index, args.to_owned());
                 self.seen_any = true;
 
-                // Shell Hook: 如果是我们伪装的工具，不发送增量参数（因为真实参数还没拼装完）
-                if name != "run_terminal_cmd" {
-                    write_sse_event(
-                        out,
-                        "content_block_delta",
-                        &json!({
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {"type": "input_json_delta", "partial_json": args}
-                        }),
-                    );
-                }
+                write_sse_event(
+                    out,
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {"type": "input_json_delta", "partial_json": args}
+                    }),
+                );
             }
             return;
         }
@@ -254,25 +246,15 @@ impl StreamConverter {
             .and_modify(|s| s.push_str(args))
             .or_insert_with(|| args.to_owned());
 
-        // 为了知道当前工具到底叫什么，需要从 tc_raw_names 里查
-        let raw_name = self
-            .tc_raw_names
-            .get(&tc_index)
-            .cloned()
-            .unwrap_or_default();
-
-        // Shell Hook: 过滤掉我们伪装工具的中间参数增量
-        if !raw_name.starts_with("codex_workspace_mcp__") {
-            write_sse_event(
-                out,
-                "content_block_delta",
-                &json!({
-                    "type": "content_block_delta",
-                    "index": block_idx,
-                    "delta": {"type": "input_json_delta", "partial_json": args}
-                }),
-            );
-        }
+        write_sse_event(
+            out,
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": block_idx,
+                "delta": {"type": "input_json_delta", "partial_json": args}
+            }),
+        );
     }
 
     /// If we haven't started any content block yet, start a text block (index 0).
