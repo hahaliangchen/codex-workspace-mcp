@@ -7,7 +7,7 @@ mod architecture_agent;
 mod database;
 mod format_translate;
 mod go_index;
-mod index_watcher;
+mod index_refresh;
 mod mcp;
 mod memory;
 mod proxy_log;
@@ -80,8 +80,6 @@ async fn main() -> anyhow::Result<()> {
 
     let workspace = Arc::new(Workspace::new(workspace_root)?);
     info!(root = %workspace.root().display(), "workspace initialized");
-
-    index_watcher::start_index_watcher(workspace.clone());
 
     // Start AI proxy on port 3001 if config exists alongside the binary
     let exe_dir = env::current_exe()

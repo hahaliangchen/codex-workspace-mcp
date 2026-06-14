@@ -85,6 +85,27 @@ async fn run_agent_loop(
     tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
 ) -> anyhow::Result<()> {
     let upstream_url = format!("{}/chat/completions", provider_url.trim_end_matches('/'));
+    send_text(tx, stream, "🧭 正在刷新代码索引...\n").await;
+    let index_workspace = Arc::clone(&workspace);
+    match tokio::task::spawn_blocking(move || {
+        crate::index_refresh::refresh_workspace_indexes(&index_workspace)
+    })
+    .await
+    {
+        Ok(summary) => {
+            send_text(tx, stream, &format_index_refresh_summary(&summary)).await;
+        }
+        Err(error) => {
+            send_text(
+                tx,
+                stream,
+                &format!("⚠️ 代码索引刷新任务失败：{}。将继续处理请求。\n", error),
+            )
+            .await;
+        }
+    }
+    run_architecture_prefetch(&workspace, &body, stream, tx).await;
+
     body["model"] = json!(upstream_model);
     body["stream"] = json!(false);
 
@@ -263,6 +284,245 @@ fn ensure_agent_instructions(body: &mut Value) {
     } else {
         json!(format!("{}\n\n{}", prefix, current))
     };
+}
+
+fn format_index_refresh_summary(summary: &crate::index_refresh::IndexRefreshSummary) -> String {
+    if summary.languages_detected.is_empty() {
+        return "✅ 代码索引刷新完成：未检测到可索引语言。\n".to_string();
+    }
+
+    let refreshed = if summary.languages_refreshed.is_empty() {
+        "无成功刷新语言".to_string()
+    } else {
+        summary
+            .languages_refreshed
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {} files / {} symbols",
+                    item.language, item.files_indexed, item.symbols_indexed
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if summary.failures.is_empty() {
+        format!("✅ 代码索引已刷新：{}。\n", refreshed)
+    } else {
+        let failures = summary
+            .failures
+            .iter()
+            .map(|item| format!("{}: {}", item.language, item.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("⚠️ 代码索引部分刷新：{}；失败：{}。\n", refreshed, failures)
+    }
+}
+
+async fn run_architecture_prefetch(
+    workspace: &Arc<crate::tools::Workspace>,
+    body: &Value,
+    stream: &mut AgentSseWriter,
+    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+) {
+    let Some(query) = latest_user_text_from_responses_body(body) else {
+        return;
+    };
+    if query.trim().is_empty() {
+        return;
+    }
+
+    send_text(tx, stream, "🧠 flash 正在分析用户意图和业务范围...\n").await;
+    match build_architecture_prefetch_request(workspace, &query) {
+        Ok(request) => {
+            match crate::architecture_agent::analyze_architecture(workspace, request).await {
+                Ok(response) => {
+                    let analysis = response.analysis;
+                    send_text(
+                        tx,
+                        stream,
+                        &format!(
+                            "📌 flash 业务定位：{}；关键符号 {} 个，语义释义 {} 个，已记录={}。\n",
+                            analysis.area,
+                            analysis.key_symbols.len(),
+                            analysis.symbol_contexts.len(),
+                            response.recorded
+                        ),
+                    )
+                    .await;
+                    if !analysis.minimal_change_scope.trim().is_empty() {
+                        send_text(
+                            tx,
+                            stream,
+                            &format!("🧭 建议最小范围：{}。\n", analysis.minimal_change_scope),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    send_text(
+                        tx,
+                        stream,
+                        &format!("⚠️ flash 业务分析失败：{}。将继续交给主模型处理。\n", error),
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(error) => {
+            send_text(
+                tx,
+                stream,
+                &format!("⚠️ flash 证据准备失败：{}。将继续交给主模型处理。\n", error),
+            )
+            .await;
+        }
+    }
+}
+
+fn build_architecture_prefetch_request(
+    workspace: &Arc<crate::tools::Workspace>,
+    query: &str,
+) -> anyhow::Result<crate::architecture_agent::AnalyzeArchitectureRequest> {
+    let workspace_root = workspace.root().display().to_string();
+    let lookup_query = compact_lookup_query(query);
+    let architecture_matches =
+        workspace.search_architecture_memory(crate::memory::SearchArchitectureMemoryRequest {
+            workspace_root: workspace_root.clone(),
+            query: lookup_query.clone(),
+            limit: 3,
+        })?;
+    let symbol_context_matches = workspace.search_symbol_business_context(
+        crate::memory::SearchSymbolBusinessContextRequest {
+            workspace_root: workspace_root.clone(),
+            query: lookup_query.clone(),
+            limit: 5,
+        },
+    )?;
+    let text_matches = workspace.search_text(crate::tools::SearchTextRequest {
+        workspace_root: Some(workspace_root.clone()),
+        query: lookup_query,
+        path: ".".to_string(),
+        paths: Vec::new(),
+        case_sensitive: false,
+        respect_gitignore: true,
+        max_matches: 8,
+    })?;
+
+    let mut evidence = Vec::new();
+    if !architecture_matches.matches.is_empty() {
+        evidence.push(format!(
+            "Matched architecture memory:\n{}",
+            architecture_matches
+                .matches
+                .iter()
+                .map(|item| format!(
+                    "Area: {}\nSummary: {}\nKey symbols: {}\nBoundaries: {}",
+                    item.area,
+                    item.summary,
+                    item.key_symbols.join(", "),
+                    item.boundaries
+                ))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !symbol_context_matches.matches.is_empty() {
+        evidence.push(format!(
+            "Matched symbol business contexts:\n{}",
+            symbol_context_matches
+                .matches
+                .iter()
+                .map(|item| format!(
+                    "Symbol: {} ({})\nArea: {}\nRole: {}\nRead when: {}\nAvoid when: {}",
+                    item.symbol_name,
+                    item.file_path,
+                    item.belongs_to_area,
+                    item.business_role,
+                    item.read_when,
+                    item.avoid_when
+                ))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !text_matches.matches.is_empty() {
+        evidence.push(format!(
+            "Indexed/text search candidates (index_used={}, index_matches={}, text_scan_used={}):\n{}",
+            text_matches.index_used,
+            text_matches.index_matches,
+            text_matches.text_scan_used,
+            text_matches
+                .matches
+                .iter()
+                .map(|item| format!("{}:{}:{} {}", item.path, item.line, item.column, item.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    Ok(crate::architecture_agent::AnalyzeArchitectureRequest {
+        workspace_root,
+        query: query.to_string(),
+        focus: "Map the latest user request to the smallest relevant code/business logic area. Build or verify semantic memory from the provided index evidence.".to_string(),
+        evidence,
+        record: true,
+    })
+}
+
+fn compact_lookup_query(query: &str) -> String {
+    let compact = query.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(80).collect()
+}
+
+fn latest_user_text_from_responses_body(body: &Value) -> Option<String> {
+    if let Some(input_arr) = body.get("input").and_then(|v| v.as_array()) {
+        for item in input_arr.iter().rev() {
+            if item.get("role").and_then(|v| v.as_str()) == Some("user") {
+                let text = response_content_to_plain_text(item.get("content").unwrap_or(item));
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    if let Some(messages_arr) = body.get("messages").and_then(|v| v.as_array()) {
+        for item in messages_arr.iter().rev() {
+            if item.get("role").and_then(|v| v.as_str()) == Some("user") {
+                let text = response_content_to_plain_text(item.get("content").unwrap_or(item));
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn response_content_to_plain_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => map
+            .get("text")
+            .or_else(|| map.get("content"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
 }
 
 fn log_blocked_tools(
