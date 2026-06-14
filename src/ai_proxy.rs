@@ -182,16 +182,6 @@ async fn chat_completions(
 ) -> Response {
     let conversation_id = conversation_id_from_body(&body, state.workspace.root());
     crate::proxy_log::set_conversation_id(Some(conversation_id));
-    crate::vision_preprocess::set_visible_images_from_body(&body);
-    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
-    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_latest_user_images(
-        &mut body,
-        &state.log,
-        true,
-        &mut image_stats,
-    )
-    .await;
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -202,6 +192,11 @@ async fn chat_completions(
                 .into_response();
         }
     };
+
+    crate::vision_preprocess::set_visible_images_from_body(&body);
+    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
+    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
+    crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
 
     log!(
         &state.log,
@@ -279,13 +274,7 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
     crate::vision_preprocess::set_visible_images_from_body(&body);
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    crate::vision_preprocess::process_latest_user_images(
-        &mut body,
-        &state.log,
-        true,
-        &mut image_stats,
-    )
-    .await;
+    crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
     let raw_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
     log!(&state.log, "=== /v1/messages  model={}", raw_model);

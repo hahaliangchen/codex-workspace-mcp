@@ -84,6 +84,8 @@ DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 {
   "default_provider": "deepseek-openai",
   "vision_provider": "gpt",
+  "architecture_provider": "deepseek-openai",
+  "architecture_model": "deepseek-v4-flash",
   "providers": {
     "deepseek-openai": {
       "url": "https://api.deepseek.com/v1",
@@ -111,6 +113,7 @@ DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 
 - `default_provider` 控制请求走哪个 provider
 - `vision_provider` 控制图片解析使用哪个 provider
+- `architecture_provider` / `architecture_model` 控制便宜模型分析代码业务逻辑并生成 architecture memory
 - `supports_vision: false` 用来明确 DeepSeek、Mimo 等文本 provider 不支持视觉
 - `/v1/responses` 一律启用本地 Agent Runtime；不再需要 `raw_codex` 或 `agent_mode` 开关
 

@@ -10,10 +10,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
+use crate::architecture_agent::AnalyzeArchitectureRequest;
 use crate::go_index::{
     IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest, SearchGoSymbolsRequest,
 };
-use crate::memory::{ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest};
+use crate::memory::{
+    ListArchitectureMemoryRequest, ListSymbolBusinessContextRequest, ListWorkMemoryRequest,
+    RecordArchitectureMemoryRequest, RecordSymbolBusinessContextRequest, RecordWorkMemoryRequest,
+    SearchArchitectureMemoryRequest, SearchSymbolBusinessContextRequest, SearchWorkMemoryRequest,
+};
 use crate::python_index::{
     IndexPythonWorkspaceRequest, ListPythonSymbolsRequest, ReadPythonSymbolRequest,
     SearchPythonSymbolsRequest,
@@ -258,6 +263,20 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                 }
             }
 
+            if let Ok(st) = workspace.list_architecture_memory(ListArchitectureMemoryRequest {
+                workspace_root: w_root.clone(),
+                limit: 100,
+            }) {
+                if !st.memories.is_empty() {
+                    resources.push(json!({
+                        "uri": "mcp://codex-workspace-mcp/architecture-memory",
+                        "name": "Architecture Memory",
+                        "mimeType": "text/plain",
+                        "description": "Read durable feature/logic area summaries, key symbols, boundaries, common tasks, and risks for this workspace."
+                    }));
+                }
+            }
+
             Ok(json!({
                 "resources": resources
             }))
@@ -372,6 +391,42 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                                 md.push_str(&format!("- **Potential Risks & Blockers**:\n  > {}\n", mem.risks.replace("\n", "\n  > ")));
                             }
                             md.push_str("\n---\n\n");
+                        }
+                    }
+                    md
+                }
+                "mcp://codex-workspace-mcp/architecture-memory" => {
+                    let st = workspace.list_architecture_memory(ListArchitectureMemoryRequest {
+                        workspace_root: w_root.clone(),
+                        limit: 100,
+                    })?;
+                    let mut md = String::from("# Architecture Memory\n\n");
+                    if st.memories.is_empty() {
+                        md.push_str("No architecture memory has been recorded in this workspace yet. Use `record_architecture_memory` after verifying a feature's key symbols and boundaries.\n");
+                    } else {
+                        for mem in st.memories {
+                            let updated = chrono::DateTime::from_timestamp(mem.updated_at_unix as i64, 0)
+                                .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| format!("Unix Epoch {}", mem.updated_at_unix));
+                            md.push_str(&format!("## {}\n", mem.area));
+                            md.push_str(&format!("- **Updated**: {}\n", updated));
+                            md.push_str(&format!("- **Summary**: {}\n", mem.summary));
+                            if !mem.key_symbols.is_empty() {
+                                md.push_str(&format!("- **Key Symbols**:\n  - {}\n", mem.key_symbols.join("\n  - ")));
+                            }
+                            if !mem.key_files.is_empty() {
+                                md.push_str(&format!("- **Key Files**:\n  - {}\n", mem.key_files.join("\n  - ")));
+                            }
+                            if !mem.common_tasks.is_empty() {
+                                md.push_str(&format!("- **Common Tasks**:\n  - {}\n", mem.common_tasks.join("\n  - ")));
+                            }
+                            if !mem.boundaries.is_empty() {
+                                md.push_str(&format!("- **Boundaries**:\n  > {}\n", mem.boundaries.replace("\n", "\n  > ")));
+                            }
+                            if !mem.risks.is_empty() {
+                                md.push_str(&format!("- **Risks**:\n  > {}\n", mem.risks.replace("\n", "\n  > ")));
+                            }
+                            md.push('\n');
                         }
                     }
                     md
@@ -550,6 +605,43 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
                 SearchWorkMemoryRequest,
             >(arguments)?)?)?
         }
+        "record_architecture_memory" => {
+            serde_json::to_value(workspace.record_architecture_memory(
+                serde_json::from_value::<RecordArchitectureMemoryRequest>(arguments)?,
+            )?)?
+        }
+        "list_architecture_memory" => {
+            serde_json::to_value(workspace.list_architecture_memory(serde_json::from_value::<
+                ListArchitectureMemoryRequest,
+            >(arguments)?)?)?
+        }
+        "search_architecture_memory" => {
+            serde_json::to_value(workspace.search_architecture_memory(
+                serde_json::from_value::<SearchArchitectureMemoryRequest>(arguments)?,
+            )?)?
+        }
+        "analyze_architecture_memory" => serde_json::to_value(
+            crate::architecture_agent::analyze_architecture(
+                workspace,
+                serde_json::from_value::<AnalyzeArchitectureRequest>(arguments)?,
+            )
+            .await?,
+        )?,
+        "record_symbol_business_context" => {
+            serde_json::to_value(workspace.record_symbol_business_context(
+                serde_json::from_value::<RecordSymbolBusinessContextRequest>(arguments)?,
+            )?)?
+        }
+        "list_symbol_business_context" => {
+            serde_json::to_value(workspace.list_symbol_business_context(
+                serde_json::from_value::<ListSymbolBusinessContextRequest>(arguments)?,
+            )?)?
+        }
+        "search_symbol_business_context" => {
+            serde_json::to_value(workspace.search_symbol_business_context(
+                serde_json::from_value::<SearchSymbolBusinessContextRequest>(arguments)?,
+            )?)?
+        }
         // Skills 按需懒加载：列出所有可用技能（名称+一句话描述）
         "list_skills" => {
             let skills = crate::skills::list_skills();
@@ -578,14 +670,6 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
 
             let result =
                 crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
-
-            // 只更新当前进程内的描述缓存，不维护跨轮图片 key -> 原图映射。
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::Hasher;
-            hasher.write(raw_data.as_bytes());
-            let hash_val = hasher.finish();
-            let hash_str = format!("{:016x}", hash_val);
-            crate::vision_preprocess::insert_cached_description(&hash_str, &result);
 
             serde_json::to_value(result)?
         }
@@ -675,7 +759,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_text",
-            "description": "Search raw text across workspace files. By default this searches the real filesystem view, including gitignored files. Best for UI strings, config keys, error messages, literals, or fallback when symbol index tools do not find enough code structure. Use `path` for one file/directory, or `paths` as an array for multiple files/directories; do not put multiple paths in one space-separated string.",
+            "description": "Fallback raw text search across workspace files. For code navigation or symbol lookup, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols and read_*_symbol. Use search_text for UI strings, config keys, error messages, log lines, literals, or when symbol index tools do not find enough code structure. By default this searches the real filesystem view, including gitignored files. Use `path` for one file/directory, or `paths` as an array for multiple files/directories; do not put multiple paths in one space-separated string.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -928,6 +1012,112 @@ pub fn tool_definitions() -> Value {
         {
             "name": "search_work_memory",
             "description": "Search past work summaries by keyword. Call before investigating a topic to check whether prior work already covers it — avoids duplicating effort across sessions.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "record_architecture_memory",
+            "description": "Create or update a durable architecture memory document for one feature/logic area in this workspace. Use after verifying code paths, and update it after large changes that alter responsibilities, key symbols, boundaries, or common tasks.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "area", "summary"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "area": { "type": "string", "description": "Stable feature/logic area name, e.g. 'Responses format translation'." },
+                    "summary": { "type": "string", "description": "Concise description of what this area owns and how the flow works." },
+                    "key_symbols": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Important symbol names or qualified functions/classes to inspect first." },
+                    "key_files": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Primary files for this area." },
+                    "boundaries": { "type": "string", "description": "What this area should not own; nearby systems to avoid unless evidence requires touching them." },
+                    "common_tasks": { "type": "array", "items": { "type": "string" }, "default": [], "description": "User-facing task phrases that map to this area." },
+                    "risks": { "type": "string", "description": "Coupling, compatibility, or regression risks." }
+                }
+            }
+        },
+        {
+            "name": "list_architecture_memory",
+            "description": "List durable architecture memory documents for this workspace. Use when you need an overview of known feature/logic areas before deciding where to inspect code.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "search_architecture_memory",
+            "description": "Search durable architecture memory by user task, feature name, symbol, file, boundary, or risk. Use before code changes to map business wording to key symbols and a minimal inspection scope.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "analyze_architecture_memory",
+            "description": "Ask the configured cheap architecture model to analyze a user task plus verified code/index evidence, then return a structured feature/logic map. Use when no useful architecture memory exists or a large change needs refreshed boundaries. Set record=true only after the provided evidence is grounded in actual code/index results.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "query"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "query": { "type": "string", "description": "User task or architecture question to map to project logic." },
+                    "focus": { "type": "string", "description": "Optional narrower feature/logic focus." },
+                    "evidence": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Verified snippets from architecture memory, symbol index results, read_*_symbol output, or short code excerpts. Do not pass whole-project source." },
+                    "record": { "type": "boolean", "default": false, "description": "When true, upsert the returned analysis into architecture memory." }
+                }
+            }
+        },
+        {
+            "name": "record_symbol_business_context",
+            "description": "Create or update semantic business context for one indexed symbol. Use after cheap architecture analysis or verified code inspection to map business wording to concrete symbols.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id", "business_role"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "symbol_id": { "type": "string", "description": "Stable symbol id from the language index when available; otherwise a qualified symbol name." },
+                    "symbol_name": { "type": "string" },
+                    "language": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "belongs_to_area": { "type": "string" },
+                    "business_role": { "type": "string" },
+                    "common_tasks": { "type": "array", "items": { "type": "string" }, "default": [] },
+                    "read_when": { "type": "string" },
+                    "avoid_when": { "type": "string" },
+                    "risks": { "type": "string" },
+                    "confidence": { "type": "number", "default": 0.0 }
+                }
+            }
+        },
+        {
+            "name": "list_symbol_business_context",
+            "description": "List semantic business contexts for indexed symbols. Optionally filter by architecture area.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root"],
+                "properties": {
+                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
+                    "belongs_to_area": { "type": "string" },
+                    "limit": { "type": "integer", "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "search_symbol_business_context",
+            "description": "Search the semantic symbol index by business wording, task phrase, symbol name, area, read_when/avoid_when guidance, file, or risk. Use before raw text search when the user describes a code feature in business terms.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],

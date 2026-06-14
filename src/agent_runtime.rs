@@ -5,14 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use futures::future::join_all;
 use futures::stream::poll_fn;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::error;
 
-const MAX_AGENT_STEPS: usize = 12;
-const MAX_TOOL_OUTPUT_CHARS: usize = 30 * 1024;
+const MAX_AGENT_STEPS: usize = 30;
+const MAX_CONSECUTIVE_FAILURES: usize = 3;
+const MAX_TOOL_OUTPUT_CHARS: usize = 300 * 1024;
 
 pub async fn run_responses_agent(
     client: Client,
@@ -31,16 +33,20 @@ pub async fn run_responses_agent(
         let mut stream = AgentSseWriter::new(session.response_id.clone(), client_model);
         let _ = tx.send(Ok(Bytes::from(stream.start()))).await;
 
-        let result = run_agent_loop(
-            client,
-            workspace,
-            log,
-            provider_url,
-            api_key,
-            body,
-            upstream_model,
-            &mut stream,
-            &tx,
+        let visible_images = crate::vision_preprocess::visible_images_from_body(&body);
+        let result = crate::vision_preprocess::scope_visible_images(
+            visible_images,
+            run_agent_loop(
+                client,
+                workspace,
+                log,
+                provider_url,
+                api_key,
+                body,
+                upstream_model,
+                &mut stream,
+                &tx,
+            ),
         )
         .await;
 
@@ -111,8 +117,9 @@ async fn run_agent_loop(
 
     send_text(tx, stream, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
 
-    let mut steps_run = 0usize;
     let mut total_tool_calls = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut steps_run = 0usize;
     for step in 1..=MAX_AGENT_STEPS {
         steps_run = step;
         let request_body = crate::format_translate::build_openai_chat_request(
@@ -151,7 +158,7 @@ async fn run_agent_loop(
                 send_text(
                     tx,
                     stream,
-                    "⚠️ [agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
+                    "\n⚠️ [agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
                 )
                 .await;
             } else {
@@ -161,21 +168,15 @@ async fn run_agent_loop(
         }
 
         total_tool_calls += tool_calls.len();
+        let mut step_failed = false;
         chat_messages.push(assistant_message);
-        for tool_call in tool_calls {
-            let display_name = &tool_call.name;
+
+        // Pre-flight: check for delegated/unknown tools before spawning any work.
+        for tool_call in &tool_calls {
             if delegated_tool_names.contains(&tool_call.name) {
-                send_text(
-                    tx,
-                    stream,
-                    &format!(
-                        "\n↪️ [tool:delegated] {} 需要 Codex 侧执行，已下发。\n",
-                        display_name
-                    ),
-                )
-                .await;
+                send_text(tx, stream, &format!("\n↪️ {}\n", &tool_call.name)).await;
                 let _ = tx
-                    .send(Ok(Bytes::from(stream.delegated_tool_call(&tool_call))))
+                    .send(Ok(Bytes::from(stream.delegated_tool_call(tool_call))))
                     .await;
                 return Ok(());
             }
@@ -185,56 +186,74 @@ async fn run_agent_loop(
                     stream,
                     &format!(
                         "\n⚠️ [tool:unknown] 上游请求了未知工具 {}，本地无法执行，也未由 Codex 注册。\n",
-                        display_name
+                        &tool_call.name
                     ),
                 )
                 .await;
                 return Ok(());
             }
-            send_text(
-                tx,
-                stream,
-                &format!(
-                    "\n🔧 [tool:local] 调用 {}\n   参数: {}\n",
-                    display_name,
-                    compact_text(&tool_call.arguments, 240)
-                ),
-            )
-            .await;
+        }
 
-            let output = execute_local_tool(&workspace, &tool_call).await;
+        // Fire 🔧 notifications in order.
+        for tool_call in &tool_calls {
+            send_text(tx, stream, &format!("\n🔧 {}\n", &tool_call.name)).await;
+        }
+
+        // Execute all local tools concurrently.
+        let workspace_ref = &workspace;
+        let tool_futures: Vec<_> = tool_calls
+            .into_iter()
+            .map(|tc| {
+                let workspace = Arc::clone(workspace_ref);
+                async move {
+                    let output = execute_local_tool(&workspace, &tc).await;
+                    (tc, output)
+                }
+            })
+            .collect();
+        let results = join_all(tool_futures).await;
+
+        // Push results into chat_messages in original order, send ✅ notifications.
+        for (tc, output) in results {
+            if output.starts_with("Agent local tool failed:") {
+                step_failed = true;
+            }
             let bounded = bound_tool_output(&output);
+            chat_messages.push(crate::format_translate::openai_chat_tool_result_message(
+                &tc, &bounded,
+            ));
             send_text(
                 tx,
                 stream,
                 &format!(
-                    "✅ [tool:local] {} 完成，返回 {} 字符。继续分析...\n",
-                    display_name,
-                    bounded.chars().count()
+                    "✅ {} 完成，返回 {} 字符{}。继续分析...\n",
+                    &tc.name,
+                    bounded.chars().count(),
+                    tool_completion_note(&tc.name, &bounded)
                 ),
             )
             .await;
+        }
 
-            chat_messages.push(json!({
-                "role": "tool",
-                "tool_call_id": tool_call.call_id,
-                "content": bounded
-            }));
+        if step_failed {
+            consecutive_failures += 1;
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                send_text(tx, stream, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
+                log_agent_summary(&log, steps_run, total_tool_calls, 0);
+                return Ok(());
+            }
+        } else {
+            consecutive_failures = 0;
         }
     }
 
-    send_text(
-        tx,
-        stream,
-        "\n⏹️ [agent] 达到最大工具循环次数，已停止。请缩小问题或补充下一步指令。\n",
-    )
-    .await;
+    send_text(tx, stream, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
     log_agent_summary(&log, steps_run, total_tool_calls, 0);
     Ok(())
 }
 
 fn ensure_agent_instructions(body: &mut Value) {
-    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally.";
+    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally. Prefer parallel tool calls: batch independent reads, searches, and lookups into a single step whenever they do not depend on each other's results. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
     let current = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -303,6 +322,61 @@ async fn execute_local_tool(
     }
 }
 
+fn tool_completion_note(name: &str, output: &str) -> String {
+    if is_symbol_index_tool(name) {
+        return "，已使用索引查询".to_string();
+    }
+
+    if name != "search_text" {
+        return String::new();
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return "，执行全文扫描".to_string();
+    };
+    let structured = value.get("structuredContent").unwrap_or(&value);
+    let index_used = structured
+        .get("index_used")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let index_matches = structured
+        .get("index_matches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let text_scan_used = structured
+        .get("text_scan_used")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    match (index_used, text_scan_used) {
+        (true, true) => format!(
+            "，已使用索引查询（命中 {} 条）并执行全文扫描",
+            index_matches
+        ),
+        (true, false) => format!("，已使用索引查询（命中 {} 条）", index_matches),
+        (false, true) => "，执行全文扫描（未使用索引）".to_string(),
+        (false, false) => String::new(),
+    }
+}
+
+fn is_symbol_index_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "search_go_symbols"
+            | "search_rust_symbols"
+            | "search_ts_symbols"
+            | "search_python_symbols"
+            | "list_go_symbols"
+            | "list_rust_symbols"
+            | "list_ts_symbols"
+            | "list_python_symbols"
+            | "read_go_symbol"
+            | "read_rust_symbol"
+            | "read_ts_symbol"
+            | "read_python_symbol"
+    )
+}
+
 fn bound_tool_output(output: &str) -> String {
     let count = output.chars().count();
     if count <= MAX_TOOL_OUTPUT_CHARS {
@@ -316,14 +390,6 @@ fn bound_tool_output(output: &str) -> String {
         "{}\n[Agent truncated tool output: original {} chars, kept first {} chars]",
         head, count, MAX_TOOL_OUTPUT_CHARS
     )
-}
-
-fn compact_text(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    format!("{}...", text.chars().take(max_chars).collect::<String>())
 }
 
 async fn send_text(
@@ -555,4 +621,51 @@ fn sanitize_id(value: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_note_marks_symbol_index_tools() {
+        assert_eq!(
+            tool_completion_note("search_rust_symbols", "{}"),
+            "，已使用索引查询"
+        );
+    }
+
+    #[test]
+    fn completion_note_reports_search_text_index_and_scan() {
+        let output = json!({
+            "structuredContent": {
+                "index_used": true,
+                "index_matches": 2,
+                "text_scan_used": true
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            tool_completion_note("search_text", &output),
+            "，已使用索引查询（命中 2 条）并执行全文扫描"
+        );
+    }
+
+    #[test]
+    fn completion_note_reports_search_text_scan_only() {
+        let output = json!({
+            "structuredContent": {
+                "index_used": false,
+                "index_matches": 0,
+                "text_scan_used": true
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            tool_completion_note("search_text", &output),
+            "，执行全文扫描（未使用索引）"
+        );
+    }
 }

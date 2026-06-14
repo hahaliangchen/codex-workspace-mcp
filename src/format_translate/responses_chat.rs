@@ -135,6 +135,14 @@ pub fn collect_all_tool_calls_from_openai_chat(
         .collect()
 }
 
+pub fn openai_chat_tool_result_message(tool_call: &OpenAiChatToolCall, content: &str) -> Value {
+    json!({
+        "role": "tool",
+        "tool_call_id": tool_call.call_id,
+        "content": content
+    })
+}
+
 pub fn collect_openai_chat_final_text(assistant_message: &Value) -> String {
     response_content_to_text(assistant_message.get("content").unwrap_or(&Value::Null))
 }
@@ -220,7 +228,7 @@ pub fn clean_unmatched_tool_calls(messages: &mut Vec<Value>) {
     let mut i = 0;
     while i < messages.len() {
         let mut msg = messages[i].clone();
-        
+
         let role = msg.get("role").and_then(|v| v.as_str());
         if role == Some("assistant") {
             let mut j = i + 1;
@@ -233,20 +241,20 @@ pub fn clean_unmatched_tool_calls(messages: &mut Vec<Value>) {
                     break;
                 }
             }
-            
+
             let mut matched_tool_call_ids = std::collections::HashSet::new();
             for t in &immediate_tool_messages {
                 if let Some(id) = t.get("tool_call_id").and_then(|v| v.as_str()) {
                     matched_tool_call_ids.insert(id.to_string());
                 }
             }
-            
+
             if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
                 tool_calls.retain(|tc| {
                     let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     matched_tool_call_ids.contains(id)
                 });
-                
+
                 if tool_calls.is_empty() {
                     if let Some(obj) = msg.as_object_mut() {
                         obj.remove("tool_calls");
@@ -256,23 +264,35 @@ pub fn clean_unmatched_tool_calls(messages: &mut Vec<Value>) {
                     }
                 }
             }
-            
+
             valid_messages.push(msg.clone());
-            
-            let assistant_tool_calls_now = valid_messages.last().unwrap().get("tool_calls").and_then(|v| v.as_array());
-            let valid_ids: std::collections::HashSet<String> = if let Some(tc_arr) = assistant_tool_calls_now {
-                tc_arr.iter().filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())).collect()
+
+            let assistant_tool_calls_now = valid_messages
+                .last()
+                .unwrap()
+                .get("tool_calls")
+                .and_then(|v| v.as_array());
+            let valid_ids: std::collections::HashSet<String> = if let Some(tc_arr) =
+                assistant_tool_calls_now
+            {
+                tc_arr
+                    .iter()
+                    .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                    .collect()
             } else {
                 std::collections::HashSet::new()
             };
-            
+
             for tm in immediate_tool_messages {
-                let tid = tm.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                let tid = tm
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if valid_ids.contains(tid) {
                     valid_messages.push(tm);
                 }
             }
-            
+
             i = j;
             continue;
         } else if role == Some("tool") {
@@ -284,7 +304,7 @@ pub fn clean_unmatched_tool_calls(messages: &mut Vec<Value>) {
             i += 1;
         }
     }
-    
+
     *messages = valid_messages;
 }
 
@@ -347,7 +367,7 @@ mod tests {
                     {"id": "call_2", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
                 ]
             }),
-            json!({"role": "tool", "tool_call_id": "call_1", "content": "file content"})
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "file content"}),
         ];
 
         clean_unmatched_tool_calls(&mut messages);
@@ -356,15 +376,13 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["id"], "call_1");
 
-        let mut messages2 = vec![
-            json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                    {"id": "call_2", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
-                ]
-            })
-        ];
+        let mut messages2 = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                {"id": "call_2", "type": "function", "function": {"name": "write_file", "arguments": "{}"}}
+            ]
+        })];
 
         clean_unmatched_tool_calls(&mut messages2);
 

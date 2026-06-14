@@ -25,6 +25,55 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         [],
     )?;
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS architecture_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_root TEXT NOT NULL,
+            area TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            key_symbols TEXT NOT NULL,
+            key_files TEXT NOT NULL,
+            boundaries TEXT NOT NULL,
+            common_tasks TEXT NOT NULL,
+            risks TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
+            UNIQUE(workspace_root, area)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_architecture_memories_workspace
+         ON architecture_memories(workspace_root, updated_at_unix)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbol_business_contexts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_root TEXT NOT NULL,
+            symbol_id TEXT NOT NULL,
+            symbol_name TEXT NOT NULL,
+            language TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            belongs_to_area TEXT NOT NULL,
+            business_role TEXT NOT NULL,
+            common_tasks TEXT NOT NULL,
+            read_when TEXT NOT NULL,
+            avoid_when TEXT NOT NULL,
+            risks TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            updated_at_unix INTEGER NOT NULL,
+            UNIQUE(workspace_root, symbol_id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_symbol_business_contexts_search
+         ON symbol_business_contexts(workspace_root, symbol_name, belongs_to_area)",
+        [],
+    )?;
+
     // Create rust_symbols table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS rust_symbols (

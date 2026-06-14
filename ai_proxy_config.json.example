@@ -1,6 +1,8 @@
 {
   "default_provider": "my_upstream_provider",
   "vision_provider": "my_vision_provider",
+  "architecture_provider": "my_deepseek_architecture_provider",
+  "architecture_model": "deepseek-v4-flash",
   "providers": {
     "my_upstream_provider": {
       "url": "https://api.openai.com/v1",
@@ -20,6 +22,15 @@
       "model_map": {
         "gpt-5-codex": "deepseek-chat",
         "gpt-4o": "deepseek-chat"
+      }
+    },
+    "my_deepseek_architecture_provider": {
+      "url": "https://api.deepseek.com/v1",
+      "api_key": "YOUR_DEEPSEEK_API_KEY_HERE",
+      "api_type": "openai",
+      "supports_vision": false,
+      "model_map": {
+        "deepseek-v4-flash": "deepseek-v4-flash"
       }
     },
     "my_mimo_text_provider": {

@@ -13,7 +13,9 @@ use crate::go_index::{
     SearchGoSymbolsRequest,
 };
 use crate::memory::{
-    self, ListWorkMemoryRequest, RecordWorkMemoryRequest, SearchWorkMemoryRequest,
+    self, ListArchitectureMemoryRequest, ListSymbolBusinessContextRequest, ListWorkMemoryRequest,
+    RecordArchitectureMemoryRequest, RecordSymbolBusinessContextRequest, RecordWorkMemoryRequest,
+    SearchArchitectureMemoryRequest, SearchSymbolBusinessContextRequest, SearchWorkMemoryRequest,
 };
 use crate::python_index::{
     self, IndexPythonWorkspaceRequest, ListPythonSymbolsRequest, ReadPythonSymbolRequest,
@@ -194,6 +196,9 @@ pub struct SearchTextRequest {
 #[derive(Debug, Serialize)]
 pub struct SearchTextResponse {
     pub query: String,
+    pub index_used: bool,
+    pub index_matches: usize,
+    pub text_scan_used: bool,
     pub matches: Vec<TextMatch>,
     pub truncated: bool,
 }
@@ -291,6 +296,10 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn with_selected_root(&self, workspace_root: &str) -> Result<Self> {
+        self.with_root(Some(workspace_root))
     }
 
     pub fn workspace_info(&self, request: WorkspaceInfoRequest) -> Result<WorkspaceInfo> {
@@ -411,6 +420,7 @@ impl Workspace {
         let mut matches = Vec::new();
         let mut truncated = false;
         let mut seen_symbols = std::collections::HashSet::new();
+        let mut index_used = false;
 
         // 1. 优先尝试从 SQLite 符号索引库中查找精确匹配的符号定义
         if let Ok(conn) = crate::database::init_db(&workspace.root) {
@@ -427,6 +437,7 @@ impl Workspace {
                     break;
                 }
                 if crate::database::get_index_generated_at(&conn, &root_str, lang).is_some() {
+                    index_used = true;
                     truncated = query_indexed_symbol_table(
                         &conn,
                         &root_str,
@@ -441,9 +452,12 @@ impl Workspace {
                 }
             }
         }
+        let index_matches = matches.len();
 
         // 2. 如果置顶的符号匹配项未把配额占满，继续进行常规全文 Walk 扫描匹配
+        let mut text_scan_used = false;
         if !truncated {
+            text_scan_used = true;
             let mut handles = Vec::new();
             for root in roots {
                 let workspace_root = workspace.root.clone();
@@ -483,6 +497,9 @@ impl Workspace {
 
         Ok(SearchTextResponse {
             query: request.query,
+            index_used,
+            index_matches,
+            text_scan_used,
             matches,
             truncated,
         })
@@ -863,6 +880,96 @@ impl Workspace {
         memory::search(
             &self.root,
             SearchWorkMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn record_architecture_memory(
+        &self,
+        request: RecordArchitectureMemoryRequest,
+    ) -> Result<memory::RecordArchitectureMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::record_architecture(
+            &self.root,
+            RecordArchitectureMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn list_architecture_memory(
+        &self,
+        request: ListArchitectureMemoryRequest,
+    ) -> Result<memory::ListArchitectureMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::list_architecture(
+            &self.root,
+            ListArchitectureMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn search_architecture_memory(
+        &self,
+        request: SearchArchitectureMemoryRequest,
+    ) -> Result<memory::SearchArchitectureMemoryResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::search_architecture(
+            &self.root,
+            SearchArchitectureMemoryRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn record_symbol_business_context(
+        &self,
+        request: RecordSymbolBusinessContextRequest,
+    ) -> Result<memory::RecordSymbolBusinessContextResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::record_symbol_business_context(
+            &self.root,
+            RecordSymbolBusinessContextRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn list_symbol_business_context(
+        &self,
+        request: ListSymbolBusinessContextRequest,
+    ) -> Result<memory::ListSymbolBusinessContextResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::list_symbol_business_context(
+            &self.root,
+            ListSymbolBusinessContextRequest {
+                workspace_root: workspace.root.display().to_string(),
+                ..request
+            },
+        )
+        .map_err(map_memory_error)
+    }
+
+    pub fn search_symbol_business_context(
+        &self,
+        request: SearchSymbolBusinessContextRequest,
+    ) -> Result<memory::SearchSymbolBusinessContextResponse> {
+        let workspace = self.with_root(Some(&request.workspace_root))?;
+        memory::search_symbol_business_context(
+            &self.root,
+            SearchSymbolBusinessContextRequest {
                 workspace_root: workspace.root.display().to_string(),
                 ..request
             },
@@ -1291,6 +1398,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].line, 2);
+        assert!(!result.index_used);
+        assert_eq!(result.index_matches, 0);
+        assert!(result.text_scan_used);
         let _ = fs::remove_dir_all(root);
     }
 
