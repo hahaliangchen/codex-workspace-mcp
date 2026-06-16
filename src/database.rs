@@ -236,6 +236,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+#[allow(dead_code)]
 pub fn insert_detailed_api_log_with_conversation(
     conn: &Connection,
     conversation_id: Option<&str>,
@@ -269,6 +270,7 @@ pub fn insert_detailed_api_log_with_conversation(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn insert_conversation_message(
     conn: &Connection,
     conversation_id: &str,

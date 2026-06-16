@@ -67,6 +67,7 @@ fn workspace_tools_for_responses() -> Vec<Value> {
                     "additionalProperties": false
                 })
             });
+            let parameters = with_tool_reason_parameter(parameters);
             tools.push(json!({
                 "type": "function",
                 "name": original_name,
@@ -157,6 +158,7 @@ fn push_delegated_tool(
                 "additionalProperties": false
             })
         });
+    let parameters = with_tool_reason_parameter(parameters);
 
     delegated_tools.push(json!({
         "type": "function",
@@ -164,4 +166,63 @@ fn push_delegated_tool(
         "description": description,
         "parameters": parameters
     }));
+}
+
+fn with_tool_reason_parameter(mut parameters: Value) -> Value {
+    let Some(object) = parameters.as_object_mut() else {
+        return parameters;
+    };
+    if object.get("type").and_then(|v| v.as_str()).is_none() {
+        object.insert("type".to_string(), json!("object"));
+    }
+    let properties = object.entry("properties").or_insert_with(|| json!({}));
+    let Some(properties) = properties.as_object_mut() else {
+        return parameters;
+    };
+    properties.entry("reason".to_string()).or_insert_with(|| {
+        json!({
+            "type": "string",
+            "description": "Short user-visible reason for this tool call. Explain what you are checking or changing before the tool runs."
+        })
+    });
+    parameters
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_reason_parameter_to_tool_schema() {
+        let schema = with_tool_reason_parameter(json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            }
+        }));
+
+        assert_eq!(
+            schema["properties"]["reason"]["type"].as_str(),
+            Some("string")
+        );
+        assert_eq!(
+            schema["properties"]["path"]["type"].as_str(),
+            Some("string")
+        );
+    }
+
+    #[test]
+    fn preserves_existing_reason_parameter() {
+        let schema = with_tool_reason_parameter(json!({
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "custom"}
+            }
+        }));
+
+        assert_eq!(
+            schema["properties"]["reason"]["description"].as_str(),
+            Some("custom")
+        );
+    }
 }

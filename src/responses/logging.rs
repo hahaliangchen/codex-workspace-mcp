@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 const MAX_RECORDED_TURN_CHARS: usize = 8 * 1024;
 const MAX_REQUEST_LOG_CHARS: usize = 1 * 1024;
+const MAX_HISTORY_ITEM_CHARS: usize = 16 * 1024;
 const MAX_DIAG_ITEMS: usize = 24;
 
 pub fn log_request_body(
@@ -12,6 +13,7 @@ pub fn log_request_body(
     client_model: &str,
 ) {
     record_conversation_turn(conversation_id, body, client_model);
+    write_user_history_snapshot(conversation_id, body, client_model);
     log_codex_shape(log, body);
 
     let input_count = body
@@ -33,6 +35,74 @@ pub fn log_request_body(
             compact_text(&summary, MAX_REQUEST_LOG_CHARS)
         ),
     );
+}
+
+fn write_user_history_snapshot(conversation_id: &str, body: &Value, client_model: &str) {
+    let user_turns = collect_user_history_turns(body);
+    let mut lines = Vec::new();
+    lines.push(format!("conversation_id: {conversation_id}"));
+    lines.push(format!("model: {client_model}"));
+    lines.push(format!("user_turns: {}", user_turns.len()));
+    lines.push(format!("generated_at: {}", crate::proxy_log::now_china()));
+    lines.push(String::new());
+
+    for (idx, turn) in user_turns.iter().enumerate() {
+        lines.push(format!("--- user turn {} ---", idx + 1));
+        lines.push(turn.clone());
+        lines.push(String::new());
+    }
+
+    crate::proxy_log::write_user_history_snapshot(conversation_id, &lines.join("\n"));
+}
+
+fn collect_user_history_turns(body: &Value) -> Vec<String> {
+    let mut turns = Vec::new();
+    collect_user_turns_from_items(body.get("input"), &mut turns);
+    collect_user_turns_from_items(body.get("messages"), &mut turns);
+    if turns.is_empty() {
+        if let Some(text) = body.get("input").and_then(|value| value.as_str()) {
+            let text = normalize_ws(text);
+            if !text.is_empty() {
+                turns.push(compact_text(&text, MAX_HISTORY_ITEM_CHARS));
+            }
+        }
+    }
+    turns
+}
+
+fn collect_user_turns_from_items(value: Option<&Value>, turns: &mut Vec<String>) {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return;
+    };
+
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let role = obj
+            .get("role")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let item_type = obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+        if matches!(
+            item_type,
+            "function_call" | "function_call_output" | "tool_call" | "tool_result"
+        ) {
+            continue;
+        }
+
+        let text = collect_text(item);
+        let text = normalize_ws(&text);
+        if !text.is_empty() {
+            turns.push(compact_text(&text, MAX_HISTORY_ITEM_CHARS));
+        }
+    }
 }
 
 fn log_codex_shape(log: &Mutex<std::fs::File>, body: &Value) {
@@ -269,4 +339,26 @@ fn compact_text(text: &str, max_chars: usize) -> String {
         char_count,
         max_chars
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn collect_user_history_turns_skips_tool_messages() {
+        let body = json!({
+            "input": [
+                {"role": "user", "content": "first user"},
+                {"role": "assistant", "content": "assistant text"},
+                {"role": "tool", "content": "tool output"},
+                {"role": "user", "type": "function_call_output", "content": "ignore me"},
+                {"role": "user", "content": "second user"}
+            ]
+        });
+
+        let turns = collect_user_history_turns(&body);
+        assert_eq!(turns, vec!["first user", "second user"]);
+    }
 }

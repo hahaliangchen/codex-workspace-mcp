@@ -12,8 +12,6 @@ struct LogEvent {
     detail: Option<String>,
     action: Option<String>,
     role: Option<String>,
-    write_file: bool,
-    write_db: bool,
 }
 
 static ASYNC_LOGGER: OnceLock<mpsc::Sender<LogEvent>> = OnceLock::new();
@@ -55,15 +53,15 @@ fn startup_log_path(log_dir: &Path) -> PathBuf {
 }
 
 /// Start a background logger. Each process start writes to a fresh timestamped
-/// file under `logs/`, while structured records can also mirror into SQLite.
-pub fn init_async(log_dir: PathBuf, workspace_root: PathBuf) -> std::io::Result<PathBuf> {
+/// file under `logs/`.
+pub fn init_async(log_dir: PathBuf, _workspace_root: PathBuf) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&log_dir)?;
     let log_path = startup_log_path(&log_dir);
     let _ = ASYNC_LOG_PATH.set(log_path.clone());
 
     let _ = ASYNC_LOGGER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<LogEvent>();
-        std::thread::spawn(move || run_async_logger(log_path, workspace_root, rx));
+        std::thread::spawn(move || run_async_logger(log_path, rx));
         tx
     });
 
@@ -73,67 +71,47 @@ pub fn init_async(log_dir: PathBuf, workspace_root: PathBuf) -> std::io::Result<
         .unwrap_or_else(|| startup_log_path(&log_dir)))
 }
 
-fn run_async_logger(log_path: PathBuf, workspace_root: PathBuf, rx: mpsc::Receiver<LogEvent>) {
+fn run_async_logger(log_path: PathBuf, rx: mpsc::Receiver<LogEvent>) {
     let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .ok();
-    let db_conn = crate::database::init_db(Path::new(&workspace_root)).ok();
 
     for event in rx {
-        if event.write_file {
-            let line = format!("[{}] {}\n", event.ts, event.msg);
-            if let Some(file) = log_file.as_mut() {
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-            }
-        }
-
-        if event.write_db {
-            let action = event.action.as_deref().unwrap_or("INFO");
-            let role = event.role.as_deref().unwrap_or("proxy");
-            if action == "CONVERSATION" {
-                if let (Some(conn), Some(conversation_id), Some(detail)) = (
-                    db_conn.as_ref(),
-                    event.conversation_id.as_deref(),
-                    event.detail.as_deref(),
-                ) {
-                    let mut parts = detail.splitn(2, '\n');
-                    let source = parts.next().unwrap_or("responses.turn");
-                    let message_type = parts.next().unwrap_or("ai_dialogue");
-                    let _ = crate::database::insert_conversation_message(
-                        conn,
-                        conversation_id,
-                        &event.ts,
-                        source,
-                        role,
-                        message_type,
-                        &event.msg,
-                    );
-                }
-                continue;
-            }
-            if should_skip_db_log(role, &event.msg) {
-                continue;
-            }
-            if let Some(conn) = db_conn.as_ref() {
-                let (short_msg, detail_opt) = event.detail.as_deref().map_or_else(
-                    || split_db_message(&event.msg),
-                    |detail| (event.msg.clone(), Some(detail)),
-                );
-                let _ = crate::database::insert_detailed_api_log_with_conversation(
-                    conn,
-                    event.conversation_id.as_deref(),
-                    &event.ts,
-                    action,
-                    role,
-                    &short_msg,
-                    detail_opt,
-                );
-            }
+        let line = format_log_line(&event);
+        if let Some(file) = log_file.as_mut() {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
         }
     }
+}
+
+fn format_log_line(event: &LogEvent) -> String {
+    let mut tags = Vec::new();
+    if let Some(conversation_id) = event.conversation_id.as_deref() {
+        tags.push(format!("conversation={conversation_id}"));
+    }
+    if let Some(action) = event.action.as_deref() {
+        tags.push(format!("action={action}"));
+    }
+    if let Some(role) = event.role.as_deref() {
+        tags.push(format!("role={role}"));
+    }
+
+    let tag_text = if tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", tags.join(" "))
+    };
+    let detail = event
+        .detail
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\n{}", value))
+        .unwrap_or_default();
+
+    format!("[{}]{} {}{}\n", event.ts, tag_text, event.msg, detail)
 }
 
 pub fn set_conversation_id(conversation_id: Option<String>) {
@@ -149,10 +127,10 @@ fn current_conversation_id() -> Option<String> {
         .and_then(|lock| lock.lock().ok().and_then(|current| current.clone()))
 }
 
-/// Write a line to the shared log file and optionally SQLite database.
+/// Write a line to the shared log file.
 pub fn write(
     log: &Mutex<std::fs::File>,
-    write_db: bool,
+    _write_db: bool,
     action: Option<&str>,
     role: Option<&str>,
     msg: &str,
@@ -166,8 +144,6 @@ pub fn write(
             detail: None,
             action: action.map(ToOwned::to_owned),
             role: role.map(ToOwned::to_owned),
-            write_file: true,
-            write_db,
         });
         return;
     }
@@ -176,30 +152,6 @@ pub fn write(
     if let Ok(mut f) = log.lock() {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
-    }
-
-    if write_db {
-        let action_str = action.unwrap_or("INFO");
-        let role_str = role.unwrap_or("proxy");
-
-        if should_skip_db_log(role_str, msg) {
-            return;
-        }
-
-        let workspace_root =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        if let Ok(conn) = crate::database::init_db(&workspace_root) {
-            let (short_msg, detail_opt) = split_db_message(msg);
-            let _ = crate::database::insert_detailed_api_log_with_conversation(
-                &conn,
-                current_conversation_id().as_deref(),
-                &ts,
-                action_str,
-                role_str,
-                &short_msg,
-                detail_opt,
-            );
-        }
     }
 }
 
@@ -218,24 +170,37 @@ pub fn write_conversation_message(
             detail: Some(format!("{source}\n{message_type}")),
             action: Some("CONVERSATION".to_string()),
             role: Some(role.to_string()),
-            write_file: false,
-            write_db: true,
         });
     }
 }
 
-fn should_skip_db_log(role: &str, msg: &str) -> bool {
-    role == "system"
-        || msg.contains("You are Codex")
-        || msg.contains("<permissions instructions>")
-        || msg.contains("<skills_instructions>")
+pub fn write_user_history_snapshot(conversation_id: &str, content: &str) {
+    let Some(log_path) = ASYNC_LOG_PATH.get() else {
+        return;
+    };
+    let Some(log_dir) = log_path.parent() else {
+        return;
+    };
+    let file_name = format!(
+        "user_history_{}.log",
+        sanitize_file_component(conversation_id)
+    );
+    let path = log_dir.join(file_name);
+    let _ = std::fs::write(path, content);
 }
 
-fn split_db_message(msg: &str) -> (String, Option<&str>) {
-    if msg.len() > 300 {
-        let truncated = msg.chars().take(300).collect::<String>();
-        (truncated + " ... [TRUNCATED]", Some(msg))
+fn sanitize_file_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(120) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
     } else {
-        (msg.to_owned(), None)
+        out
     }
 }

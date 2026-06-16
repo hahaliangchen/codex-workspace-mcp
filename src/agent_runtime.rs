@@ -14,7 +14,9 @@ use tracing::error;
 
 const MAX_AGENT_STEPS: usize = 30;
 const MAX_CONSECUTIVE_FAILURES: usize = 3;
+const MAX_CONSECUTIVE_NON_FINAL_TEXT: usize = 2;
 const MAX_TOOL_OUTPUT_CHARS: usize = 300 * 1024;
+const FINALITY_PROBE_MAX_TOKENS: usize = 8;
 
 pub async fn run_responses_agent(
     client: Client,
@@ -85,26 +87,59 @@ async fn run_agent_loop(
     tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
 ) -> anyhow::Result<()> {
     let upstream_url = format!("{}/chat/completions", provider_url.trim_end_matches('/'));
-    send_text(tx, stream, "🧭 正在刷新代码索引...\n").await;
-    let index_workspace = Arc::clone(&workspace);
-    match tokio::task::spawn_blocking(move || {
-        crate::index_refresh::refresh_workspace_indexes(&index_workspace)
-    })
-    .await
-    {
-        Ok(summary) => {
-            send_text(tx, stream, &format_index_refresh_summary(&summary)).await;
+    let requested_cwd = request_cwd_from_body(&body);
+    let workspace = select_request_workspace(&workspace, requested_cwd.as_deref());
+    send_text(
+        tx,
+        stream,
+        &format!(
+            "📂 当前工作区：{}{}\n",
+            workspace.root().display(),
+            requested_cwd
+                .as_deref()
+                .map(|cwd| format!("（Codex cwd: {cwd}）"))
+                .unwrap_or_default()
+        ),
+    )
+    .await;
+    let project_gate = run_project_analysis_gate(&body, stream, tx).await;
+    let should_run_project_prefetch = project_gate
+        .as_ref()
+        .map(|gate| gate.requires_project_analysis)
+        .unwrap_or(true);
+    if !should_run_project_prefetch {
+        let gate = project_gate.as_ref().unwrap();
+        send_debug_text(
+            tx,
+            stream,
+            &format!(
+                "⚡ 便宜模型判断无需项目分析：{}。跳过索引刷新和架构预取。\n",
+                gate.reason
+            ),
+        )
+        .await;
+    } else {
+        send_debug_text(tx, stream, "🧭 正在刷新代码索引...\n").await;
+        let index_workspace = Arc::clone(&workspace);
+        match tokio::task::spawn_blocking(move || {
+            crate::index_refresh::refresh_workspace_indexes(&index_workspace)
+        })
+        .await
+        {
+            Ok(summary) => {
+                send_debug_text(tx, stream, &format_index_refresh_summary(&summary)).await;
+            }
+            Err(error) => {
+                send_debug_text(
+                    tx,
+                    stream,
+                    &format!("⚠️ 代码索引刷新任务失败：{}。将继续处理请求。\n", error),
+                )
+                .await;
+            }
         }
-        Err(error) => {
-            send_text(
-                tx,
-                stream,
-                &format!("⚠️ 代码索引刷新任务失败：{}。将继续处理请求。\n", error),
-            )
-            .await;
-        }
+        run_architecture_prefetch(&workspace, &body, stream, tx).await;
     }
-    run_architecture_prefetch(&workspace, &body, stream, tx).await;
 
     body["model"] = json!(upstream_model);
     body["stream"] = json!(false);
@@ -135,11 +170,15 @@ async fn run_agent_loop(
 
     ensure_agent_instructions(&mut body);
     let mut chat_messages = crate::format_translate::responses_body_to_openai_chat_messages(&body);
+    if let Some(gate) = project_gate {
+        chat_messages.push(project_gate_chat_message(&gate));
+    }
 
-    send_text(tx, stream, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
+    send_debug_text(tx, stream, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
 
     let mut total_tool_calls = 0usize;
     let mut consecutive_failures = 0usize;
+    let mut consecutive_non_final_text = 0usize;
     let mut steps_run = 0usize;
     for step in 1..=MAX_AGENT_STEPS {
         steps_run = step;
@@ -174,35 +213,83 @@ async fn run_agent_loop(
             crate::format_translate::collect_all_tool_calls_from_openai_chat(&assistant_message);
         if tool_calls.is_empty() {
             let text = crate::format_translate::collect_openai_chat_final_text(&assistant_message);
-            log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
             if text.trim().is_empty() {
-                send_text(
+                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                send_debug_text(
                     tx,
                     stream,
                     "\n⚠️ [agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
                 )
                 .await;
-            } else {
-                send_text(tx, stream, &text).await;
+                return Ok(());
             }
+
+            let finality = if step < MAX_AGENT_STEPS {
+                confirm_text_finality(
+                    &client,
+                    &upstream_url,
+                    &api_key,
+                    &upstream_model,
+                    latest_user_text_from_responses_body(&body)
+                        .as_deref()
+                        .unwrap_or(""),
+                    &text,
+                )
+                .await
+            } else {
+                FinalityDecision::Done
+            };
+
+            if matches!(finality, FinalityDecision::Done) {
+                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                send_text(tx, stream, &text).await;
+                return Ok(());
+            }
+
+            consecutive_non_final_text += 1;
+            if consecutive_non_final_text > MAX_CONSECUTIVE_NON_FINAL_TEXT {
+                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                send_debug_text(
+                    tx,
+                    stream,
+                    "⚠️ 上游连续返回未完成的无工具文本，已停止继续追问并输出最近一次文本。\n",
+                )
+                .await;
+                send_text(tx, stream, &text).await;
+                return Ok(());
+            }
+
+            if step < MAX_AGENT_STEPS {
+                chat_messages.push(assistant_message);
+                chat_messages.push(json!({
+                    "role": "system",
+                    "content": continuation_nudge_for_non_final_text(&text, &finality)
+                }));
+                send_debug_text(tx, stream, "⚠️ 上游文本未确认完成，继续推进一轮。\n").await;
+                continue;
+            }
+
+            log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+            send_text(tx, stream, &text).await;
             return Ok(());
         }
 
         total_tool_calls += tool_calls.len();
+        consecutive_non_final_text = 0;
         let mut step_failed = false;
         chat_messages.push(assistant_message);
 
         // Pre-flight: check for delegated/unknown tools before spawning any work.
         for tool_call in &tool_calls {
             if delegated_tool_names.contains(&tool_call.name) {
-                send_text(tx, stream, &format!("\n↪️ {}\n", &tool_call.name)).await;
+                send_debug_text(tx, stream, &format!("↪️ {}\n", &tool_call.name)).await;
                 let _ = tx
                     .send(Ok(Bytes::from(stream.delegated_tool_call(tool_call))))
                     .await;
                 return Ok(());
             }
             if !local_tool_names.contains(&tool_call.name) {
-                send_text(
+                send_debug_text(
                     tx,
                     stream,
                     &format!(
@@ -217,7 +304,10 @@ async fn run_agent_loop(
 
         // Fire 🔧 notifications in order.
         for tool_call in &tool_calls {
-            send_text(tx, stream, &format!("\n🔧 {}\n", &tool_call.name)).await;
+            if let Some(reason) = tool_call_reason(tool_call) {
+                send_debug_text(tx, stream, &format!("{}\n", reason)).await;
+            }
+            send_debug_text(tx, stream, &format!("⚡ {}\n", &tool_call.name)).await;
         }
 
         // Execute all local tools concurrently.
@@ -243,7 +333,7 @@ async fn run_agent_loop(
             chat_messages.push(crate::format_translate::openai_chat_tool_result_message(
                 &tc, &bounded,
             ));
-            send_text(
+            send_debug_text(
                 tx,
                 stream,
                 &format!(
@@ -259,7 +349,7 @@ async fn run_agent_loop(
         if step_failed {
             consecutive_failures += 1;
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                send_text(tx, stream, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
+                send_debug_text(tx, stream, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
                 log_agent_summary(&log, steps_run, total_tool_calls, 0);
                 return Ok(());
             }
@@ -268,13 +358,13 @@ async fn run_agent_loop(
         }
     }
 
-    send_text(tx, stream, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
+    send_debug_text(tx, stream, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
     log_agent_summary(&log, steps_run, total_tool_calls, 0);
     Ok(())
 }
 
 fn ensure_agent_instructions(body: &mut Value) {
-    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally. Prefer parallel tool calls: batch independent reads, searches, and lookups into a single step whenever they do not depend on each other's results. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
+    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally. Every tool call includes a user-visible `reason` argument; fill it with one short sentence explaining why that tool is being called, written as progress narration rather than private chain-of-thought. Do not stop at a progress note, plan, or future-tense statement such as saying you will inspect files; either call the needed tools or provide the complete final answer. Prefer parallel tool calls: batch independent reads, searches, and lookups into a single step whenever they do not depend on each other's results. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
     let current = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -288,7 +378,7 @@ fn ensure_agent_instructions(body: &mut Value) {
 
 fn format_index_refresh_summary(summary: &crate::index_refresh::IndexRefreshSummary) -> String {
     if summary.languages_detected.is_empty() {
-        return "✅ 代码索引刷新完成：未检测到可索引语言。\n".to_string();
+        return "✅ 代码索引刷新完成：当前工作区未检测到可索引源码文件。\n".to_string();
     }
 
     let refreshed = if summary.languages_refreshed.is_empty() {
@@ -333,13 +423,13 @@ async fn run_architecture_prefetch(
         return;
     }
 
-    send_text(tx, stream, "🧠 flash 正在分析用户意图和业务范围...\n").await;
+    send_debug_text(tx, stream, "🧠 flash 正在分析用户意图和业务范围...\n").await;
     match build_architecture_prefetch_request(workspace, &query) {
         Ok(request) => {
             match crate::architecture_agent::analyze_architecture(workspace, request).await {
                 Ok(response) => {
                     let analysis = response.analysis;
-                    send_text(
+                    send_debug_text(
                         tx,
                         stream,
                         &format!(
@@ -352,7 +442,7 @@ async fn run_architecture_prefetch(
                     )
                     .await;
                     if !analysis.minimal_change_scope.trim().is_empty() {
-                        send_text(
+                        send_debug_text(
                             tx,
                             stream,
                             &format!("🧭 建议最小范围：{}。\n", analysis.minimal_change_scope),
@@ -361,7 +451,7 @@ async fn run_architecture_prefetch(
                     }
                 }
                 Err(error) => {
-                    send_text(
+                    send_debug_text(
                         tx,
                         stream,
                         &format!("⚠️ flash 业务分析失败：{}。将继续交给主模型处理。\n", error),
@@ -371,7 +461,7 @@ async fn run_architecture_prefetch(
             }
         }
         Err(error) => {
-            send_text(
+            send_debug_text(
                 tx,
                 stream,
                 &format!("⚠️ flash 证据准备失败：{}。将继续交给主模型处理。\n", error),
@@ -474,6 +564,70 @@ fn build_architecture_prefetch_request(
 fn compact_lookup_query(query: &str) -> String {
     let compact = query.split_whitespace().collect::<Vec<_>>().join(" ");
     compact.chars().take(80).collect()
+}
+
+fn select_request_workspace(
+    workspace: &Arc<crate::tools::Workspace>,
+    requested_cwd: Option<&str>,
+) -> Arc<crate::tools::Workspace> {
+    let Some(cwd) = requested_cwd else {
+        return Arc::clone(workspace);
+    };
+    match workspace.with_selected_root(&cwd) {
+        Ok(selected) => Arc::new(selected),
+        Err(_) => Arc::clone(workspace),
+    }
+}
+
+fn request_cwd_from_body(body: &Value) -> Option<String> {
+    find_workspace_root_hint(body)
+        .or_else(|| {
+            latest_user_text_from_responses_body(body)
+                .and_then(|text| extract_tag_text(&text, "cwd"))
+        })
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(|cwd| cwd.trim().to_string())
+}
+
+fn find_workspace_root_hint(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "cwd",
+                "workspace_root",
+                "workspaceRoot",
+                "workdir",
+                "current_dir",
+                "currentDir",
+            ] {
+                if let Some(text) = map.get(key).and_then(|value| value.as_str()) {
+                    if !text.trim().is_empty() {
+                        return Some(text.trim().to_string());
+                    }
+                }
+            }
+
+            for item in map.values() {
+                if let Some(cwd) = find_workspace_root_hint(item) {
+                    return Some(cwd);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items.iter().find_map(find_workspace_root_hint),
+        Value::String(text) => extract_tag_text(text, "cwd")
+            .filter(|cwd| !cwd.trim().is_empty())
+            .map(|cwd| cwd.trim().to_string()),
+        _ => None,
+    }
+}
+
+fn extract_tag_text(text: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag)? + start_tag.len();
+    let end = text[start..].find(&end_tag)? + start;
+    Some(text[start..end].to_string())
 }
 
 fn latest_user_text_from_responses_body(body: &Value) -> Option<String> {
@@ -619,6 +773,100 @@ fn tool_completion_note(name: &str, output: &str) -> String {
     }
 }
 
+fn tool_call_reason(tool_call: &crate::format_translate::OpenAiChatToolCall) -> Option<String> {
+    let arguments = serde_json::from_str::<Value>(&tool_call.arguments).ok()?;
+    let reason = arguments.get("reason").and_then(|value| value.as_str())?;
+    let reason = reason.trim();
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_string())
+    }
+}
+
+fn looks_like_incomplete_process_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let has_forward_intent = [
+        "我先",
+        "我会",
+        "我将",
+        "接下来",
+        "先把",
+        "先看",
+        "拉出来",
+        "看一下",
+        "检查一下",
+        "分析一下",
+        "i'll",
+        "i will",
+        "let me",
+        "i need to",
+        "next,",
+    ]
+    .iter()
+    .any(|needle| lower.contains(&needle.to_ascii_lowercase()));
+    let mentions_more_work = [
+        "完整",
+        "对照",
+        "看看",
+        "确认",
+        "检查",
+        "分析",
+        "拉出来",
+        "inspect",
+        "check",
+        "analyze",
+        "look at",
+        "pull",
+    ]
+    .iter()
+    .any(|needle| lower.contains(&needle.to_ascii_lowercase()));
+    let has_final_signal = [
+        "结论",
+        "原因是",
+        "根因",
+        "已经",
+        "已完成",
+        "the cause is",
+        "root cause",
+        "done",
+        "completed",
+    ]
+    .iter()
+    .any(|needle| lower.contains(&needle.to_ascii_lowercase()));
+
+    if !(has_forward_intent && mentions_more_work) {
+        return false;
+    }
+    if !has_final_signal {
+        return true;
+    }
+
+    let final_signal_pos = ["结论", "原因是", "根因", "the cause is", "root cause"]
+        .iter()
+        .filter_map(|needle| lower.find(&needle.to_ascii_lowercase()))
+        .min();
+    let process_pos = [
+        "我先",
+        "我会",
+        "我将",
+        "接下来",
+        "先把",
+        "先看",
+        "let me",
+        "i will",
+    ]
+    .iter()
+    .filter_map(|needle| lower.rfind(&needle.to_ascii_lowercase()))
+    .max();
+
+    matches!((final_signal_pos, process_pos), (Some(final_pos), Some(process_pos)) if process_pos > final_pos)
+}
+
 fn is_symbol_index_tool(name: &str) -> bool {
     matches!(
         name,
@@ -661,6 +909,157 @@ async fn send_text(
         return;
     }
     let _ = tx.send(Ok(Bytes::from(stream.text_delta(text)))).await;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FinalityDecision {
+    Done,
+    Continue,
+    Unknown,
+}
+
+async fn confirm_text_finality(
+    client: &Client,
+    upstream_url: &str,
+    api_key: &str,
+    upstream_model: &str,
+    user_request: &str,
+    assistant_text: &str,
+) -> FinalityDecision {
+    let request = json!({
+        "model": upstream_model,
+        "stream": false,
+        "temperature": 0,
+        "max_tokens": FINALITY_PROBE_MAX_TOKENS,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict agent runtime finality checker. Decide whether the assistant text fully completes the user's request. Reply with exactly one lowercase token: done or continue. Reply done only if the text is ready to show as the final answer and does not promise future work. Reply continue if it is a plan, progress note, tool-intent message, incomplete answer, or says it will inspect/analyze/check/do something next."
+            },
+            {
+                "role": "user",
+                "content": format!(
+                    "User request:\n{}\n\nAssistant text:\n{}\n\nIs the assistant text final? Reply exactly done or continue.",
+                    user_request,
+                    assistant_text
+                )
+            }
+        ]
+    });
+
+    let Ok(response) = client
+        .post(upstream_url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request)
+        .send()
+        .await
+    else {
+        return FinalityDecision::Unknown;
+    };
+    if !response.status().is_success() {
+        return FinalityDecision::Unknown;
+    }
+    let Ok(response_text) = response.text().await else {
+        return FinalityDecision::Unknown;
+    };
+    let Ok(response_json) = serde_json::from_str::<Value>(&response_text) else {
+        return FinalityDecision::Unknown;
+    };
+    let assistant_message = crate::format_translate::openai_chat_assistant_message(&response_json);
+    let decision = parse_finality_probe_text(
+        &crate::format_translate::collect_openai_chat_final_text(&assistant_message),
+    );
+    if matches!(decision, FinalityDecision::Unknown)
+        && looks_like_incomplete_process_text(assistant_text)
+    {
+        return FinalityDecision::Continue;
+    }
+    decision
+}
+
+fn parse_finality_probe_text(text: &str) -> FinalityDecision {
+    let normalized = text
+        .trim()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "done" => FinalityDecision::Done,
+        "continue" => FinalityDecision::Continue,
+        _ => FinalityDecision::Unknown,
+    }
+}
+
+fn continuation_nudge_for_non_final_text(text: &str, finality: &FinalityDecision) -> String {
+    let reason = match finality {
+        FinalityDecision::Continue => {
+            "A finality check decided this was not a complete final answer."
+        }
+        FinalityDecision::Unknown => {
+            "A finality check could not confirm this was a complete final answer."
+        }
+        FinalityDecision::Done => "This should not happen.",
+    };
+    format!(
+        "{} Your previous message had no tool calls and should not stop the agent loop yet. Previous message:\n{}\n\nContinue now: call the needed tools, or provide a complete final answer if no tools are needed. Do not stop at a plan or future-tense inspection note.",
+        reason, text
+    )
+}
+
+async fn run_project_analysis_gate(
+    body: &Value,
+    stream: &mut AgentSseWriter,
+    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+) -> Option<crate::architecture_agent::ProjectAnalysisDecision> {
+    let query = latest_user_text_from_responses_body(body)?;
+    if query.trim().is_empty() {
+        return None;
+    }
+
+    send_debug_text(tx, stream, "🧠 便宜模型正在判断是否需要项目分析...\n").await;
+    match crate::architecture_agent::decide_project_analysis_requirement(&query).await {
+        Ok(decision) => {
+            send_debug_text(
+                tx,
+                stream,
+                &format!(
+                    "📌 项目分析判断：requires_project_analysis={}；confidence={:.2}；reason={}。\n",
+                    decision.requires_project_analysis, decision.confidence, decision.reason
+                ),
+            )
+            .await;
+            Some(decision)
+        }
+        Err(error) => {
+            send_debug_text(
+                tx,
+                stream,
+                &format!(
+                    "⚠️ 项目分析判断失败：{}。将按需要项目分析继续处理。\n",
+                    error
+                ),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+fn project_gate_chat_message(gate: &crate::architecture_agent::ProjectAnalysisDecision) -> Value {
+    json!({
+        "role": "system",
+        "content": format!(
+            "Cheap model project-analysis routing decision: requires_project_analysis={}, confidence={:.2}, reason={}. If project analysis is not required, answer the user directly or use only the minimal ordinary tool needed for the request.",
+            gate.requires_project_analysis, gate.confidence, gate.reason
+        )
+    })
+}
+
+async fn send_debug_text(
+    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    stream: &mut AgentSseWriter,
+    text: &str,
+) {
+    send_text(tx, stream, text).await;
 }
 
 struct AgentSession {
@@ -926,6 +1325,133 @@ mod tests {
         assert_eq!(
             tool_completion_note("search_text", &output),
             "，执行全文扫描（未使用索引）"
+        );
+    }
+
+    #[test]
+    fn extracts_tool_call_reason_from_arguments() {
+        let tool_call = crate::format_translate::OpenAiChatToolCall {
+            call_id: "call_1".to_string(),
+            name: "read_file_lines".to_string(),
+            arguments: json!({
+                "path": "src/agent_runtime.rs",
+                "reason": "我先查看 agent 主循环，确认工具调用前的展示逻辑。"
+            })
+            .to_string(),
+        };
+
+        assert_eq!(
+            tool_call_reason(&tool_call).as_deref(),
+            Some("我先查看 agent 主循环，确认工具调用前的展示逻辑。")
+        );
+
+        let tool_call = crate::format_translate::OpenAiChatToolCall {
+            call_id: "call_2".to_string(),
+            name: "read_file_lines".to_string(),
+            arguments: json!({"reason": "   "}).to_string(),
+        };
+        assert!(tool_call_reason(&tool_call).is_none());
+    }
+
+    #[test]
+    fn detects_incomplete_process_text() {
+        assert!(looks_like_incomplete_process_text(
+            "我先把完整的架构提示词拉出来，对照之前出错的现象说清楚原因。"
+        ));
+        assert!(looks_like_incomplete_process_text(
+            "Let me inspect the prompt and analyze the issue."
+        ));
+        assert!(looks_like_incomplete_process_text(
+            "好的——其实 response_format 已经在了。格式问题的根因不在 API 参数，而在提示词和解析层面。我先把完整的架构提示词及两处 prompt（gate + 架构分析）一起拉出来，对照之前出错的三类现象说清楚原因。"
+        ));
+        assert!(!looks_like_incomplete_process_text(
+            "结论：格式问题的根因是解析层对类型漂移不够宽容。"
+        ));
+    }
+
+    #[test]
+    fn parses_finality_probe_tokens() {
+        assert_eq!(parse_finality_probe_text("done."), FinalityDecision::Done);
+        assert_eq!(
+            parse_finality_probe_text(" continue\n"),
+            FinalityDecision::Continue
+        );
+        assert_eq!(
+            parse_finality_probe_text("I think it is done"),
+            FinalityDecision::Unknown
+        );
+    }
+
+    #[test]
+    fn continuation_nudge_preserves_non_final_text() {
+        let nudge =
+            continuation_nudge_for_non_final_text("我先看一下日志。", &FinalityDecision::Continue);
+        assert!(nudge.contains("not a complete final answer"));
+        assert!(nudge.contains("我先看一下日志。"));
+    }
+
+    #[test]
+    fn project_gate_message_preserves_no_analysis_decision() {
+        let message =
+            project_gate_chat_message(&crate::architecture_agent::ProjectAnalysisDecision {
+                requires_project_analysis: false,
+                reason: "Simple repository state request.".to_string(),
+                confidence: 0.91,
+            });
+
+        let content = message.get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.contains("requires_project_analysis=false"));
+        assert!(content.contains("Simple repository state request."));
+    }
+
+    #[test]
+    fn extracts_request_cwd_from_environment_context() {
+        let body = json!({
+            "input": [{
+                "role": "user",
+                "content": "<environment_context>\n  <cwd>C:\\project\\real-app</cwd>\n</environment_context>\n当前是什么分支？"
+            }]
+        });
+
+        assert_eq!(
+            request_cwd_from_body(&body).as_deref(),
+            Some("C:\\project\\real-app")
+        );
+    }
+
+    #[test]
+    fn extracts_request_cwd_from_metadata_or_older_items() {
+        let body = json!({
+            "metadata": {
+                "cwd": "D:\\workspace\\from-metadata"
+            },
+            "input": [{
+                "role": "user",
+                "content": "继续"
+            }]
+        });
+
+        assert_eq!(
+            request_cwd_from_body(&body).as_deref(),
+            Some("D:\\workspace\\from-metadata")
+        );
+
+        let body = json!({
+            "input": [
+                {
+                    "role": "user",
+                    "content": "<environment_context><cwd>E:\\older\\project</cwd></environment_context>"
+                },
+                {
+                    "role": "user",
+                    "content": "改一下代码"
+                }
+            ]
+        });
+
+        assert_eq!(
+            request_cwd_from_body(&body).as_deref(),
+            Some("E:\\older\\project")
         );
     }
 }
