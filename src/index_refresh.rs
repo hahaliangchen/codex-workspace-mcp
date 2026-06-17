@@ -28,7 +28,7 @@ const NOISE_DIRS: &[&str] = &[
 ];
 
 static INDEX_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static INDEX_MEMORY_CACHE: OnceLock<Mutex<Option<IndexSnapshot>>> = OnceLock::new();
+static INDEX_MEMORY_CACHE: OnceLock<Mutex<HashMap<PathBuf, IndexSnapshot>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct IndexSnapshot {
@@ -70,7 +70,7 @@ pub fn refresh_workspace_indexes(workspace: &Workspace) -> IndexRefreshSummary {
 
 fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
     let current_mtimes = scan_source_mtimes(root);
-    if let Some(summary) = cached_summary_if_unchanged(&current_mtimes) {
+    if let Some(summary) = cached_summary_if_unchanged(root, &current_mtimes) {
         debug!(
             root = %root.display(),
             files = current_mtimes.len(),
@@ -85,7 +85,7 @@ fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
         .unwrap();
 
     let locked_mtimes = scan_source_mtimes(root);
-    if let Some(summary) = cached_summary_if_unchanged(&locked_mtimes) {
+    if let Some(summary) = cached_summary_if_unchanged(root, &locked_mtimes) {
         debug!(
             root = %root.display(),
             files = locked_mtimes.len(),
@@ -130,7 +130,7 @@ fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
         languages_refreshed,
         failures,
     };
-    update_index_memory_cache(locked_mtimes, final_summary.clone());
+    update_index_memory_cache(root, locked_mtimes, final_summary.clone());
     final_summary
 }
 
@@ -146,11 +146,12 @@ fn detect_languages_from_mtimes(mtimes: &HashMap<PathBuf, SystemTime>) -> BTreeS
 }
 
 fn cached_summary_if_unchanged(
+    root: &Path,
     current_mtimes: &HashMap<PathBuf, SystemTime>,
 ) -> Option<IndexRefreshSummary> {
-    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
-    let snapshot = cache.lock().ok()?;
-    let snapshot = snapshot.as_ref()?;
+    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_map = cache.lock().ok()?;
+    let snapshot = cache_map.get(root)?;
     if snapshot.last_mtimes == *current_mtimes {
         Some(snapshot.last_summary.clone())
     } else {
@@ -159,12 +160,13 @@ fn cached_summary_if_unchanged(
 }
 
 fn update_index_memory_cache(
+    root: &Path,
     last_mtimes: HashMap<PathBuf, SystemTime>,
     last_summary: IndexRefreshSummary,
 ) {
-    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut snapshot) = cache.lock() {
-        *snapshot = Some(IndexSnapshot {
+    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut cache_map) = cache.lock() {
+        cache_map.insert(root.to_path_buf(), IndexSnapshot {
             last_mtimes,
             last_summary,
         });
