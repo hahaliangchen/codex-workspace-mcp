@@ -28,6 +28,13 @@ const NOISE_DIRS: &[&str] = &[
 ];
 
 static INDEX_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static INDEX_MEMORY_CACHE: OnceLock<Mutex<Option<IndexSnapshot>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct IndexSnapshot {
+    last_mtimes: HashMap<PathBuf, SystemTime>,
+    last_summary: IndexRefreshSummary,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexLanguage {
@@ -37,21 +44,21 @@ pub enum IndexLanguage {
     Go,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexRefreshSummary {
     pub languages_detected: Vec<String>,
     pub languages_refreshed: Vec<LanguageRefreshSummary>,
     pub failures: Vec<LanguageRefreshFailure>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LanguageRefreshSummary {
     pub language: String,
     pub files_indexed: usize,
     pub symbols_indexed: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LanguageRefreshFailure {
     pub language: String,
     pub error: String,
@@ -62,11 +69,38 @@ pub fn refresh_workspace_indexes(workspace: &Workspace) -> IndexRefreshSummary {
 }
 
 fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
+    let current_mtimes = scan_source_mtimes(root);
+    if let Some(summary) = cached_summary_if_unchanged(&current_mtimes) {
+        debug!(
+            root = %root.display(),
+            files = current_mtimes.len(),
+            "index refresh: memory cache hit before rebuild lock"
+        );
+        return summary;
+    }
+
     let _guard = INDEX_REFRESH_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let languages = detect_workspace_languages(root);
+
+    let locked_mtimes = scan_source_mtimes(root);
+    if let Some(summary) = cached_summary_if_unchanged(&locked_mtimes) {
+        debug!(
+            root = %root.display(),
+            files = locked_mtimes.len(),
+            "index refresh: memory cache hit after rebuild lock"
+        );
+        return summary;
+    }
+
+    debug!(
+        root = %root.display(),
+        files = locked_mtimes.len(),
+        "index refresh: memory cache miss; rebuilding indexes"
+    );
+
+    let languages = detect_languages_from_mtimes(&locked_mtimes);
     let languages_detected = languages
         .iter()
         .map(|lang| lang.as_str().to_string())
@@ -91,18 +125,50 @@ fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
         }
     }
 
-    IndexRefreshSummary {
+    let final_summary = IndexRefreshSummary {
         languages_detected,
         languages_refreshed,
         failures,
-    }
+    };
+    update_index_memory_cache(locked_mtimes, final_summary.clone());
+    final_summary
 }
 
 fn detect_workspace_languages(root: &Path) -> BTreeSet<IndexLanguage> {
-    scan_source_mtimes(root)
+    detect_languages_from_mtimes(&scan_source_mtimes(root))
+}
+
+fn detect_languages_from_mtimes(mtimes: &HashMap<PathBuf, SystemTime>) -> BTreeSet<IndexLanguage> {
+    mtimes
         .keys()
         .filter_map(|path| language_for_path(path))
         .collect()
+}
+
+fn cached_summary_if_unchanged(
+    current_mtimes: &HashMap<PathBuf, SystemTime>,
+) -> Option<IndexRefreshSummary> {
+    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
+    let snapshot = cache.lock().ok()?;
+    let snapshot = snapshot.as_ref()?;
+    if snapshot.last_mtimes == *current_mtimes {
+        Some(snapshot.last_summary.clone())
+    } else {
+        None
+    }
+}
+
+fn update_index_memory_cache(
+    last_mtimes: HashMap<PathBuf, SystemTime>,
+    last_summary: IndexRefreshSummary,
+) {
+    let cache = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut snapshot) = cache.lock() {
+        *snapshot = Some(IndexSnapshot {
+            last_mtimes,
+            last_summary,
+        });
+    }
 }
 
 fn scan_source_mtimes(root: &Path) -> HashMap<PathBuf, SystemTime> {

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::Context;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,6 @@ const FINALITY_PROBE_MAX_TOKENS: usize = 8;
 pub async fn run_responses_agent(
     client: Client,
     workspace: Arc<crate::tools::Workspace>,
-    log: Arc<Mutex<std::fs::File>>,
     provider_url: String,
     api_key: String,
     body: Value,
@@ -41,7 +40,6 @@ pub async fn run_responses_agent(
             run_agent_loop(
                 client,
                 workspace,
-                log,
                 provider_url,
                 api_key,
                 body,
@@ -78,7 +76,6 @@ pub async fn run_responses_agent(
 async fn run_agent_loop(
     client: Client,
     workspace: Arc<crate::tools::Workspace>,
-    log: Arc<Mutex<std::fs::File>>,
     provider_url: String,
     api_key: String,
     mut body: Value,
@@ -145,7 +142,7 @@ async fn run_agent_loop(
     body["stream"] = json!(false);
 
     let prepared_tools = crate::tool_prepare::prepare_responses_tools(body.get("tools"));
-    log_blocked_tools(&log, &prepared_tools.blocked);
+    log_blocked_tools(&prepared_tools.blocked);
     let local_tool_names: std::collections::HashSet<String> = prepared_tools
         .tools
         .iter()
@@ -188,6 +185,7 @@ async fn run_agent_loop(
             &chat_messages,
             &chat_tools,
         );
+        log_agent_to_upstream_request(step, &upstream_model, &upstream_url, &request_body);
 
         let response = client
             .post(&upstream_url)
@@ -198,6 +196,7 @@ async fn run_agent_loop(
 
         let status = response.status();
         let response_text = response.text().await.unwrap_or_default();
+        log_upstream_to_agent_response(step, status.as_u16(), &response_text);
         if !status.is_success() {
             anyhow::bail!(
                 "upstream agent request failed: status={} body={}",
@@ -214,7 +213,7 @@ async fn run_agent_loop(
         if tool_calls.is_empty() {
             let text = crate::format_translate::collect_openai_chat_final_text(&assistant_message);
             if text.trim().is_empty() {
-                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                log_agent_summary(steps_run, total_tool_calls, text.chars().count());
                 send_debug_text(
                     tx,
                     stream,
@@ -241,14 +240,14 @@ async fn run_agent_loop(
             };
 
             if matches!(finality, FinalityDecision::Done) {
-                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                log_agent_summary(steps_run, total_tool_calls, text.chars().count());
                 send_text(tx, stream, &text).await;
                 return Ok(());
             }
 
             consecutive_non_final_text += 1;
             if consecutive_non_final_text > MAX_CONSECUTIVE_NON_FINAL_TEXT {
-                log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+                log_agent_summary(steps_run, total_tool_calls, text.chars().count());
                 send_debug_text(
                     tx,
                     stream,
@@ -269,7 +268,7 @@ async fn run_agent_loop(
                 continue;
             }
 
-            log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
+            log_agent_summary(steps_run, total_tool_calls, text.chars().count());
             send_text(tx, stream, &text).await;
             return Ok(());
         }
@@ -350,7 +349,7 @@ async fn run_agent_loop(
             consecutive_failures += 1;
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                 send_debug_text(tx, stream, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
-                log_agent_summary(&log, steps_run, total_tool_calls, 0);
+                log_agent_summary(steps_run, total_tool_calls, 0);
                 return Ok(());
             }
         } else {
@@ -359,7 +358,7 @@ async fn run_agent_loop(
     }
 
     send_debug_text(tx, stream, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
-    log_agent_summary(&log, steps_run, total_tool_calls, 0);
+    log_agent_summary(steps_run, total_tool_calls, 0);
     Ok(())
 }
 
@@ -679,52 +678,147 @@ fn response_content_to_plain_text(value: &Value) -> String {
     }
 }
 
-fn log_blocked_tools(
-    log: &Mutex<std::fs::File>,
-    blocked_tools: &[crate::tool_prepare::BlockedTool],
-) {
+fn log_blocked_tools(blocked_tools: &[crate::tool_prepare::BlockedTool]) {
     for blocked in blocked_tools {
         let label = match blocked.kind {
             crate::tool_prepare::BlockedToolKind::Type => "type",
             crate::tool_prepare::BlockedToolKind::Name => "name",
         };
-        crate::proxy_log::write(
-            log,
-            true,
-            Some("TOOL_BLOCKED"),
-            Some("proxy"),
-            &format!(
-                "agent runtime blocked unsafe tool by {}: '{}'",
-                label, blocked.value
-            ),
+        tracing::info!(
+            "agent runtime blocked unsafe tool by {}: '{}'",
+            label,
+            blocked.value
         );
     }
 }
 
-fn log_agent_summary(
-    log: &Mutex<std::fs::File>,
-    steps: usize,
-    tool_calls: usize,
-    final_chars: usize,
-) {
-    crate::proxy_log::write(
-        log,
-        true,
-        Some("AGENT_DONE"),
-        Some("proxy"),
-        &format!(
-            "agent runtime completed steps={} tool_calls={} final_chars={}",
-            steps, tool_calls, final_chars
-        ),
+fn log_agent_summary(steps: usize, tool_calls: usize, final_chars: usize) {
+    tracing::info!(
+        "agent runtime completed steps={} tool_calls={} final_chars={}",
+        steps,
+        tool_calls,
+        final_chars
     );
+}
+
+fn log_agent_to_upstream_request(
+    step: usize,
+    upstream_model: &str,
+    upstream_url: &str,
+    request_body: &Value,
+) {
+    tracing::info!(
+        "AGENT -> UPSTREAM step={} model={} url={} {}",
+        step,
+        upstream_model,
+        upstream_url,
+        summarize_chat_request(request_body)
+    );
+}
+
+fn log_upstream_to_agent_response(step: usize, status: u16, response_text: &str) {
+    tracing::info!(
+        "UPSTREAM -> AGENT step={} status={} {}",
+        step,
+        status,
+        summarize_chat_response(response_text)
+    );
+}
+
+fn summarize_chat_request(body: &Value) -> String {
+    let message_summary = summarize_chat_messages(body.get("messages"));
+    let tool_count = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    format!(
+        "stream={} messages={} tools={}",
+        stream, message_summary, tool_count
+    )
+}
+
+fn summarize_chat_messages(value: Option<&Value>) -> String {
+    let Some(messages) = value.and_then(|v| v.as_array()) else {
+        return "<none>".to_string();
+    };
+    let mut role_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut tool_call_count = 0usize;
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<none>")
+            .to_string();
+        *role_counts.entry(role).or_insert(0) += 1;
+        tool_call_count += message
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+    }
+    format!(
+        "len={} role_counts={} tool_calls={}",
+        messages.len(),
+        serde_json::to_string(&role_counts).unwrap_or_else(|_| "{}".to_string()),
+        tool_call_count
+    )
+}
+
+fn summarize_chat_response(response_text: &str) -> String {
+    let Ok(response_json) = serde_json::from_str::<Value>(response_text) else {
+        return format!(
+            "body={}",
+            crate::ai_proxy::fmt_body(response_text.as_bytes())
+        );
+    };
+    let assistant_message = crate::format_translate::openai_chat_assistant_message(&response_json);
+    let tool_calls =
+        crate::format_translate::collect_all_tool_calls_from_openai_chat(&assistant_message);
+    let text = crate::format_translate::collect_openai_chat_final_text(&assistant_message);
+    let finish_reason = response_json
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    format!(
+        "finish_reason={} assistant_text_chars={} tool_calls={} tool_names={}",
+        finish_reason,
+        text.chars().count(),
+        tool_calls.len(),
+        summarize_tool_call_names(&tool_calls)
+    )
+}
+
+fn summarize_tool_call_names(tool_calls: &[crate::format_translate::OpenAiChatToolCall]) -> String {
+    if tool_calls.is_empty() {
+        return "[]".to_string();
+    }
+    let names = tool_calls
+        .iter()
+        .take(12)
+        .map(|tool_call| tool_call.name.as_str())
+        .collect::<Vec<_>>();
+    let suffix = if tool_calls.len() > names.len() {
+        format!("...+{}", tool_calls.len() - names.len())
+    } else {
+        String::new()
+    };
+    format!("[{}{}]", names.join(","), suffix)
 }
 
 async fn execute_local_tool(
     workspace: &Arc<crate::tools::Workspace>,
     tool_call: &crate::format_translate::OpenAiChatToolCall,
 ) -> String {
-    let arguments =
-        serde_json::from_str::<Value>(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+    let arguments = tool_arguments_without_reason(tool_call);
     let params = json!({
         "name": tool_call.name,
         "arguments": arguments
@@ -782,6 +876,15 @@ fn tool_call_reason(tool_call: &crate::format_translate::OpenAiChatToolCall) -> 
     } else {
         Some(reason.to_string())
     }
+}
+
+fn tool_arguments_without_reason(tool_call: &crate::format_translate::OpenAiChatToolCall) -> Value {
+    let mut arguments =
+        serde_json::from_str::<Value>(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("reason");
+    }
+    arguments
 }
 
 fn looks_like_incomplete_process_text(text: &str) -> bool {
@@ -1351,6 +1454,45 @@ mod tests {
             arguments: json!({"reason": "   "}).to_string(),
         };
         assert!(tool_call_reason(&tool_call).is_none());
+    }
+
+    #[test]
+    fn removes_display_reason_from_executable_arguments() {
+        let tool_call = crate::format_translate::OpenAiChatToolCall {
+            call_id: "call_1".to_string(),
+            name: "read_file_lines".to_string(),
+            arguments: json!({
+                "path": "src/agent_runtime.rs",
+                "start_line": 1,
+                "end_line": 8,
+                "reason": "我先查看 agent 主循环。"
+            })
+            .to_string(),
+        };
+
+        let arguments = tool_arguments_without_reason(&tool_call);
+        assert_eq!(arguments["path"].as_str(), Some("src/agent_runtime.rs"));
+        assert!(arguments.get("reason").is_none());
+    }
+
+    #[test]
+    fn delegated_tool_call_keeps_display_reason_for_codex() {
+        let tool_call = crate::format_translate::OpenAiChatToolCall {
+            call_id: "call_1".to_string(),
+            name: "external_tool".to_string(),
+            arguments: json!({
+                "query": "abc",
+                "reason": "用于展示，不应传给真实工具。"
+            })
+            .to_string(),
+        };
+        let mut writer = AgentSseWriter::new("resp_1".to_string(), "test-model".to_string());
+        let bytes = writer.delegated_tool_call(&tool_call);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains(r#"\"query\":\"abc\""#));
+        assert!(text.contains("用于展示"));
+        assert!(text.contains(r#"\"reason\""#));
     }
 
     #[test]

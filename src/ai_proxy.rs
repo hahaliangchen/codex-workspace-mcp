@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -53,34 +53,7 @@ struct AiProxyConfig {
 struct AiProxyState {
     config: Arc<AiProxyConfig>,
     client: Client,
-    log: Arc<Mutex<std::fs::File>>,
     workspace: Arc<crate::tools::Workspace>,
-}
-
-// ---------------------------------------------------------------------------
-// Logging helpers
-// ---------------------------------------------------------------------------
-
-pub fn log_write(
-    log: &Mutex<std::fs::File>,
-    write_db: bool,
-    action: Option<&str>,
-    role: Option<&str>,
-    msg: &str,
-) {
-    crate::proxy_log::write(log, write_db, action, role, msg);
-}
-
-macro_rules! log {
-    ($log:expr, $($arg:tt)*) => {
-        log_write(&*$log, false, None, None, &format!($($arg)*))
-    };
-}
-
-macro_rules! log_db {
-    ($state:expr, $action:expr, $role:expr, $($arg:tt)*) => {
-        log_write(&*$state.log, true, Some($action), Some($role), &format!($($arg)*))
-    };
 }
 
 /// Resolve a client-visible model name → (provider config, upstream model name).
@@ -180,8 +153,6 @@ async fn chat_completions(
     State(state): State<AiProxyState>,
     Json(mut body): Json<Value>,
 ) -> Response {
-    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
-    crate::proxy_log::set_conversation_id(Some(conversation_id));
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -198,11 +169,7 @@ async fn chat_completions(
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
     crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
 
-    log!(
-        &state.log,
-        "=== /v1/chat/completions  model={}",
-        client_model
-    );
+    info!("=== /v1/chat/completions  model={}", client_model);
 
     let (provider, mut upstream_model) = match resolve_model(&state.config, &client_model) {
         Ok(r) => r,
@@ -213,20 +180,16 @@ async fn chat_completions(
         let old_model = upstream_model.clone();
         upstream_model = crate::vision_preprocess::adjust_model_for_vision(&upstream_model);
         if old_model != upstream_model {
-            log!(
-                &state.log,
+            info!(
                 "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
-                old_model,
-                upstream_model
+                old_model, upstream_model
             );
         }
     }
 
-    log!(
-        &state.log,
+    info!(
         "   resolved: provider={} upstream_model={}",
-        provider.url,
-        upstream_model
+        provider.url, upstream_model
     );
 
     body["model"] = json!(upstream_model);
@@ -248,8 +211,7 @@ async fn chat_completions(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    log!(
-        &state.log,
+    info!(
         "   chat completions body: {}",
         fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
     );
@@ -262,24 +224,20 @@ async fn chat_completions(
         &body,
         is_stream,
         &client_model,
-        state.log.clone(),
     )
     .await
 }
 
 /// POST /v1/messages — Anthropic Messages API endpoint.
 async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>) -> Response {
-    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
-    crate::proxy_log::set_conversation_id(Some(conversation_id));
     crate::vision_preprocess::set_visible_images_from_body(&body);
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
     crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
     let raw_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
-    log!(&state.log, "=== /v1/messages  model={}", raw_model);
-    log!(
-        &state.log,
+    info!("=== /v1/messages  model={}", raw_model);
+    info!(
         "   anthropic body: {}",
         fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
     );
@@ -293,20 +251,16 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
         let old_model = upstream_model.clone();
         upstream_model = crate::vision_preprocess::adjust_model_for_vision(&upstream_model);
         if old_model != upstream_model {
-            log!(
-                &state.log,
+            info!(
                 "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
-                old_model,
-                upstream_model
+                old_model, upstream_model
             );
         }
     }
 
-    log!(
-        &state.log,
+    info!(
         "   resolved: provider={} upstream_model={}",
-        provider.url,
-        upstream_model
+        provider.url, upstream_model
     );
 
     let is_stream = body
@@ -320,18 +274,13 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
         // Anthropic-native upstream: forward raw, no conversion.
         let mut raw_body = body.clone();
         raw_body["model"] = json!(upstream_model);
-        log!(
-            &state.log,
-            "   anthropic native forward, url={}",
-            provider.url
-        );
+        info!("   anthropic native forward, url={}", provider.url);
         (raw_body, provider.url.clone())
     } else {
         // OpenAI-compatible upstream: convert Anthropic → OpenAI.
         let mut openai_body = format_translate::anthropic_to_openai(&body);
         openai_body["model"] = json!(upstream_model);
-        log!(
-            &state.log,
+        info!(
             "   openai body: {}",
             fmt_body(
                 serde_json::to_string(&openai_body)
@@ -350,7 +299,6 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
         &forward_body,
         is_stream,
         raw_model,
-        state.log.clone(),
     )
     .await;
 
@@ -360,7 +308,6 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
         let body_bytes = match axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await {
             Ok(b) => b,
             Err(e) => {
-                log!(&state.log, "!! CONVERT ERROR  {}", e);
                 error!(%e, "failed to read response body for Anthropic conversion");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -370,13 +317,12 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
             }
         };
 
-        log!(&state.log, "   openai resp body: {}", fmt_body(&body_bytes));
+        info!("   openai resp body: {}", fmt_body(&body_bytes));
 
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(openai_resp) => {
                 let anthropic_resp = format_translate::openai_to_anthropic(&openai_resp, raw_model);
-                log!(
-                    &state.log,
+                info!(
                     "   anthropic resp: {}",
                     fmt_body(
                         serde_json::to_string(&anthropic_resp)
@@ -392,7 +338,6 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
                     .into_response()
             }
             Err(e) => {
-                log!(&state.log, "!! PARSE ERROR  {}", e);
                 error!(%e, "failed to parse upstream OpenAI response");
                 (
                     StatusCode::BAD_GATEWAY,
@@ -409,7 +354,6 @@ async fn messages(State(state): State<AiProxyState>, Json(mut body): Json<Value>
 /// POST /v1/responses — OpenAI Responses API endpoint for Codex.
 async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -> Response {
     let conversation_id = conversation_id_from_body(&body, state.workspace.root());
-    crate::proxy_log::set_conversation_id(Some(conversation_id.clone()));
     let client_model = match body.get("model").and_then(|v| v.as_str()) {
         Some(m) => m.to_owned(),
         None => {
@@ -426,17 +370,11 @@ async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -
         Err(resp) => return resp,
     };
 
-    crate::responses::logging::log_request_body(&state.log, &conversation_id, &body, &client_model);
-    log_db!(
-        &state,
-        "PROXY",
-        "proxy",
-        "   responses request entering local agent runtime"
-    );
+    crate::responses::logging::log_request_body(&conversation_id, &body, &client_model).await;
+    info!("   responses request entering local agent runtime");
     crate::agent_runtime::run_responses_agent(
         state.client.clone(),
         state.workspace.clone(),
-        state.log.clone(),
         provider.url.clone(),
         provider.api_key.clone(),
         body,
@@ -466,16 +404,10 @@ pub async fn run(
         .build()?;
 
     let log_dir = config_path.with_file_name("logs");
-    let log_path = crate::proxy_log::init_async(log_dir, workspace.root().to_path_buf())?;
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log = Arc::new(Mutex::new(log_file));
+    crate::proxy_log::init(log_dir)?;
 
-    log!(&log, "========== AI Proxy started ==========");
-    log!(
-        &log,
+    info!("========== AI Proxy started ==========");
+    info!(
         "config: {} providers, {} total model mappings, default={:?}",
         config.providers.len(),
         total_maps,
@@ -485,7 +417,6 @@ pub async fn run(
     let state = AiProxyState {
         config,
         client,
-        log,
         workspace,
     };
 

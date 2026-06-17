@@ -1,4 +1,3 @@
-use std::sync::{Arc, Mutex};
 use std::task::Context;
 
 use axum::{
@@ -11,7 +10,7 @@ use futures::stream::poll_fn;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::format_translate;
 
@@ -22,20 +21,17 @@ pub async fn forward_to_upstream(
     body: &Value,
     is_stream: bool,
     client_model: &str,
-    log: Arc<Mutex<std::fs::File>>,
 ) -> Response {
-    crate::ai_proxy::log_write(
-        &*log,
-        false,
-        None,
-        None,
-        &format!(
-            ">> UPSTREAM REQ  model={}  url={}  stream={}  body={}",
-            client_model,
-            upstream_url,
-            is_stream,
-            crate::ai_proxy::fmt_body(serde_json::to_string(body).unwrap_or_default().as_bytes())
-        ),
+    let full_req_json = serde_json::to_string_pretty(body).unwrap_or_default();
+    crate::proxy_log::write_upstream_context(&format!(
+        "UPSTREAM REQ\nmodel: {}\nurl: {}\nstream: {}\n\n{}",
+        client_model, upstream_url, is_stream, full_req_json
+    ))
+    .await;
+
+    info!(
+        ">> UPSTREAM REQ  model={}  url={}  stream={}",
+        client_model, upstream_url, is_stream
     );
 
     match client
@@ -47,33 +43,20 @@ pub async fn forward_to_upstream(
     {
         Ok(resp) => {
             let status = resp.status();
-            crate::ai_proxy::log_write(
-                &*log,
-                false,
-                None,
-                None,
-                &format!(
-                    "<< UPSTREAM RESP  status={}  model={}",
-                    status.as_u16(),
-                    client_model
-                ),
+            info!(
+                "<< UPSTREAM RESP  status={}  model={}",
+                status.as_u16(),
+                client_model
             );
 
             if is_stream {
-                forward_chat_stream(resp, status, client_model, log).await
+                forward_chat_stream(resp, status, client_model).await
             } else {
-                forward_non_streaming_body(resp, status, log).await
+                forward_non_streaming_body(resp, status).await
             }
         }
         Err(e) => {
-            crate::ai_proxy::log_write(
-                &*log,
-                false,
-                None,
-                None,
-                &format!("!! CONNECT ERROR  {}", e),
-            );
-            error!(%e, "upstream request failed");
+            error!(%e, "!! CONNECT ERROR upstream request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "application/json")],
@@ -88,9 +71,7 @@ async fn forward_chat_stream(
     resp: reqwest::Response,
     status: reqwest::StatusCode,
     client_model: &str,
-    log: Arc<Mutex<std::fs::File>>,
 ) -> Response {
-    let log2 = log.clone();
     let model = client_model.to_owned();
     let converter = std::sync::Mutex::new(format_translate::StreamConverter::new(model));
     let stream = resp.bytes_stream();
@@ -114,13 +95,7 @@ async fn forward_chat_stream(
                     }
                 }
                 Err(e) => {
-                    crate::ai_proxy::log_write(
-                        &*log2,
-                        false,
-                        None,
-                        None,
-                        &format!("!! STREAM ERROR  {}", e),
-                    );
+                    error!(%e, "!! STREAM ERROR");
                     let _ = tx
                         .send(Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>))
                         .await;
@@ -155,7 +130,6 @@ async fn forward_chat_stream(
 async fn forward_non_streaming_body(
     resp: reqwest::Response,
     status: reqwest::StatusCode,
-    log: Arc<Mutex<std::fs::File>>,
 ) -> Response {
     let content_type = resp
         .headers()
@@ -166,17 +140,7 @@ async fn forward_non_streaming_body(
 
     match resp.bytes().await {
         Ok(body_bytes) => {
-            crate::ai_proxy::log_write(
-                &*log,
-                false,
-                None,
-                None,
-                &format!(
-                    "<< UPSTREAM BODY  {} bytes  {}",
-                    body_bytes.len(),
-                    crate::ai_proxy::fmt_body(&body_bytes)
-                ),
-            );
+            info!("<< UPSTREAM BODY  {} bytes", body_bytes.len());
             Response::builder()
                 .status(status)
                 .header("content-type", content_type)
@@ -187,8 +151,7 @@ async fn forward_non_streaming_body(
                 })
         }
         Err(e) => {
-            crate::ai_proxy::log_write(&*log, false, None, None, &format!("!! READ ERROR  {}", e));
-            error!(%e, "failed to read upstream body");
+            error!(%e, "!! READ ERROR failed to read upstream body");
             (
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "application/json")],
