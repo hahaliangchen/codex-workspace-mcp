@@ -5,6 +5,7 @@ mod agent_runtime;
 mod ai_proxy;
 mod architecture_agent;
 mod database;
+mod expert_surgery;
 mod format_translate;
 mod go_index;
 mod index_refresh;
@@ -20,6 +21,8 @@ mod tools;
 mod ts_index;
 mod upstream;
 mod vision_preprocess;
+mod sandbox_diagnostic;
+mod conflict_resolver;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 

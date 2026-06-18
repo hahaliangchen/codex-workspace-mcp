@@ -1,6 +1,10 @@
 {
   "default_provider": "my_upstream_provider",
   "vision_provider": "my_vision_provider",
+  "orchestrator_provider": "my_deepseek_architecture_provider",
+  "orchestrator_model": "deepseek-v4-flash",
+  "expert_provider": "my_agent_provider",
+  "expert_model": "deepseek-v4-pro",
   "architecture_provider": "my_deepseek_architecture_provider",
   "architecture_model": "deepseek-v4-flash",
   "providers": {

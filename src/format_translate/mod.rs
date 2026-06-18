@@ -5,6 +5,7 @@
 mod anthropic;
 mod anthropic_stream;
 mod responses_chat;
+pub mod codex_protocol;
 
 pub use anthropic::{anthropic_to_openai, openai_to_anthropic};
 pub use anthropic_stream::StreamConverter;
