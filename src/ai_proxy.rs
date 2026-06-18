@@ -42,7 +42,33 @@ fn default_api_type() -> String {
 struct AiProxyConfig {
     #[serde(default)]
     default_provider: Option<String>,
+    #[serde(default)]
+    orchestrator_provider: Option<String>,
+    #[serde(default)]
+    orchestrator_model: Option<String>,
+    #[serde(default)]
+    expert_provider: Option<String>,
+    #[serde(default)]
+    expert_model: Option<String>,
     providers: HashMap<String, ProviderConfig>,
+}
+
+impl AiProxyConfig {
+    fn resolve_expert_provider(&self) -> Option<crate::expert_surgery::ExpertProvider> {
+        let default_provider = self.default_provider.as_deref().unwrap_or("");
+        let provider_name = self.expert_provider.as_deref().unwrap_or(default_provider);
+        let provider = self.providers.get(provider_name)?;
+        
+        let model = self.expert_model.clone().or_else(|| {
+            provider.model_map.values().next().cloned()
+        })?;
+        
+        Some(crate::expert_surgery::ExpertProvider {
+            url: provider.url.trim_end_matches('/').to_string(),
+            api_key: provider.api_key.clone(),
+            model,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +131,38 @@ fn resolve_model<'a>(
         .get(model)
         .cloned()
         .unwrap_or_else(|| model.to_owned());
+    Ok((provider, upstream))
+}
+
+/// Resolve the stateful Agent Runtime model. When orchestrator_* is configured,
+/// /v1/responses physically runs the ReAct loop on that cheap model instead of
+/// the client-requested model. Without the new fields, keep legacy routing.
+fn resolve_orchestrator_model<'a>(
+    config: &'a AiProxyConfig,
+    client_model: &str,
+) -> Result<(&'a ProviderConfig, String), Response> {
+    if config.orchestrator_provider.is_none() && config.orchestrator_model.is_none() {
+        return resolve_model(config, client_model);
+    }
+
+    let provider_name = config
+        .orchestrator_provider
+        .as_deref()
+        .or(config.default_provider.as_deref())
+        .unwrap_or("");
+    let provider = config.providers.get(provider_name).ok_or_else(|| {
+        error!(provider = %provider_name, "orchestrator provider not found");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("orchestrator provider not found: {}", provider_name)})),
+        )
+            .into_response()
+    })?;
+    let upstream = config
+        .orchestrator_model
+        .clone()
+        .or_else(|| provider.model_map.get(client_model).cloned())
+        .unwrap_or_else(|| client_model.to_owned());
     Ok((provider, upstream))
 }
 
@@ -421,17 +479,20 @@ async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -
         }
     };
 
-    let (provider, upstream_model) = match resolve_model(&state.config, &client_model) {
+    let (provider, upstream_model) = match resolve_orchestrator_model(&state.config, &client_model)
+    {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    let expert_provider = state.config.resolve_expert_provider();
 
     crate::responses::logging::log_request_body(&state.log, &conversation_id, &body, &client_model);
     log_db!(
         &state,
         "PROXY",
         "proxy",
-        "   responses request entering local agent runtime"
+        "   responses request entering local agent runtime with orchestrator model"
     );
     crate::agent_runtime::run_responses_agent(
         state.client.clone(),
@@ -442,6 +503,7 @@ async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -
         body,
         upstream_model,
         client_model,
+        expert_provider,
     )
     .await
 }
@@ -518,5 +580,76 @@ mod tests {
         let id = conversation_id_from_body(&body, Path::new("D:/workspace"));
 
         assert_eq!(id, "workspace:D:_workspace");
+    }
+
+    fn provider(url: &str, models: &[(&str, &str)]) -> ProviderConfig {
+        ProviderConfig {
+            url: url.to_string(),
+            api_key: "test-key".to_string(),
+            model_map: models
+                .iter()
+                .map(|(client, upstream)| (client.to_string(), upstream.to_string()))
+                .collect(),
+            api_type: "openai".to_string(),
+        }
+    }
+
+    #[test]
+    fn orchestrator_routing_keeps_legacy_model_when_not_configured() {
+        let config = AiProxyConfig {
+            default_provider: Some("default".to_string()),
+            orchestrator_provider: None,
+            orchestrator_model: None,
+            expert_provider: None,
+            expert_model: None,
+            providers: [(
+                "default".to_string(),
+                provider(
+                    "https://default.example/v1",
+                    &[("gpt-5-codex", "pro-model")],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let (provider, model) = resolve_orchestrator_model(&config, "gpt-5-codex").unwrap();
+
+        assert_eq!(provider.url, "https://default.example/v1");
+        assert_eq!(model, "pro-model");
+    }
+
+    #[test]
+    fn orchestrator_routing_uses_configured_cheap_model() {
+        let config = AiProxyConfig {
+            default_provider: Some("default".to_string()),
+            orchestrator_provider: Some("cheap".to_string()),
+            orchestrator_model: Some("deepseek-v4-flash".to_string()),
+            expert_provider: None,
+            expert_model: None,
+            providers: [
+                (
+                    "default".to_string(),
+                    provider(
+                        "https://default.example/v1",
+                        &[("gpt-5-codex", "pro-model")],
+                    ),
+                ),
+                (
+                    "cheap".to_string(),
+                    provider(
+                        "https://cheap.example/v1",
+                        &[("gpt-5-codex", "cheap-mapped")],
+                    ),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let (provider, model) = resolve_orchestrator_model(&config, "gpt-5-codex").unwrap();
+
+        assert_eq!(provider.url, "https://cheap.example/v1");
+        assert_eq!(model, "deepseek-v4-flash");
     }
 }

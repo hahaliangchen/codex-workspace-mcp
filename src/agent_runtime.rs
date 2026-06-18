@@ -18,6 +18,18 @@ const MAX_CONSECUTIVE_NON_FINAL_TEXT: usize = 2;
 const MAX_TOOL_OUTPUT_CHARS: usize = 300 * 1024;
 const FINALITY_PROBE_MAX_TOKENS: usize = 8;
 
+tokio::task_local! {
+    pub static SURGERY_SENDER: mpsc::Sender<crate::expert_surgery::SurgeryEvent>;
+}
+
+pub enum EventBusMessage {
+    Start,
+    TextDelta(String),
+    Surgery(crate::expert_surgery::SurgeryEvent),
+    DelegatedToolCall(crate::format_translate::OpenAiChatToolCall),
+    Finished,
+}
+
 pub async fn run_responses_agent(
     client: Client,
     workspace: Arc<crate::tools::Workspace>,
@@ -27,18 +39,62 @@ pub async fn run_responses_agent(
     body: Value,
     upstream_model: String,
     client_model: String,
+    expert_provider: Option<crate::expert_surgery::ExpertProvider>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>(32);
-    let session = AgentSession::new(client_model.clone());
+    let (event_bus_tx, mut event_bus_rx) = mpsc::channel::<EventBusMessage>(128);
+    let (surgery_tx, mut surgery_rx) = mpsc::channel::<crate::expert_surgery::SurgeryEvent>(64);
 
+    let session = AgentSession::new(client_model.clone());
+    let response_id = session.response_id.clone();
+    let client_model_clone = client_model.clone();
+
+    // Spawn the Event Bus Task
+    let tx_clone = tx.clone();
     tokio::spawn(async move {
-        let mut stream = AgentSseWriter::new(session.response_id.clone(), client_model);
-        let _ = tx.send(Ok(Bytes::from(stream.start()))).await;
+        let mut stream = AgentSseWriter::new(response_id.clone(), client_model_clone);
+        while let Some(msg) = event_bus_rx.recv().await {
+            match msg {
+                EventBusMessage::Start => {
+                    let _ = tx_clone.send(Ok(Bytes::from(stream.start()))).await;
+                }
+                EventBusMessage::TextDelta(delta) => {
+                    if !delta.is_empty() {
+                        let _ = tx_clone.send(Ok(Bytes::from(stream.text_delta(&delta)))).await;
+                    }
+                }
+                EventBusMessage::Surgery(event) => {
+                    let narrative = crate::format_translate::codex_protocol::event_to_narrative(&event);
+                    let _ = tx_clone.send(Ok(Bytes::from(stream.text_delta(&narrative)))).await;
+                }
+                EventBusMessage::DelegatedToolCall(tool_call) => {
+                    let _ = tx_clone.send(Ok(Bytes::from(stream.delegated_tool_call(&tool_call)))).await;
+                }
+                EventBusMessage::Finished => {
+                    let _ = tx_clone.send(Ok(Bytes::from(stream.finish()))).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    // Spawn forwarder task for surgery events
+    let event_bus_tx_for_surgery = event_bus_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = surgery_rx.recv().await {
+            let _ = event_bus_tx_for_surgery.send(EventBusMessage::Surgery(event)).await;
+        }
+    });
+
+    // Spawn main agent runner task
+    let event_bus_tx_for_agent = event_bus_tx.clone();
+    tokio::spawn(async move {
+        let _ = event_bus_tx.send(EventBusMessage::Start).await;
 
         let visible_images = crate::vision_preprocess::visible_images_from_body(&body);
         let result = crate::vision_preprocess::scope_visible_images(
             visible_images,
-            run_agent_loop(
+            SURGERY_SENDER.scope(surgery_tx, run_agent_loop(
                 client,
                 workspace,
                 log,
@@ -46,18 +102,18 @@ pub async fn run_responses_agent(
                 api_key,
                 body,
                 upstream_model,
-                &mut stream,
-                &tx,
-            ),
+                event_bus_tx_for_agent.clone(),
+                expert_provider,
+            )),
         )
         .await;
 
         if let Err(error) = result {
             let text = format!("\n[agent:error] {}\n", error);
-            let _ = tx.send(Ok(Bytes::from(stream.text_delta(&text)))).await;
+            let _ = event_bus_tx.send(EventBusMessage::TextDelta(text)).await;
         }
 
-        let _ = tx.send(Ok(Bytes::from(stream.finish()))).await;
+        let _ = event_bus_tx.send(EventBusMessage::Finished).await;
     });
 
     let mut rx = rx;
@@ -83,15 +139,14 @@ async fn run_agent_loop(
     api_key: String,
     mut body: Value,
     upstream_model: String,
-    stream: &mut AgentSseWriter,
-    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    event_bus_tx: mpsc::Sender<EventBusMessage>,
+    expert_provider: Option<crate::expert_surgery::ExpertProvider>,
 ) -> anyhow::Result<()> {
     let upstream_url = format!("{}/chat/completions", provider_url.trim_end_matches('/'));
     let requested_cwd = request_cwd_from_body(&body);
     let workspace = select_request_workspace(&workspace, requested_cwd.as_deref());
     send_text(
-        tx,
-        stream,
+        &event_bus_tx,
         &format!(
             "📂 当前工作区：{}{}\n",
             workspace.root().display(),
@@ -102,7 +157,7 @@ async fn run_agent_loop(
         ),
     )
     .await;
-    let project_gate = run_project_analysis_gate(&body, stream, tx).await;
+    let project_gate = run_project_analysis_gate(&body, &event_bus_tx).await;
     let should_run_project_prefetch = project_gate
         .as_ref()
         .map(|gate| gate.requires_project_analysis)
@@ -110,8 +165,7 @@ async fn run_agent_loop(
     if !should_run_project_prefetch {
         let gate = project_gate.as_ref().unwrap();
         send_debug_text(
-            tx,
-            stream,
+            &event_bus_tx,
             &format!(
                 "⚡ 便宜模型判断无需项目分析：{}。跳过索引刷新和架构预取。\n",
                 gate.reason
@@ -119,7 +173,7 @@ async fn run_agent_loop(
         )
         .await;
     } else {
-        send_debug_text(tx, stream, "🧭 正在刷新代码索引...\n").await;
+        send_debug_text(&event_bus_tx, "🧭 正在刷新代码索引...\n").await;
         let index_workspace = Arc::clone(&workspace);
         match tokio::task::spawn_blocking(move || {
             crate::index_refresh::refresh_workspace_indexes(&index_workspace)
@@ -127,18 +181,17 @@ async fn run_agent_loop(
         .await
         {
             Ok(summary) => {
-                send_debug_text(tx, stream, &format_index_refresh_summary(&summary)).await;
+                send_debug_text(&event_bus_tx, &format_index_refresh_summary(&summary)).await;
             }
             Err(error) => {
                 send_debug_text(
-                    tx,
-                    stream,
+                    &event_bus_tx,
                     &format!("⚠️ 代码索引刷新任务失败：{}。将继续处理请求。\n", error),
                 )
                 .await;
             }
         }
-        run_architecture_prefetch(&workspace, &body, stream, tx).await;
+        run_architecture_prefetch(&workspace, &body, &event_bus_tx).await;
     }
 
     body["model"] = json!(upstream_model);
@@ -174,7 +227,7 @@ async fn run_agent_loop(
         chat_messages.push(project_gate_chat_message(&gate));
     }
 
-    send_debug_text(tx, stream, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
+    send_debug_text(&event_bus_tx, "🤖 [agent] 已接管本轮请求，开始分析。\n").await;
 
     let mut total_tool_calls = 0usize;
     let mut consecutive_failures = 0usize;
@@ -216,8 +269,7 @@ async fn run_agent_loop(
             if text.trim().is_empty() {
                 log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
                 send_debug_text(
-                    tx,
-                    stream,
+                    &event_bus_tx,
                     "\n⚠️ [agent] 上游没有继续调用工具，但也没有给出文本答案。\n",
                 )
                 .await;
@@ -242,7 +294,7 @@ async fn run_agent_loop(
 
             if matches!(finality, FinalityDecision::Done) {
                 log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
-                send_text(tx, stream, &text).await;
+                send_text(&event_bus_tx, &text).await;
                 return Ok(());
             }
 
@@ -250,12 +302,11 @@ async fn run_agent_loop(
             if consecutive_non_final_text > MAX_CONSECUTIVE_NON_FINAL_TEXT {
                 log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
                 send_debug_text(
-                    tx,
-                    stream,
+                    &event_bus_tx,
                     "⚠️ 上游连续返回未完成的无工具文本，已停止继续追问并输出最近一次文本。\n",
                 )
                 .await;
-                send_text(tx, stream, &text).await;
+                send_text(&event_bus_tx, &text).await;
                 return Ok(());
             }
 
@@ -265,12 +316,12 @@ async fn run_agent_loop(
                     "role": "system",
                     "content": continuation_nudge_for_non_final_text(&text, &finality)
                 }));
-                send_debug_text(tx, stream, "⚠️ 上游文本未确认完成，继续推进一轮。\n").await;
+                send_debug_text(&event_bus_tx, "⚠️ 上游文本未确认完成，继续推进一轮。\n").await;
                 continue;
             }
 
             log_agent_summary(&log, steps_run, total_tool_calls, text.chars().count());
-            send_text(tx, stream, &text).await;
+            send_text(&event_bus_tx, &text).await;
             return Ok(());
         }
 
@@ -282,16 +333,15 @@ async fn run_agent_loop(
         // Pre-flight: check for delegated/unknown tools before spawning any work.
         for tool_call in &tool_calls {
             if delegated_tool_names.contains(&tool_call.name) {
-                send_debug_text(tx, stream, &format!("↪️ {}\n", &tool_call.name)).await;
-                let _ = tx
-                    .send(Ok(Bytes::from(stream.delegated_tool_call(tool_call))))
+                send_debug_text(&event_bus_tx, &format!("↪️ {}\n", &tool_call.name)).await;
+                let _ = event_bus_tx
+                    .send(EventBusMessage::DelegatedToolCall(tool_call.clone()))
                     .await;
                 return Ok(());
             }
             if !local_tool_names.contains(&tool_call.name) {
                 send_debug_text(
-                    tx,
-                    stream,
+                    &event_bus_tx,
                     &format!(
                         "\n⚠️ [tool:unknown] 上游请求了未知工具 {}，本地无法执行，也未由 Codex 注册。\n",
                         &tool_call.name
@@ -305,9 +355,9 @@ async fn run_agent_loop(
         // Fire 🔧 notifications in order.
         for tool_call in &tool_calls {
             if let Some(reason) = tool_call_reason(tool_call) {
-                send_debug_text(tx, stream, &format!("{}\n", reason)).await;
+                send_debug_text(&event_bus_tx, &format!("{}\n", reason)).await;
             }
-            send_debug_text(tx, stream, &format!("⚡ {}\n", &tool_call.name)).await;
+            send_debug_text(&event_bus_tx, &format!("⚡ {}\n", &tool_call.name)).await;
         }
 
         // Execute all local tools concurrently.
@@ -316,8 +366,9 @@ async fn run_agent_loop(
             .into_iter()
             .map(|tc| {
                 let workspace = Arc::clone(workspace_ref);
+                let expert = expert_provider.clone();
                 async move {
-                    let output = execute_local_tool(&workspace, &tc).await;
+                    let output = execute_local_tool(&workspace, &tc, expert.as_ref()).await;
                     (tc, output)
                 }
             })
@@ -334,8 +385,7 @@ async fn run_agent_loop(
                 &tc, &bounded,
             ));
             send_debug_text(
-                tx,
-                stream,
+                &event_bus_tx,
                 &format!(
                     "✅ {} 完成，返回 {} 字符{}。继续分析...\n",
                     &tc.name,
@@ -349,7 +399,7 @@ async fn run_agent_loop(
         if step_failed {
             consecutive_failures += 1;
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                send_debug_text(tx, stream, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
+                send_debug_text(&event_bus_tx, "\n⏹️ 连续3次工具调用失败，已停止。\n").await;
                 log_agent_summary(&log, steps_run, total_tool_calls, 0);
                 return Ok(());
             }
@@ -358,13 +408,13 @@ async fn run_agent_loop(
         }
     }
 
-    send_debug_text(tx, stream, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
+    send_debug_text(&event_bus_tx, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
     log_agent_summary(&log, steps_run, total_tool_calls, 0);
     Ok(())
 }
 
 fn ensure_agent_instructions(body: &mut Value) {
-    let prefix = "You are the upstream reasoning model inside a local Agent Runtime. Use the provided local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. When you need information, call tools; when enough information is available, answer normally. Every tool call includes a user-visible `reason` argument; fill it with one short sentence explaining why that tool is being called, written as progress narration rather than private chain-of-thought. Do not stop at a progress note, plan, or future-tense statement such as saying you will inspect files; either call the needed tools or provide the complete final answer. Prefer parallel tool calls: batch independent reads, searches, and lookups into a single step whenever they do not depend on each other's results. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
+    let prefix = "You are the cheap Master Orchestrator inside a local Agent Runtime. You own the stateful ReAct loop and the complete tool registry. Use local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. The top model is not an agent here: it is physically exposed only as the expert_code_surgery tool, a stateless pure function LargeModel(arguments) -> SEARCH/REPLACE patch. The expert has no tool visibility and cannot do nested tool calls. For complex code rewrites, especially changes crossing responsibilities, symbols, or files, first gather verified local evidence with index/search/read tools and then call expert_code_surgery with a precise symbol_id and rewrite instruction. Do not send chat history, plans, or unrelated tool outputs in that instruction; pass only the verified constraints the expert needs. For small mechanical edits, local tools may still be used. Every tool call includes a user-visible `reason` argument; fill it with one short sentence explaining why that tool is being called, written as progress narration rather than private chain-of-thought. Do not stop at a progress note, plan, or future-tense statement such as saying you will inspect files; either call the needed tools or provide the complete final answer. Prefer parallel tool calls for independent reads, searches, and lookups, but do not batch expert_code_surgery with unrelated write tools. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
     let current = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -413,8 +463,7 @@ fn format_index_refresh_summary(summary: &crate::index_refresh::IndexRefreshSumm
 async fn run_architecture_prefetch(
     workspace: &Arc<crate::tools::Workspace>,
     body: &Value,
-    stream: &mut AgentSseWriter,
-    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    event_bus_tx: &mpsc::Sender<EventBusMessage>,
 ) {
     let Some(query) = latest_user_text_from_responses_body(body) else {
         return;
@@ -423,15 +472,14 @@ async fn run_architecture_prefetch(
         return;
     }
 
-    send_debug_text(tx, stream, "🧠 flash 正在分析用户意图和业务范围...\n").await;
+    send_debug_text(event_bus_tx, "🧠 flash 正在分析用户意图和业务范围...\n").await;
     match build_architecture_prefetch_request(workspace, &query) {
         Ok(request) => {
             match crate::architecture_agent::analyze_architecture(workspace, request).await {
                 Ok(response) => {
                     let analysis = response.analysis;
                     send_debug_text(
-                        tx,
-                        stream,
+                        event_bus_tx,
                         &format!(
                             "📌 flash 业务定位：{}；关键符号 {} 个，语义释义 {} 个，已记录={}。\n",
                             analysis.area,
@@ -443,8 +491,7 @@ async fn run_architecture_prefetch(
                     .await;
                     if !analysis.minimal_change_scope.trim().is_empty() {
                         send_debug_text(
-                            tx,
-                            stream,
+                            event_bus_tx,
                             &format!("🧭 建议最小范围：{}。\n", analysis.minimal_change_scope),
                         )
                         .await;
@@ -452,8 +499,7 @@ async fn run_architecture_prefetch(
                 }
                 Err(error) => {
                     send_debug_text(
-                        tx,
-                        stream,
+                        event_bus_tx,
                         &format!("⚠️ flash 业务分析失败：{}。将继续交给主模型处理。\n", error),
                     )
                     .await;
@@ -462,11 +508,10 @@ async fn run_architecture_prefetch(
         }
         Err(error) => {
             send_debug_text(
-                tx,
-                stream,
+                event_bus_tx,
                 &format!("⚠️ flash 证据准备失败：{}。将继续交给主模型处理。\n", error),
             )
-            .await;
+                    .await;
         }
     }
 }
@@ -722,9 +767,21 @@ fn log_agent_summary(
 async fn execute_local_tool(
     workspace: &Arc<crate::tools::Workspace>,
     tool_call: &crate::format_translate::OpenAiChatToolCall,
+    expert_provider: Option<&crate::expert_surgery::ExpertProvider>,
 ) -> String {
-    let arguments =
+    let mut arguments =
         serde_json::from_str::<Value>(&tool_call.arguments).unwrap_or_else(|_| json!({}));
+
+    if tool_call.name == "expert_code_surgery" {
+        if let Some(expert) = expert_provider {
+            if let serde_json::Value::Object(ref mut map) = arguments {
+                map.insert("expert_url".to_string(), json!(expert.url));
+                map.insert("expert_api_key".to_string(), json!(expert.api_key));
+                map.insert("expert_model".to_string(), json!(expert.model));
+            }
+        }
+    }
+
     let params = json!({
         "name": tool_call.name,
         "arguments": arguments
@@ -901,14 +958,13 @@ fn bound_tool_output(output: &str) -> String {
 }
 
 async fn send_text(
-    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
-    stream: &mut AgentSseWriter,
+    event_bus_tx: &mpsc::Sender<EventBusMessage>,
     text: &str,
 ) {
     if text.is_empty() {
         return;
     }
-    let _ = tx.send(Ok(Bytes::from(stream.text_delta(text)))).await;
+    let _ = event_bus_tx.send(EventBusMessage::TextDelta(text.to_string())).await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1007,20 +1063,18 @@ fn continuation_nudge_for_non_final_text(text: &str, finality: &FinalityDecision
 
 async fn run_project_analysis_gate(
     body: &Value,
-    stream: &mut AgentSseWriter,
-    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    event_bus_tx: &mpsc::Sender<EventBusMessage>,
 ) -> Option<crate::architecture_agent::ProjectAnalysisDecision> {
     let query = latest_user_text_from_responses_body(body)?;
     if query.trim().is_empty() {
         return None;
     }
 
-    send_debug_text(tx, stream, "🧠 便宜模型正在判断是否需要项目分析...\n").await;
+    send_debug_text(event_bus_tx, "🧠 便宜模型正在判断是否需要项目分析...\n").await;
     match crate::architecture_agent::decide_project_analysis_requirement(&query).await {
         Ok(decision) => {
             send_debug_text(
-                tx,
-                stream,
+                event_bus_tx,
                 &format!(
                     "📌 项目分析判断：requires_project_analysis={}；confidence={:.2}；reason={}。\n",
                     decision.requires_project_analysis, decision.confidence, decision.reason
@@ -1031,8 +1085,7 @@ async fn run_project_analysis_gate(
         }
         Err(error) => {
             send_debug_text(
-                tx,
-                stream,
+                event_bus_tx,
                 &format!(
                     "⚠️ 项目分析判断失败：{}。将按需要项目分析继续处理。\n",
                     error
@@ -1055,11 +1108,10 @@ fn project_gate_chat_message(gate: &crate::architecture_agent::ProjectAnalysisDe
 }
 
 async fn send_debug_text(
-    tx: &mpsc::Sender<Result<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
-    stream: &mut AgentSseWriter,
+    event_bus_tx: &mpsc::Sender<EventBusMessage>,
     text: &str,
 ) {
-    send_text(tx, stream, text).await;
+    send_text(event_bus_tx, text).await;
 }
 
 struct AgentSession {

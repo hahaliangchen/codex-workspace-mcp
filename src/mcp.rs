@@ -501,6 +501,15 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         "replace_range" => serde_json::to_value(
             workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?,
         )?,
+        "expert_code_surgery" => serde_json::to_value(
+            crate::expert_surgery::run_expert_code_surgery(
+                workspace,
+                serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
+                    arguments,
+                )?,
+            )
+            .await?,
+        )?,
         "index_go_workspace" => {
             serde_json::to_value(workspace.index_go_workspace(serde_json::from_value::<
                 IndexGoWorkspaceRequest,
@@ -786,6 +795,43 @@ pub fn tool_definitions() -> Value {
                         "description": "When true, skip files ignored by .gitignore/.ignore. Defaults to false so logs and generated files remain searchable."
                     },
                     "max_matches": { "type": "integer", "default": 100 }
+                }
+            }
+        },
+        {
+            "name": "expert_code_surgery",
+            "description": "Invoke the stateless top-model code surgery compiler for one indexed Rust symbol. Use this for complex code rewrites after local inspection. The harness strips chat history, builds a fixed cache-aligned prefix from architecture memory and symbol business context, sends only the target AST code block plus rewrite command as volatile input, accepts only <<<<<<< SEARCH / ======= / >>>>>>> REPLACE output, performs byte-span merge from SQLite symbol coordinates, validates Rust syntax locally, then runs cargo fmt and cargo check.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["workspace_root", "symbol_id", "instruction"],
+                "properties": {
+                    "workspace_root": {
+                        "type": "string",
+                        "description": "Absolute project directory containing the Rust symbol index."
+                    },
+                    "symbol_id": {
+                        "type": "string",
+                        "description": "Exact Rust symbol id from search_rust_symbols/list_rust_symbols/read_rust_symbol."
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "Precise rewrite command for the target symbol. Include verified constraints and intended behavior; do not include chat history."
+                    },
+                    "related_symbol_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "default": [],
+                        "description": "Optional explicit readonly Rust symbol ids to include as relationship context. These blocks help the expert understand callers/callees/types, but only symbol_id may be replaced."
+                    },
+                    "architecture_query": {
+                        "type": "string",
+                        "description": "Optional feature/area query used to select durable architecture memory for the fixed prefix."
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "When true, call the expert and validate syntax, but do not write files or run cargo fmt/check."
+                    }
                 }
             }
         },

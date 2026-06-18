@@ -977,7 +977,7 @@ impl Workspace {
         .map_err(map_memory_error)
     }
 
-    fn with_root(&self, raw_root: Option<&str>) -> Result<Self> {
+    pub(crate) fn with_root(&self, raw_root: Option<&str>) -> Result<Self> {
         match raw_root {
             Some(root) if !root.trim().is_empty() => {
                 let root = root.trim();
