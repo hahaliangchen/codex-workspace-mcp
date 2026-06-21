@@ -7,16 +7,14 @@ use crate::sandbox_diagnostic::AstNodeSnippet;
 
 struct NodeVisitor {
     target_line: usize,
-    target_column: usize,
     best_match: Option<AstNodeSnippet>,
     min_range: usize,
 }
 
 impl NodeVisitor {
-    fn new(line: usize, column: usize) -> Self {
+    fn new(line: usize) -> Self {
         Self {
             target_line: line,
-            target_column: column,
             best_match: None,
             min_range: usize::MAX,
         }
@@ -99,10 +97,10 @@ impl<'ast> Visit<'ast> for NodeVisitor {
     }
 }
 
-pub fn diagnose_ast_error(line: usize, column: usize, source_code: &str) -> Option<AstNodeSnippet> {
+pub fn diagnose_ast_error(line: usize, _column: usize, source_code: &str) -> Option<AstNodeSnippet> {
     let file = syn::parse_file(source_code).ok()?;
     
-    let mut visitor = NodeVisitor::new(line, column);
+    let mut visitor = NodeVisitor::new(line);
     visitor.visit_file(&file);
 
     visitor.best_match

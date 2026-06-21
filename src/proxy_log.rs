@@ -1,18 +1,9 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use chrono::FixedOffset;
-
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Current time in China timezone (UTC+8).
-pub fn now_china() -> String {
-    let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
-    chrono::Utc::now()
-        .with_timezone(&offset)
-        .format("%Y-%m-%d %H:%M:%S%.3f")
-        .to_string()
-}
+
 
 pub fn init(log_dir: PathBuf) -> std::io::Result<()> {
     std::fs::create_dir_all(&log_dir)?;

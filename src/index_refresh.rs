@@ -70,7 +70,7 @@ pub fn refresh_workspace_indexes(workspace: &Workspace) -> IndexRefreshSummary {
     refresh_workspace_indexes_at(workspace.root())
 }
 
-fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
+pub fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
     // 【第一阶段】：锁外并发元数据嗅探与多项目对账拦截（保持你原有的优秀非阻塞设计）
     let current_mtimes = scan_source_mtimes(root);
     let root_buf = root.to_path_buf();
@@ -165,6 +165,7 @@ fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
     final_summary
 }
 
+#[cfg(test)]
 fn detect_workspace_languages(root: &Path) -> BTreeSet<IndexLanguage> {
     scan_source_mtimes(root)
         .keys()

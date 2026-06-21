@@ -6,6 +6,7 @@ mod ai_proxy;
 mod architecture_agent;
 mod database;
 mod expert_surgery;
+pub mod verification_harness;
 mod format_translate;
 mod go_index;
 mod index_refresh;

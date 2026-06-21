@@ -501,15 +501,12 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         "replace_range" => serde_json::to_value(
             workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?,
         )?,
-        "expert_code_surgery" => serde_json::to_value(
-            crate::expert_surgery::run_expert_code_surgery(
-                workspace,
-                serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
-                    arguments,
-                )?,
-            )
-            .await?,
-        )?,
+        "expert_code_surgery" => {
+            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(arguments)?;
+            let draft = crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
+            let response = crate::verification_harness::apply_and_verify(workspace, &request, draft).await?;
+            serde_json::to_value(response)?
+        }
         "index_go_workspace" => {
             serde_json::to_value(workspace.index_go_workspace(serde_json::from_value::<
                 IndexGoWorkspaceRequest,

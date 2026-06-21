@@ -1,5 +1,4 @@
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use reqwest::Client;
 use rusqlite::params;
@@ -9,7 +8,7 @@ use serde_json::{Value, json};
 use crate::rust_index::ReadRustSymbolRequest;
 use crate::tools::Workspace;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ExpertCodeSurgeryRequest {
     #[serde(default)]
     pub workspace_root: Option<String>,
@@ -101,26 +100,40 @@ pub struct ExpertProvider {
 }
 
 #[derive(Debug)]
-struct SymbolSpan {
-    id: String,
-    name: String,
-    kind: String,
-    file_path: String,
-    start_line: usize,
-    end_line: usize,
-    signature: String,
-    docstring: String,
-    byte_start: usize,
-    byte_end: usize,
-    source: String,
+pub struct SymbolSpan {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub signature: String,
+    pub docstring: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub source: String,
+}
+
+#[derive(Debug)]
+pub struct ExpertSurgeryDraft {
+    pub symbol: SymbolSpan,
+    pub related_blocks: Vec<RelatedCodeBlock>,
+    pub fixed_prefix_chars: usize,
+    pub volatile_chars: usize,
+    pub patch: SearchReplacePatch,
+    pub original_file_content_before_await: String,
 }
 
 pub async fn run_expert_code_surgery(
     workspace: &Workspace,
     request: ExpertCodeSurgeryRequest,
-) -> anyhow::Result<ExpertCodeSurgeryResponse> {
+) -> anyhow::Result<ExpertSurgeryDraft> {
     let workspace = workspace.with_root(request.workspace_root.as_deref())?;
-    crate::rust_index::index_workspace(workspace.root())?;
+    let index_root = workspace.root().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        crate::index_refresh::refresh_workspace_indexes_at(&index_root);
+    })
+    .await?;
     let symbol = load_rust_symbol_span(&workspace, &request.symbol_id)?;
     let related_blocks =
         load_related_rust_blocks(&workspace, &symbol, &request.related_symbol_ids)?;
@@ -142,91 +155,13 @@ pub async fn run_expert_code_surgery(
     emit_event(SurgeryEvent::ProModelGraphDone { elapsed_ms });
     let patch = parse_search_replace_patch(&raw_patch)?;
 
-    if crate::conflict_resolver::normalize_newlines(&patch.search).trim() != crate::conflict_resolver::normalize_newlines(&symbol.source).trim() {
-        anyhow::bail!(
-            "expert patch SEARCH block does not match indexed symbol span; refusing fuzzy merge"
-        );
-    }
-
-    let mut replacement = crate::conflict_resolver::normalize_newlines(&patch.replace);
-    if symbol.source.ends_with('\n') && !replacement.ends_with('\n') {
-        replacement.push('\n');
-    }
-
-    emit_event(SurgeryEvent::PreWriteVerificationStarted);
-    let current_disk_content = std::fs::read_to_string(&path)?;
-
-    let mut file_content = current_disk_content.clone();
-
-    if current_disk_content == original_file_content_before_await {
-        file_content.replace_range(symbol.byte_start..symbol.byte_end, &replacement);
-        emit_event(SurgeryEvent::FileConsistentApproved);
-    } else {
-        emit_event(SurgeryEvent::OffsetDriftDetected);
-        if let Some((start_byte, end_byte)) = crate::conflict_resolver::find_unique_normalized_match(&current_disk_content, &patch.search) {
-            file_content.replace_range(start_byte..end_byte, &replacement);
-            emit_event(SurgeryEvent::ThreeWayRelocationSuccess { byte_range: (start_byte, end_byte) });
-        } else {
-            emit_event(SurgeryEvent::HardConflictEncountered);
-            emit_event(SurgeryEvent::FlashResolverStarted);
-
-            let (ours_start, ours_end) = crate::conflict_resolver::locate_drifted_symbol(
-                &current_disk_content,
-                &symbol.name,
-                &symbol.signature,
-                symbol.byte_start,
-            );
-            let ours_block = &current_disk_content[ours_start..ours_end];
-
-            let flash_provider = crate::conflict_resolver::load_default_provider()?;
-            let merged = crate::conflict_resolver::call_flash_merge(&flash_provider, &patch.search, &replacement, ours_block).await?;
-
-            file_content.replace_range(ours_start..ours_end, &merged);
-            emit_event(SurgeryEvent::FlashResolverSuccess);
-        }
-    }
-
-    // AST syntax validation in-memory
-    emit_event(SurgeryEvent::LocalLintStarted);
-    if let Err(err) = validate_rust_syntax(&file_content) {
-        emit_event(SurgeryEvent::TransactionRolledBack {
-            reason: format!("AST syntax validation failed: {}", err),
-        });
-        anyhow::bail!("AST syntax validation failed after patch: {}", err);
-    }
-    emit_event(SurgeryEvent::SyntaxTreeVerified);
-
-    let mut fmt_status = VerificationStatus {
-        ran: false,
-        success: true,
-        output: String::new(),
-    };
-    let mut check_status = VerificationStatus {
-        ran: false,
-        success: true,
-        output: String::new(),
-    };
-
-    if !request.dry_run {
-        let verify_res = write_and_verify(&path, workspace.root(), &file_content, &current_disk_content).await?;
-        fmt_status = verify_res.0;
-        check_status = verify_res.1;
-    }
-
-    Ok(ExpertCodeSurgeryResponse {
-        symbol_id: symbol.id,
-        file_path: symbol.file_path,
-        start_byte: symbol.byte_start,
-        end_byte: symbol.byte_end,
-        dry_run: request.dry_run,
+    Ok(ExpertSurgeryDraft {
+        symbol,
+        related_blocks,
         fixed_prefix_chars: fixed_prefix.chars().count(),
         volatile_chars: volatile.chars().count(),
-        related_blocks,
-        replacement_bytes: replacement.len(),
-        syntax_ok: true,
-        fmt_status,
-        check_status,
         patch,
+        original_file_content_before_await,
     })
 }
 
@@ -643,91 +578,6 @@ fn line_range_to_byte_span(
     let start = start.ok_or_else(|| anyhow::anyhow!("start_line is outside file"))?;
     let end = end.unwrap_or(content.len());
     Ok((start, end))
-}
-
-fn validate_rust_syntax(content: &str) -> anyhow::Result<()> {
-    syn::parse_file(content)
-        .map(|_| ())
-        .map_err(|error| anyhow::anyhow!("Rust syntax parse failed after patch: {}", error))
-}
-
-fn run_command_capture(cwd: &Path, program: &str, args: &[&str]) -> VerificationStatus {
-    let output = Command::new(program).args(args).current_dir(cwd).output();
-    match output {
-        Ok(output) => {
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            VerificationStatus {
-                ran: true,
-                success: output.status.success(),
-                output: text,
-            }
-        }
-        Err(error) => VerificationStatus {
-            ran: true,
-            success: false,
-            output: error.to_string(),
-        },
-    }
-}
-
-async fn write_and_verify(
-    path: &Path,
-    root: &Path,
-    file_content: &str,
-    current_disk_content: &str,
-) -> anyhow::Result<(VerificationStatus, VerificationStatus)> {
-    let path_clone = path.to_path_buf();
-    let file_content_clone = file_content.to_string();
-    let root_clone = root.to_path_buf();
-
-    std::fs::write(&path_clone, file_content_clone.as_bytes())?;
-
-    let (fmt_status, check_status) = tokio::task::spawn_blocking(move || {
-        let fmt_status = run_command_capture(&root_clone, "cargo", &["fmt"]);
-        let check_status = run_command_capture(&root_clone, "cargo", &["check"]);
-        (fmt_status, check_status)
-    })
-    .await?;
-
-    if fmt_status.success && check_status.success {
-        emit_event(SurgeryEvent::CargoCheckPassed);
-        Ok((fmt_status, check_status))
-    } else {
-        std::fs::write(&path_clone, current_disk_content.as_bytes())?;
-        let mut reason = format!(
-            "cargo check/fmt failed\ncargo fmt success={}\ncargo check success={}",
-            fmt_status.success, check_status.success
-        );
-
-        let mut final_error_message = format!(
-            "local verification failed after byte-span merge\ncargo fmt:\n{}\n\ncargo check:\n{}",
-            fmt_status.output,
-            check_status.output
-        );
-
-        if !check_status.success {
-            // Run again with JSON output to generate diagnostic report
-            let root_clone2 = root.to_path_buf();
-            let check_json = tokio::task::spawn_blocking(move || {
-                run_command_capture(&root_clone2, "cargo", &["check", "--message-format=json"])
-            })
-            .await?;
-            
-            let diagnostic_report = crate::sandbox_diagnostic::generate_report(root, path, &check_json.output);
-            
-            reason.push_str("\nGenerated AST Diagnostic Report.");
-            final_error_message = format!(
-                "local verification failed after byte-span merge.\n{}\n\nRaw cargo check output:\n{}",
-                diagnostic_report,
-                check_status.output
-            );
-        }
-
-        emit_event(SurgeryEvent::TransactionRolledBack { reason });
-        anyhow::bail!("{}", final_error_message);
-    }
 }
 
 
