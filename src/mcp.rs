@@ -502,9 +502,13 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?,
         )?,
         "expert_code_surgery" => {
-            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(arguments)?;
-            let draft = crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
-            let response = crate::verification_harness::apply_and_verify(workspace, &request, draft).await?;
+            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
+                arguments,
+            )?;
+            let draft =
+                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
+            let response =
+                crate::verification_harness::apply_and_verify(workspace, &request, draft).await?;
             serde_json::to_value(response)?
         }
         "index_go_workspace" => {
@@ -797,18 +801,23 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "expert_code_surgery",
-            "description": "Invoke the stateless top-model code surgery compiler for one indexed Rust symbol. Use this for complex code rewrites after local inspection. The harness strips chat history, builds a fixed cache-aligned prefix from architecture memory and symbol business context, sends only the target AST code block plus rewrite command as volatile input, accepts only <<<<<<< SEARCH / ======= / >>>>>>> REPLACE output, performs byte-span merge from SQLite symbol coordinates, validates Rust syntax locally, then runs cargo fmt and cargo check.",
+            "description": "Invoke the stateless top-model code surgery compiler for one indexed code symbol. Use this for complex code rewrites after local inspection. The harness strips chat history, selects a language-specific symbol provider, builds a fixed cache-aligned prefix from architecture memory and symbol business context, sends only the target AST code block plus rewrite command as volatile input, accepts only <<<<<<< SEARCH / ======= / >>>>>>> REPLACE output, performs byte-span merge from symbol coordinates, validates syntax locally, then runs language-appropriate format/check commands when available.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id", "instruction"],
                 "properties": {
                     "workspace_root": {
                         "type": "string",
-                        "description": "Absolute project directory containing the Rust symbol index."
+                        "description": "Absolute project directory containing the symbol index."
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["rust", "typescript", "python", "go"],
+                        "description": "Language-specific symbol provider to use. If omitted, the runtime infers it from the symbol_id prefix and falls back to rust for legacy calls."
                     },
                     "symbol_id": {
                         "type": "string",
-                        "description": "Exact Rust symbol id from search_rust_symbols/list_rust_symbols/read_rust_symbol."
+                        "description": "Exact symbol id from the matching search/list/read symbol tool for the chosen language."
                     },
                     "instruction": {
                         "type": "string",
@@ -818,7 +827,7 @@ pub fn tool_definitions() -> Value {
                         "type": "array",
                         "items": { "type": "string" },
                         "default": [],
-                        "description": "Optional explicit readonly Rust symbol ids to include as relationship context. These blocks help the expert understand callers/callees/types, but only symbol_id may be replaced."
+                        "description": "Optional explicit readonly symbol ids from the same language provider to include as relationship context. These blocks help the expert understand callers/callees/types, but only symbol_id may be replaced."
                     },
                     "architecture_query": {
                         "type": "string",

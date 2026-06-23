@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::expert_surgery::{
-    emit_event, ExpertCodeSurgeryRequest, ExpertCodeSurgeryResponse, ExpertSurgeryDraft,
-    SurgeryEvent, VerificationStatus,
+    ExpertCodeSurgeryRequest, ExpertCodeSurgeryResponse, ExpertSurgeryDraft, SurgeryEvent,
+    VerificationStatus, emit_event,
 };
 use crate::tools::Workspace;
 
@@ -41,9 +41,10 @@ pub async fn apply_and_verify(
         emit_event(SurgeryEvent::FileConsistentApproved);
     } else {
         emit_event(SurgeryEvent::OffsetDriftDetected);
-        if let Some((start_byte, end_byte)) =
-            crate::conflict_resolver::find_unique_normalized_match(&current_disk_content, &patch.search)
-        {
+        if let Some((start_byte, end_byte)) = crate::conflict_resolver::find_unique_normalized_match(
+            &current_disk_content,
+            &patch.search,
+        ) {
             file_content.replace_range(start_byte..end_byte, &replacement);
             emit_event(SurgeryEvent::ThreeWayRelocationSuccess {
                 byte_range: (start_byte, end_byte),
@@ -80,7 +81,7 @@ pub async fn apply_and_verify(
     let mut syntax_error_msg = String::new();
 
     emit_event(SurgeryEvent::LocalLintStarted);
-    if let Err(err) = validate_syntax_in_memory(&file_content, ext) {
+    if let Err(err) = validate_syntax_in_memory(&file_content, ext, draft.symbol.language) {
         syntax_ok = false;
         syntax_error_msg = err;
         emit_event(SurgeryEvent::TransactionRolledBack {
@@ -122,6 +123,7 @@ pub async fn apply_and_verify(
     }
 
     Ok(ExpertCodeSurgeryResponse {
+        language: draft.symbol.language,
         symbol_id: draft.symbol.id.clone(),
         file_path: draft.symbol.file_path.clone(),
         start_byte: draft.symbol.byte_start,
@@ -138,14 +140,16 @@ pub async fn apply_and_verify(
     })
 }
 
-fn validate_syntax_in_memory(content: &str, ext: &str) -> Result<(), String> {
-    match ext {
-        "rs" => {
-            syn::parse_file(content)
-                .map(|_| ())
-                .map_err(|error| format!("Rust syntax parse failed after patch: {}", error))
-        }
-        // Add fast in-memory checks for ts/py if available, for now assume ok
+fn validate_syntax_in_memory(
+    content: &str,
+    ext: &str,
+    language: crate::symbol_provider::SymbolLanguage,
+) -> Result<(), String> {
+    match (language, ext) {
+        (crate::symbol_provider::SymbolLanguage::Rust, "rs") => syn::parse_file(content)
+            .map(|_| ())
+            .map_err(|error| format!("Rust syntax parse failed after patch: {}", error)),
+        // Other languages are verified through external language tools when available.
         _ => Ok(()),
     }
 }
@@ -182,6 +186,7 @@ async fn run_semantic_gate(
     let file_content_clone = file_content.to_string();
     let root_clone = root.to_path_buf();
     let ext_clone = ext.to_string();
+    let path_for_commands = path_clone.clone();
 
     std::fs::write(&path_clone, file_content_clone.as_bytes())?;
 
@@ -193,15 +198,53 @@ async fn run_semantic_gate(
                 (fmt, chk)
             }
             "ts" | "tsx" => {
-                let fmt = VerificationStatus { ran: false, success: true, output: "".to_string() };
+                let fmt = VerificationStatus {
+                    ran: false,
+                    success: true,
+                    output: "".to_string(),
+                };
                 let chk = run_command_capture(&root_clone, "npx", &["tsc", "--noEmit"]);
+                (fmt, chk)
+            }
+            "py" => {
+                let fmt = VerificationStatus {
+                    ran: false,
+                    success: true,
+                    output: "".to_string(),
+                };
+                let chk = run_command_capture(
+                    &root_clone,
+                    "python",
+                    &[
+                        "-m",
+                        "py_compile",
+                        path_for_commands.to_string_lossy().as_ref(),
+                    ],
+                );
+                (fmt, chk)
+            }
+            "go" => {
+                let fmt = run_command_capture(
+                    &root_clone,
+                    "gofmt",
+                    &["-w", path_for_commands.to_string_lossy().as_ref()],
+                );
+                let chk = run_command_capture(&root_clone, "go", &["test", "./..."]);
                 (fmt, chk)
             }
             _ => {
                 // Fallback to true if no semantic checker defined
                 (
-                    VerificationStatus { ran: false, success: true, output: "".to_string() },
-                    VerificationStatus { ran: false, success: true, output: "".to_string() },
+                    VerificationStatus {
+                        ran: false,
+                        success: true,
+                        output: "".to_string(),
+                    },
+                    VerificationStatus {
+                        ran: false,
+                        success: true,
+                        output: "".to_string(),
+                    },
                 )
             }
         }
@@ -214,7 +257,7 @@ async fn run_semantic_gate(
     } else {
         // Atomic rollback
         std::fs::write(&path_clone, current_disk_content.as_bytes())?;
-        
+
         let mut reason = format!(
             "Semantic check/fmt failed\nfmt success={}\ncheck success={}",
             fmt_status.success, check_status.success
@@ -222,8 +265,7 @@ async fn run_semantic_gate(
 
         let mut final_error_message = format!(
             "local verification failed after byte-span merge\nfmt:\n{}\n\ncheck:\n{}",
-            fmt_status.output,
-            check_status.output
+            fmt_status.output, check_status.output
         );
 
         // If Rust cargo check failed, try to get JSON diagnostics
@@ -233,14 +275,14 @@ async fn run_semantic_gate(
                 run_command_capture(&root_clone2, "cargo", &["check", "--message-format=json"])
             })
             .await?;
-            
-            let diagnostic_report = crate::sandbox_diagnostic::generate_report(root, path, &check_json.output);
-            
+
+            let diagnostic_report =
+                crate::sandbox_diagnostic::generate_report(root, path, &check_json.output);
+
             reason.push_str("\nGenerated AST Diagnostic Report.");
             final_error_message = format!(
                 "local verification failed after byte-span merge.\n{}\n\nRaw cargo check output:\n{}",
-                diagnostic_report,
-                check_status.output
+                diagnostic_report, check_status.output
             );
         }
 

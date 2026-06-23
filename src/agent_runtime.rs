@@ -59,15 +59,22 @@ pub async fn run_responses_agent(
                 }
                 EventBusMessage::TextDelta(delta) => {
                     if !delta.is_empty() {
-                        let _ = tx_clone.send(Ok(Bytes::from(stream.text_delta(&delta)))).await;
+                        let _ = tx_clone
+                            .send(Ok(Bytes::from(stream.text_delta(&delta))))
+                            .await;
                     }
                 }
                 EventBusMessage::Surgery(event) => {
-                    let narrative = crate::format_translate::codex_protocol::event_to_narrative(&event);
-                    let _ = tx_clone.send(Ok(Bytes::from(stream.text_delta(&narrative)))).await;
+                    let narrative =
+                        crate::format_translate::codex_protocol::event_to_narrative(&event);
+                    let _ = tx_clone
+                        .send(Ok(Bytes::from(stream.text_delta(&narrative))))
+                        .await;
                 }
                 EventBusMessage::DelegatedToolCall(tool_call) => {
-                    let _ = tx_clone.send(Ok(Bytes::from(stream.delegated_tool_call(&tool_call)))).await;
+                    let _ = tx_clone
+                        .send(Ok(Bytes::from(stream.delegated_tool_call(&tool_call))))
+                        .await;
                 }
                 EventBusMessage::Finished => {
                     let _ = tx_clone.send(Ok(Bytes::from(stream.finish()))).await;
@@ -81,7 +88,9 @@ pub async fn run_responses_agent(
     let event_bus_tx_for_surgery = event_bus_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = surgery_rx.recv().await {
-            let _ = event_bus_tx_for_surgery.send(EventBusMessage::Surgery(event)).await;
+            let _ = event_bus_tx_for_surgery
+                .send(EventBusMessage::Surgery(event))
+                .await;
         }
     });
 
@@ -93,16 +102,19 @@ pub async fn run_responses_agent(
         let visible_images = crate::vision_preprocess::visible_images_from_body(&body);
         let result = crate::vision_preprocess::scope_visible_images(
             visible_images,
-            SURGERY_SENDER.scope(surgery_tx, run_agent_loop(
-                client,
-                workspace,
-                provider_url,
-                api_key,
-                body,
-                upstream_model,
-                event_bus_tx_for_agent.clone(),
-                expert_provider,
-            )),
+            SURGERY_SENDER.scope(
+                surgery_tx,
+                run_agent_loop(
+                    client,
+                    workspace,
+                    provider_url,
+                    api_key,
+                    body,
+                    upstream_model,
+                    event_bus_tx_for_agent.clone(),
+                    expert_provider,
+                ),
+            ),
         )
         .await;
 
@@ -407,13 +419,17 @@ async fn run_agent_loop(
         }
     }
 
-    send_debug_text(&event_bus_tx, "\n⏹️ 达到最大工具循环次数（30次），已停止。\n").await;
+    send_debug_text(
+        &event_bus_tx,
+        "\n⏹️ 达到最大工具循环次数（30次），已停止。\n",
+    )
+    .await;
     log_agent_summary(steps_run, total_tool_calls, 0);
     Ok(())
 }
 
 fn ensure_agent_instructions(body: &mut Value) {
-    let prefix = "You are the cheap Master Orchestrator inside a local Agent Runtime. You own the stateful ReAct loop and the complete tool registry. Use local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. The top model is not an agent here: it is physically exposed only as the expert_code_surgery tool, a stateless pure function LargeModel(arguments) -> SEARCH/REPLACE patch. The expert has no tool visibility and cannot do nested tool calls. For complex code rewrites, especially changes crossing responsibilities, symbols, or files, first gather verified local evidence with index/search/read tools and then call expert_code_surgery with a precise symbol_id and rewrite instruction. Do not send chat history, plans, or unrelated tool outputs in that instruction; pass only the verified constraints the expert needs. For small mechanical edits, local tools may still be used. Every tool call includes a user-visible `reason` argument; fill it with one short sentence explaining why that tool is being called, written as progress narration rather than private chain-of-thought. Do not stop at a progress note, plan, or future-tense statement such as saying you will inspect files; either call the needed tools or provide the complete final answer. Prefer parallel tool calls for independent reads, searches, and lookups, but do not batch expert_code_surgery with unrelated write tools. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
+    let prefix = "You are the cheap Master Orchestrator inside a local Agent Runtime. You own the stateful ReAct loop and the complete tool registry. Use local workspace tools directly whenever current workspace files, logs, code, configuration, or repository state are needed. Do not ask the outer Codex client to execute tools. The top model is not an agent here: it is physically exposed only as the expert_code_surgery tool, a stateless pure function LargeModel(arguments) -> SEARCH/REPLACE patch. The expert has no tool visibility and cannot do nested tool calls. For complex code rewrites, especially changes crossing responsibilities, symbols, languages, or files, first gather verified local evidence with the matching language index/search/read tools, choose the target language (rust, typescript, python, or go), then call expert_code_surgery with language, a precise symbol_id, and a rewrite instruction. Do not send chat history, plans, or unrelated tool outputs in that instruction; pass only the verified constraints the expert needs. For small mechanical edits, local tools may still be used. Every tool call includes a user-visible `reason` argument; fill it with one short sentence explaining why that tool is being called, written as progress narration rather than private chain-of-thought. Do not stop at a progress note, plan, or future-tense statement such as saying you will inspect files; either call the needed tools or provide the complete final answer. Prefer parallel tool calls for independent reads, searches, and lookups, but do not batch expert_code_surgery with unrelated write tools. Before code changes or architecture questions, search_symbol_business_context and search_architecture_memory for the relevant business wording and feature/logic area. If no useful semantic memory exists, gather minimal verified evidence with indexed symbol tools, then call analyze_architecture_memory to let the configured cheap architecture model map the business logic and symbol roles. Pass only verified architecture memory, symbol business contexts, symbol index results, read_*_symbol output, or short code excerpts as evidence; do not send whole-project source. Set record=true only when the evidence is grounded enough to create/update durable architecture memory and symbol business contexts. For large changes that alter responsibilities, key symbols, boundaries, common tasks, risks, or symbol roles, update semantic memory before finishing. For code navigation, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols, list_*_symbols, then read_*_symbol with include_context when dependencies, callers, callees, or imports are useful. Use search_text mainly for literals, UI strings, log lines, config keys, error messages, or as a fallback when indexed symbol tools do not locate the code. Before editing, assess the relevant architecture area, smallest plausible change, files/symbols to touch, boundaries to avoid, regression risks, and coupling level. Distinguish business-critical information from incidental protocol/display/history noise: if unmatched tool calls, stale history, missing optional metadata, or display-only artifacts are not needed for the model to complete the user's task, prefer dropping, ignoring, normalizing, or isolating them instead of expanding the design to preserve them. If the minimal fix crosses unrelated architecture areas or requires broad shared-infrastructure changes, pause and explain the coupling, risks, and smaller alternatives to the user before making a large edit.";
     let current = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -510,7 +526,7 @@ async fn run_architecture_prefetch(
                 event_bus_tx,
                 &format!("⚠️ flash 证据准备失败：{}。将继续交给主模型处理。\n", error),
             )
-                    .await;
+            .await;
         }
     }
 }
@@ -1059,14 +1075,13 @@ fn bound_tool_output(output: &str) -> String {
     )
 }
 
-async fn send_text(
-    event_bus_tx: &mpsc::Sender<EventBusMessage>,
-    text: &str,
-) {
+async fn send_text(event_bus_tx: &mpsc::Sender<EventBusMessage>, text: &str) {
     if text.is_empty() {
         return;
     }
-    let _ = event_bus_tx.send(EventBusMessage::TextDelta(text.to_string())).await;
+    let _ = event_bus_tx
+        .send(EventBusMessage::TextDelta(text.to_string()))
+        .await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,10 +1224,7 @@ fn project_gate_chat_message(gate: &crate::architecture_agent::ProjectAnalysisDe
     })
 }
 
-async fn send_debug_text(
-    event_bus_tx: &mpsc::Sender<EventBusMessage>,
-    text: &str,
-) {
+async fn send_debug_text(event_bus_tx: &mpsc::Sender<EventBusMessage>, text: &str) {
     send_text(event_bus_tx, text).await;
 }
 

@@ -4,9 +4,9 @@ mod agent;
 mod agent_runtime;
 mod ai_proxy;
 mod architecture_agent;
+mod conflict_resolver;
 mod database;
 mod expert_surgery;
-pub mod verification_harness;
 mod format_translate;
 mod go_index;
 mod index_refresh;
@@ -16,14 +16,15 @@ mod proxy_log;
 mod python_index;
 mod responses;
 mod rust_index;
+mod sandbox_diagnostic;
 mod skills;
+mod symbol_provider;
 mod tool_prepare;
 mod tools;
 mod ts_index;
 mod upstream;
+pub mod verification_harness;
 mod vision_preprocess;
-mod sandbox_diagnostic;
-mod conflict_resolver;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
 

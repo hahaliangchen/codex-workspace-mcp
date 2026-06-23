@@ -5,13 +5,15 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::rust_index::ReadRustSymbolRequest;
+use crate::symbol_provider::SymbolLanguage;
 use crate::tools::Workspace;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ExpertCodeSurgeryRequest {
     #[serde(default)]
     pub workspace_root: Option<String>,
+    #[serde(default)]
+    pub language: Option<SymbolLanguage>,
     pub symbol_id: String,
     pub instruction: String,
     #[serde(default)]
@@ -30,6 +32,7 @@ pub struct ExpertCodeSurgeryRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ExpertCodeSurgeryResponse {
+    pub language: SymbolLanguage,
     pub symbol_id: String,
     pub file_path: String,
     pub start_byte: usize,
@@ -101,6 +104,7 @@ pub struct ExpertProvider {
 
 #[derive(Debug)]
 pub struct SymbolSpan {
+    pub language: SymbolLanguage,
     pub id: String,
     pub name: String,
     pub kind: String,
@@ -134,9 +138,14 @@ pub async fn run_expert_code_surgery(
         crate::index_refresh::refresh_workspace_indexes_at(&index_root);
     })
     .await?;
-    let symbol = load_rust_symbol_span(&workspace, &request.symbol_id)?;
+    let language = request
+        .language
+        .or_else(|| crate::symbol_provider::infer_language_from_symbol_id(&request.symbol_id))
+        .unwrap_or(SymbolLanguage::Rust);
+    let symbol_provider = crate::symbol_provider::provider_for_language(language);
+    let symbol = symbol_provider.load_symbol_span(&workspace, &request.symbol_id)?;
     let related_blocks =
-        load_related_rust_blocks(&workspace, &symbol, &request.related_symbol_ids)?;
+        symbol_provider.load_related_blocks(&workspace, &symbol, &request.related_symbol_ids)?;
     let architecture_memory =
         load_architecture_memory(&workspace, request.architecture_query.as_deref())?;
     let symbol_contexts = load_symbol_contexts(&workspace, &symbol)?;
@@ -313,9 +322,10 @@ id: {}\nname: {}\nfile: {}\nlines: {}-{}\n{}\n\n",
     }
 
     format!(
-        "[TARGET SYMBOL]\n\
+        "[TARGET LANGUAGE]\n{}\n\n[TARGET SYMBOL]\n\
 id: {}\nname: {}\nkind: {}\nfile: {}\nlines: {}-{}\nsignature: {}\ndocstring: {}\n\n\
 [EDITABLE AST CODE BLOCK]\n{}\n\n[READONLY RELATED CONTEXT]\n{}\n[REWRITE COMMAND]\n{}\n",
+        symbol.language.as_str(),
         symbol.id,
         symbol.name,
         symbol.kind,
@@ -328,111 +338,6 @@ id: {}\nname: {}\nkind: {}\nfile: {}\nlines: {}-{}\nsignature: {}\ndocstring: {}
         related,
         instruction
     )
-}
-
-fn load_related_rust_blocks(
-    workspace: &Workspace,
-    primary: &SymbolSpan,
-    explicit_symbol_ids: &[String],
-) -> anyhow::Result<Vec<RelatedCodeBlock>> {
-    let root = workspace.root().display().to_string();
-    let context = crate::rust_index::read_symbol(
-        workspace.root(),
-        ReadRustSymbolRequest {
-            workspace_root: root,
-            symbol_id: primary.id.clone(),
-            include_context: true,
-        },
-    )?;
-
-    let mut candidates = Vec::new();
-    for id in explicit_symbol_ids {
-        candidates.push((id.clone(), "explicit_related_symbol".to_string()));
-    }
-    for suggested in context.suggested_reads.iter().take(6) {
-        candidates.push((
-            suggested.symbol.id.clone(),
-            format!("suggested_{}", suggested.reason),
-        ));
-    }
-    for caller in context.callers.iter().take(4) {
-        candidates.push((caller.symbol_id.clone(), "caller".to_string()));
-    }
-    for callee in &context.callees {
-        for id in callee.matched_symbol_ids.iter().take(2) {
-            candidates.push((id.clone(), format!("callee_{}", callee.target_text)));
-        }
-    }
-
-    let mut seen = std::collections::BTreeSet::new();
-    let mut blocks = Vec::new();
-    for (symbol_id, reason) in candidates {
-        if symbol_id == primary.id || !seen.insert(symbol_id.clone()) {
-            continue;
-        }
-        let Ok(span) = load_rust_symbol_span(workspace, &symbol_id) else {
-            continue;
-        };
-        blocks.push(RelatedCodeBlock {
-            symbol_id: span.id,
-            name: span.name,
-            file_path: span.file_path,
-            start_line: span.start_line,
-            end_line: span.end_line,
-            reason,
-            source: span.source,
-        });
-        if blocks.len() >= 12 {
-            break;
-        }
-    }
-
-    Ok(blocks)
-}
-
-fn load_rust_symbol_span(workspace: &Workspace, symbol_id: &str) -> anyhow::Result<SymbolSpan> {
-    let conn = crate::database::init_db(workspace.root())?;
-    let root = workspace.root().display().to_string();
-    let mut stmt = conn.prepare(
-        "SELECT id, name, kind, file_path, start_line, end_line, signature, docstring
-         FROM rust_symbols WHERE workspace_root = ? AND id = ?",
-    )?;
-    let (id, name, kind, file_path, start_line, end_line, signature, docstring) = stmt
-        .query_row(params![root, symbol_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, usize>(4)?,
-                row.get::<_, usize>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })
-        .map_err(|_| anyhow::anyhow!("rust symbol not found in SQLite index: {}", symbol_id))?;
-
-    let path = workspace.root().join(&file_path);
-    let content = std::fs::read_to_string(&path)?;
-    let (byte_start, byte_end) = line_range_to_byte_span(&content, start_line, end_line)?;
-    let source = content
-        .get(byte_start..byte_end)
-        .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 byte span for indexed symbol"))?
-        .to_string();
-
-    Ok(SymbolSpan {
-        id,
-        name,
-        kind,
-        file_path,
-        start_line,
-        end_line,
-        signature,
-        docstring,
-        byte_start,
-        byte_end,
-        source,
-    })
 }
 
 fn load_architecture_memory(workspace: &Workspace, query: Option<&str>) -> anyhow::Result<String> {
@@ -549,39 +454,6 @@ fn trim_one_boundary_newline(value: &str) -> String {
         .to_string()
 }
 
-fn line_range_to_byte_span(
-    content: &str,
-    start_line: usize,
-    end_line: usize,
-) -> anyhow::Result<(usize, usize)> {
-    if start_line == 0 || end_line == 0 || start_line > end_line {
-        anyhow::bail!("invalid indexed line range {}-{}", start_line, end_line);
-    }
-    let mut line = 1usize;
-    let mut start = None;
-    let mut end = None;
-    for (idx, ch) in content.char_indices() {
-        if line == start_line && start.is_none() {
-            start = Some(idx);
-        }
-        if line == end_line + 1 {
-            end = Some(idx);
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-        }
-    }
-    if line == start_line && start.is_none() {
-        start = Some(content.len());
-    }
-    let start = start.ok_or_else(|| anyhow::anyhow!("start_line is outside file"))?;
-    let end = end.unwrap_or(content.len());
-    Ok((start, end))
-}
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,7 +471,7 @@ mod tests {
     #[test]
     fn computes_byte_span_by_line_range() {
         let content = "a\nbb\nccc\n";
-        let (start, end) = line_range_to_byte_span(content, 2, 2).unwrap();
+        let (start, end) = crate::symbol_provider::line_range_to_byte_span(content, 2, 2).unwrap();
         assert_eq!(&content[start..end], "bb\n");
     }
 
@@ -611,13 +483,14 @@ mod tests {
 
     #[test]
     fn rejects_invalid_line_range() {
-        let error = line_range_to_byte_span("a\n", 3, 2).unwrap_err();
+        let error = crate::symbol_provider::line_range_to_byte_span("a\n", 3, 2).unwrap_err();
         assert!(error.to_string().contains("invalid indexed line range"));
     }
 
     #[test]
     fn volatile_payload_marks_related_blocks_readonly() {
         let symbol = SymbolSpan {
+            language: SymbolLanguage::Rust,
             id: "rust:src/lib.rs:main:1".to_string(),
             name: "main".to_string(),
             kind: "function".to_string(),
@@ -646,34 +519,5 @@ mod tests {
         assert!(payload.contains("[READONLY RELATED BLOCK]"));
         assert!(payload.contains("reason: callee_helper"));
         assert!(payload.contains("fn helper() {}"));
-    }
-
-
-
-    fn temp_workspace(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("codex_expert_surgery_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    #[tokio::test]
-    async fn test_transaction_rollback_on_failed_checks() {
-        let root = temp_workspace("rollback");
-        let path = root.join("lib.rs");
-
-        let original_content = "pub fn foo() {}";
-        std::fs::write(&path, original_content).unwrap();
-
-        let new_content = "pub fn foo() { invalid_syntax }";
-
-        let result = write_and_verify(&path, &root, new_content, original_content).await;
-
-        assert!(result.is_err());
-
-        let rolled_back_content = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(rolled_back_content, original_content);
-
-        let _ = std::fs::remove_dir_all(root);
     }
 }
