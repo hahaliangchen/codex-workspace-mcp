@@ -41,4 +41,3 @@ pub fn event_to_narrative(event: &crate::expert_surgery::SurgeryEvent) -> String
         }
     }
 }
-

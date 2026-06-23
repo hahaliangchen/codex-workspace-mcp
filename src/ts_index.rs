@@ -1,9 +1,9 @@
 pub mod api;
+pub mod diagnostic;
 pub mod parser;
 pub mod resolve;
 pub mod types;
 pub mod utils;
-pub mod diagnostic;
 
 pub use api::*;
 pub use types::*;

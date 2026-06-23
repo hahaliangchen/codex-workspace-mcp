@@ -1,5 +1,5 @@
-pub mod parser;
 pub mod diagnostic;
+pub mod parser;
 
 pub use parser::*;
 

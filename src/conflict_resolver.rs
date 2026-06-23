@@ -1,5 +1,5 @@
-use serde_json::{Value, json};
 use reqwest::Client;
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 use crate::expert_surgery::ExpertProvider;
@@ -237,14 +237,20 @@ mod tests {
         let haystack = "line1\r\nfn target() {\r\n    println!(\"hi\");\r\n}\r\nline3";
         let needle = "fn target() {\n    println!(\"hi\");\n}";
         let res = find_unique_normalized_match(haystack, needle).unwrap();
-        assert_eq!(&haystack[res.0..res.1], "fn target() {\r\n    println!(\"hi\");\r\n}");
+        assert_eq!(
+            &haystack[res.0..res.1],
+            "fn target() {\r\n    println!(\"hi\");\r\n}"
+        );
     }
 
     #[test]
     fn locates_drifted_symbol_brace_matching() {
         let content = "fn unrelated() {}\npub fn target() {\n    let x = 1;\n    if true {\n        println!(\"yes\");\n    }\n}\nfn other() {}";
         let (start, end) = locate_drifted_symbol(content, "target", "pub fn target()", 20);
-        assert_eq!(&content[start..end], "pub fn target() {\n    let x = 1;\n    if true {\n        println!(\"yes\");\n    }\n}");
+        assert_eq!(
+            &content[start..end],
+            "pub fn target() {\n    let x = 1;\n    if true {\n        println!(\"yes\");\n    }\n}"
+        );
     }
 
     #[test]
@@ -254,6 +260,9 @@ mod tests {
         let search = "fn target() {\n    let x = 1;\n}";
 
         let match_range = find_unique_normalized_match(current_disk, search).unwrap();
-        assert_eq!(&current_disk[match_range.0..match_range.1], "fn target() {\n    let x = 1;\n}");
+        assert_eq!(
+            &current_disk[match_range.0..match_range.1],
+            "fn target() {\n    let x = 1;\n}"
+        );
     }
 }

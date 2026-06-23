@@ -58,11 +58,12 @@ impl AiProxyConfig {
         let default_provider = self.default_provider.as_deref().unwrap_or("");
         let provider_name = self.expert_provider.as_deref().unwrap_or(default_provider);
         let provider = self.providers.get(provider_name)?;
-        
-        let model = self.expert_model.clone().or_else(|| {
-            provider.model_map.values().next().cloned()
-        })?;
-        
+
+        let model = self
+            .expert_model
+            .clone()
+            .or_else(|| provider.model_map.values().next().cloned())?;
+
         Some(crate::expert_surgery::ExpertProvider {
             url: provider.url.trim_end_matches('/').to_string(),
             api_key: provider.api_key.clone(),

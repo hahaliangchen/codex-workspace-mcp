@@ -3,8 +3,6 @@ use std::sync::OnceLock;
 
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-
-
 pub fn init(log_dir: PathBuf) -> std::io::Result<()> {
     std::fs::create_dir_all(&log_dir)?;
     let _ = LOG_DIR.set(log_dir);

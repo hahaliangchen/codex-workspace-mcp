@@ -1,7 +1,7 @@
-use syn::visit::Visit;
-use syn::{ItemFn, ItemStruct, ItemEnum, ItemImpl, ImplItemFn};
-use quote::ToTokens;
 use proc_macro2::LineColumn;
+use quote::ToTokens;
+use syn::visit::Visit;
+use syn::{ImplItemFn, ItemEnum, ItemFn, ItemImpl, ItemStruct};
 
 use crate::sandbox_diagnostic::AstNodeSnippet;
 
@@ -20,7 +20,14 @@ impl NodeVisitor {
         }
     }
 
-    fn check_span(&mut self, start: LineColumn, end: LineColumn, kind: &str, signature: &str, body: &str) {
+    fn check_span(
+        &mut self,
+        start: LineColumn,
+        end: LineColumn,
+        kind: &str,
+        signature: &str,
+        body: &str,
+    ) {
         if self.target_line >= start.line && self.target_line <= end.line {
             let range = end.line - start.line;
             if range < self.min_range {
@@ -97,9 +104,13 @@ impl<'ast> Visit<'ast> for NodeVisitor {
     }
 }
 
-pub fn diagnose_ast_error(line: usize, _column: usize, source_code: &str) -> Option<AstNodeSnippet> {
+pub fn diagnose_ast_error(
+    line: usize,
+    _column: usize,
+    source_code: &str,
+) -> Option<AstNodeSnippet> {
     let file = syn::parse_file(source_code).ok()?;
-    
+
     let mut visitor = NodeVisitor::new(line);
     visitor.visit_file(&file);
 

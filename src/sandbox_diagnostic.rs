@@ -1,5 +1,5 @@
-use std::path::Path;
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct CompilerError {
@@ -39,14 +39,31 @@ pub fn parse_compiler_output(output: &str) -> Vec<CompilerError> {
                 // message is usually an object in rustc json
                 if let Some(level) = msg.get("level").and_then(|l| l.as_str()) {
                     if level == "error" {
-                        let text = msg.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+                        let text = msg
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         if let Some(spans) = msg.get("spans").and_then(|s| s.as_array()) {
                             // Find the primary span
-                            if let Some(span) = spans.iter().find(|s| s.get("is_primary").and_then(|p| p.as_bool()).unwrap_or(false)) {
-                                let file_name = span.get("file_name").and_then(|f| f.as_str()).unwrap_or("").to_string();
-                                let line_start = span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
-                                let column_start = span.get("column_start").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
-                                
+                            if let Some(span) = spans.iter().find(|s| {
+                                s.get("is_primary")
+                                    .and_then(|p| p.as_bool())
+                                    .unwrap_or(false)
+                            }) {
+                                let file_name = span
+                                    .get("file_name")
+                                    .and_then(|f| f.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let line_start =
+                                    span.get("line_start").and_then(|l| l.as_u64()).unwrap_or(0)
+                                        as usize;
+                                let column_start =
+                                    span.get("column_start")
+                                        .and_then(|c| c.as_u64())
+                                        .unwrap_or(0) as usize;
+
                                 errors.push(CompilerError {
                                     file_path: file_name,
                                     line: line_start,
@@ -64,11 +81,14 @@ pub fn parse_compiler_output(output: &str) -> Vec<CompilerError> {
 }
 
 /// Step 2: Route the error to the appropriate language diagnostic module
-pub fn dispatch_diagnostic_by_language(error: &CompilerError, workspace_root: &Path) -> Option<AstNodeSnippet> {
+pub fn dispatch_diagnostic_by_language(
+    error: &CompilerError,
+    workspace_root: &Path,
+) -> Option<AstNodeSnippet> {
     if error.file_path.is_empty() || error.line == 0 {
         return None;
     }
-    
+
     let path = workspace_root.join(&error.file_path);
     let Ok(source_code) = std::fs::read_to_string(&path) else {
         return None;
@@ -98,10 +118,16 @@ pub fn format_diagnostic_report(report: &DiagnosticSandboxReport) -> String {
 
     for (i, diag) in report.diagnostics.iter().enumerate() {
         out.push_str(&format!("#### Error {}: {}\n", i + 1, diag.error.message));
-        out.push_str(&format!("**Location**: `{}:{}:{}`\n\n", diag.error.file_path, diag.error.line, diag.error.column));
+        out.push_str(&format!(
+            "**Location**: `{}:{}:{}`\n\n",
+            diag.error.file_path, diag.error.line, diag.error.column
+        ));
 
         if let Some(ref snippet) = diag.snippet {
-            out.push_str(&format!("**AST Node Context**: {} `{}`\n", snippet.kind, snippet.signature));
+            out.push_str(&format!(
+                "**AST Node Context**: {} `{}`\n",
+                snippet.kind, snippet.signature
+            ));
             out.push_str("```rust\n");
             out.push_str(&snippet.body);
             out.push_str("\n```\n\n");
@@ -113,17 +139,30 @@ pub fn format_diagnostic_report(report: &DiagnosticSandboxReport) -> String {
     out
 }
 
-pub fn generate_report(workspace_root: &Path, file_path: &Path, compiler_raw_output: &str) -> String {
+pub fn generate_report(
+    workspace_root: &Path,
+    file_path: &Path,
+    compiler_raw_output: &str,
+) -> String {
     let all_errors = parse_compiler_output(compiler_raw_output);
-    
+
     // Filter errors specific to the file we just edited, to avoid noise
-    let target_file_str = file_path.strip_prefix(workspace_root).unwrap_or(file_path).display().to_string();
+    let target_file_str = file_path
+        .strip_prefix(workspace_root)
+        .unwrap_or(file_path)
+        .display()
+        .to_string();
     // Use ends_with or exact match to filter
-    let file_errors: Vec<_> = all_errors.into_iter().filter(|e| {
-        let normalized_e = e.file_path.replace("\\", "/");
-        let normalized_t = target_file_str.replace("\\", "/");
-        normalized_e == normalized_t || normalized_e.ends_with(&normalized_t) || normalized_t.ends_with(&normalized_e)
-    }).collect();
+    let file_errors: Vec<_> = all_errors
+        .into_iter()
+        .filter(|e| {
+            let normalized_e = e.file_path.replace("\\", "/");
+            let normalized_t = target_file_str.replace("\\", "/");
+            normalized_e == normalized_t
+                || normalized_e.ends_with(&normalized_t)
+                || normalized_t.ends_with(&normalized_e)
+        })
+        .collect();
 
     let mut diagnostics = Vec::new();
     for err in file_errors {
@@ -161,21 +200,19 @@ mod tests {
     fn test_format_diagnostic_report() {
         let report = DiagnosticSandboxReport {
             file_path: "src/main.rs".to_string(),
-            diagnostics: vec![
-                CompilerDiagnostic {
-                    error: CompilerError {
-                        file_path: "src/main.rs".to_string(),
-                        line: 10,
-                        column: 5,
-                        message: "cannot find value `x`".to_string(),
-                    },
-                    snippet: Some(AstNodeSnippet {
-                        kind: "Function".to_string(),
-                        signature: "fn main()".to_string(),
-                        body: "fn main() {\n    x = 1;\n}".to_string(),
-                    }),
-                }
-            ],
+            diagnostics: vec![CompilerDiagnostic {
+                error: CompilerError {
+                    file_path: "src/main.rs".to_string(),
+                    line: 10,
+                    column: 5,
+                    message: "cannot find value `x`".to_string(),
+                },
+                snippet: Some(AstNodeSnippet {
+                    kind: "Function".to_string(),
+                    signature: "fn main()".to_string(),
+                    body: "fn main() {\n    x = 1;\n}".to_string(),
+                }),
+            }],
         };
 
         let output = format_diagnostic_report(&report);
