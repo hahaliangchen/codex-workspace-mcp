@@ -4,7 +4,6 @@ mod agent;
 mod agent_runtime;
 mod ai_proxy;
 mod architecture_agent;
-mod conflict_resolver;
 mod database;
 mod expert_surgery;
 mod format_translate;
@@ -23,7 +22,6 @@ mod tool_prepare;
 mod tools;
 mod ts_index;
 mod upstream;
-pub mod verification_harness;
 mod vision_preprocess;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -85,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
 
     let workspace = Arc::new(Workspace::new(workspace_root)?);
     info!(root = %workspace.root().display(), "workspace initialized");
+
+    // Initialize database background write queue
+    let _ = crate::database::init_db_writer(workspace.root());
 
     // Start AI proxy on port 3001 if config exists alongside the binary
     let exe_dir = env::current_exe()

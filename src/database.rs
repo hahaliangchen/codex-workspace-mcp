@@ -1,6 +1,8 @@
 use rusqlite::{Connection, Result, params};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
 pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     let index_dir = workspace_root.join(".codex-workspace-mcp");
@@ -9,6 +11,8 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     }
     let db_path = index_dir.join("codex_state.db");
     let conn = Connection::open(db_path)?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.execute("PRAGMA journal_mode=WAL;", []);
 
     // Create memories table
     conn.execute(
@@ -236,9 +240,126 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+pub enum DbWriteEvent {
+    ApiLog {
+        conversation_id: Option<String>,
+        time_str: String,
+        action: String,
+        role: String,
+        message: String,
+        detail: Option<String>,
+    },
+    ConversationMessage {
+        conversation_id: String,
+        time_str: String,
+        source: String,
+        role: String,
+        message_type: String,
+        content: String,
+    },
+}
+
+pub static DB_WRITE_QUEUE: OnceLock<mpsc::Sender<DbWriteEvent>> = OnceLock::new();
+
+pub fn init_db_writer(workspace_root: &Path) -> Result<()> {
+    let (tx, mut rx) = mpsc::channel::<DbWriteEvent>(1024);
+    let root_path = workspace_root.to_path_buf();
+    
+    tokio::spawn(async move {
+        if let Ok(conn) = init_db(&root_path) {
+            while let Some(event) = rx.recv().await {
+                if let Err(e) = execute_write_sync(&conn, event) {
+                    tracing::error!("Database background write failed: {}", e);
+                }
+            }
+        }
+    });
+
+    let _ = DB_WRITE_QUEUE.set(tx);
+    Ok(())
+}
+
+pub fn queue_write(event: DbWriteEvent, workspace_root: &Path) {
+    if let Some(tx) = DB_WRITE_QUEUE.get() {
+        if let Err(e) = tx.try_send(event) {
+            // fallback to sync write if queue is full or closed
+            if let Ok(conn) = init_db(workspace_root) {
+                let _ = execute_write_sync(&conn, e.into_inner());
+            }
+        }
+    } else {
+        // fallback to sync write if queue is not initialized
+        if let Ok(conn) = init_db(workspace_root) {
+            let _ = execute_write_sync(&conn, event);
+        }
+    }
+}
+
+fn execute_write_sync(conn: &Connection, event: DbWriteEvent) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0) as i64;
+    match event {
+        DbWriteEvent::ApiLog {
+            conversation_id,
+            time_str,
+            action,
+            role,
+            message,
+            detail,
+        } => {
+            conn.execute(
+                "INSERT INTO api_logs (timestamp, time_str, conversation_id, action, role, message, detail)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    now,
+                    time_str,
+                    conversation_id,
+                    action,
+                    role,
+                    message,
+                    detail
+                ],
+            )?;
+            let cutoff = now - 24 * 3600;
+            conn.execute("DELETE FROM api_logs WHERE timestamp < ?", params![cutoff])?;
+        }
+        DbWriteEvent::ConversationMessage {
+            conversation_id,
+            time_str,
+            source,
+            role,
+            message_type,
+            content,
+        } => {
+            conn.execute(
+                "INSERT INTO conversation_messages
+                 (conversation_id, timestamp, time_str, source, role, message_type, content)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    conversation_id,
+                    now,
+                    time_str,
+                    source,
+                    role,
+                    message_type,
+                    content
+                ],
+            )?;
+            let cutoff = now - 24 * 3600;
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE timestamp < ?",
+                params![cutoff],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn insert_detailed_api_log_with_conversation(
-    conn: &Connection,
+    workspace_root: &Path,
     conversation_id: Option<&str>,
     time_str: &str,
     action: &str,
@@ -246,33 +367,21 @@ pub fn insert_detailed_api_log_with_conversation(
     message: &str,
     detail: Option<&str>,
 ) -> Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
-        .unwrap_or(0) as i64;
-    conn.execute(
-        "INSERT INTO api_logs (timestamp, time_str, conversation_id, action, role, message, detail)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![
-            now,
-            time_str,
-            conversation_id,
-            action,
-            role,
-            message,
-            detail
-        ],
-    )?;
-
-    // Auto cleanup older than 24 hours (86400 seconds)
-    let cutoff = now - 24 * 3600;
-    conn.execute("DELETE FROM api_logs WHERE timestamp < ?", params![cutoff])?;
+    let event = DbWriteEvent::ApiLog {
+        conversation_id: conversation_id.map(String::from),
+        time_str: time_str.to_string(),
+        action: action.to_string(),
+        role: role.to_string(),
+        message: message.to_string(),
+        detail: detail.map(String::from),
+    };
+    queue_write(event, workspace_root);
     Ok(())
 }
 
 #[allow(dead_code)]
 pub fn insert_conversation_message(
-    conn: &Connection,
+    workspace_root: &Path,
     conversation_id: &str,
     time_str: &str,
     source: &str,
@@ -280,29 +389,15 @@ pub fn insert_conversation_message(
     message_type: &str,
     content: &str,
 ) -> Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|v| v.as_secs())
-        .unwrap_or(0) as i64;
-    conn.execute(
-        "INSERT INTO conversation_messages
-         (conversation_id, timestamp, time_str, source, role, message_type, content)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-        params![
-            conversation_id,
-            now,
-            time_str,
-            source,
-            role,
-            message_type,
-            content
-        ],
-    )?;
-    let cutoff = now - 24 * 3600;
-    conn.execute(
-        "DELETE FROM conversation_messages WHERE timestamp < ?",
-        params![cutoff],
-    )?;
+    let event = DbWriteEvent::ConversationMessage {
+        conversation_id: conversation_id.to_string(),
+        time_str: time_str.to_string(),
+        source: source.to_string(),
+        role: role.to_string(),
+        message_type: message_type.to_string(),
+        content: content.to_string(),
+    };
+    queue_write(event, workspace_root);
     Ok(())
 }
 

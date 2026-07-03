@@ -505,10 +505,8 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
                 arguments,
             )?;
-            let draft =
-                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
             let response =
-                crate::verification_harness::apply_and_verify(workspace, &request, draft).await?;
+                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
             serde_json::to_value(response)?
         }
         "index_go_workspace" => {
@@ -801,7 +799,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "expert_code_surgery",
-            "description": "Invoke the stateless top-model code surgery compiler for one indexed code symbol. Use this for complex code rewrites after local inspection. The harness strips chat history, selects a language-specific symbol provider, builds a fixed cache-aligned prefix from architecture memory and symbol business context, sends only the target AST code block plus rewrite command as volatile input, accepts only <<<<<<< SEARCH / ======= / >>>>>>> REPLACE output, performs byte-span merge from symbol coordinates, validates syntax locally, then runs language-appropriate format/check commands when available.",
+            "description": "Invoke the stateless top-model code surgery helper for one indexed code symbol. It uses AST to locate the target symbol context, queries the expert model for a rewritten code block, and returns the rewritten code block. It does not perform writes, conflict resolution, or verification check. The caller (the orchestrator) is responsible for applying the replacement using `replace_range` and executing verification tools.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "symbol_id", "instruction"],
@@ -832,11 +830,6 @@ pub fn tool_definitions() -> Value {
                     "architecture_query": {
                         "type": "string",
                         "description": "Optional feature/area query used to select durable architecture memory for the fixed prefix."
-                    },
-                    "dry_run": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "When true, call the expert and validate syntax, but do not write files or run cargo fmt/check."
                     }
                 }
             }

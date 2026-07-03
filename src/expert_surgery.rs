@@ -32,20 +32,11 @@ pub struct ExpertCodeSurgeryRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ExpertCodeSurgeryResponse {
-    pub language: SymbolLanguage,
-    pub symbol_id: String,
     pub file_path: String,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub dry_run: bool,
-    pub fixed_prefix_chars: usize,
-    pub volatile_chars: usize,
-    pub related_blocks: Vec<RelatedCodeBlock>,
-    pub replacement_bytes: usize,
-    pub syntax_ok: bool,
-    pub fmt_status: VerificationStatus,
-    pub check_status: VerificationStatus,
-    pub patch: SearchReplacePatch,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub original_code: String,
+    pub rewritten_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,18 +62,7 @@ pub fn emit_event(event: SurgeryEvent) {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub struct VerificationStatus {
-    pub ran: bool,
-    pub success: bool,
-    pub output: String,
-}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SearchReplacePatch {
-    pub search: String,
-    pub replace: String,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RelatedCodeBlock {
@@ -118,20 +98,10 @@ pub struct SymbolSpan {
     pub source: String,
 }
 
-#[derive(Debug)]
-pub struct ExpertSurgeryDraft {
-    pub symbol: SymbolSpan,
-    pub related_blocks: Vec<RelatedCodeBlock>,
-    pub fixed_prefix_chars: usize,
-    pub volatile_chars: usize,
-    pub patch: SearchReplacePatch,
-    pub original_file_content_before_await: String,
-}
-
 pub async fn run_expert_code_surgery(
     workspace: &Workspace,
     request: ExpertCodeSurgeryRequest,
-) -> anyhow::Result<ExpertSurgeryDraft> {
+) -> anyhow::Result<ExpertCodeSurgeryResponse> {
     let workspace = workspace.with_root(request.workspace_root.as_deref())?;
     let index_root = workspace.root().to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -154,23 +124,29 @@ pub async fn run_expert_code_surgery(
     let volatile = build_volatile_payload(&symbol, &related_blocks, &request.instruction);
     let provider = load_expert_provider(&request)?;
 
-    let path = workspace.root().join(&symbol.file_path);
-    let original_file_content_before_await = std::fs::read_to_string(&path)?;
-
     emit_event(SurgeryEvent::ProModelInvoked);
     let start_time = std::time::Instant::now();
-    let raw_patch = call_expert_model(&provider, &fixed_prefix, &volatile).await?;
+    let raw_output = call_expert_model(&provider, &fixed_prefix, &volatile).await?;
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
     emit_event(SurgeryEvent::ProModelGraphDone { elapsed_ms });
-    let patch = parse_search_replace_patch(&raw_patch)?;
 
-    Ok(ExpertSurgeryDraft {
-        symbol,
-        related_blocks,
-        fixed_prefix_chars: fixed_prefix.chars().count(),
-        volatile_chars: volatile.chars().count(),
-        patch,
-        original_file_content_before_await,
+    let mut cleaned = raw_output.trim();
+    if cleaned.starts_with("```") {
+        if let Some(first_newline) = cleaned.find('\n') {
+            cleaned = &cleaned[first_newline..];
+        }
+        if cleaned.ends_with("```") {
+            cleaned = &cleaned[..cleaned.len() - 3];
+        }
+    }
+    let rewritten_code = cleaned.trim().to_string();
+
+    Ok(ExpertCodeSurgeryResponse {
+        file_path: symbol.file_path,
+        start_line: symbol.start_line,
+        end_line: symbol.end_line,
+        original_code: symbol.source,
+        rewritten_code,
     })
 }
 
@@ -286,12 +262,10 @@ async fn call_expert_model(
 
 fn build_fixed_prefix(architecture_memory: &str, symbol_contexts: &str) -> String {
     format!(
-        "You are expert_code_surgery, a stateless atomic code surgery compiler. \
+        "You are expert_code_surgery, a stateless atomic code surgery helper. \
 You have no tools, no memory, no authority to ask for more context, and no permission to rewrite whole files. \
-Return exactly one structured diff block and no prose:\n\
-<<<<<<< SEARCH\n<exact input code block>\n=======\n<replacement code block>\n>>>>>>> REPLACE\n\n\
-The SEARCH block must be byte-span equivalent to the provided symbol source after newline normalization. \
-The REPLACE block must contain only the new source for that same symbol span.\n\n\
+Your task is to rewrite the target symbol code according to the instruction. \
+Return ONLY the complete, rewritten code block for the target symbol. Do not include markdown code block formatting (like ```rust), do not include SEARCH/REPLACE markers, and do not include any explanatory prose or chat.\n\n\
 [ARCHITECTURE MEMORY]\n{}\n\n[SYMBOL BUSINESS CONTEXT]\n{}\n",
         architecture_memory, symbol_contexts
     )
@@ -423,62 +397,15 @@ fn load_symbol_contexts(workspace: &Workspace, symbol: &SymbolSpan) -> anyhow::R
     })
 }
 
-fn parse_search_replace_patch(text: &str) -> anyhow::Result<SearchReplacePatch> {
-    let search_marker = "<<<<<<< SEARCH";
-    let sep_marker = "=======";
-    let replace_marker = ">>>>>>> REPLACE";
-    let search_start = text
-        .find(search_marker)
-        .ok_or_else(|| anyhow::anyhow!("expert output missing <<<<<<< SEARCH marker"))?
-        + search_marker.len();
-    let sep = text[search_start..]
-        .find(sep_marker)
-        .map(|idx| search_start + idx)
-        .ok_or_else(|| anyhow::anyhow!("expert output missing ======= marker"))?;
-    let replace_end = text[sep..]
-        .find(replace_marker)
-        .map(|idx| sep + idx)
-        .ok_or_else(|| anyhow::anyhow!("expert output missing >>>>>>> REPLACE marker"))?;
-    let replace_start = sep + sep_marker.len();
-
-    Ok(SearchReplacePatch {
-        search: trim_one_boundary_newline(&text[search_start..sep]),
-        replace: trim_one_boundary_newline(&text[replace_start..replace_end]),
-    })
-}
-
-fn trim_one_boundary_newline(value: &str) -> String {
-    value
-        .trim_start_matches(['\r', '\n'])
-        .trim_end_matches(['\r', '\n'])
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_search_replace_block() {
-        let patch = parse_search_replace_patch(
-            "x\n<<<<<<< SEARCH\nold()\n=======\nnew()\n>>>>>>> REPLACE\n",
-        )
-        .unwrap();
-        assert_eq!(patch.search, "old()");
-        assert_eq!(patch.replace, "new()");
-    }
 
     #[test]
     fn computes_byte_span_by_line_range() {
         let content = "a\nbb\nccc\n";
         let (start, end) = crate::symbol_provider::line_range_to_byte_span(content, 2, 2).unwrap();
         assert_eq!(&content[start..end], "bb\n");
-    }
-
-    #[test]
-    fn rejects_patch_without_markers() {
-        let error = parse_search_replace_patch("old\nnew").unwrap_err();
-        assert!(error.to_string().contains("<<<<<<< SEARCH"));
     }
 
     #[test]
