@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use reqwest::Client;
 use serde::Deserialize;
@@ -458,6 +458,8 @@ pub async fn run(
     let config: AiProxyConfig =
         serde_json::from_str(&tokio::fs::read_to_string(config_path).await?)?;
 
+    crate::agent_service::recover_orphaned_tasks(workspace.root()).await?;
+
     let total_maps: usize = config.providers.values().map(|p| p.model_map.len()).sum();
 
     let config = Arc::new(config);
@@ -476,6 +478,52 @@ pub async fn run(
         config.default_provider
     );
 
+    let agent_provider_name = config.default_provider.as_deref().unwrap_or("");
+    let agent_provider = config.providers.get(agent_provider_name);
+    let agent_url = agent_provider.map(|p| p.url.clone()).unwrap_or_default();
+    let agent_key = agent_provider
+        .map(|p| p.api_key.clone())
+        .unwrap_or_default();
+    let agent_model = config
+        .orchestrator_model
+        .clone()
+        .or_else(|| agent_provider.and_then(|p| p.model_map.values().next().cloned()))
+        .or_else(|| agent_provider.and_then(|p| p.model_map.keys().next().cloned()))
+        .unwrap_or_default();
+    let agent_state = crate::agent_service::AgentServiceState {
+        workspace: workspace.clone(),
+        client: client.clone(),
+        provider_url: agent_url,
+        api_key: agent_key,
+        default_model: agent_model,
+        model_map: agent_provider
+            .map(|p| p.model_map.clone())
+            .unwrap_or_default(),
+        cancellations: Arc::default(),
+    };
+    let agent_routes = Router::new()
+        .route(
+            "/agent/tasks",
+            get(crate::agent_service::list_tasks).post(crate::agent_service::create_task),
+        )
+        .route(
+            "/agent/tasks/{task_id}",
+            get(crate::agent_service::get_task),
+        )
+        .route(
+            "/agent/tasks/{task_id}/events",
+            get(crate::agent_service::get_events),
+        )
+        .route(
+            "/agent/tasks/{task_id}/stream",
+            get(crate::agent_service::stream_events),
+        )
+        .route(
+            "/agent/tasks/{task_id}",
+            delete(crate::agent_service::cancel_task),
+        )
+        .with_state(agent_state);
+
     let state = AiProxyState {
         config,
         client,
@@ -487,6 +535,7 @@ pub async fn run(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
+        .merge(agent_routes)
         .with_state(state)
         .layer(CorsLayer::permissive());
 

@@ -168,6 +168,19 @@ DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
 4. 当前上下文没有原图时，让用户重新上传
 ## 启动
 
+### Rust Agent Tasks
+
+AI Proxy（默认 `127.0.0.1:3001`）新增独立任务接口，不依赖 Codex 的 `/v1/responses` 入口：
+
+- `POST /agent/tasks`：提交 `{ "prompt": "...", "model": "...", "max_steps": 30 }`，返回 `task_id`。
+- `GET /agent/tasks?limit=50`：读取最近任务，供会话列表和历史恢复使用。
+- `GET /agent/tasks/{task_id}`：读取任务状态。
+- `GET /agent/tasks/{task_id}/events`：读取持久化的完整事件历史。
+- `GET /agent/tasks/{task_id}/stream`：通过 SSE 订阅新事件，事件载荷使用 dsh SessionEvent 的 `type/seq/time/data/surfaceOp` 结构。
+- `DELETE /agent/tasks/{task_id}`：取消运行中的任务。
+
+事件使用 dsh 的 `turn/start`、`user/message`、`step/start`、`assistant/message`、`tool/call`、`tool/result`、`step/end` 和 `turn/end` 类型。Agent 顺序调用本地文件、索引和记忆工具，并提供工作区 cwd 与最长 120 秒超时的 `run_command`。历史保存在工作区 `.codex-workspace-mcp/codex_state.db` 中。
+
 ```powershell
 cargo run
 ```

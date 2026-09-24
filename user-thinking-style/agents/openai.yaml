@@ -1,0 +1,4 @@
+interface:
+  display_name: "用我的思维工作"
+  short_description: "按我的问题建模、实验和迭代方式完成任务"
+  default_prompt: "使用这个 skill 的思维方法分析并完成当前任务。"

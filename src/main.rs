@@ -2,6 +2,7 @@
 
 mod agent;
 mod agent_runtime;
+mod agent_service;
 mod ai_proxy;
 mod architecture_agent;
 mod database;
