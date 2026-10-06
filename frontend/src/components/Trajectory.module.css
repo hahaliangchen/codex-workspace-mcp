@@ -1,0 +1,132 @@
+.scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* Bottom clears the composer seat floating over this view. */
+  padding: 16px 32px 180px;
+}
+
+.column {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.empty {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 13px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 72px 16px minmax(0, 1fr) 72px;
+  column-gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.row:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.time,
+.duration {
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.duration {
+  text-align: right;
+}
+
+.rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding-top: 6px;
+}
+
+.rail::before {
+  content: '';
+  position: absolute;
+  top: 16px;
+  bottom: -14px;
+  left: 50%;
+  border-left: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.row:last-child .rail::before {
+  display: none;
+}
+
+.body {
+  min-width: 0;
+}
+
+.head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.head:disabled {
+  cursor: default;
+}
+
+.title {
+  flex: none;
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+.tool .title {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.failed .title {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.preview {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.detail {
+  max-height: 360px;
+  margin: 6px 0 2px;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 0.5px solid var(--dsw-alias-border-l1);
+  border-radius: 10px;
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-markdown-code-block-small);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.link {
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--dsw-alias-state-business-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}

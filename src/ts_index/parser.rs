@@ -11,75 +11,112 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::ts_index::*;
 
 pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
-    let mut files_indexed = 0;
-    let mut symbols_indexed = 0;
+    build_index_scope(root,None)
+}
 
-    let mut conn = crate::database::init_db(root).unwrap();
-    let tx = conn.transaction().unwrap();
-    tx.execute(
-        "DELETE FROM ts_symbols WHERE workspace_root = ?",
-        rusqlite::params![root.to_string_lossy()],
-    )
-    .unwrap();
+pub(crate) fn build_index_scope(root: &Path, changed_path: Option<&Path>) -> Result<(usize, usize)> {
+    build_index_scoped(root,changed_path,false)
+}
 
-    for entry in walk_source_files(root) {
-        let path = match entry {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if path.extension().and_then(|value| value.to_str()) == Some("js")
-            || path.extension().and_then(|value| value.to_str()) == Some("jsx")
-            || path.extension().and_then(|value| value.to_str()) == Some("ts")
-            || path.extension().and_then(|value| value.to_str()) == Some("tsx")
-        {
-            let metadata = std::fs::metadata(&path)?;
-            if metadata.len() > MAX_TS_FILE_BYTES {
+pub(crate) fn build_index_scoped(root: &Path, changed_path: Option<&Path>, directory: bool) -> Result<(usize, usize)> {
+    let refresh_lock = crate::symbol_index_state::lock(root, "ts");
+    let _guard = refresh_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut conn = crate::database::init_db(root)?;
+    let plan = match changed_path {Some(path) if directory=>crate::symbol_index_state::RefreshPlan::for_directory(root,"ts",&conn,path)?, Some(path)=>crate::symbol_index_state::RefreshPlan::for_file(root,"ts",&conn,path)?,None=>crate::symbol_index_state::RefreshPlan::new(root,"ts",&conn)?};
+    if !plan.needs_update() {
+        plan.record_check(&conn, root, "ts")?;
+        return Ok(crate::symbol_index_state::counts(
+            &conn,
+            root,
+            "ts",
+            "ts_symbols",
+        )?);
+    }
+    let tx = conn.transaction()?;
+    plan.prepare(&tx, root, "ts", "ts_symbols")?;
+    for relative in &plan.changed {
+        let path_buf = root.join(relative);
+        let path = path_buf.as_path();
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_TS_FILE_BYTES {
+            plan.record(
+                &tx,
+                root,
+                "ts",
+                path,
+                "skipped_size",
+                "source exceeds the 2 MiB indexing limit",
+            )?;
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) => {
+                plan.record(
+                    &tx,
+                    root,
+                    "ts",
+                    path,
+                    "parse_or_read_error",
+                    &error.to_string(),
+                )?;
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(_) => continue,
-            };
-            files_indexed += 1;
-            let parsed = parse_ts_file(root, &path, &content);
-            let mut symbols_to_insert = parsed.symbols;
-            if symbols_to_insert.is_empty() && !parsed.re_exports.is_empty() {
-                let file_path_str = relative_display(root, &path);
-                let id = format!("ts:{}:<file-facade>:1", file_path_str);
-                symbols_to_insert.push(TsSymbol {
-                    id,
-                    name: "<file-facade>".to_string(),
-                    kind: TsSymbolKind::Component,
-                    file_path: file_path_str,
-                    scope_path: String::new(),
-                    parent_id: None,
-                    start_line: 1,
-                    end_line: 1,
-                    signature: String::new(),
-                    docstring: String::new(),
-                    export: false,
-                    export_names: Vec::new(),
-                    calls: Vec::new(),
-                    import_bindings: Vec::new(),
-                    imports: Vec::new(),
-                    re_exports: parsed.re_exports.clone(),
-                });
-            }
-            for mut sym in symbols_to_insert {
-                sym.re_exports = parsed.re_exports.clone(); // Attach re_exports to symbol
-                let export_names_json =
-                    serde_json::to_string(&sym.export_names).unwrap_or_default();
-                let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
-                let import_bindings_json =
-                    serde_json::to_string(&sym.import_bindings).unwrap_or_default();
-                let imports_json = serde_json::to_string(&sym.imports).unwrap_or_default();
-                let kind = serde_json::to_string(&sym.kind)
-                    .unwrap_or_default()
-                    .trim_matches('"')
-                    .to_string();
-                let re_exports_json = serde_json::to_string(&sym.re_exports).unwrap_or_default();
+        };
 
-                tx.execute(
+        plan.record_content(&tx, root, "ts", path, &content)?;
+        let parsed = parse_ts_file(root, path, &content);
+        plan.record(
+            &tx,
+            root,
+            "ts",
+            path,
+            if parsed.parse_error.is_some() {
+                "parse_error_or_partial"
+            } else {
+                "indexed"
+            },
+            parsed.parse_error.as_deref().unwrap_or(""),
+        )?;
+        let mut symbols_to_insert = parsed.symbols;
+        if symbols_to_insert.is_empty() && !parsed.re_exports.is_empty() {
+            let file_path_str = relative_display(root, path);
+            let id = format!("ts:{}:<file-facade>:1", file_path_str);
+            symbols_to_insert.push(TsSymbol {
+                id,
+                name: "<file-facade>".to_string(),
+                kind: TsSymbolKind::Component,
+                file_path: file_path_str,
+                scope_path: String::new(),
+                parent_id: None,
+                start_line: 1,
+                end_line: 1,
+                signature: String::new(),
+                docstring: String::new(),
+                export: false,
+                export_names: Vec::new(),
+                calls: Vec::new(),
+                import_bindings: Vec::new(),
+                imports: Vec::new(),
+                re_exports: parsed.re_exports.clone(),
+            });
+        }
+        for mut sym in symbols_to_insert {
+            sym.re_exports = parsed.re_exports.clone(); // Attach re_exports to symbol
+            let export_names_json = serde_json::to_string(&sym.export_names).unwrap_or_default();
+            let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
+            let import_bindings_json =
+                serde_json::to_string(&sym.import_bindings).unwrap_or_default();
+            let imports_json = serde_json::to_string(&sym.imports).unwrap_or_default();
+            let kind = serde_json::to_string(&sym.kind)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            let re_exports_json = serde_json::to_string(&sym.re_exports).unwrap_or_default();
+
+            tx.execute(
                     "INSERT INTO ts_symbols (
                         id, workspace_root, name, kind, file_path, scope_path, parent_id, start_line, end_line,
                         signature, docstring, export, export_names_json, calls_json, import_bindings_json, imports_json, re_exports_json
@@ -89,20 +126,23 @@ pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
                         sym.start_line, sym.end_line, sym.signature, sym.docstring, if sym.export { 1 } else { 0 },
                         export_names_json, calls_json, import_bindings_json, imports_json, re_exports_json
                     ]
-                ).unwrap();
-                symbols_indexed += 1;
-            }
+                )?;
         }
     }
-    tx.commit().unwrap();
-    // Bug3: 记录本次索引的实际时间戳
+    plan.finish(&tx, root, "ts")?;
     let ts = crate::rust_index::now_unix();
-    let meta_conn = crate::database::init_db(root).unwrap();
-    crate::database::upsert_index_metadata(&meta_conn, &root.to_string_lossy(), "ts", ts).unwrap();
-    Ok((files_indexed, symbols_indexed))
+    crate::database::upsert_index_metadata(&tx, &root.to_string_lossy(), "ts", ts)?;
+    tx.commit()?;
+    Ok(crate::symbol_index_state::counts(
+        &conn,
+        root,
+        "ts",
+        "ts_symbols",
+    )?)
 }
 
 pub(crate) struct ParsedTsFile {
+    parse_error: Option<String>,
     symbols: Vec<TsSymbol>,
     re_exports: Vec<TsReExport>,
 }
@@ -132,16 +172,26 @@ pub(crate) fn parse_ts_file(root: &Path, path: &Path, content: &str) -> ParsedTs
     let mut parser = Parser::new_from(lexer);
     let module = match parser.parse_module() {
         Ok(module) => module,
-        Err(_) => {
+        Err(error) => {
             return ParsedTsFile {
+                parse_error: Some(format!("{:?}", error.kind())),
                 symbols: Vec::new(),
                 re_exports: Vec::new(),
             };
         }
     };
+    let parse_errors = parser.take_errors();
+    let parse_error = (!parse_errors.is_empty()).then(|| {
+        format!(
+            "{} recoverable parser errors: {:?}",
+            parse_errors.len(),
+            parse_errors[0].kind()
+        )
+    });
     let mut collector = TsCollector::new(relative_path, content, cm);
     collector.collect(&module);
     ParsedTsFile {
+        parse_error,
         symbols: collector.symbols,
         re_exports: collector.re_exports,
     }
@@ -831,4 +881,8 @@ pub(crate) fn expr_to_text(expr: &Expr) -> Option<String> {
         }
         _ => None,
     }
+}
+
+pub(crate) fn ensure_query_index(root: &Path, file: Option<&str>, directory: Option<&str>) -> Result<()> {
+    crate::symbol_index_state::ensure_query_index(root,"ts",file,directory,|path,is_directory|build_index_scoped(root,path,is_directory).map(|_|()))
 }

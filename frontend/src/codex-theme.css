@@ -1,0 +1,104 @@
+/* ==========================================================================
+   Codex Desktop Design System & Theme Tokens
+   ========================================================================== */
+
+/* Load Inter font with full optical sizing & weights for buttery-smooth rendering */
+@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap');
+
+:root {
+  /* Ultra-smooth font stack matching OpenAI Codex Desktop */
+  --codex-font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text',
+    'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei',
+    'Source Han Sans CN', sans-serif;
+  --dsw-font-family: var(--codex-font-sans);
+
+  --codex-bg-main: #ffffff;
+  --codex-dock-bg: #ffffff;
+  --codex-sidebar-bg: #fbfbfb;
+  --codex-panel-bg: #fbfbfb;
+  --codex-card-bg: #ffffff;
+
+  /* Crisp, high-contrast text matching OpenAI Codex Desktop */
+  --codex-text-primary: #111827;
+  --codex-text-secondary: #374151;
+  --codex-text-muted: #6b7280;
+
+  --codex-border-subtle: #efefef;
+  --codex-card-border: #e5e7eb;
+  --codex-hover-bg: #f4f4f5;
+  --codex-active-pill: #ebecee;
+  --codex-active-hover: #e4e4e7;
+  --codex-blue-primary: #007aff;
+  --codex-blue-hover: #0066d6;
+  --codex-amber-circle: #d97706;
+  --codex-amber-bg: #fef3c7;
+  --codex-amber-border: #fde68a;
+  --codex-diff-add: #16a34a;
+  --codex-diff-add-bg: #dcfce7;
+  --codex-diff-del: #dc2626;
+  --codex-diff-del-bg: #fee2e2;
+
+  /* Harmonize DSH tokens with Codex aesthetic */
+  --dsw-alias-bg-base: #ffffff;
+  --dsw-specific-sidebar-fill: #fbfbfb;
+  --dsw-alias-border-l2: #e5e7eb;
+  --dsw-alias-border-l3: #efefef;
+  --dsw-alias-label-primary: #111827;
+  --dsw-alias-label-secondary: #374151;
+  --dsw-alias-label-tertiary: #6b7280;
+  --dsw-alias-interactive-bg-hover: #f4f4f5;
+  --dsw-alias-state-business-primary: #007aff;
+}
+
+body[data-ds-dark-theme] {
+  --codex-bg-main: #18181b;
+  --codex-dock-bg: #141415;
+  --codex-sidebar-bg: #18181b;
+  --codex-panel-bg: #18181b;
+  --codex-card-bg: #202024;
+  --codex-text-primary: #f4f4f5;
+  --codex-text-secondary: #e4e4e7;
+  --codex-text-muted: #a1a1aa;
+  --codex-border-subtle: #27272a;
+  --codex-card-border: #323238;
+  --codex-hover-bg: #27272a;
+  --codex-active-pill: #2e2e33;
+  --codex-active-hover: #38383f;
+  --codex-blue-primary: #0a84ff;
+  --codex-blue-hover: #0070e0;
+  --codex-amber-circle: #f59e0b;
+  --codex-amber-bg: #78350f33;
+  --codex-amber-border: #b45309;
+
+  --dsw-alias-bg-base: #18181b;
+  --dsw-specific-sidebar-fill: #18181b;
+  --dsw-alias-border-l2: #323238;
+  --dsw-alias-border-l3: #27272a;
+  --dsw-alias-label-primary: #f4f4f5;
+  --dsw-alias-label-secondary: #e4e4e7;
+  --dsw-alias-label-tertiary: #a1a1aa;
+  --dsw-alias-interactive-bg-hover: #27272a;
+  --dsw-alias-state-business-primary: #0a84ff;
+}
+
+/* ==========================================================================
+   Global Anti-Aliasing and Soft Typography Rules
+   ========================================================================== */
+*, *::before, *::after {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+html, body, input, button, textarea, select {
+  font-family: var(--codex-font-sans);
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  letter-spacing: -0.012em;
+  color: var(--codex-text-primary);
+}
+
+/* Eliminate harsh browser focus outlines on button tabs */
+button:focus-visible {
+  outline: 2px solid var(--codex-blue-primary);
+  outline-offset: 1px;
+}

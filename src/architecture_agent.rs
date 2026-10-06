@@ -1,4 +1,3 @@
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -93,6 +92,7 @@ pub async fn analyze_architecture(
         for context in &analysis.symbol_contexts {
             workspace.record_symbol_business_context(
                 crate::memory::RecordSymbolBusinessContextRequest {
+                    description: crate::symbol_description::RecordOptions { qualified_name: context.qualified_name.clone(), keywords: context.keywords.clone(), scope: context.scope.clone(), source: "architecture".to_owned(), expected_code_hash: None },
                     workspace_root: workspace.root().display().to_string(),
                     symbol_id: context.symbol_id.clone(),
                     symbol_name: context.symbol_name.clone(),
@@ -126,71 +126,14 @@ pub async fn analyze_architecture(
 }
 
 fn get_architecture_provider() -> anyhow::Result<ArchitectureProvider> {
-    let config_path = ai_proxy_config_path();
-    if !config_path.exists() {
-        anyhow::bail!("ai_proxy_config.json not found in exe dir");
-    }
-
-    let config_content = std::fs::read_to_string(&config_path)?;
-    let config: Value = serde_json::from_str(&config_content)?;
-    let default_provider_name = config
-        .get("default_provider")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing default_provider in config"))?;
-    let provider_name = config
-        .get("architecture_provider")
-        .and_then(|v| v.as_str())
-        .unwrap_or(default_provider_name);
-    let providers = config
-        .get("providers")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow::anyhow!("missing providers in config"))?;
-    let provider = providers
-        .get(provider_name)
-        .ok_or_else(|| anyhow::anyhow!("architecture/default provider not found in providers"))?;
-
-    let url = provider
-        .get("url")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing url in architecture provider"))?
-        .trim_end_matches('/')
-        .to_string();
-    let api_key = provider
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing api_key in architecture provider"))?
-        .to_string();
-    let requested_model = config
-        .get("architecture_model")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
-        .or_else(|| provider_default_model(provider))
-        .ok_or_else(|| anyhow::anyhow!("architecture provider model_map is empty"))?;
-    let model = resolve_provider_model(provider, &requested_model);
+    let route = crate::ai_proxy::selected_route(false)?;
 
     Ok(ArchitectureProvider {
-        name: provider_name.to_string(),
-        url,
-        api_key,
-        model,
+        name: route.name,
+        url: route.url,
+        api_key: route.api_key,
+        model: route.model,
     })
-}
-
-fn ai_proxy_config_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("ai_proxy_config.json")
-}
-
-fn provider_default_model(provider: &Value) -> Option<String> {
-    provider
-        .get("model_map")
-        .and_then(|v| v.as_object())
-        .and_then(|m| m.values().next())
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
 }
 
 fn resolve_provider_model(provider: &Value, requested_model: &str) -> String {

@@ -43,6 +43,10 @@ fn indexes_rust_symbols_docstrings_and_calls() {
     let search = search_symbols(
         &root,
         SearchRustSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "create".to_string(),
             limit: 10,
@@ -60,6 +64,7 @@ fn indexes_rust_symbols_docstrings_and_calls() {
     let read = read_symbol(
         &root,
         ReadRustSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: create.id.clone(),
             include_context: true,
@@ -91,6 +96,10 @@ fn search_builds_index_when_missing() {
     let search = search_symbols(
         &root,
         SearchRustSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "auto_build".to_string(),
             limit: 5,

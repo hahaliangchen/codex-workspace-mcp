@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::Write,
     path::{Component, Path, PathBuf},
 };
 
@@ -74,6 +73,16 @@ pub enum ToolError {
     InvalidLineRange { start: usize, end: usize },
     #[error("expected_old_text did not match the selected line range")]
     ExpectedTextMismatch,
+    #[error("write_conflict: {0}")]
+    WriteConflict(String),
+    #[error("write_precondition_required: {0}")]
+    WritePreconditionRequired(String),
+    #[error("path is outside the selected workspace: {0}")]
+    OutsideWorkspace(String),
+    #[error("invalid_edit: {0}")]
+    InvalidEdit(String),
+    #[error("invalid search pattern: {0}")]
+    InvalidSearchPattern(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("utf-8 error: {0}")]
@@ -148,9 +157,11 @@ pub struct ReadFileRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ReadFileResponse {
+    pub code_hash: String,
     pub path: String,
     pub bytes: usize,
     pub content: String,
+    pub total_lines: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,10 +175,15 @@ pub struct ReadFileLinesRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ReadFileLinesResponse {
+    pub code_hash: String,
     pub path: String,
     pub start_line: usize,
     pub end_line: usize,
     pub lines: Vec<LineContent>,
+    pub content: String,
+    pub total_lines: usize,
+    pub requested_end_line: usize,
+    pub end_clamped_to_eof: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +197,8 @@ pub struct SearchTextRequest {
     #[serde(default)]
     pub workspace_root: Option<String>,
     pub query: String,
+    #[serde(default)]
+    pub regex: bool,
     #[serde(default = "default_dot")]
     pub path: String,
     #[serde(default)]
@@ -196,6 +214,9 @@ pub struct SearchTextRequest {
 #[derive(Debug, Serialize)]
 pub struct SearchTextResponse {
     pub query: String,
+    pub match_mode: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<&'static str>,
     pub index_used: bool,
     pub index_matches: usize,
     pub text_scan_used: bool,
@@ -219,6 +240,7 @@ pub struct WriteFileRequest {
     pub content: String,
     #[serde(default = "default_true")]
     pub create_parent_dirs: bool,
+    pub expected_code_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +248,10 @@ pub struct WriteFileResponse {
     pub path: String,
     pub bytes_written: usize,
     pub go_reindexed: bool,
+    pub changed: bool,
+    pub created: bool,
+    pub code_hash: String,
+    pub index_refresh: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +263,7 @@ pub struct ReplaceRangeRequest {
     pub end_line: usize,
     pub replacement: String,
     pub expected_old_text: Option<String>,
+    pub expected_code_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +273,21 @@ pub struct ReplaceRangeResponse {
     pub end_line: usize,
     pub bytes_written: usize,
     pub go_reindexed: bool,
+    pub changed: bool,
+    pub code_hash: String,
+    pub index_refresh: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TextEdit { pub old_text: String, pub new_text: String }
+
+#[derive(Debug, Deserialize)]
+pub struct EditFileRequest {
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+    pub path: String,
+    pub edits: Vec<TextEdit>,
+    pub expected_code_hash: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,7 +352,7 @@ impl Workspace {
         Ok(WorkspaceInfo {
             workspace_root: workspace.root.display().to_string(),
             platform: std::env::consts::OS.to_string(),
-            allowed_scope: "file tools can read/write absolute paths accessible to the MCP server; relative paths resolve below workspace_root".to_string(),
+            allowed_scope: "reads can use accessible absolute paths; structured writes must stay inside the selected workspace_root, including resolved symlinks and junctions; relative paths resolve below workspace_root".to_string(),
             default_ignored_dirs: NOISE_DIRS.to_vec(),
         })
     }
@@ -371,19 +413,22 @@ impl Workspace {
         let workspace = self.with_root(request.workspace_root.as_deref())?;
         let path = workspace.resolve_existing_file(&request.path)?;
         let metadata = fs::metadata(&path)?;
-        if metadata.len() > request.max_bytes {
+        let limit=request.max_bytes.min(crate::source_read::FILE_LIMIT as u64);
+        if metadata.len() > limit {
             return Err(ToolError::FileTooLarge {
                 actual: metadata.len(),
-                limit: request.max_bytes,
+                limit,
             });
         }
 
-        let bytes = fs::read(&path)?;
-        let content = String::from_utf8(bytes)?;
+        let snapshot=crate::source_read::read(&path,limit as usize)?;
+        let content=snapshot.content.clone();
         Ok(ReadFileResponse {
+            code_hash: snapshot.hash.clone(),
             path: workspace.relative_display(&path)?,
             bytes: content.len(),
             content,
+            total_lines:snapshot.line_count(),
         })
     }
 
@@ -391,28 +436,39 @@ impl Workspace {
         validate_line_range(request.start_line, request.end_line)?;
         let workspace = self.with_root(request.workspace_root.as_deref())?;
         let path = workspace.resolve_existing_file(&request.path)?;
-        let content = fs::read_to_string(&path)?;
+        let snapshot=crate::source_read::read(&path,crate::source_read::FILE_LIMIT)?;
+        let total_lines=snapshot.line_count();
+        if request.start_line>total_lines {return Err(ToolError::InvalidEdit(format!("source_range_out_of_bounds: start_line={}, total_lines={total_lines}; no source returned",request.start_line)));}
+        let end_line=request.end_line.min(total_lines);
+        let content=snapshot.range(request.start_line,end_line)?.to_owned();
         let lines = content
             .lines()
             .enumerate()
-            .filter_map(|(index, text)| {
-                let line = index + 1;
-                (line >= request.start_line && line <= request.end_line).then(|| LineContent {
-                    line,
+            .map(|(index, text)| {
+                LineContent {
+                    line: request.start_line+index,
                     text: text.to_string(),
-                })
+                }
             })
             .collect();
 
         Ok(ReadFileLinesResponse {
+            code_hash: snapshot.hash.clone(),
             path: workspace.relative_display(&path)?,
             start_line: request.start_line,
-            end_line: request.end_line,
-            lines,
+            end_line,
+            lines, content,total_lines,requested_end_line:request.end_line,end_clamped_to_eof:end_line<request.end_line,
         })
     }
 
     pub fn search_text(&self, request: SearchTextRequest) -> Result<SearchTextResponse> {
+        // Compile once, before opening the index or walking files. Escaping
+        // preserves literal defaults and gives Unicode-safe match offsets.
+        let pattern = if request.regex { request.query.clone() } else { regex::escape(&request.query) };
+        let matcher = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(!request.case_sensitive)
+            .size_limit(2 * 1024 * 1024)
+            .build().map_err(|error| ToolError::InvalidSearchPattern(error.to_string()))?;
         let workspace = self.with_root(request.workspace_root.as_deref())?;
         let roots = workspace.resolve_search_roots(&request)?;
         let root_filters = workspace.search_root_filters(&roots)?;
@@ -423,7 +479,7 @@ impl Workspace {
         let mut index_used = false;
 
         // 1. 优先尝试从 SQLite 符号索引库中查找精确匹配的符号定义
-        if let Ok(conn) = crate::database::init_db(&workspace.root) {
+        if !request.regex && let Ok(conn) = crate::database::init_db(&workspace.root) {
             let root_str = workspace.root.to_string_lossy().to_string();
             let query_name = request.query.trim();
 
@@ -461,15 +517,13 @@ impl Workspace {
             let mut handles = Vec::new();
             for root in roots {
                 let workspace_root = workspace.root.clone();
-                let query = request.query.clone();
-                let case_sensitive = request.case_sensitive;
+                let matcher = matcher.clone();
                 let respect_gitignore = request.respect_gitignore;
                 handles.push(std::thread::spawn(move || {
                     scan_text_root(
                         workspace_root,
                         root,
-                        query,
-                        case_sensitive,
+                        matcher,
                         respect_gitignore,
                         max_matches,
                     )
@@ -496,6 +550,10 @@ impl Workspace {
         }
 
         Ok(SearchTextResponse {
+            match_mode: if request.regex { "regex" } else { "literal" },
+            hints: if !request.regex && request.query.contains('|') {
+                vec!["Literal mode treats '|' as an ordinary character. For alternatives such as A|B, set regex=true; a zero literal match does not establish that A or B is absent."]
+            } else { Vec::new() },
             query: request.query,
             index_used,
             index_matches,
@@ -548,119 +606,72 @@ impl Workspace {
     }
 
     pub fn write_file(&self, request: WriteFileRequest) -> Result<WriteFileResponse> {
-        if request.content.len() > DEFAULT_WRITE_LIMIT_BYTES {
-            return Err(ToolError::ContentTooLarge {
-                actual: request.content.len(),
-                limit: DEFAULT_WRITE_LIMIT_BYTES,
-            });
-        }
+        check_write_size(request.content.len())?;
         let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let path = workspace.resolve_for_write(&request.path)?;
-        if let Some(parent) = path.parent() {
-            if request.create_parent_dirs {
-                fs::create_dir_all(parent)?;
-            } else if !parent.exists() {
-                return Err(ToolError::NotFound(parent.display().to_string()));
-            }
+        let _guard = crate::file_edit::WRITES.lock().unwrap_or_else(|error|error.into_inner());
+        let path = crate::file_edit::workspace_path(&workspace.root, &request.path)?;
+        let original = crate::file_edit::snapshot(&path)?;
+        if original.is_some() && request.expected_code_hash.is_none() {
+            return Err(ToolError::WritePreconditionRequired("overwriting an existing file requires expected_code_hash from a source read or notebook retrieval; use edit_file for focused edits".into()));
         }
-
-        write_atomic(&path, request.content.as_bytes())?;
-        let go_reindexed = go_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let ts_reindexed = ts_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let rust_reindexed = rust_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let python_reindexed = python_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
+        crate::file_edit::check_hash(original.as_deref(), request.expected_code_hash.as_deref())?;
+        if let Some(parent)=path.parent() {
+            if request.create_parent_dirs { fs::create_dir_all(parent)?; }
+            else if !parent.exists() { return Err(ToolError::NotFound(parent.display().to_string())); }
+        }
+        let changed=crate::file_edit::commit(&path, original.as_deref(), request.content.as_bytes())?;
+        drop(_guard);
+        let index_refresh=refresh_written_index(&workspace.root,&path,changed);
         Ok(WriteFileResponse {
-            path: workspace.relative_display(&path)?,
-            bytes_written: request.content.len(),
-            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed || python_reindexed,
+            path: workspace.relative_display(&path)?, bytes_written: if changed { request.content.len() } else {0},
+            go_reindexed:index_refresh["status"]=="updated" && index_refresh["language"]=="go",
+            created:original.is_none(), changed, code_hash:crate::symbol_description::content_hash(request.content.as_bytes()), index_refresh,
         })
     }
 
     pub fn replace_range(&self, request: ReplaceRangeRequest) -> Result<ReplaceRangeResponse> {
-        validate_line_range(request.start_line, request.end_line)?;
-        if request.replacement.len() > DEFAULT_WRITE_LIMIT_BYTES {
-            return Err(ToolError::ContentTooLarge {
-                actual: request.replacement.len(),
-                limit: DEFAULT_WRITE_LIMIT_BYTES,
-            });
+        validate_line_range(request.start_line,request.end_line)?;
+        check_write_size(request.replacement.len())?;
+        if request.expected_old_text.is_none() && request.expected_code_hash.is_none() {
+            return Err(ToolError::WritePreconditionRequired("replace_range requires expected_old_text or expected_code_hash from current source".into()));
         }
-
-        let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let path = workspace.resolve_existing_file(&request.path)?;
-        let content = fs::read_to_string(&path)?;
-        let had_trailing_newline = content.ends_with('\n');
-        let mut lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-
-        if request.end_line > lines.len() {
-            return Err(ToolError::InvalidLineRange {
-                start: request.start_line,
-                end: request.end_line,
-            });
-        }
-
-        let selected = lines[(request.start_line - 1)..request.end_line].join("\n");
-        if let Some(expected) = request.expected_old_text.as_deref() {
-            if normalize_newlines(expected).trim_end_matches('\n') != selected {
-                return Err(ToolError::ExpectedTextMismatch);
-            }
-        }
-
-        let replacement = normalize_newlines(&request.replacement);
-        let replacement_lines: Vec<String> = if replacement.is_empty() {
-            Vec::new()
-        } else {
-            replacement
-                .trim_end_matches('\n')
-                .lines()
-                .map(ToString::to_string)
-                .collect()
-        };
-        lines.splice(
-            (request.start_line - 1)..request.end_line,
-            replacement_lines,
-        );
-
-        let mut new_content = lines.join("\n");
-        if had_trailing_newline || request.replacement.ends_with('\n') {
-            new_content.push('\n');
-        }
-
-        write_atomic(&path, new_content.as_bytes())?;
-        let go_reindexed = go_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let ts_reindexed = ts_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let rust_reindexed = rust_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
-        let python_reindexed = python_index::maybe_reindex_after_write(&workspace.root, &path)
-            .ok()
-            .flatten()
-            .is_some();
+        let workspace=self.with_root(request.workspace_root.as_deref())?;
+        let _guard=crate::file_edit::WRITES.lock().unwrap_or_else(|error|error.into_inner());
+        let path=crate::file_edit::workspace_path(&workspace.root,&request.path)?;
+        let original=fs::read(&path)?;
+        crate::file_edit::check_hash(Some(&original),request.expected_code_hash.as_deref())?;
+        let content=String::from_utf8(original.clone())?;
+        let updated=crate::file_edit::line_replacement(&content,request.start_line,request.end_line,&request.replacement,request.expected_old_text.as_deref())?;
+        check_write_size(updated.len())?;
+        let changed=crate::file_edit::commit(&path,Some(&original),updated.as_bytes())?;
+        drop(_guard);
+        let index_refresh=refresh_written_index(&workspace.root,&path,changed);
         Ok(ReplaceRangeResponse {
-            path: workspace.relative_display(&path)?,
-            start_line: request.start_line,
-            end_line: request.end_line,
-            bytes_written: new_content.len(),
-            go_reindexed: go_reindexed || ts_reindexed || rust_reindexed || python_reindexed,
+            path:workspace.relative_display(&path)?, start_line:request.start_line,end_line:request.end_line,
+            bytes_written:if changed {updated.len()} else {0}, changed,
+            code_hash:crate::symbol_description::content_hash(updated.as_bytes()),
+            go_reindexed:index_refresh["status"]=="updated" && index_refresh["language"]=="go",index_refresh,
         })
+    }
+
+    pub fn edit_file(&self, request: EditFileRequest) -> Result<WriteFileResponse> {
+        let edit_size=request.edits.iter().try_fold(0usize,|size,edit|size.checked_add(edit.old_text.len()).and_then(|size|size.checked_add(edit.new_text.len())))
+            .ok_or(ToolError::ContentTooLarge {actual:usize::MAX,limit:DEFAULT_WRITE_LIMIT_BYTES})?;
+        check_write_size(edit_size)?;
+        let workspace=self.with_root(request.workspace_root.as_deref())?;
+        let _guard=crate::file_edit::WRITES.lock().unwrap_or_else(|error|error.into_inner());
+        let path=crate::file_edit::workspace_path(&workspace.root,&request.path)?;
+        let original=fs::read(&path)?;
+        crate::file_edit::check_hash(Some(&original),request.expected_code_hash.as_deref())?;
+        let content=String::from_utf8(original.clone())?;
+        let updated=crate::file_edit::text_edits(&content,&request.edits)?;
+        check_write_size(updated.len())?;
+        let changed=crate::file_edit::commit(&path,Some(&original),updated.as_bytes())?;
+        drop(_guard);
+        let index_refresh=refresh_written_index(&workspace.root,&path,changed);
+        Ok(WriteFileResponse { path:workspace.relative_display(&path)?,bytes_written:if changed {updated.len()} else {0},
+            created:false,changed,code_hash:crate::symbol_description::content_hash(updated.as_bytes()),
+            go_reindexed:index_refresh["status"]=="updated" && index_refresh["language"]=="go",index_refresh })
     }
 
     pub fn index_go_workspace(&self, request: IndexGoWorkspaceRequest) -> Result<GoIndexResult> {
@@ -1059,22 +1070,35 @@ fn validate_line_range(start: usize, end: usize) -> Result<()> {
     }
 }
 
-fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
-    let mut tmp = path.to_path_buf();
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!("{value}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
-    tmp.set_extension(extension);
-
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-    }
-    fs::rename(tmp, path)?;
+fn check_write_size(size:usize) -> Result<()> {
+    if size>DEFAULT_WRITE_LIMIT_BYTES { return Err(ToolError::ContentTooLarge {actual:size,limit:DEFAULT_WRITE_LIMIT_BYTES}); }
     Ok(())
+}
+
+fn refresh_written_index(root:&Path,path:&Path,changed:bool) -> serde_json::Value {
+    use serde_json::json;
+    if !changed { return json!({"status":"unchanged"}); }
+    let (language,table,result)=match path.extension().and_then(|ext|ext.to_str()) {
+        Some("rs")=>("rust","rust_symbols",rust_index::maybe_reindex_after_write(root,path).map(|value|value.is_some()).map_err(|error|error.to_string())),
+        Some("go")=>("go","go_symbols",go_index::maybe_reindex_after_write(root,path).map(|value|value.is_some()).map_err(|error|error.to_string())),
+        Some("py")=>("python","python_symbols",python_index::maybe_reindex_after_write(root,path).map(|value|value.is_some()).map_err(|error|error.to_string())),
+        Some("ts"|"tsx"|"js"|"jsx"|"mjs"|"cjs")=>("ts","ts_symbols",ts_index::maybe_reindex_after_write(root,path).map(|value|value.is_some()).map_err(|error|error.to_string())),
+        _=>return json!({"status":"not_applicable"}),
+    };
+    match result {
+        Ok(true)=>{
+            let relative=path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\',"/");
+            let file_status=crate::database::init_db(root).ok().and_then(|conn|conn.query_row(
+                "SELECT status,error FROM symbol_index_files WHERE workspace_root=?1 AND language=?2 AND file_path=?3",
+                rusqlite::params![root.to_string_lossy(),language,relative],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).ok());
+            match file_status {
+                Some((status,error))=>json!({"status":if status=="indexed" {"updated"} else {"incomplete"},"language":language,"scope":"changed_file","file_status":status,"error":error,"index":crate::symbol_index_state::health(root,language,table).ok()}),
+                None=>json!({"status":"excluded","language":language,"scope":"changed_file","guidance":"File saved but not included by the index ignore rules."}),
+            }
+        },
+        Ok(false)=>json!({"status":"not_initialized","language":language}),
+        Err(error)=>{tracing::warn!(%language,%error,"file saved but index refresh failed");json!({"status":"failed","language":language,"error":error,"file_saved":true})},
+    }
 }
 
 fn entry_kind(metadata: &fs::Metadata) -> EntryKind {
@@ -1088,10 +1112,6 @@ fn entry_kind(metadata: &fs::Metadata) -> EntryKind {
     } else {
         EntryKind::Other
     }
-}
-
-fn normalize_newlines(value: &str) -> String {
-    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn default_dot() -> String {
@@ -1138,16 +1158,10 @@ fn map_memory_error(error: memory::MemoryError) -> ToolError {
 fn scan_text_root(
     workspace_root: PathBuf,
     root: PathBuf,
-    query: String,
-    case_sensitive: bool,
+    matcher: regex::Regex,
     respect_gitignore: bool,
     max_matches: usize,
 ) -> (Vec<TextMatch>, bool) {
-    let needle = if case_sensitive {
-        query
-    } else {
-        query.to_lowercase()
-    };
     let mut matches = Vec::new();
     let mut truncated = false;
 
@@ -1187,12 +1201,7 @@ fn scan_text_root(
         };
 
         for (line_index, line) in content.lines().enumerate() {
-            let haystack = if case_sensitive {
-                line.to_string()
-            } else {
-                line.to_lowercase()
-            };
-            if let Some(byte_index) = haystack.find(&needle) {
+            if let Some(found) = matcher.find(line) {
                 if matches.len() >= max_matches {
                     truncated = true;
                     break 'outer;
@@ -1202,7 +1211,7 @@ fn scan_text_root(
                     .unwrap_or(path)
                     .display()
                     .to_string();
-                let column = line[..byte_index.min(line.len())].chars().count() + 1;
+                let column = line[..found.start()].chars().count() + 1;
                 matches.push(TextMatch {
                     path: rel_path,
                     line: line_index + 1,
@@ -1371,6 +1380,7 @@ mod tests {
                 end_line: 2,
                 replacement: "BETA".to_string(),
                 expected_old_text: Some("beta".to_string()),
+                expected_code_hash: None,
             })
             .unwrap();
         assert_eq!(
@@ -1391,6 +1401,7 @@ mod tests {
                 query: "beta".to_string(),
                 path: ".".to_string(),
                 paths: Vec::new(),
+                regex: false,
                 case_sensitive: false,
                 respect_gitignore: false,
                 max_matches: 10,
@@ -1419,6 +1430,7 @@ mod tests {
                 query: "needle".to_string(),
                 path: ".".to_string(),
                 paths: vec!["one".to_string(), "two".to_string()],
+                regex: false,
                 case_sensitive: false,
                 respect_gitignore: false,
                 max_matches: 10,
@@ -1444,6 +1456,7 @@ mod tests {
                 query: "needle".to_string(),
                 path: "one two".to_string(),
                 paths: Vec::new(),
+                regex: false,
                 case_sensitive: false,
                 respect_gitignore: false,
                 max_matches: 10,
@@ -1468,6 +1481,7 @@ mod tests {
                 query: "needle".to_string(),
                 path: ".".to_string(),
                 paths: Vec::new(),
+                regex: false,
                 case_sensitive: false,
                 respect_gitignore: false,
                 max_matches: 10,
@@ -1492,6 +1506,7 @@ mod tests {
                 query: "needle".to_string(),
                 path: ".".to_string(),
                 paths: Vec::new(),
+                regex: false,
                 case_sensitive: false,
                 respect_gitignore: true,
                 max_matches: 10,
@@ -1579,12 +1594,13 @@ mod tests {
                 path: "demo.go".to_string(),
                 content: "package demo\n\nfunc NewName() {}\n".to_string(),
                 create_parent_dirs: true,
+                expected_code_hash: Some(crate::symbol_description::content_hash(&fs::read(root.join("demo.go")).unwrap())),
             })
             .unwrap();
 
         assert!(result.go_reindexed);
         let search = workspace
-            .search_go_symbols(SearchGoSymbolsRequest {
+            .search_go_symbols(SearchGoSymbolsRequest { options: Default::default(),
                 workspace_root: root.display().to_string(),
                 query: "NewName".to_string(),
                 limit: 5,

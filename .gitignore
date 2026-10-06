@@ -1,3 +1,5 @@
 /target
-ai_proxy_config.json
-.codex-workspace-mcp/codex_state.db
+/frontend/node_modules
+/frontend/dist
+/ai_proxy_config.json
+/.codex-workspace-mcp/

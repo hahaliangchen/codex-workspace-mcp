@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>设置 · Workspace Agent</title>
+    <link rel="stylesheet" href="/agent/dsh-base.css">
+    <link rel="stylesheet" href="/agent/dsh-design.css">
+    <link rel="stylesheet" href="/agent/settings.css">
+    <script src="/agent/settings.js" type="module"></script>
+  </head>
+  <body>
+    <div class="settings-shell">
+      <aside class="settings-sidebar">
+        <a class="back-link" href="/agent">← 返回任务</a>
+        <div class="settings-brand"><span class="brand-icon">✦</span><span>设置</span></div>
+        <nav class="settings-nav" aria-label="设置导航">
+          <button id="nav-models" class="active" type="button">◈ <span>模型提供商</span></button>
+          <button id="nav-agents" type="button">⚙ <span>子代理</span></button>
+          <button id="nav-plugins" type="button">▦ <span>插件树</span></button>
+        </nav>
+        <p class="sidebar-note">设置保存到 DSH profile 的 cordis.patch.yml；密钥写入 .credentials.yaml。</p>
+      </aside>
+      <main class="settings-main">
+        <header class="settings-header">
+          <div><span class="eyebrow">WORKSPACE AGENT</span><h1 id="page-title">模型提供商</h1></div>
+          <button id="theme-toggle" class="theme-toggle" type="button" aria-label="切换外观">◐</button>
+        </header>
+        <div class="settings-content">
+          <div id="status" class="status" role="status" aria-live="polite"></div>
+          <section id="models-panel">
+            <p class="intro">按 DSH 的提供商格式配置端点、协议和模型。主代理与子代理目前使用 OpenAI Chat Completions 协议。API 密钥只写入 DSH 凭据文件，页面不会读取或回显密钥。</p>
+            <div id="provider-list" class="provider-list"></div>
+            <button id="add-provider" class="outline-button" type="button">＋ 添加模型提供商</button>
+          </section>
+          <section id="agents-panel" hidden>
+            <p class="intro">主代理负责规划和执行工具。启用子代理后，主代理可将一项工作交给子代理，并等待其结果后继续。</p>
+            <div class="settings-card">
+              <h2>主代理模型</h2>
+              <p class="card-help">每个新任务首先由这条路由执行。Codex 兼容接口也使用它作为编排模型。</p>
+              <div class="field-grid">
+                <label>提供商<select id="main-provider"></select></label>
+                <label>模型 ID<input id="main-model" list="main-model-options" autocomplete="off" placeholder="选择或输入上游模型 ID"><datalist id="main-model-options"></datalist></label>
+              </div>
+            </div>
+            <div class="settings-card">
+              <div class="card-heading"><div><h2>子代理</h2><p class="card-help">默认与主代理使用同一模型。主代理可自主委派；每个主任务最多启动一个子代理，子代理不能继续派生。</p></div><label class="switch"><input id="enable-subagent" type="checkbox"><span>启用</span></label></div>
+              <details id="subagent-override">
+                <summary>单独指定子代理模型（可选）</summary>
+                <p class="field-note">留空时使用主代理的提供商和模型。</p>
+                <div class="field-grid">
+                  <label>提供商<select id="expert-provider"></select></label>
+                  <label>模型 ID<input id="expert-model" list="expert-model-options" autocomplete="off" placeholder="选择或输入上游模型 ID"><datalist id="expert-model-options"></datalist></label>
+                </div>
+              </details>
+            </div>
+          </section>
+          <section id="plugins-panel" hidden>
+            <p class="intro">Rust 与浏览器运行时都按作用域挂载内置插件。浏览器视图通过插槽组合，任务和设置通过 Rust API 交互。</p>
+            <button id="refresh-plugins" class="outline-button" type="button">刷新状态</button>
+            <h2 class="plugin-events-title">浏览器插件</h2>
+            <div id="browser-plugin-tree" class="plugin-tree"></div>
+            <h2 class="plugin-events-title">Rust 插件</h2>
+            <div id="plugin-tree" class="plugin-tree" aria-live="polite"></div>
+            <h2 class="plugin-events-title">最近生命周期事件</h2>
+            <div id="plugin-events" class="plugin-events"></div>
+          </section>
+        </div>
+        <footer id="settings-footer" class="settings-footer"><span id="save-hint">修改后点击保存，新任务立即生效</span><button id="save-settings" class="primary-button" type="button">保存设置</button></footer>
+      </main>
+    </div>
+  </body>
+</html>

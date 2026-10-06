@@ -46,6 +46,10 @@ def validate(topic: str) -> bool:
     let search = search_symbols(
         &root,
         SearchPythonSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "create".to_string(),
             limit: 10,
@@ -61,6 +65,7 @@ def validate(topic: str) -> bool:
     let read = read_symbol(
         &root,
         ReadPythonSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: create.id.clone(),
             include_context: true,

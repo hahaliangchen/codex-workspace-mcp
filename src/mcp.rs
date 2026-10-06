@@ -29,7 +29,7 @@ use crate::rust_index::{
 };
 use crate::tools::{
     ListDirRequest, ReadFileLinesRequest, ReadFileRequest, ReplaceRangeRequest, SearchTextRequest,
-    Workspace, WorkspaceInfoRequest, WriteFileRequest,
+    Workspace, WorkspaceInfoRequest, WriteFileRequest, EditFileRequest,
 };
 use crate::ts_index::{
     IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest, SearchTsSymbolsRequest,
@@ -294,8 +294,8 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                 "mcp://codex-workspace-mcp/notice" => {
                     "NOTICE TO AI: This MCP server provides powerful AST-based semantic code indexing tools for Rust, TypeScript/JavaScript, Python, and Go.\n\
                      You can query classes, functions, calls, definitions, and outlines across the workspace.\n\
-                     If you need to analyze code, check mcp://codex-workspace-mcp/ast/status first to see which languages are indexed.\n\
-                     If a language index is missing, you can run index_<lang>_workspace to build it."
+                     Read known files directly, use symbol tools for definitions, and text search for literals. No index-status check is required.\n\
+                     Symbol queries automatically build or incrementally refresh their language index."
                         .to_string()
                 }
                 "mcp://codex-workspace-mcp/ast/status" => {
@@ -326,8 +326,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     md
                 }
                 "mcp://codex-workspace-mcp/ast/rust/symbols" => {
-                    let st = workspace.list_rust_symbols(ListRustSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let st = workspace.list_rust_symbols(ListRustSymbolsRequest { options: Default::default(), workspace_root: w_root.clone(), file_path: None, kind: None })?;
                     let mut md = String::from("# Rust AST Symbols Index\n\n");
+                    md.push_str(&format!("Showing {} of {} symbols; next offset {:?}. Use list_*_symbols with file/directory filters or offset for further entries.\n\n",st.symbols.len(),st.page.total,st.page.next_offset));
                     for sym in st.symbols {
                         let impl_str = sym.impl_type.map(|t| format!(" (impl {})", t)).unwrap_or_default();
                         md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{}){}\n  > {}\n", 
@@ -336,8 +337,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     md
                 }
                 "mcp://codex-workspace-mcp/ast/ts/symbols" => {
-                    let st = workspace.list_ts_symbols(ListTsSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let st = workspace.list_ts_symbols(ListTsSymbolsRequest { options: Default::default(), workspace_root: w_root.clone(), file_path: None, kind: None })?;
                     let mut md = String::from("# TS/JS AST Symbols Index\n\n");
+                    md.push_str(&format!("Showing {} of {} symbols; next offset {:?}. Use list_*_symbols with file/directory filters or offset for further entries.\n\n",st.symbols.len(),st.page.total,st.page.next_offset));
                     for sym in st.symbols {
                         md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
                             sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
@@ -345,8 +347,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     md
                 }
                 "mcp://codex-workspace-mcp/ast/python/symbols" => {
-                    let st = workspace.list_python_symbols(ListPythonSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let st = workspace.list_python_symbols(ListPythonSymbolsRequest { options: Default::default(), workspace_root: w_root.clone(), file_path: None, kind: None })?;
                     let mut md = String::from("# Python AST Symbols Index\n\n");
+                    md.push_str(&format!("Showing {} of {} symbols; next offset {:?}. Use list_*_symbols with file/directory filters or offset for further entries.\n\n",st.symbols.len(),st.page.total,st.page.next_offset));
                     for sym in st.symbols {
                         md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
                             sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
@@ -354,8 +357,9 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     md
                 }
                 "mcp://codex-workspace-mcp/ast/go/symbols" => {
-                    let st = workspace.list_go_symbols(ListGoSymbolsRequest { workspace_root: w_root.clone(), file_path: None, kind: None })?;
+                    let st = workspace.list_go_symbols(ListGoSymbolsRequest { options: Default::default(), workspace_root: w_root.clone(), file_path: None, kind: None })?;
                     let mut md = String::from("# Go AST Symbols Index\n\n");
+                    md.push_str(&format!("Showing {} of {} symbols; next offset {:?}. Use list_*_symbols with file/directory filters or offset for further entries.\n\n",st.symbols.len(),st.page.total,st.page.next_offset));
                     for sym in st.symbols {
                         md.push_str(&format!("- **{}** ({:?}): `{}` in `{}` (L{}-L{})\n  > {}\n", 
                             sym.name, sym.kind, sym.signature, sym.file_path, sym.start_line, sym.end_line, sym.docstring.trim().replace("\n", "\n  > ")));
@@ -378,6 +382,18 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
 
                             md.push_str(&format!("### Memory #{}: {}\n", st.memories.len() - idx, mem.summary));
                             md.push_str(&format!("- **Recorded Time**: {}\n", local_time));
+                            if mem.kind == "observer" {
+                                md.push_str("- **Recorded By**: Observer\n");
+                            }
+                            if let Some(task_id) = &mem.source_task_id {
+                                md.push_str(&format!("- **Source Task**: {}\n", task_id));
+                            }
+                            if !mem.applies_to.is_empty() {
+                                md.push_str(&format!("- **Applies To**: {}\n", mem.applies_to));
+                            }
+                            if !mem.source_refs.is_empty() {
+                                md.push_str(&format!("- **Source Paths/Symbols**: {}\n", mem.source_refs.join(", ")));
+                            }
                             if !mem.files_changed.is_empty() {
                                 md.push_str(&format!("- **Files Changed**:\n  - {}\n", mem.files_changed.join("\n  - ")));
                             }
@@ -478,37 +494,49 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    let value = match name {
-        "workspace_info" => serde_json::to_value(
-            workspace.workspace_info(serde_json::from_value::<WorkspaceInfoRequest>(arguments)?)?,
-        )?,
-        "list_dir" => serde_json::to_value(
-            workspace.list_dir(serde_json::from_value::<ListDirRequest>(arguments)?)?,
-        )?,
-        "read_file" => serde_json::to_value(
-            workspace.read_file(serde_json::from_value::<ReadFileRequest>(arguments)?)?,
-        )?,
-        "read_file_lines" => serde_json::to_value(
-            workspace
-                .read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(arguments)?)?,
-        )?,
-        "search_text" => serde_json::to_value(
-            workspace.search_text(serde_json::from_value::<SearchTextRequest>(arguments)?)?,
-        )?,
-        "write_file" => serde_json::to_value(
-            workspace.write_file(serde_json::from_value::<WriteFileRequest>(arguments)?)?,
-        )?,
-        "replace_range" => serde_json::to_value(
-            workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?,
-        )?,
-        "expert_code_surgery" => {
-            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
-                arguments,
-            )?;
-            let response =
-                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
-            serde_json::to_value(response)?
+    if crate::http_probe::is_tool(name) {
+        let value=crate::http_probe::execute(&arguments).await?;
+        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+    }
+    if crate::browser_control::is_tool(name) {
+        let value = crate::browser_control::execute(workspace, name, &arguments).await?;
+        return crate::visual_artifacts::mcp_result(workspace.root(),&crate::visual_artifacts::VisualContext::mcp(workspace.root()),value);
+    }
+    if crate::project_process::is_tool(name) {
+        let value=crate::project_process::execute(workspace,name,arguments).await?;
+        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+    }
+
+    if crate::worker_read_cache::is_source_read(name) {
+        let workspace=Workspace::new(workspace.root())?;
+        let tool_name=name.to_owned();let source_args=arguments.clone();
+        let mut value=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            if source_args["force_read"]==true {crate::source_read::clear();}
+            Ok(match tool_name.as_str() {
+                "read_file"=>serde_json::to_value(workspace.read_file(serde_json::from_value::<ReadFileRequest>(source_args)?)?)?,
+                "read_file_lines"=>serde_json::to_value(workspace.read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(source_args)?)?)?,
+                "read_rust_symbol"=>serde_json::to_value(workspace.read_rust_symbol(serde_json::from_value::<ReadRustSymbolRequest>(source_args)?)?)?,
+                "read_go_symbol"=>serde_json::to_value(workspace.read_go_symbol(serde_json::from_value::<ReadGoSymbolRequest>(source_args)?)?)?,
+                "read_ts_symbol"=>serde_json::to_value(workspace.read_ts_symbol(serde_json::from_value::<ReadTsSymbolRequest>(source_args)?)?)?,
+                "read_python_symbol"=>serde_json::to_value(workspace.read_python_symbol(serde_json::from_value::<ReadPythonSymbolRequest>(source_args)?)?)?,
+                _=>unreachable!(),
+            })
+        }).await??;
+        crate::source_read::page(&mut value,&arguments)?;
+        if value.get("symbol").is_some() {
+            value["source_index_check"]=json!("current_source_hash_verified");
+            if arguments["include_context"]==true {value["related_context_freshness"]=json!("indexed_navigation_hints; related files refresh when read");}
         }
+        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+    }
+
+    if name == "search_code_map" || name.ends_with("_symbols") || name.starts_with("index_") || name.ends_with("_index_status") {
+        let selected_root=arguments.get("workspace_root").and_then(Value::as_str).filter(|value|!value.is_empty()).map(std::path::Path::new).unwrap_or(workspace.root());
+        let workspace=Workspace::new(selected_root)?;
+        let name=name.to_owned();
+        let value=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            let value=match name.as_str() {
+                "search_code_map" => crate::code_map::search(workspace.root(),serde_json::from_value(arguments)?)?,
         "index_go_workspace" => {
             serde_json::to_value(workspace.index_go_workspace(serde_json::from_value::<
                 IndexGoWorkspaceRequest,
@@ -598,6 +626,50 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             serde_json::to_value(workspace.read_python_symbol(serde_json::from_value::<
                 ReadPythonSymbolRequest,
             >(arguments)?)?)?
+        }
+                _=>anyhow::bail!("unknown index tool: {name}"),
+            };
+            Ok(value)
+        }).await??;
+        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+    }
+
+    let value = match name {
+        "workspace_info" => serde_json::to_value(
+            workspace.workspace_info(serde_json::from_value::<WorkspaceInfoRequest>(arguments)?)?,
+        )?,
+        "list_dir" => serde_json::to_value(
+            workspace.list_dir(serde_json::from_value::<ListDirRequest>(arguments)?)?,
+        )?,
+        "read_file" => serde_json::to_value(
+            workspace.read_file(serde_json::from_value::<ReadFileRequest>(arguments)?)?,
+        )?,
+        "read_file_lines" => serde_json::to_value(
+            workspace
+                .read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(arguments)?)?,
+        )?,
+        "search_text" => serde_json::to_value(
+            workspace.search_text(serde_json::from_value::<SearchTextRequest>(arguments)?)?,
+        )?,
+        "write_file" => {
+            let workspace=Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.write_file(serde_json::from_value::<WriteFileRequest>(arguments)?)?)?) }).await??
+        },
+        "replace_range" => {
+            let workspace=Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?)?) }).await??
+        },
+        "edit_file" => {
+            let workspace=Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.edit_file(serde_json::from_value::<EditFileRequest>(arguments)?)?)?) }).await??
+        },
+        "expert_code_surgery" => {
+            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
+                arguments,
+            )?;
+            let response =
+                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
+            serde_json::to_value(response)?
         }
         "record_work_memory" => {
             serde_json::to_value(workspace.record_work_memory(serde_json::from_value::<
@@ -696,7 +768,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
 }
 
 pub fn tool_definitions() -> Value {
-    json!([
+    let mut definitions=json!([
         {
             "name": "workspace_info",
             "description": "Return workspace root, platform, file access scope, and ignore summary. Requires workspace_root.",
@@ -734,7 +806,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_file",
-            "description": "Read a UTF-8 file by relative workspace path or absolute filesystem path with a byte limit. Prefer read_go_symbol / read_ts_symbol / read_rust_symbol when you need a specific function or type — they return only the relevant range and include caller/callee context. Use read_file when you need the full file or when no index exists.",
+            "description": "Read a UTF-8 file by path with a byte limit. Read known files directly. For one known definition, read_*_symbol with file_path + name avoids reading the whole file. No prior symbol search or index-status call is required.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
@@ -750,7 +822,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "read_file_lines",
-            "description": "Read a 1-indexed inclusive line range from a UTF-8 file. Use when you already know the exact line numbers (e.g., from an index result). For unknown locations prefer search_go_symbols / search_ts_symbols / search_rust_symbols first.",
+            "description": "Read an inclusive 1-indexed line range. Use known locations directly. Choose text search for literals and symbol search for unknown definitions.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "start_line", "end_line"],
@@ -767,7 +839,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_text",
-            "description": "Fallback raw text search across workspace files. For code navigation or symbol lookup, prefer indexed symbol tools first: search_go_symbols/search_rust_symbols/search_ts_symbols/search_python_symbols and read_*_symbol. Use search_text for UI strings, config keys, error messages, log lines, literals, or when symbol index tools do not find enough code structure. By default this searches the real filesystem view, including gitignored files. Use `path` for one file/directory, or `paths` as an array for multiple files/directories; do not put multiple paths in one space-separated string.",
+            "description": "Search workspace text. Literal matching is the default; set regex=true for patterns such as A|B, anchors, or character classes. Patterns match each line; invalid expressions return an error. Search directly for literals, UI strings, config keys, error messages, log lines, imports, and syntax patterns. Symbol tools are useful for definitions and relationships; text searches do not require trying a symbol tool first. By default this searches the real filesystem view, including gitignored files. Use `path` for one file/directory, or `paths` as an array for multiple files/directories; do not put multiple paths in one space-separated string.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -777,6 +849,7 @@ pub fn tool_definitions() -> Value {
                         "description": "Optional absolute project directory to use for this call. Defaults to the server startup directory."
                     },
                     "query": { "type": "string" },
+                    "regex": { "type": "boolean", "default": false, "description": "Enable regular expressions explicitly. Use regex=true for alternatives such as loadPptx|loadVirtualDocument. Literal mode does not interpret | as OR. Regex matching is per line; invalid expressions return an error." },
                     "path": {
                         "type": "string",
                         "default": ".",
@@ -836,7 +909,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "write_file",
-            "description": "Create or overwrite a UTF-8 file by relative workspace path or absolute filesystem path.",
+            "description": "Create a UTF-8 file or replace its complete contents inside the selected workspace. Existing files REQUIRE expected_code_hash from the latest source read or notebook retrieval. Prefer edit_file for localized changes. Returns changed, created, code_hash and index_refresh; a failed index refresh does not undo a saved file.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -847,13 +920,14 @@ pub fn tool_definitions() -> Value {
                     },
                     "path": { "type": "string" },
                     "content": { "type": "string" },
-                    "create_parent_dirs": { "type": "boolean", "default": true }
+                    "create_parent_dirs": { "type": "boolean", "default": true },
+                    "expected_code_hash": {"type":"string","description":"Required when path already exists. Use the code_hash returned by a current source read or notebook retrieval."}
                 }
             }
         },
         {
             "name": "replace_range",
-            "description": "Replace an inclusive 1-indexed line range with optional old-text verification.",
+            "description": "Replace an inclusive 1-indexed line range inside the selected workspace, preserving untouched bytes and the selected region newline style. Requires expected_old_text or expected_code_hash. Prefer edit_file when a unique text anchor is available. Conflicts apply no changes; retrieve only the affected source.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "start_line", "end_line", "replacement"],
@@ -863,20 +937,53 @@ pub fn tool_definitions() -> Value {
                         "description": "Optional absolute project directory to use for this call. Defaults to the server startup directory."
                     },
                     "path": { "type": "string" },
-                    "start_line": { "type": "integer" },
-                    "end_line": { "type": "integer" },
+                    "start_line": { "type": "integer", "minimum":1 },
+                    "end_line": { "type": "integer", "minimum":1 },
                     "replacement": { "type": "string" },
-                    "expected_old_text": { "type": "string" }
+                    "expected_old_text": { "type": "string", "description":"Exact selected source excluding its final line delimiter; required unless expected_code_hash is provided." },
+                    "expected_code_hash": { "type":"string","description":"Current file version from a source read or notebook retrieval." }
                 }
             }
         },
         {
+            "name": "edit_file",
+            "description": "Apply 1-100 exact text edits to ONE existing UTF-8 file inside the selected workspace. Each old_text must match uniquely in the original file; use enough surrounding code. All anchors refer to the same original snapshot and may not overlap. All edits are validated before one atomic commit. For insertion keep the anchor in new_text; for deletion set new_text empty. LF anchors may match CRLF source; untouched bytes stay unchanged. Prefer this over line-number edits. Returns changed, code_hash and index_refresh; mismatches apply no changes.",
+            "inputSchema": {
+                "type":"object", "required":["path","edits"],
+                "properties": {
+                    "workspace_root":{"type":"string","description":"Optional absolute selected project directory."},
+                    "path":{"type":"string"},
+                    "expected_code_hash":{"type":"string","description":"Optional current file version. Recommended when the edits depend on code outside their anchors."},
+                    "edits":{"type":"array","minItems":1,"maxItems":100,"items":{"type":"object","required":["old_text","new_text"],"properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}}}}
+                }
+            }
+        },
+        {
+            "name":"search_code_map",
+            "description":"Locate functionality as a single definition, a source module, or a saved group of related files/definitions. Searches task wording and responsibility descriptions across supported languages and returns grouped responsibilities with direct code entry points. Does not infer functionality from call chains. No separate index or memory lookup is required. Missing or stale descriptions are explicit; confirm source details only when needed.",
+            "inputSchema":{"type":"object","required":["workspace_root","query"],"properties":{
+                "workspace_root":{"type":"string"},"query":{"type":"string","description":"Functionality or definition to locate, e.g. 节点拖拽 or 图片渲染."},
+                "language":{"type":"string","enum":["rust","ts","typescript","javascript","python","go"]},
+                "file_path":{"type":"string","description":"Optional exact workspace-relative source file."},
+                "directory":{"type":"string","description":"Optional workspace-relative subtree."},
+                "limit":{"type":"integer","minimum":1,"maximum":20,"default":8},
+                "entry_limit":{"type":"integer","minimum":1,"maximum":20,"default":6},
+                "offset":{"type":"integer","minimum":0,"default":0,"description":"Page each language's ranked symbol candidates; see language_pages."},
+                "group_offset":{"type":"integer","minimum":0,"default":0,"description":"Page groups within the current candidate window."}
+            }}
+        },
+        {
             "name": "list_go_symbols",
-            "description": "List indexed Go symbols with code positions. Note: Go index is automatically built and updated by the server. Prefer this over raw text search when browsing Go file structure, functions, methods, structs, interfaces, or types.",
+            "description": "Browse a compact, paginated symbol outline. Prefer a known file or directory filter. Default limit 40, max 100; local symbols hidden unless include_locals=true. Read page.next_offset to continue only if needed. Each result includes a concise responsibility and its current/stale/missing status. Index freshness and skipped/failed file coverage are included.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
                 "properties": {
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 40 },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false, "description": "Include signature/doc previews (240/480 characters); normally read only the selected definition." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "file_path": { "type": "string" },
                     "kind": { "type": "string", "enum": ["function", "method", "struct", "interface", "type"] }
@@ -885,24 +992,34 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_go_symbols",
-            "description": "Search indexed Go symbols by name, signature, docstring, package, or file path. Note: Go index is automatically built and updated by the server. Prefer this before search_text when investigating Go code structure or locating definitions.",
+            "description": "Locate definitions by name, scope, signature, docstring, path, responsibility description or task keywords. Multi-keyword query defaults to any-term matching (up to 24 distinct terms), ranked by relevance before pagination. Use match_mode=all to require every term, or phrase for a literal substring. Use file/directory/kind filters to narrow results. Index updates automatically; unfiltered consecutive queries share a 2-second scan window, while known source reads verify their current hash. Chinese task terms include a bounded task-vocabulary expansion in any mode; all and phrase remain literal. Zero matches are not proof code is absent.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Exact workspace-relative file path." },
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "kind": { "type": "string", "enum": ["function", "method", "struct", "interface", "type"] },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "match_mode": { "type": "string", "enum": ["any", "all", "phrase"], "default": "any" },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "default": 20 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         },
         {
             "name": "read_go_symbol",
-            "description": "Read an indexed Go symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Go index is automatically built by the server.",
+            "description": "Read a definition directly using file_path + name (qualified names accepted), or an existing symbol_id. Known file and name need no prior search/list call. Ambiguous names return candidate IDs. include_context=true adds heuristic caller/callee/import relationships, not compiler-verified dependencies. Includes a responsibility, qualified name and code_hash for optional version-checked annotation. The source index refreshes automatically.",
             "inputSchema": {
                 "type": "object",
-                "required": ["workspace_root", "symbol_id"],
+                "required": ["workspace_root"],
+                "anyOf": [{ "required": ["symbol_id"] }, { "required": ["file_path", "name"] }],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Workspace-relative file path; required with name when symbol_id is omitted." },
+                    "name": { "type": "string", "description": "Definition name, optionally qualified, e.g. PptxParser.parse or Renderer::render_slide." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "symbol_id": { "type": "string" },
                     "include_context": { "type": "boolean", "default": false }
@@ -911,11 +1028,16 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_rust_symbols",
-            "description": "List indexed Rust symbols with code positions. Note: Rust index is automatically built and updated by the server. Prefer this over raw text search when browsing Rust modules, functions, methods, structs, enums, traits, aliases, consts, or statics.",
+            "description": "Browse a compact, paginated symbol outline. Prefer a known file or directory filter. Default limit 40, max 100; local symbols hidden unless include_locals=true. Read page.next_offset to continue only if needed. Each result includes a concise responsibility and its current/stale/missing status. Index freshness and skipped/failed file coverage are included.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
                 "properties": {
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 40 },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false, "description": "Include signature/doc previews (240/480 characters); normally read only the selected definition." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "file_path": { "type": "string" },
                     "kind": { "type": "string", "enum": ["function", "method", "struct", "enum", "trait", "type_alias", "const", "static", "module"] }
@@ -924,24 +1046,34 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_rust_symbols",
-            "description": "Search indexed Rust symbols by name, signature, docstring, module, impl type, or file path. Note: Rust index is automatically built and updated by the server. Prefer this before search_text when investigating Rust code structure or locating definitions.",
+            "description": "Locate definitions by name, scope, signature, docstring, path, responsibility description or task keywords. Multi-keyword query defaults to any-term matching (up to 24 distinct terms), ranked by relevance before pagination. Use match_mode=all to require every term, or phrase for a literal substring. Use file/directory/kind filters to narrow results. Index updates automatically; unfiltered consecutive queries share a 2-second scan window, while known source reads verify their current hash. Chinese task terms include a bounded task-vocabulary expansion in any mode; all and phrase remain literal. Zero matches are not proof code is absent.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Exact workspace-relative file path." },
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "kind": { "type": "string", "enum": ["function", "method", "struct", "enum", "trait", "type_alias", "const", "static", "module"] },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "match_mode": { "type": "string", "enum": ["any", "all", "phrase"], "default": "any" },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "default": 20 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         },
         {
             "name": "read_rust_symbol",
-            "description": "Read an indexed Rust symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Rust index is automatically built by the server.",
+            "description": "Read a definition directly using file_path + name (qualified names accepted), or an existing symbol_id. Known file and name need no prior search/list call. Ambiguous names return candidate IDs. include_context=true adds heuristic caller/callee/import relationships, not compiler-verified dependencies. Includes a responsibility, qualified name and code_hash for optional version-checked annotation. The source index refreshes automatically.",
             "inputSchema": {
                 "type": "object",
-                "required": ["workspace_root", "symbol_id"],
+                "required": ["workspace_root"],
+                "anyOf": [{ "required": ["symbol_id"] }, { "required": ["file_path", "name"] }],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Workspace-relative file path; required with name when symbol_id is omitted." },
+                    "name": { "type": "string", "description": "Definition name, optionally qualified, e.g. PptxParser.parse or Renderer::render_slide." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "symbol_id": { "type": "string" },
                     "include_context": { "type": "boolean", "default": false }
@@ -950,11 +1082,16 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_ts_symbols",
-            "description": "List indexed TS/JS symbols with code positions. Note: TS/JS index is automatically built and updated by the server. Prefer this over raw text search when browsing TS/JS file structure, functions, components, classes, methods, interfaces, types, enums, or consts.",
+            "description": "Browse a compact, paginated symbol outline. Prefer a known file or directory filter. Default limit 40, max 100; local symbols hidden unless include_locals=true. Read page.next_offset to continue only if needed. Each result includes a concise responsibility and its current/stale/missing status. Index freshness and skipped/failed file coverage are included.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
                 "properties": {
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 40 },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false, "description": "Include signature/doc previews (240/480 characters); normally read only the selected definition." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "file_path": { "type": "string" },
                     "kind": { "type": "string", "enum": ["function", "arrow_function", "class", "method", "interface", "type_alias", "enum", "const", "component"] }
@@ -963,37 +1100,54 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_ts_symbols",
-            "description": "Search indexed TS/JS symbols by name, signature, docstring, imports, exports, or file path. Note: TS/JS index is automatically built and updated by the server. Prefer this before search_text when investigating TS/JS code structure, locating definitions, or following component/function dependencies.",
+            "description": "Locate definitions by name, scope, signature, docstring, path, responsibility description or task keywords. Multi-keyword query defaults to any-term matching (up to 24 distinct terms), ranked by relevance before pagination. Use match_mode=all to require every term, or phrase for a literal substring. Use file/directory/kind filters to narrow results. Index updates automatically; unfiltered consecutive queries share a 2-second scan window, while known source reads verify their current hash. Chinese task terms include a bounded task-vocabulary expansion in any mode; all and phrase remain literal. Zero matches are not proof code is absent.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Exact workspace-relative file path." },
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "kind": { "type": "string", "enum": ["function", "arrow_function", "class", "method", "interface", "type_alias", "enum", "const", "component"] },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "match_mode": { "type": "string", "enum": ["any", "all", "phrase"], "default": "any" },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "default": 20 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         },
         {
             "name": "read_ts_symbol",
-            "description": "Read an indexed TS/JS symbol's exact code range. Set include_context=true when you need dependency edges, imports, callers, callees, and suggested related symbols. Note: TS/JS index is automatically built by the server.",
+            "description": "Read a known TypeScript definition directly by file_path + name or symbol_id. For editing, include_related_types=true adds up to eight local type definitions (12000 source characters, two levels); include_outline=true adds parent and six nearest sibling positions/signatures. These are bounded navigation hints, not compiler-resolved types. include_context=true separately expands heuristic call relationships. Returns current source and version hash; no prerequisite list/search needed.",
             "inputSchema": {
                 "type": "object",
-                "required": ["workspace_root", "symbol_id"],
+                "required": ["workspace_root"],
+                "anyOf": [{ "required": ["symbol_id"] }, { "required": ["file_path", "name"] }],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Workspace-relative file path; required with name when symbol_id is omitted." },
+                    "name": { "type": "string", "description": "Definition name, optionally qualified, e.g. PptxParser.parse or Renderer::render_slide." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "symbol_id": { "type": "string" },
-                    "include_context": { "type": "boolean", "default": false }
+                    "include_context": { "type": "boolean", "default": false },
+                    "include_related_types": { "type": "boolean", "default": false, "description": "Include bounded referenced local interface/type/enum bodies for an edit; external packages, namespace imports and re-exports are not expanded." },
+                    "include_outline": { "type": "boolean", "default": false, "description": "Return parent and nearby definition positions/signatures for locating a change without listing the whole file." }
                 }
             }
         },
         {
             "name": "list_python_symbols",
-            "description": "List indexed Python symbols with code positions. Note: Python index is automatically built and updated by the server. Prefer this over raw text search when browsing Python file structure, functions, methods, or classes.",
+            "description": "Browse a compact, paginated symbol outline. Prefer a known file or directory filter. Default limit 40, max 100; local symbols hidden unless include_locals=true. Read page.next_offset to continue only if needed. Each result includes a concise responsibility and its current/stale/missing status. Index freshness and skipped/failed file coverage are included.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
                 "properties": {
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 40 },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false, "description": "Include signature/doc previews (240/480 characters); normally read only the selected definition." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "file_path": { "type": "string" },
                     "kind": { "type": "string", "enum": ["function", "method", "class"] }
@@ -1002,24 +1156,34 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_python_symbols",
-            "description": "Search indexed Python symbols by name, signature, docstring, decorator, class name, or file path. Note: Python index is automatically built and updated by the server. Prefer this before search_text when investigating Python code structure or locating definitions.",
+            "description": "Locate definitions by name, scope, signature, docstring, path, responsibility description or task keywords. Multi-keyword query defaults to any-term matching (up to 24 distinct terms), ranked by relevance before pagination. Use match_mode=all to require every term, or phrase for a literal substring. Use file/directory/kind filters to narrow results. Index updates automatically; unfiltered consecutive queries share a 2-second scan window, while known source reads verify their current hash. Chinese task terms include a bounded task-vocabulary expansion in any mode; all and phrase remain literal. Zero matches are not proof code is absent.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Exact workspace-relative file path." },
+                    "directory": { "type": "string", "description": "Workspace-relative directory prefix." },
+                    "kind": { "type": "string", "enum": ["function", "method", "class"] },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "match_mode": { "type": "string", "enum": ["any", "all", "phrase"], "default": "any" },
+                    "include_locals": { "type": "boolean", "default": false },
+                    "detailed": { "type": "boolean", "default": false },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "query": { "type": "string" },
-                    "limit": { "type": "integer", "default": 20 }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         },
         {
             "name": "read_python_symbol",
-            "description": "Read an indexed Python symbol's exact code range. Set include_context=true when you need dependency edges, callers, callees, and suggested related symbols. Note: Python index is automatically built by the server.",
+            "description": "Read a definition directly using file_path + name (qualified names accepted), or an existing symbol_id. Known file and name need no prior search/list call. Ambiguous names return candidate IDs. include_context=true adds heuristic caller/callee/import relationships, not compiler-verified dependencies. Includes a responsibility, qualified name and code_hash for optional version-checked annotation. The source index refreshes automatically.",
             "inputSchema": {
                 "type": "object",
-                "required": ["workspace_root", "symbol_id"],
+                "required": ["workspace_root"],
+                "anyOf": [{ "required": ["symbol_id"] }, { "required": ["file_path", "name"] }],
                 "properties": {
+                    "file_path": { "type": "string", "description": "Workspace-relative file path; required with name when symbol_id is omitted." },
+                    "name": { "type": "string", "description": "Definition name, optionally qualified, e.g. PptxParser.parse or Renderer::render_slide." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
                     "symbol_id": { "type": "string" },
                     "include_context": { "type": "boolean", "default": false }
@@ -1028,7 +1192,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "record_work_memory",
-            "description": "Record a work summary after completing code changes or a significant investigation. Always call this when finishing a task — include what changed, why, and any risks. This is how context is preserved for future sessions.",
+            "description": "Record durable reusable work findings when useful. Do not create a routine summary for every task or duplicate an Observer retrospective memory.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "summary"],
@@ -1044,7 +1208,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_work_memory",
-            "description": "List recent work summaries for a workspace. Call this at the start of a new task to recall what was previously done — saves re-investigating code that was already understood.",
+            "description": "List recent work summaries when a focused search term is unavailable. Reuse relevant entries and check their applicability.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root"],
@@ -1056,7 +1220,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_work_memory",
-            "description": "Search past work summaries by keyword. Call before investigating a topic to check whether prior work already covers it — avoids duplicating effort across sessions.",
+            "description": "Search prior project work and Observer memories with one focused query when they can shorten the task. Use source paths and applicability as pointers, and verify facts against current code.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -1127,13 +1291,18 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "record_symbol_business_context",
-            "description": "Create or update semantic business context for one indexed symbol. Use after cheap architecture analysis or verified code inspection to map business wording to concrete symbols.",
+            "description": "Save a reusable responsibility after reading a definition or module. Ordinary symbol searches will match this description and its task-wording keywords. Supply a symbol_id or file_path + qualified_name; scope=file describes a whole source module. Pass expected_code_hash from the read result to reject changed source. Optional: do not add reads or annotation calls merely to complete an inventory.",
             "inputSchema": {
                 "type": "object",
-                "required": ["workspace_root", "symbol_id", "business_role"],
+                "required": ["workspace_root", "business_role"],
                 "properties": {
+                    "qualified_name": { "type":"string", "description":"Qualified definition name with file_path, e.g. PptxParser.parsePicture." },
+                    "keywords": { "type":"array", "items":{"type":"string"}, "maxItems":24, "description":"Task wording and feature aliases, including Chinese words when useful." },
+                    "scope": { "type":"string", "enum":["symbol","file"], "default":"symbol" },
+                    "source": { "type":"string", "enum":["worker","observer","architecture"], "default":"worker" },
+                    "expected_code_hash": { "type":"string", "description":"Source version from description.code_hash or read_file.code_hash; changed source rejects the write." },
                     "workspace_root": { "type": "string", "description": "Absolute workspace root." },
-                    "symbol_id": { "type": "string", "description": "Stable symbol id from the language index when available; otherwise a qualified symbol name." },
+                    "symbol_id": { "type": "string", "description": "Current symbol ID from a read/search result. Can be omitted when file_path and qualified_name are supplied." },
                     "symbol_name": { "type": "string" },
                     "language": { "type": "string" },
                     "file_path": { "type": "string" },
@@ -1162,7 +1331,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "search_symbol_business_context",
-            "description": "Search the semantic symbol index by business wording, task phrase, symbol name, area, read_when/avoid_when guidance, file, or risk. Use before raw text search when the user describes a code feature in business terms.",
+            "description": "Inspect saved responsibility records, including keywords and stale flags. Ordinary search_*_symbols already searches these records and returns live definitions; no separate lookup is required for normal navigation.",
             "inputSchema": {
                 "type": "object",
                 "required": ["workspace_root", "query"],
@@ -1248,5 +1417,21 @@ pub fn tool_definitions() -> Value {
                 }
             }
         }
-    ])
+    ]);
+    definitions.as_array_mut().unwrap().extend(crate::project_process::definitions());
+    definitions.as_array_mut().unwrap().extend(crate::http_probe::definitions());
+    definitions.as_array_mut().unwrap().extend(crate::browser_control::definitions());
+    for tool in definitions.as_array_mut().into_iter().flatten() {
+        let name=tool["name"].as_str().unwrap_or("");
+        if crate::worker_read_cache::is_source_read(name) {
+            tool["description"]=json!(format!("{} Source pages preserve original bytes and line delimiters; complete/next_start_line identify pagination. max_chars defaults to 24000, max 60000. Reads are bounded to 16 MiB; force_read bypasses snapshot caching.",tool["description"].as_str().unwrap_or("")));
+            let props=tool["inputSchema"]["properties"].as_object_mut().unwrap();
+            props.insert("max_chars".into(),json!({"type":"integer","minimum":1000,"maximum":60000,"default":24000}));
+            props.entry("start_line").or_insert(json!({"type":"integer","minimum":1,"description":"Optional page start within this file/definition. Use next_start_line to continue."}));
+            props.entry("end_line").or_insert(json!({"type":"integer","minimum":1}));
+            props.insert("start_column".into(),json!({"type":"integer","minimum":1,"description":"Continue a partial long line using next_column. Unicode columns include line delimiters; default 1."}));
+            props.insert("force_read".into(),json!({"type":"boolean","default":false,"description":"Bypass source snapshot caching when a fresh disk read is required."}));
+        }
+    }
+    definitions
 }

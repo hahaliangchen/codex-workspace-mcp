@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use swc_common::{SourceMap, Span, sync::Lrc};
 use swc_ecma_ast::*;
@@ -48,43 +48,62 @@ pub(crate) fn normalize_workspace_relative_path(value: &str) -> String {
     normalized
 }
 
-pub(crate) fn walk_source_files(root: &Path) -> Vec<std::io::Result<PathBuf>> {
-    let mut paths = Vec::new();
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(true)
-        .filter_entry(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| !NOISE_DIRS.contains(&name))
-                .unwrap_or(true)
-        });
-    for item in builder.build() {
-        let entry = match item {
-            Ok(entry) => entry,
-            Err(err) => {
-                paths.push(Err(std::io::Error::other(err)));
-                continue;
-            }
-        };
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        paths.push(Ok(entry.path().to_path_buf()));
-    }
-    paths
+pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
+    load_selected_symbols(
+        root,
+        &crate::symbol_query::Selection {
+            include_locals: true,
+            include_relationships: true,
+            include_details: true,
+            ..Default::default()
+        },
+    )
 }
 
-pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
+pub(crate) fn load_selected_symbols(
+    root: &std::path::Path,
+    selection: &crate::symbol_query::Selection<'_>,
+) -> Result<Vec<TsSymbol>> {
     let conn =
         crate::database::init_db(root).map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
-    let mut stmt = conn.prepare("SELECT id, name, kind, file_path, scope_path, parent_id, start_line, end_line, signature, docstring, export, export_names_json, calls_json, import_bindings_json, imports_json, re_exports_json FROM ts_symbols WHERE workspace_root = ?").map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
+    let (mut where_sql, mut params) = selection.sql(
+        root,
+        "ts_symbols",
+        &["name", "scope_path", "signature", "docstring", "file_path"],
+    );
+    let mut select = "SELECT id, name, kind, file_path, scope_path, parent_id, start_line, end_line, signature, docstring, export, export_names_json, calls_json, import_bindings_json, imports_json, re_exports_json FROM ts_symbols".to_owned();
+    if !selection.include_relationships {
+        for column in &[
+            "export_names_json",
+            "calls_json",
+            "import_bindings_json",
+            "imports_json",
+            "re_exports_json",
+        ] {
+            select = select.replace(column, &format!("'[]' AS {column}"));
+        }
+    }
+    if !selection.include_details {
+        select = select
+            .replace(", signature,", ", '' AS signature,")
+            .replace(", docstring,", ", '' AS docstring,");
+    }
+    if let Some((offset, limit)) = selection.pagination {
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+        params.push(rusqlite::types::Value::Integer(
+            i64::try_from(offset).unwrap_or(i64::MAX),
+        ));
+        where_sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            params.len() - 1,
+            params.len()
+        ));
+    }
+    let mut stmt = conn
+        .prepare(&(select + where_sql.as_str()))
+        .map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
     let symbol_iter = stmt
-        .query_map(rusqlite::params![root.to_string_lossy()], |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(TsSymbol {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -108,26 +127,7 @@ pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<TsSymbol>> 
         })
         .map_err(|e| TsIndexError::SymbolNotFound(e.to_string()))?;
 
-    let mut symbols = Vec::new();
-    for sym in symbol_iter {
-        if let Ok(s) = sym {
-            symbols.push(s);
-        }
-    }
-    Ok(symbols)
-}
-
-pub(crate) fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<TsSymbol>> {
-    // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
-    let conn = crate::database::init_db(root).unwrap();
-    let already_indexed =
-        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "ts").is_some();
-    let symbols = load_all_symbols(root)?;
-    if !already_indexed {
-        index_workspace(root)?;
-        return load_all_symbols(root);
-    }
-    Ok(symbols)
+    Ok(symbol_iter.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 pub(crate) fn relative_display(root: &Path, path: &Path) -> String {

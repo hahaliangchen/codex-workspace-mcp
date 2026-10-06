@@ -1,0 +1,388 @@
+/* ==========================================================================
+   Codex & DSH Tool Card Presentation Styles
+   (Folder explorer view, param badges, syntax-colored JSON, and card polish)
+   ========================================================================== */
+
+/* 1. Main Container Card */
+.card {
+  display: flex;
+  flex-direction: column;
+  margin: 6px 0 6px 0;
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  border-radius: 12px;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+  font-family: var(--codex-font-sans, -apple-system, BlinkMacSystemFont, sans-serif);
+}
+
+:global(body[data-ds-dark-theme]) .card {
+  background: transparent;
+  border-color: #2e2e34;
+  box-shadow: none;
+}
+
+/* 2. Parameter Badges Header (Suggestion 3: 关键参数提取胶囊) */
+.paramsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 2px 6px 2px;
+  background: transparent;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+:global(body[data-ds-dark-theme]) .paramsHeader {
+  background: transparent;
+}
+
+.badgesGroup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--codex-bg-main, #ffffff);
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  color: var(--codex-text-secondary, #4b5563);
+  font-size: 11.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+:global(body[data-ds-dark-theme]) .badge {
+  background: #18181b;
+  border-color: #323238;
+  color: #d4d4d8;
+}
+
+.badgeKey {
+  color: var(--codex-text-muted, #6b7280);
+  font-weight: 500;
+}
+
+:global(body[data-ds-dark-theme]) .badgeKey {
+  color: #a1a1aa;
+}
+
+.badgeVal {
+  color: var(--codex-text-primary, #18181b);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+:global(body[data-ds-dark-theme]) .badgeVal {
+  color: #f4f4f5;
+}
+
+.copyActionBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  background: var(--codex-bg-main, #ffffff);
+  color: var(--codex-text-secondary, #4b5563);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+
+:global(body[data-ds-dark-theme]) .copyActionBtn {
+  background: #18181b;
+  border-color: #323238;
+  color: #a1a1aa;
+}
+
+.copyActionBtn:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .copyActionBtn:hover {
+  background: #2e2e34;
+  color: #f4f4f5;
+}
+
+/* 3. Folder & File Explorer View (User Requested: 文件夹显示风格) */
+.folderBlock {
+  display: flex;
+  flex-direction: column;
+}
+
+.folderSummaryBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px 8px 2px;
+  background: transparent;
+  border-bottom: 1px solid var(--codex-card-border, #f0f0f2);
+  font-size: 12px;
+  color: var(--codex-text-secondary, #52525b);
+}
+
+:global(body[data-ds-dark-theme]) .folderSummaryBar {
+  background: transparent;
+  border-bottom-color: #27272a;
+  color: #a1a1aa;
+}
+
+.folderStatText {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+}
+
+.folderList {
+  display: flex;
+  flex-direction: column;
+  max-height: 250px;
+  overflow-y: auto;
+  padding: 4px 6px;
+}
+
+.folderItem {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  border-radius: 6px;
+  transition: background 0.12s;
+  cursor: default;
+  gap: 8px;
+}
+
+.folderItem:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+}
+
+:global(body[data-ds-dark-theme]) .folderItem:hover {
+  background: #27272a;
+}
+
+.folderItemMain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.itemIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+}
+
+.iconFolder {
+  color: #d97706;
+}
+
+:global(body[data-ds-dark-theme]) .iconFolder {
+  color: #fbbf24;
+}
+
+.iconFile {
+  color: var(--codex-text-muted, #6b7280);
+}
+
+:global(body[data-ds-dark-theme]) .iconFile {
+  color: #9ca3af;
+}
+
+.pathWrapper {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 12.5px;
+  font-family: var(--ds-font-family-code, monospace);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pathPrefix {
+  color: var(--codex-text-muted, #8e8e93);
+  font-weight: 400;
+}
+
+:global(body[data-ds-dark-theme]) .pathPrefix {
+  color: #71717a;
+}
+
+.pathName {
+  color: var(--codex-text-primary, #18181b);
+  font-weight: 500;
+}
+
+:global(body[data-ds-dark-theme]) .pathName {
+  color: #f4f4f5;
+}
+
+.itemMeta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.fileSize {
+  font-size: 11px;
+  font-family: var(--ds-font-family-code, monospace);
+  color: var(--codex-text-muted, #71717a);
+  background: transparent;
+  padding: 1px 0;
+}
+
+:global(body[data-ds-dark-theme]) .fileSize {
+  background: transparent;
+  color: #a1a1aa;
+}
+
+.emptyFolder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px 16px;
+  color: var(--codex-text-muted, #71717a);
+  font-size: 12.5px;
+}
+
+/* 4. Sectional Input / Output Card for General Tools */
+.ioSection {
+  display: flex;
+  flex-direction: column;
+}
+
+.ioSectionBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: transparent;
+  border-bottom: 1px solid var(--codex-card-border, #f0f0f2);
+}
+
+:global(body[data-ds-dark-theme]) .ioSectionBar {
+  background: transparent;
+  border-bottom-color: #2c2c32;
+}
+
+.ioSectionTag {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--codex-text-muted, #6b7280);
+}
+
+:global(body[data-ds-dark-theme]) .ioSectionTag {
+  color: #a1a1aa;
+}
+
+.ioSectionTagError {
+  color: #dc2626;
+}
+
+:global(body[data-ds-dark-theme]) .ioSectionTagError {
+  color: #ef4444;
+}
+
+.ioSectionContent {
+  padding: 10px 14px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-family: var(--ds-font-family-code, monospace);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: transparent;
+}
+
+:global(body[data-ds-dark-theme]) .ioSectionContent {
+  background: transparent;
+}
+
+.ioDivider {
+  height: 1px;
+  background: var(--codex-card-border, #e5e7eb);
+}
+
+:global(body[data-ds-dark-theme]) .ioDivider {
+  background: #2e2e34;
+}
+
+/* 5. Syntax Highlighting Colors for JSON Viewer */
+.jsonKey {
+  color: #0969da;
+  font-weight: 500;
+}
+
+:global(body[data-ds-dark-theme]) .jsonKey {
+  color: #79c0ff;
+}
+
+.jsonString {
+  color: #0a7b45;
+}
+
+:global(body[data-ds-dark-theme]) .jsonString {
+  color: #7ee787;
+}
+
+.jsonNumber {
+  color: #d97706;
+}
+
+:global(body[data-ds-dark-theme]) .jsonNumber {
+  color: #ffa657;
+}
+
+.jsonBool {
+  color: #9333ea;
+  font-weight: 600;
+}
+
+:global(body[data-ds-dark-theme]) .jsonBool {
+  color: #d2a8ff;
+}
+
+.jsonNull {
+  color: #ef4444;
+  font-style: italic;
+}
+
+:global(body[data-ds-dark-theme]) .jsonNull {
+  color: #ff7b72;
+}
+
+.jsonPunct {
+  color: #9ca3af;
+}
+
+:global(body[data-ds-dark-theme]) .jsonPunct {
+  color: #6e7681;
+}

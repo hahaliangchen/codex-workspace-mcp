@@ -45,6 +45,10 @@ function normalize(id: string) {
     let search = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "createPptSession".to_string(),
             limit: 5,
@@ -61,9 +65,12 @@ function normalize(id: string) {
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: symbol.id.clone(),
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -76,6 +83,10 @@ function normalize(id: string) {
     let save_search = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "save".to_string(),
             limit: 5,
@@ -90,9 +101,12 @@ function normalize(id: string) {
     let save_read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: save.id.clone(),
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -115,6 +129,10 @@ fn search_builds_index_when_missing() {
     let search = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "AutoBuild".to_string(),
             limit: 5,
@@ -166,6 +184,10 @@ export function run() {
     let run = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "run".to_string(),
             limit: 5,
@@ -179,9 +201,12 @@ export function run() {
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -201,6 +226,10 @@ export function run() {
     let create = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "createThing".to_string(),
             limit: 5,
@@ -214,9 +243,12 @@ export function run() {
     let create_read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: create.id,
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -253,6 +285,10 @@ export function run() {
     let run = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "run".to_string(),
             limit: 5,
@@ -266,9 +302,12 @@ export function run() {
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -307,6 +346,10 @@ export function run() {
     let run = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "run".to_string(),
             limit: 5,
@@ -320,9 +363,12 @@ export function run() {
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -370,6 +416,11 @@ foo() {}
     let update_disk = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                include_locals: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "updateDisk".to_string(),
             limit: 10,
@@ -386,6 +437,11 @@ foo() {}
     let wrapper = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                include_locals: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "Wrapper".to_string(),
             limit: 10,
@@ -403,9 +459,12 @@ foo() {}
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: update_disk.id.clone(),
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();
@@ -435,6 +494,10 @@ const Wrapped = class extends Base {
     let foo = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "foo".to_string(),
             limit: 10,
@@ -471,6 +534,11 @@ return 42;
     let inner = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                include_locals: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "inner".to_string(),
             limit: 10,
@@ -487,6 +555,10 @@ return 42;
     let outer = search_symbols(
         &root,
         SearchTsSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "outer".to_string(),
             limit: 10,
@@ -500,9 +572,12 @@ return 42;
     let read = read_symbol(
         &root,
         ReadTsSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: outer.id.clone(),
             include_context: true,
+                include_related_types: false,
+                include_outline: false,
         },
     )
     .unwrap();

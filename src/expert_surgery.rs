@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 
 use reqwest::Client;
 use rusqlite::params;
@@ -163,53 +162,8 @@ fn load_expert_provider(request: &ExpertCodeSurgeryRequest) -> anyhow::Result<Ex
         });
     }
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let config_path = exe_dir.join("ai_proxy_config.json");
-    let config: Value = serde_json::from_str(&std::fs::read_to_string(config_path)?)?;
-    let default_provider = config
-        .get("default_provider")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing default_provider in ai_proxy_config.json"))?;
-    let provider_name = config
-        .get("expert_provider")
-        .and_then(Value::as_str)
-        .unwrap_or(default_provider);
-    let provider = config
-        .get("providers")
-        .and_then(Value::as_object)
-        .and_then(|providers| providers.get(provider_name))
-        .ok_or_else(|| anyhow::anyhow!("expert provider '{}' not found", provider_name))?;
-    let model = config
-        .get("expert_model")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            provider
-                .get("model_map")
-                .and_then(Value::as_object)
-                .and_then(|map| map.values().next())
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .ok_or_else(|| anyhow::anyhow!("expert provider has no model_map or expert_model"))?;
-
-    Ok(ExpertProvider {
-        url: provider
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("expert provider missing url"))?
-            .trim_end_matches('/')
-            .to_string(),
-        api_key: provider
-            .get("api_key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("expert provider missing api_key"))?
-            .to_string(),
-        model,
-    })
+    let route = crate::ai_proxy::selected_route(true)?;
+    Ok(ExpertProvider { url: route.url, api_key: route.api_key, model: route.model })
 }
 
 async fn call_expert_model(

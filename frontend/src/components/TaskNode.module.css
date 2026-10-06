@@ -1,0 +1,274 @@
+.nodeWrapper {
+  width: 300px;
+  background: var(--dsw-alias-bg-layer-1, #ffffff);
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04), 0 2px 8px rgba(0, 0, 0, 0.02);
+  transition: all 0.2s cubic-bezier(0.2, 0, 0, 1);
+  cursor: pointer;
+  position: relative;
+  font-family: inherit;
+  user-select: none;
+  box-sizing: border-box;
+}
+
+.nodeWrapper:hover {
+  border-color: var(--dsw-alias-border-l4, rgba(0, 0, 0, 0.24));
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+  transform: translateY(-1px);
+}
+
+.selected {
+  border-color: var(--dsw-alias-button-info-fill, #4176e6) !important;
+  box-shadow: 0 0 0 3px rgba(65, 118, 230, 0.18), 0 4px 16px rgba(65, 118, 230, 0.12) !important;
+}
+
+.running {
+  border-color: var(--dsw-alias-button-info-fill, #4176e6);
+  animation: pulseBorder 2s infinite ease-in-out;
+}
+
+.deprecated {
+  background: var(--dsw-alias-bg-base, #f9fafb) !important;
+  border: 1px dashed var(--dsw-alias-border-l3, #cbd5e1) !important;
+  border-left: 3.5px dashed #9ca3af !important;
+  opacity: 0.65;
+  filter: grayscale(80%);
+}
+
+.deprecated:hover {
+  opacity: 0.9;
+  filter: grayscale(20%);
+}
+
+.deprecated .title {
+  color: var(--dsw-alias-label-secondary, #64748b) !important;
+  text-decoration: line-through;
+}
+
+.deprecated .kindBadge {
+  background: rgba(156, 163, 175, 0.15) !important;
+  color: #6b7280 !important;
+}
+
+@keyframes pulseBorder {
+  0% {
+    box-shadow: 0 0 0 0 rgba(65, 118, 230, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(65, 118, 230, 0.08);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(65, 118, 230, 0);
+  }
+}
+
+/* Left accent bar based on kind */
+.accentResearch {
+  border-left: 3.5px solid rgb(147, 51, 234);
+}
+
+.accentCoding {
+  border-left: 3.5px solid var(--dsw-static-deepseek-500, #4176e6);
+}
+
+.accentVerify {
+  border-left: 3.5px solid var(--dsw-alias-state-success-primary, #22c55e);
+}
+
+.accentIssue {
+  border-left: 3.5px solid var(--dsw-alias-state-warn-primary, #f59e0b);
+}
+
+.accentGate {
+  border-left: 3.5px solid var(--dsw-alias-state-error-primary, #ec1313);
+}
+
+.accentPlan {
+  border-left: 3.5px solid var(--dsw-static-neutral-bluish-400, #94a3b8);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.badgeGroup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+
+.kindBadge {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Kind badge color variants */
+.kindResearch {
+  background: rgba(147, 51, 234, 0.08);
+  color: rgb(147, 51, 234);
+}
+
+.kindCoding {
+  background: var(--dsw-static-deepseek-50, #edf3fe);
+  color: var(--dsw-static-deepseek-500, #4176e6);
+}
+
+.kindVerify {
+  background: var(--dsw-alias-state-success-tertiary, #e6faed);
+  color: var(--dsw-alias-state-success-primary, #22c55e);
+}
+
+.kindIssue {
+  background: var(--dsw-alias-state-warn-tertiary, #fef5e7);
+  color: var(--dsw-alias-state-warn-label, #dd8629);
+}
+
+.kindGate {
+  background: var(--dsw-static-red-50, #fef2f2);
+  color: var(--dsw-alias-state-error-primary, #ec1313);
+}
+
+.kindPlan {
+  background: var(--dsw-static-neutral-bluish-75, #f1f3f5);
+  color: var(--dsw-alias-label-secondary, #61666b);
+}
+
+.nodeIdTag {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-caption, #9ca3af);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 140px;
+}
+
+.statusIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(65, 118, 230, 0.2);
+  border-top-color: var(--dsw-alias-button-info-fill, #4176e6);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary, #111827);
+  line-height: 1.4;
+  margin-bottom: 5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.description {
+  font-size: 11.5px;
+  color: var(--dsw-alias-label-secondary, #61666b);
+  line-height: 1.45;
+  margin-bottom: 6px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding-top: 5px;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.05));
+  font-size: 10.5px;
+}
+
+.toolPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--dsw-static-neutral-bluish-60, #f5f6f7);
+  color: var(--dsw-alias-label-secondary, #61666b);
+  padding: 1.5px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+}
+
+.filePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--dsw-static-deepseek-50, #edf3fe);
+  color: var(--dsw-static-deepseek-600, #4868b2);
+  padding: 1.5px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.consultPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: rgba(147, 51, 234, 0.08);
+  color: rgb(147, 51, 234);
+  padding: 1.5px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+/* Distinct handles */
+.handleBase {
+  width: 7px;
+  height: 7px;
+  background: var(--dsw-alias-border-l4, #94a3b8);
+  border: 1.5px solid var(--dsw-alias-bg-layer-1, #ffffff);
+  border-radius: 50%;
+  opacity: 0.5;
+  transition: all 0.15s ease;
+}
+
+.nodeWrapper:hover .handleBase {
+  opacity: 0.9;
+  background: var(--dsw-alias-button-info-fill, #4176e6);
+}

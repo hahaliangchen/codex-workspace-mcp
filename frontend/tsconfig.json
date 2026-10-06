@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["ES2024", "DOM", "DOM.Iterable", "ESNext.Disposable"],
+    "types": [],
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "paths": {
+      "@deepseek-ai/dsh-client-ui-primitives": ["./src/dsh/ui-primitives/index.ts"],
+      "@deepseek-ai/dsh-client-store": ["./src/dsh/store/index.ts"],
+      "@deepseek-ai/dsh-client-ui-slots": ["./src/dsh/ui-slots/index.ts"],
+      "@deepseek-ai/dsh-util-workspace-path": ["./src/dsh/workspace-path/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/dsh/cordis"]
+}

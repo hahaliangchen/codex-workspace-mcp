@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, Result, params, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::OnceLock;
@@ -10,9 +10,10 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         let _ = std::fs::create_dir_all(&index_dir);
     }
     let db_path = index_dir.join("codex_state.db");
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let _ = conn.execute("PRAGMA journal_mode=WAL;", []);
+    crate::symbol_index_state::schema(&conn)?;
 
     // Create memories table
     conn.execute(
@@ -28,6 +29,23 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         )",
         [],
     )?;
+    // Older workspaces already have the original memories table.
+    let _ = conn.execute("ALTER TABLE memories ADD COLUMN source_task_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'", []);
+    let _ = conn.execute("ALTER TABLE memories ADD COLUMN applies_to TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE memories ADD COLUMN source_refs TEXT NOT NULL DEFAULT '[]'", []);
+    let legacy_memory_index:Option<String>=conn.query_row("SELECT sql FROM sqlite_master WHERE name='idx_memories_source_task'",[],|row|row.get(0)).optional()?;
+    if legacy_memory_index.is_some_and(|sql|!sql.contains("kind")) {
+        conn.execute("DROP INDEX IF EXISTS idx_memories_source_task",[])?;
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_task
+         ON memories(workspace_root, source_task_id) WHERE source_task_id IS NOT NULL AND kind <> 'observer'",
+        [],
+    )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS observer_memory_sources (
+        workspace_root TEXT NOT NULL, summary TEXT NOT NULL, implementation TEXT NOT NULL,
+        sources TEXT NOT NULL, PRIMARY KEY(workspace_root,summary,implementation));")?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS architecture_memories (
@@ -78,10 +96,12 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
         [],
     )?;
 
+    crate::symbol_description::schema(&conn)?;
+
     // Create rust_symbols table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS rust_symbols (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
             workspace_root TEXT NOT NULL,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -94,7 +114,8 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
             visibility TEXT NOT NULL,
             impl_type TEXT,
             trait_name TEXT,
-            calls_json TEXT NOT NULL
+            calls_json TEXT NOT NULL,
+            PRIMARY KEY (workspace_root, id)
         )",
         [],
     )?;
@@ -102,7 +123,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     // Create go_symbols table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS go_symbols (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
             workspace_root TEXT NOT NULL,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -116,7 +137,8 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
             receiver_name TEXT,
             receiver_type TEXT,
             calls_json TEXT NOT NULL,
-            file_imports_json TEXT NOT NULL
+            file_imports_json TEXT NOT NULL,
+            PRIMARY KEY (workspace_root, id)
         )",
         [],
     )?;
@@ -124,7 +146,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     // Create ts_symbols table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS ts_symbols (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
             workspace_root TEXT NOT NULL,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -140,7 +162,8 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
             calls_json TEXT NOT NULL,
             import_bindings_json TEXT NOT NULL,
             imports_json TEXT NOT NULL,
-            re_exports_json TEXT NOT NULL
+            re_exports_json TEXT NOT NULL,
+            PRIMARY KEY (workspace_root, id)
         )",
         [],
     )?;
@@ -148,7 +171,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     // Create python_symbols table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS python_symbols (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
             workspace_root TEXT NOT NULL,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -160,10 +183,18 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
             docstring TEXT NOT NULL,
             decorators_json TEXT NOT NULL,
             calls_json TEXT NOT NULL,
-            file_imports_json TEXT NOT NULL
+            file_imports_json TEXT NOT NULL,
+            PRIMARY KEY (workspace_root, id)
         )",
         [],
     )?;
+
+    migrate_legacy_symbol_keys(&mut conn)?;
+
+    for language in ["rust","ts","python","go"] {
+        conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS idx_{language}_workspace_file ON {language}_symbols(workspace_root,file_path,start_line); CREATE INDEX IF NOT EXISTS idx_{language}_workspace_name ON {language}_symbols(workspace_root,name);"))?;
+    }
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_workspace_parent ON ts_symbols(workspace_root,parent_id)",[])?;
 
     // Create index_metadata table — tracks when each language index was last built
     conn.execute(
@@ -238,6 +269,40 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     )?;
 
     Ok(conn)
+}
+
+/// Older symbol tables used `id` as a global primary key even though IDs are
+/// relative to a workspace. Preserve their rows and IDs while scoping the key.
+fn migrate_legacy_symbol_keys(conn: &mut Connection) -> Result<()> {
+    let mut legacy = Vec::new();
+    for table in ["rust_symbols", "go_symbols", "ts_symbols", "python_symbols"] {
+        let schema: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if schema.contains("id TEXT PRIMARY KEY") {
+            legacy.push((table, schema));
+        }
+    }
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for (table, schema) in legacy {
+        let columns = &schema[schema.find('(').expect("symbol table has columns") + 1
+            ..schema.rfind(')').expect("symbol table has closing parenthesis")];
+        let columns = columns.replacen("id TEXT PRIMARY KEY", "id TEXT NOT NULL", 1);
+        let migrated = format!("{table}_scope_key_migration");
+        tx.execute_batch(&format!(
+            "CREATE TABLE {migrated} ({columns}, PRIMARY KEY (workspace_root, id));
+             INSERT INTO {migrated} SELECT * FROM {table};
+             DROP TABLE {table};
+             ALTER TABLE {migrated} RENAME TO {table};"
+        ))?;
+    }
+    tx.commit()
 }
 
 pub enum DbWriteEvent {

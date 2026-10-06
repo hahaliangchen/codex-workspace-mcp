@@ -43,6 +43,10 @@ func SaveWorkflow(topic string) error {
     let search = search_symbols(
         &root,
         SearchGoSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "workflow".to_string(),
             limit: 10,
@@ -67,6 +71,7 @@ func SaveWorkflow(topic string) error {
     let read = read_symbol(
         &root,
         ReadGoSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: create.id.clone(),
             include_context: true,
@@ -90,6 +95,7 @@ func SaveWorkflow(topic string) error {
     let save_read = read_symbol(
         &root,
         ReadGoSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: save.id.clone(),
             include_context: true,
@@ -137,6 +143,10 @@ func Run() {
     let run = search_symbols(
         &root,
         SearchGoSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "Run".to_string(),
             limit: 5,
@@ -150,6 +160,7 @@ func Run() {
     let read = read_symbol(
         &root,
         ReadGoSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
@@ -192,6 +203,10 @@ func (s *PptService) Save(topic string) error {
     let create = search_symbols(
         &root,
         SearchGoSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "Create".to_string(),
             limit: 5,
@@ -207,6 +222,7 @@ func (s *PptService) Save(topic string) error {
     let read = read_symbol(
         &root,
         ReadGoSymbolRequest {
+            options: Default::default(),
             workspace_root: root.display().to_string(),
             symbol_id: create.id,
             include_context: true,
@@ -236,6 +252,10 @@ fn search_builds_index_when_missing() {
     let search = search_symbols(
         &root,
         SearchGoSymbolsRequest {
+            options: crate::symbol_query::SearchOptions {
+                detailed: true,
+                ..Default::default()
+            },
             workspace_root: root.display().to_string(),
             query: "AutoBuild".to_string(),
             limit: 5,

@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeSet,
-    fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,21 +8,6 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Parser};
 
 const MAX_GO_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const NOISE_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".codex-workspace-mcp",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoIndexError {
@@ -119,6 +103,7 @@ pub struct IndexGoWorkspaceRequest {
 
 #[derive(Debug, Serialize)]
 pub struct IndexGoWorkspaceResponse {
+    pub index: crate::symbol_index_state::IndexHealth,
     pub index_path: String,
     pub files_indexed: usize,
     pub symbols_indexed: usize,
@@ -127,6 +112,7 @@ pub struct IndexGoWorkspaceResponse {
 
 #[derive(Debug, Serialize)]
 pub struct GoIndexStatus {
+    pub index: Option<crate::symbol_index_state::IndexHealth>,
     pub index_path: String,
     pub exists: bool,
     pub workspace_root: String,
@@ -137,6 +123,8 @@ pub struct GoIndexStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct ListGoSymbolsRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::ListOptions,
     pub workspace_root: String,
     pub file_path: Option<String>,
     pub kind: Option<GoSymbolKind>,
@@ -144,11 +132,15 @@ pub struct ListGoSymbolsRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ListGoSymbolsResponse {
+    pub page: crate::symbol_query::PageInfo,
+    pub index: crate::symbol_index_state::IndexHealth,
     pub symbols: Vec<GoSymbolSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SearchGoSymbolsRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::SearchOptions,
     pub workspace_root: String,
     pub query: String,
     #[serde(default = "default_symbol_limit")]
@@ -157,13 +149,20 @@ pub struct SearchGoSymbolsRequest {
 
 #[derive(Debug, Serialize)]
 pub struct SearchGoSymbolsResponse {
+    pub terms: Vec<String>,
+    pub match_mode: crate::symbol_query::MatchMode,
+    pub page: crate::symbol_query::PageInfo,
+    pub index: crate::symbol_index_state::IndexHealth,
     pub query: String,
     pub matches: Vec<GoSymbolSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ReadGoSymbolRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::ReadOptions,
     pub workspace_root: String,
+    #[serde(default)]
     pub symbol_id: String,
     #[serde(default)]
     pub include_context: bool,
@@ -171,6 +170,9 @@ pub struct ReadGoSymbolRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ReadGoSymbolResponse {
+    pub description: crate::symbol_description::Description,
+    pub index: crate::symbol_index_state::IndexHealth,
+    pub relationship_accuracy: &'static str,
     pub symbol: GoSymbol,
     pub content: String,
     pub callers: Vec<GoCaller>,
@@ -180,6 +182,12 @@ pub struct ReadGoSymbolResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GoSymbolSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<crate::symbol_description::Description>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
     pub id: String,
     pub name: String,
     pub kind: GoSymbolKind,
@@ -187,7 +195,9 @@ pub struct GoSymbolSummary {
     pub file_path: String,
     pub start_line: usize,
     pub end_line: usize,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub signature: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub docstring: String,
     pub receiver: Option<String>,
 }
@@ -221,15 +231,26 @@ pub struct GoSuggestedRead {
 pub fn index_workspace(root: &Path) -> Result<IndexGoWorkspaceResponse> {
     let (files_indexed, symbols_indexed) = build_index(root)?;
     Ok(IndexGoWorkspaceResponse {
+        index: crate::symbol_index_state::health(root, "go", "go_symbols")?,
         index_path: "SQLite".to_string(),
         files_indexed,
         symbols_indexed,
-        generated_at_unix: now_unix(),
+        generated_at_unix: status(root).generated_at_unix.unwrap_or_else(now_unix),
     })
 }
 
 pub fn status(root: &Path) -> GoIndexStatus {
-    let conn = crate::database::init_db(root).unwrap();
+    let Some(conn) = crate::database::init_db(root).ok() else {
+        return GoIndexStatus {
+            index: None,
+            index_path: "SQLite".to_string(),
+            exists: false,
+            workspace_root: root.display().to_string(),
+            generated_at_unix: None,
+            files_indexed: None,
+            symbols_indexed: None,
+        };
+    };
     // Bug3: 读取元数据中记录的真实索引创建时间
     let generated_at =
         crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go");
@@ -243,12 +264,13 @@ pub fn status(root: &Path) -> GoIndexStatus {
             .unwrap_or(0);
         let files_indexed: i64 = conn
             .query_row(
-                "SELECT count(DISTINCT file_path) FROM go_symbols WHERE workspace_root = ?",
+                "SELECT count(*) FROM symbol_index_files WHERE workspace_root = ? AND language = 'go' AND status = 'indexed'",
                 rusqlite::params![root.to_string_lossy()],
                 |row| row.get(0),
             )
             .unwrap_or(0);
         return GoIndexStatus {
+            index: crate::symbol_index_state::health(root, "go", "go_symbols").ok(),
             index_path: "SQLite".to_string(),
             exists: true,
             workspace_root: root.display().to_string(),
@@ -258,6 +280,7 @@ pub fn status(root: &Path) -> GoIndexStatus {
         };
     }
     GoIndexStatus {
+        index: crate::symbol_index_state::health(root, "go", "go_symbols").ok(),
         index_path: "SQLite".to_string(),
         exists: false,
         workspace_root: root.display().to_string(),
@@ -274,151 +297,341 @@ pub fn maybe_reindex_after_write(
     if changed_path.extension().and_then(|value| value.to_str()) != Some("go") {
         return Ok(None);
     }
-    let conn = crate::database::init_db(root).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM go_symbols WHERE workspace_root = ?",
-            rusqlite::params![root.to_string_lossy()],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    if count == 0 {
+    let conn = crate::database::init_db(root)?;
+    if crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go").is_none() {
         return Ok(None);
     }
-    index_workspace(root).map(Some)
+    let (files_indexed,symbols_indexed)=build_index_scope(root,Some(changed_path))?;
+    Ok(Some(IndexGoWorkspaceResponse { index:crate::symbol_index_state::health(root,"go","go_symbols")?, index_path:"SQLite".into(), files_indexed,symbols_indexed, generated_at_unix:crate::rust_index::now_unix() }))
 }
 
 pub fn list_symbols(root: &Path, request: ListGoSymbolsRequest) -> Result<ListGoSymbolsResponse> {
-    let index_symbols = load_or_build_or_create(root)?;
-    let symbols = index_symbols
+    ensure_query_index(root,request.file_path.as_deref(),request.options.directory.as_deref())?;
+    let kind = request
+        .kind
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let mut selection = crate::symbol_query::Selection {
+        file_path: request.file_path.as_deref(),
+        directory: request.options.directory.as_deref(),
+        kind: kind.as_deref(),
+        include_locals: request.options.include_locals,
+        include_details: request.options.detailed,
+        ..Default::default()
+    };
+    let total = selection.count(root, "go_symbols")?;
+    let page = crate::symbol_query::page(total, request.options.offset, request.options.limit);
+    selection.pagination = Some((page.offset, page.limit));
+    let symbols = load_selected_symbols(root, &selection)?;
+    let catalog = crate::symbol_description::Catalog::load_for_files(root, "go", &symbols.iter().map(|symbol|symbol.file_path.as_str()).collect::<Vec<_>>())?;
+    let symbols = symbols
         .iter()
-        .filter(|symbol| {
-            request
-                .file_path
-                .as_deref()
-                .map(|file| symbol.file_path == normalize_slashes(file))
-                .unwrap_or(true)
+        .map(|symbol| {
+            let mut summary = compact_summary(symbol, request.options.detailed);
+            summary.description = Some(describe_symbol(&catalog, symbol));
+            summary
         })
-        .filter(|symbol| {
-            request
-                .kind
-                .as_ref()
-                .map(|kind| &symbol.kind == kind)
-                .unwrap_or(true)
-        })
-        .map(GoSymbolSummary::from)
         .collect();
-    Ok(ListGoSymbolsResponse { symbols })
+    Ok(ListGoSymbolsResponse {
+        symbols,
+        page,
+        index: crate::symbol_index_state::health(root, "go", "go_symbols")?,
+    })
+}
+
+fn describe_symbol(
+    catalog: &crate::symbol_description::Catalog,
+    symbol: &GoSymbol,
+) -> crate::symbol_description::Description {
+    let scope = format!(
+        "{}.{}",
+        symbol.package,
+        symbol.receiver_type.as_deref().unwrap_or("")
+    )
+    .trim_matches('.')
+    .to_owned();
+    let qualified = crate::symbol_description::qualified_name("go", &scope, &symbol.name);
+    catalog.describe(&symbol.id, &symbol.file_path, &qualified)
+}
+
+fn compact_summary(symbol: &GoSymbol, detailed: bool) -> GoSymbolSummary {
+    let mut summary = GoSymbolSummary::from(symbol);
+    if detailed {
+        summary.signature = crate::symbol_query::preview(&symbol.signature, 240);
+        summary.docstring = crate::symbol_query::preview(&symbol.docstring, 480);
+    } else {
+        summary.signature.clear();
+        summary.docstring.clear();
+    }
+    summary
 }
 
 pub fn search_symbols(
     root: &Path,
     request: SearchGoSymbolsRequest,
 ) -> Result<SearchGoSymbolsResponse> {
-    let needle = request.query.to_lowercase();
-    let index_symbols = load_or_build_or_create(root)?;
-    let mut matches: Vec<_> = index_symbols
+    let terms = crate::symbol_query::terms(&request.query, request.options.match_mode);
+    if terms.is_empty() {
+        return Err(std::io::Error::other("query must contain at least one search term").into());
+    }
+    ensure_query_index(root,request.options.file_path.as_deref(),request.options.directory.as_deref())?;
+    let selection = crate::symbol_query::Selection {
+        file_path: request.options.file_path.as_deref(),
+        directory: request.options.directory.as_deref(),
+        kind: request.options.kind.as_deref(),
+        include_details: true,
+        terms: &terms,
+        mode: request.options.match_mode,
+        include_locals: request.options.include_locals,
+        ..Default::default()
+    };
+    let symbols = load_selected_symbols(root, &selection)?;
+    let catalog = crate::symbol_description::Catalog::load_for_files(root, "go", &symbols.iter().map(|symbol|symbol.file_path.as_str()).collect::<Vec<_>>())?;
+    let mut ranked: Vec<_> = symbols
         .iter()
-        .filter(|symbol| {
-            [
-                symbol.name.as_str(),
-                symbol.signature.as_str(),
-                symbol.docstring.as_str(),
-                symbol.file_path.as_str(),
-                symbol.package.as_str(),
-            ]
-            .join("\n")
-            .to_lowercase()
-            .contains(&needle)
+        .filter_map(|symbol| {
+            let scope = format!(
+                "{}.{}",
+                symbol.package,
+                symbol.receiver_type.as_deref().unwrap_or("")
+            )
+            .trim_end_matches('.')
+            .to_owned();
+            let description = describe_symbol(&catalog, symbol);
+            crate::symbol_query::score(
+                &symbol.name,
+                &scope,
+                &symbol.signature,
+                &symbol.docstring,
+                &symbol.file_path,
+                &terms,
+                request.options.match_mode,
+                &description,
+            )
+            .map(|(score, matched)| (score, symbol, matched, description))
         })
-        .take(request.limit.max(1))
-        .map(GoSymbolSummary::from)
         .collect();
-    matches.sort_by(|a, b| {
-        a.file_path
-            .cmp(&b.file_path)
+    let page = crate::symbol_query::rank_page(&mut ranked, request.options.offset, request.limit, |(a_score, a, _, _), (b_score, b, _, _)| {
+        b_score
+            .cmp(a_score)
+            .then(a.file_path.cmp(&b.file_path))
             .then(a.start_line.cmp(&b.start_line))
+            .then(a.id.cmp(&b.id))
     });
+    let matches = ranked
+        .iter()
+        .skip(page.offset)
+        .take(page.limit)
+        .map(|(score, symbol, matched, description)| {
+            let mut summary = compact_summary(symbol, request.options.detailed);
+            summary.description = Some(description.clone());
+            summary.score = Some(*score);
+            summary.matched_terms = matched.clone();
+            summary
+        })
+        .collect();
     Ok(SearchGoSymbolsResponse {
+        terms,
+        match_mode: request.options.match_mode,
         query: request.query,
         matches,
+        page,
+        index: crate::symbol_index_state::health(root, "go", "go_symbols")?,
     })
 }
 
 pub fn read_symbol(root: &Path, request: ReadGoSymbolRequest) -> Result<ReadGoSymbolResponse> {
-    let index_symbols = load_or_build_or_create(root)?;
-    let symbol = index_symbols
-        .iter()
-        .find(|symbol| symbol.id == request.symbol_id)
-        .cloned()
-        .ok_or_else(|| GoIndexError::SymbolNotFound(request.symbol_id.clone()))?;
-    let path = root.join(&symbol.file_path);
-    let content = fs::read_to_string(path)?;
-    let lines: Vec<_> = content.lines().collect();
-    let content = lines[(symbol.start_line - 1)..symbol.end_line.min(lines.len())].join("\n");
+    read_symbol_snapshot(root,&request,true)
+}
 
+fn read_symbol_snapshot(root: &Path, request: &ReadGoSymbolRequest, retry:bool) -> Result<ReadGoSymbolResponse> {
+    if request.symbol_id.is_empty()
+        && (request
+            .options
+            .file_path
+            .as_deref()
+            .is_none_or(str::is_empty)
+            || request.options.name.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(std::io::Error::other(
+            "provide symbol_id or both file_path and name (qualified name allowed)",
+        )
+        .into());
+    }
+    let initialized=crate::database::init_db(root).ok().is_some_and(|conn|crate::database::get_index_generated_at(&conn,&root.to_string_lossy(),"go").is_some());
+    if !initialized {build_index(root)?;}
+    else if request.symbol_id.is_empty() {
+        if let Some(file)=request.options.file_path.as_deref() {
+            if crate::source_read::needs_index_refresh(root,"go",file) {maybe_reindex_after_write(root,&root.join(file))?;}
+        }
+    }
+    let by_id = !request.symbol_id.is_empty();
+    let selection = crate::symbol_query::Selection {
+        symbol_id: by_id.then_some(request.symbol_id.as_str()),
+        file_path: if by_id {
+            None
+        } else {
+            request.options.file_path.as_deref()
+        },
+        name: if by_id {
+            None
+        } else {
+            request.options.name.as_deref()
+        },
+        include_locals: true,
+        include_relationships: true,
+        include_details: true,
+        ..Default::default()
+    };
+    let mut candidates = load_selected_symbols(root, &selection)?;
+    if !by_id {
+        candidates.retain(|symbol| {
+            let scope = format!(
+                "{}.{}",
+                symbol.package,
+                symbol.receiver_type.as_deref().unwrap_or("")
+            )
+            .trim_end_matches('.')
+            .to_owned();
+            crate::symbol_query::name_matches(
+                &symbol.name,
+                &scope,
+                request.options.name.as_deref().unwrap_or(""),
+            )
+        });
+    }
+    if candidates.len() > 1 {
+        let choices = candidates
+            .iter()
+            .take(10)
+            .map(|symbol| {
+                format!(
+                    "{} ({}:{}-{})",
+                    symbol.id, symbol.file_path, symbol.start_line, symbol.end_line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(std::io::Error::other(format!(
+            "ambiguous symbol name; use a qualified name or symbol_id: {choices}"
+        ))
+        .into());
+    }
+    let symbol = candidates.pop().ok_or_else(|| {
+        GoIndexError::SymbolNotFound(if by_id {
+            request.symbol_id.clone()
+        } else {
+            format!(
+                "{}:{}",
+                request.options.file_path.as_deref().unwrap_or(""),
+                request.options.name.as_deref().unwrap_or("")
+            )
+        })
+    })?;
+    let snapshot=crate::source_read::read(&root.join(&symbol.file_path),crate::source_read::FILE_LIMIT)?;
+    if crate::source_read::indexed_hash(root,"go",&symbol.file_path).as_deref()!=Some(snapshot.hash.as_str()) {
+        if !retry {return Err(std::io::Error::other("source_version_conflict: indexed symbol and source versions differ; no source returned").into());}
+        maybe_reindex_after_write(root,&root.join(&symbol.file_path))?;
+        return read_symbol_snapshot(root,request,false);
+    }
+    let source_code_hash=snapshot.hash.clone();
+    let content = crate::symbol_query::source_range(&snapshot.content, symbol.start_line, symbol.end_line)?;
     let (callers, callees, suggested_reads) = if request.include_context {
+        let index_symbols = load_all_symbols(root)?;
         build_context(&index_symbols, &symbol)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
-
+    let catalog = crate::symbol_description::Catalog::load_for_files(root, "go", &[symbol.file_path.as_str()])?;
+    let mut description = describe_symbol(&catalog, &symbol);
+    if description.code_hash != source_code_hash && description.status == "current" {
+        description.status = "stale";
+    }
+    description.code_hash = source_code_hash;
     Ok(ReadGoSymbolResponse {
+        description,
         symbol,
         content,
         callers,
         callees,
         suggested_reads,
+        index: crate::symbol_index_state::health(root, "go", "go_symbols")?,
+        relationship_accuracy: "heuristic_not_type_checked",
     })
 }
 
 fn build_index(root: &Path) -> Result<(usize, usize)> {
-    let mut files_indexed = 0;
-    let mut symbols_indexed = 0;
-    let mut builder = ignore::WalkBuilder::new(root);
-    builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(true)
-        .filter_entry(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| !NOISE_DIRS.contains(&name))
-                .unwrap_or(true)
-        });
+    build_index_scope(root,None)
+}
 
-    let mut conn = crate::database::init_db(root).unwrap();
-    let tx = conn.transaction().unwrap();
-    tx.execute(
-        "DELETE FROM go_symbols WHERE workspace_root = ?",
-        rusqlite::params![root.to_string_lossy()],
-    )
-    .unwrap();
+fn build_index_scope(root: &Path, changed_path: Option<&Path>) -> Result<(usize, usize)> {
+    build_index_scoped(root,changed_path,false)
+}
 
-    for item in builder.build() {
-        let entry = match item {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("go") {
-            continue;
-        }
+fn build_index_scoped(root: &Path, changed_path: Option<&Path>, directory: bool) -> Result<(usize, usize)> {
+    let refresh_lock = crate::symbol_index_state::lock(root, "go");
+    let _guard = refresh_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut conn = crate::database::init_db(root)?;
+    let plan = match changed_path { Some(path) if directory=>crate::symbol_index_state::RefreshPlan::for_directory(root,"go",&conn,path)?, Some(path)=>crate::symbol_index_state::RefreshPlan::for_file(root,"go",&conn,path)?, None=>crate::symbol_index_state::RefreshPlan::new(root,"go",&conn)? };
+    if !plan.needs_update() {
+        plan.record_check(&conn, root, "go")?;
+        return Ok(crate::symbol_index_state::counts(
+            &conn,
+            root,
+            "go",
+            "go_symbols",
+        )?);
+    }
+    let tx = conn.transaction()?;
+    plan.prepare(&tx, root, "go", "go_symbols")?;
+    for relative in &plan.changed {
+        let path_buf = root.join(relative);
+        let path = path_buf.as_path();
         let metadata = std::fs::metadata(path)?;
         if metadata.len() > MAX_GO_FILE_BYTES {
+            plan.record(
+                &tx,
+                root,
+                "go",
+                path,
+                "skipped_size",
+                "source exceeds the 2 MiB indexing limit",
+            )?;
             continue;
         }
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
-            Err(_) => continue,
+            Err(error) => {
+                plan.record(
+                    &tx,
+                    root,
+                    "go",
+                    path,
+                    "parse_or_read_error",
+                    &error.to_string(),
+                )?;
+                continue;
+            }
         };
+        plan.record_content(&tx, root, "go", path, &content)?;
         let parsed = parse_go_file(root, path, &content);
-        files_indexed += 1;
+        plan.record(
+            &tx,
+            root,
+            "go",
+            path,
+            if parsed.parse_error.is_some() {
+                "parse_error_or_partial"
+            } else {
+                "indexed"
+            },
+            parsed.parse_error.as_deref().unwrap_or(""),
+        )?;
+
         for sym in parsed.symbols {
             let calls_json = serde_json::to_string(&sym.calls).unwrap_or_default();
             let file_imports_json = serde_json::to_string(&parsed.file.imports).unwrap_or_default();
@@ -436,19 +649,23 @@ fn build_index(root: &Path) -> Result<(usize, usize)> {
                     sym.start_line, sym.end_line, sym.signature, sym.docstring,
                     sym.receiver, sym.receiver_name, sym.receiver_type, calls_json, file_imports_json
                 ]
-            ).unwrap();
-            symbols_indexed += 1;
+            )?;
         }
     }
-    tx.commit().unwrap();
-    // Bug3: 记录本次索引的实际时间戳
+    plan.finish(&tx, root, "go")?;
     let ts = now_unix();
-    let meta_conn = crate::database::init_db(root).unwrap();
-    crate::database::upsert_index_metadata(&meta_conn, &root.to_string_lossy(), "go", ts).unwrap();
-    Ok((files_indexed, symbols_indexed))
+    crate::database::upsert_index_metadata(&tx, &root.to_string_lossy(), "go", ts)?;
+    tx.commit()?;
+    Ok(crate::symbol_index_state::counts(
+        &conn,
+        root,
+        "go",
+        "go_symbols",
+    )?)
 }
 
 struct ParsedGoFile {
+    parse_error: Option<String>,
     file: GoFileInfo,
     symbols: Vec<GoSymbol>,
 }
@@ -463,6 +680,7 @@ fn parse_go_file(root: &Path, path: &Path, content: &str) -> ParsedGoFile {
         .is_err()
     {
         return ParsedGoFile {
+            parse_error: Some("Go parser could not produce a syntax tree".to_owned()),
             file: GoFileInfo {
                 file_path: relative_path,
                 package: String::new(),
@@ -473,6 +691,7 @@ fn parse_go_file(root: &Path, path: &Path, content: &str) -> ParsedGoFile {
     }
     let Some(tree) = parser.parse(content, None) else {
         return ParsedGoFile {
+            parse_error: Some("Go parser could not produce a syntax tree".to_owned()),
             file: GoFileInfo {
                 file_path: relative_path,
                 package: String::new(),
@@ -495,6 +714,9 @@ fn parse_go_file(root: &Path, path: &Path, content: &str) -> ParsedGoFile {
     );
 
     ParsedGoFile {
+        parse_error: root_node
+            .has_error()
+            .then(|| "Go syntax tree contains errors; symbols may be partial".to_owned()),
         file: GoFileInfo {
             file_path: relative_path,
             package,
@@ -991,11 +1213,62 @@ fn suggestion_reason(caller: &GoSymbol, matched: &GoSymbol) -> &'static str {
 }
 
 pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
+    load_selected_symbols(
+        root,
+        &crate::symbol_query::Selection {
+            include_locals: true,
+            include_relationships: true,
+            include_details: true,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn load_selected_symbols(
+    root: &std::path::Path,
+    selection: &crate::symbol_query::Selection<'_>,
+) -> Result<Vec<GoSymbol>> {
     let conn =
         crate::database::init_db(root).map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
-    let mut stmt = conn.prepare("SELECT id, name, kind, package_name, file_path, start_line, end_line, signature, docstring, receiver, receiver_name, receiver_type, calls_json, file_imports_json FROM go_symbols WHERE workspace_root = ?").map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
+    let (mut where_sql, mut params) = selection.sql(
+        root,
+        "go_symbols",
+        &[
+            "name",
+            "package_name",
+            "receiver_type",
+            "signature",
+            "docstring",
+            "file_path",
+        ],
+    );
+    let mut select = "SELECT id, name, kind, package_name, file_path, start_line, end_line, signature, docstring, receiver, receiver_name, receiver_type, calls_json, file_imports_json FROM go_symbols".to_owned();
+    if !selection.include_relationships {
+        for column in &["calls_json", "file_imports_json"] {
+            select = select.replace(column, &format!("'[]' AS {column}"));
+        }
+    }
+    if !selection.include_details {
+        select = select
+            .replace(", signature,", ", '' AS signature,")
+            .replace(", docstring,", ", '' AS docstring,");
+    }
+    if let Some((offset, limit)) = selection.pagination {
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+        params.push(rusqlite::types::Value::Integer(
+            i64::try_from(offset).unwrap_or(i64::MAX),
+        ));
+        where_sql.push_str(&format!(
+            " LIMIT ?{} OFFSET ?{}",
+            params.len() - 1,
+            params.len()
+        ));
+    }
+    let mut stmt = conn
+        .prepare(&(select + where_sql.as_str()))
+        .map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
     let symbol_iter = stmt
-        .query_map(rusqlite::params![root.to_string_lossy()], |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(GoSymbol {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -1016,26 +1289,7 @@ pub(crate) fn load_all_symbols(root: &std::path::Path) -> Result<Vec<GoSymbol>> 
         })
         .map_err(|e| GoIndexError::SymbolNotFound(e.to_string()))?;
 
-    let mut symbols = Vec::new();
-    for sym in symbol_iter {
-        if let Ok(s) = sym {
-            symbols.push(s);
-        }
-    }
-    Ok(symbols)
-}
-
-fn load_or_build_or_create(root: &std::path::Path) -> Result<Vec<GoSymbol>> {
-    // Bug4: 用元数据判断是否已索引，避免把「空项目」误判为「从未索引」
-    let conn = crate::database::init_db(root).unwrap();
-    let already_indexed =
-        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "go").is_some();
-    let symbols = load_all_symbols(root)?;
-    if !already_indexed {
-        index_workspace(root)?;
-        return load_all_symbols(root);
-    }
-    Ok(symbols)
+    Ok(symbol_iter.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
@@ -1043,10 +1297,6 @@ fn relative_display(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-fn normalize_slashes(value: &str) -> String {
-    value.replace('\\', "/")
 }
 
 fn symbol_id(file_path: &str, name: &str, line: usize, receiver: Option<&str>) -> String {
@@ -1072,6 +1322,9 @@ fn default_symbol_limit() -> usize {
 impl From<&GoSymbol> for GoSymbolSummary {
     fn from(symbol: &GoSymbol) -> Self {
         Self {
+            description: None,
+            score: None,
+            matched_terms: Vec::new(),
             id: symbol.id.clone(),
             name: symbol.name.clone(),
             kind: symbol.kind.clone(),
@@ -1079,9 +1332,13 @@ impl From<&GoSymbol> for GoSymbolSummary {
             file_path: symbol.file_path.clone(),
             start_line: symbol.start_line,
             end_line: symbol.end_line,
-            signature: symbol.signature.clone(),
-            docstring: symbol.docstring.clone(),
+            signature: crate::symbol_query::preview(&symbol.signature, 160),
+            docstring: crate::symbol_query::preview(&symbol.docstring, 240),
             receiver: symbol.receiver.clone(),
         }
     }
+}
+
+pub(crate) fn ensure_query_index(root: &Path, file: Option<&str>, directory: Option<&str>) -> Result<()> {
+    crate::symbol_index_state::ensure_query_index(root,"go",file,directory,|path,is_directory|build_index_scoped(root,path,is_directory).map(|_|()))
 }

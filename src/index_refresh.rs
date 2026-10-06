@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock}, // 👈 引入 Arc
+    sync::{Arc, Mutex, OnceLock},
     time::SystemTime,
 };
 
@@ -27,16 +27,8 @@ const NOISE_DIRS: &[&str] = &[
     ".codex-workspace-mcp",
 ];
 
-// 🔥 核心重构：将全局单一重锁升级为“多工作区锁表”，用项目绝对路径路由各自独立的锁
+// Serialize refreshes within one workspace; other workspaces remain independent.
 static WORKSPACE_REBUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-
-#[derive(Debug, Clone)]
-struct IndexSnapshot {
-    mtimes: HashMap<PathBuf, SystemTime>,
-    summary: IndexRefreshSummary,
-}
-
-static INDEX_MEMORY_CACHE: OnceLock<Mutex<HashMap<PathBuf, IndexSnapshot>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexLanguage {
@@ -71,56 +63,50 @@ pub fn refresh_workspace_indexes(workspace: &Workspace) -> IndexRefreshSummary {
 }
 
 pub fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
-    // 【第一阶段】：锁外并发元数据嗅探与多项目对账拦截（保持你原有的优秀非阻塞设计）
+    // Detect source languages; language builders handle freshness and incremental updates.
     let current_mtimes = scan_source_mtimes(root);
     let root_buf = root.to_path_buf();
 
-    let cache_lock = INDEX_MEMORY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let cache = cache_lock.lock().unwrap();
-        if let Some(snapshot) = cache.get(&root_buf) {
-            if snapshot.mtimes == current_mtimes {
-                debug!(
-                    path = %root.display(),
-                    "多工作区物理防线：精准命中本工作区缓存，短路排他大锁并秒回"
-                );
-                return snapshot.summary.clone();
-            }
-        }
-    }
-
-    // 【第二阶段】：从全局锁表里，定向获取（或现场初始化）属于当前 root 的独立互斥锁
+    // Use a separate coordination lock for each workspace.
     let ws_rebuild_lock = {
         let mut locks = WORKSPACE_REBUILD_LOCKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap();
         locks
-            .entry(root_buf.clone())
+            .entry(root_buf)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
 
-    // 🔥 关键性能质变：仅锁定当前项目！项目 A 的重建绝对不再阻塞项目 B 的重建，实现真正的跨项目多线程并行
     let _guard = ws_rebuild_lock.lock().unwrap();
 
-    // 经典的双重检查锁定（针对当前工作区）
-    {
-        let cache = cache_lock.lock().unwrap();
-        if let Some(snapshot) = cache.get(&root_buf) {
-            if snapshot.mtimes == current_mtimes {
-                return snapshot.summary.clone();
-            }
-        }
-    }
-
-    // 直接复用锁外已经收集好的 current_mtimes 榨出语言集合，白嫖零成本资产
-    let languages: BTreeSet<IndexLanguage> = current_mtimes
+    // Reuse the discovery scan for language selection.
+    let mut languages: BTreeSet<IndexLanguage> = current_mtimes
         .keys()
         .filter_map(|path| language_for_path(path))
         .collect();
 
-    let languages_detected = languages
+    // Refresh initialized languages too, so deletion of the final source file
+    // clears its stored symbols. Builders reparse only changed files.
+    if let Ok(conn) = crate::database::init_db(root) {
+        for (language, key) in [
+            (IndexLanguage::Rust, "rust"),
+            (IndexLanguage::TypeScript, "ts"),
+            (IndexLanguage::Python, "python"),
+            (IndexLanguage::Go, "go"),
+        ] {
+            if crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), key)
+                .is_some()
+            {
+                languages.insert(language);
+            }
+        }
+    }
+    let languages_detected = current_mtimes
+        .keys()
+        .filter_map(|path| language_for_path(path))
+        .collect::<BTreeSet<_>>()
         .iter()
         .map(|lang| lang.as_str().to_string())
         .collect();
@@ -128,10 +114,7 @@ pub fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
     let mut failures = Vec::new();
 
     for lang in languages {
-        info!(
-            ?lang,
-            "index refresh: rebuilding request-scoped symbol index"
-        );
+        info!(?lang, "index refresh: checking source changes");
         match rebuild_index_for_language(root, lang) {
             Ok(summary) => languages_refreshed.push(summary),
             Err(error) => {
@@ -150,18 +133,6 @@ pub fn refresh_workspace_indexes_at(root: &Path) -> IndexRefreshSummary {
         failures,
     };
 
-    // 【第三阶段】：历史记账
-    {
-        let mut cache = cache_lock.lock().unwrap();
-        cache.insert(
-            root_buf,
-            IndexSnapshot {
-                mtimes: current_mtimes,
-                summary: final_summary.clone(),
-            },
-        );
-    }
-
     final_summary
 }
 
@@ -173,7 +144,7 @@ fn detect_workspace_languages(root: &Path) -> BTreeSet<IndexLanguage> {
         .collect()
 }
 
-fn scan_source_mtimes(root: &Path) -> HashMap<PathBuf, SystemTime> {
+pub(crate) fn scan_source_mtimes(root: &Path) -> HashMap<PathBuf, SystemTime> {
     let mut mtimes = HashMap::new();
     let mut builder = WalkBuilder::new(root);
     builder

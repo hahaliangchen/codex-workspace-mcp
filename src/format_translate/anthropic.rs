@@ -255,6 +255,12 @@ fn split_user(content: Option<&Value>) -> (Vec<Value>, Vec<Value>) {
                 }));
             }
             Some("thinking") => {} // drop
+            Some("image") => {
+                let source=&b["source"];
+                let url=if source["type"]=="base64" {format!("data:{};base64,{}",source["media_type"].as_str().unwrap_or("image/png"),source["data"].as_str().unwrap_or(""))}
+                    else {source["url"].as_str().unwrap_or("").to_owned()};
+                if !url.is_empty() {plain.push(json!({"type":"image_url","image_url":{"url":url}}));}
+            }
             Some("text") => {
                 let mut b_cleaned = b.clone();
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {

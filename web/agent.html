@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Agent · Workspace</title>
+    <link rel="stylesheet" href="/agent/dsh-base.css">
+    <link rel="stylesheet" href="/agent/dsh-design.css">
+    <link rel="stylesheet" href="/agent/app.css">
+    <script src="/agent/app.js" type="module"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="任务列表">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">✦</div>
+          <div class="brand-copy"><strong>Workspace Agent</strong><span>Rust runtime · DSH 风格界面</span></div>
+        </div>
+        <button class="new-task" id="new-task" type="button"><span aria-hidden="true">＋</span> 新任务</button>
+        <a class="settings-entry" href="/agent/settings">⚙ <span>设置</span></a>
+        <div class="section-heading">最近任务</div>
+        <nav class="task-list" id="task-list" aria-label="最近任务"></nav>
+        <div class="sidebar-footer">
+          <div class="footer-label">当前工作区</div>
+          <div class="workspace-path" id="workspace-path" title="当前工作区">连接中…</div>
+        </div>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <button class="icon-button mobile-menu" id="menu-toggle" type="button" aria-label="打开任务列表">☰</button>
+          <div class="topbar-title"><span class="eyebrow">AGENT TASK</span><h1 id="task-title">新任务</h1></div>
+          <div class="topbar-actions">
+            <span class="connection" id="connection"><span class="status-dot"></span><span id="connection-text">连接中</span></span>
+            <button class="icon-button" id="theme-toggle" type="button" aria-label="切换外观" title="切换外观">◐</button>
+          </div>
+        </header>
+
+        <div class="viewbar">
+          <div class="view-tabs" role="tablist" aria-label="任务视图">
+            <button class="view-tab active" id="tab-chat" type="button" role="tab" aria-selected="true">对话</button>
+            <button class="view-tab" id="tab-trajectory" type="button" role="tab" aria-selected="false">轨迹</button>
+          </div>
+          <div class="task-controls"><button class="cancel-button" id="parent-task" type="button" hidden>返回主任务</button><span class="task-status" id="task-status"></span><button class="cancel-button" id="cancel-task" type="button" hidden>停止任务</button></div>
+        </div>
+
+        <div class="content-scroll" id="content-scroll">
+          <div class="content-inner" id="content">
+            <div class="welcome" id="welcome">
+              <div class="welcome-symbol" aria-hidden="true">✦</div>
+              <h2>让 Agent 开始工作</h2>
+              <p>描述要完成的任务。Agent 可以读取与修改工作区文件、搜索代码，并在需要时运行受限命令。</p>
+              <div class="welcome-capabilities"><span>文件操作</span><span>代码索引</span><span>任务轨迹</span><span>历史恢复</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="composer-wrap">
+          <form class="composer" id="task-form">
+            <label class="sr-only" for="prompt">任务描述</label>
+            <textarea id="prompt" rows="3" placeholder="描述你希望 Agent 完成的工作…" spellcheck="true"></textarea>
+            <div class="composer-bottom"><span id="composer-hint">Ctrl + Enter 发送</span><button class="send-button" id="send-task" type="submit" disabled>开始任务 <span aria-hidden="true">↗</span></button></div>
+          </form>
+          <p class="composer-note" id="composer-note">Agent 将在当前工作区中执行任务。</p>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,666 @@
+.root {
+  width: min(760px, calc(100% - 32px));
+  margin: 0 auto 16px;
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.hero {
+  width: 100%;
+  margin: 0 auto;
+}
+
+.notice {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--codex-hover-bg);
+  color: var(--codex-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* 1. Full Access Warning Banner (Figure 2) */
+.permissionBanner {
+  width: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  margin-bottom: 0;
+  border-radius: 12px;
+  background: var(--codex-card-bg, #ffffff);
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--codex-text-secondary, #52525b);
+  animation: bannerFadeIn 0.2s ease-out;
+}
+
+:global(body[data-ds-dark-theme]) .permissionBanner {
+  background: #202024;
+  border-color: #2e2e33;
+  color: #d4d4d8;
+  box-shadow: none;
+}
+
+.bannerLeft {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.infoIcon {
+  color: var(--codex-text-muted, #71717a);
+  font-size: 13.5px;
+  line-height: 1.4;
+  flex: none;
+}
+
+.bannerContent {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.bannerTitle {
+  font-weight: 600;
+  font-size: 12.5px;
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .bannerTitle {
+  color: #f4f4f5;
+}
+
+.bannerText {
+  color: var(--codex-text-secondary, #6b7280);
+  font-size: 11.5px;
+  line-height: 16px;
+  word-break: break-word;
+}
+
+:global(body[data-ds-dark-theme]) .bannerText {
+  color: #a1a1aa;
+}
+
+.learnMoreLink {
+  color: var(--codex-text-primary, #18181b);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+:global(body[data-ds-dark-theme]) .learnMoreLink {
+  color: #f4f4f5;
+}
+
+.bannerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.dismissBtn {
+  padding: 4px 12px;
+  border-radius: 9999px;
+  border: none;
+  background: #18181b;
+  color: #ffffff;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.15s;
+  white-space: nowrap;
+}
+
+:global(body[data-ds-dark-theme]) .dismissBtn {
+  background: #ffffff;
+  color: #18181b;
+}
+
+.dismissBtn:hover {
+  opacity: 0.85;
+}
+
+.closeBannerBtn {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--codex-text-muted, #71717a);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  font-size: 13px;
+}
+
+.closeBannerBtn:hover {
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .closeBannerBtn:hover {
+  color: #f4f4f5;
+}
+
+/* 2. Layered Composer Dock (media_1791084397752.png) */
+.composerBox {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  position: relative;
+}
+
+/* Layer 2: Floating White Card with Google Search Box elevation */
+.card {
+  position: relative;
+  z-index: 2;
+  margin-top: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  background: var(--codex-card-bg, #ffffff);
+  border: 1px solid var(--codex-card-border, #dfe1e5);
+  border-radius: 20px;
+  /* Softer, higher-blur ambient elevation with +2px spread */
+  box-shadow: 0 2px 14px 2px rgba(32, 33, 36, 0.10);
+  padding: 12px 16px 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.2s cubic-bezier(0.2, 0, 0, 1), box-shadow 0.2s cubic-bezier(0.2, 0, 0, 1);
+}
+
+.card:hover {
+  border-color: rgba(223, 225, 229, 0);
+  box-shadow: 0 3px 18px 2px rgba(32, 33, 36, 0.14);
+}
+
+.card:focus-within {
+  border-color: transparent;
+  box-shadow: 0 4px 22px 3px rgba(32, 33, 36, 0.16);
+}
+
+:global(body[data-ds-dark-theme]) .card {
+  background: #202024;
+  border-color: #303134;
+  box-shadow: 0 2px 14px 2px rgba(0, 0, 0, 0.35);
+}
+
+:global(body[data-ds-dark-theme]) .card:hover {
+  border-color: transparent;
+  box-shadow: 0 3px 18px 2px rgba(0, 0, 0, 0.45);
+}
+
+:global(body[data-ds-dark-theme]) .card:focus-within {
+  border-color: transparent;
+  box-shadow: 0 4px 22px 3px rgba(0, 0, 0, 0.6);
+}
+
+.inputWrap {
+  width: 100%;
+  position: relative;
+}
+
+.textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 28px;
+  max-height: 260px;
+  resize: none;
+  overflow-y: auto;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--codex-text-primary, #18181b);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 22px;
+  padding: 2px 0 0;
+}
+
+:global(body[data-ds-dark-theme]) .textarea {
+  color: #f4f4f5;
+}
+
+.textarea::placeholder {
+  color: var(--codex-text-muted, #9ca3af);
+}
+
+.textarea:disabled {
+  opacity: 0.6;
+}
+
+/* 3. Bottom Action Toolbar */
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 4px;
+  gap: 8px;
+}
+
+.leftControls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Bare Plus Button matching media_1791084397752.png */
+.barePlusBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: none;
+  background: transparent;
+  color: var(--codex-text-primary, #18181b);
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+:global(body[data-ds-dark-theme]) .barePlusBtn {
+  color: #f4f4f5;
+}
+
+.barePlusBtn:hover {
+  opacity: 0.7;
+}
+
+/* Permission Pill: (!) 完全访问 / 🛡️ 只读 / 📝 工作区写入 (media_1791084397752.png & media_1791085181305.png) */
+.permPill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #ea580c;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  user-select: none;
+}
+
+.permPill:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+}
+
+:global(body[data-ds-dark-theme]) .permPill {
+  background: transparent;
+  color: #fb923c;
+}
+
+:global(body[data-ds-dark-theme]) .permPill:hover {
+  background: #27272a;
+}
+
+.permPillNeutral {
+  color: var(--codex-text-secondary, #4b5563);
+}
+
+:global(body[data-ds-dark-theme]) .permPillNeutral {
+  color: #d4d4d8;
+}
+
+.permPillSafe {
+  color: #059669;
+}
+
+:global(body[data-ds-dark-theme]) .permPillSafe {
+  color: #34d399;
+}
+
+/* 4. Codex-styled Permission Popover for DSH permissions (media_1791085181305.png) */
+.permPopover {
+  position: fixed;
+  z-index: 10000;
+  width: 350px;
+  max-width: calc(100vw - 32px);
+  background: var(--codex-card-bg, #ffffff);
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  border-radius: 14px;
+  box-shadow: 0 16px 36px -4px rgba(0, 0, 0, 0.14), 0 6px 16px -2px rgba(0, 0, 0, 0.08);
+  padding: 14px 12px 10px;
+  box-sizing: border-box;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+}
+
+:global(body[data-ds-dark-theme]) .permPopover {
+  background: #202024;
+  border-color: #323238;
+  box-shadow: 0 16px 36px -4px rgba(0, 0, 0, 0.4), 0 6px 16px -2px rgba(0, 0, 0, 0.25);
+}
+
+.permPopoverHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 10px 4px;
+}
+
+.permPopoverTitle {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--codex-text-primary, #18181b);
+  letter-spacing: -0.1px;
+}
+
+:global(body[data-ds-dark-theme]) .permPopoverTitle {
+  color: #f4f4f5;
+}
+
+.permPopoverLearnMore {
+  font-size: 12px;
+  color: var(--codex-text-muted, #71717a);
+  text-decoration: underline;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+.permPopoverLearnMore:hover {
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .permPopoverLearnMore:hover {
+  color: #f4f4f5;
+}
+
+.permOptionList {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.permOptionItem {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  text-align: left;
+  width: 100%;
+  box-sizing: border-box;
+  transition: background-color 0.15s;
+}
+
+.permOptionItem:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+}
+
+:global(body[data-ds-dark-theme]) .permOptionItem:hover {
+  background: #27272a;
+}
+
+.permOptionIcon {
+  flex: none;
+  margin-top: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--codex-text-secondary, #4b5563);
+}
+
+:global(body[data-ds-dark-theme]) .permOptionIcon {
+  color: #a1a1aa;
+}
+
+.permOptionIconWarn {
+  color: #ea580c;
+}
+
+:global(body[data-ds-dark-theme]) .permOptionIconWarn {
+  color: #fb923c;
+}
+
+.permOptionBody {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.permOptionTitle {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .permOptionTitle {
+  color: #f4f4f5;
+}
+
+.permOptionTitleWarn {
+  color: #ea580c;
+}
+
+:global(body[data-ds-dark-theme]) .permOptionTitleWarn {
+  color: #fb923c;
+}
+
+.permOptionDesc {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--codex-text-muted, #71717a);
+}
+
+:global(body[data-ds-dark-theme]) .permOptionDesc {
+  color: #a1a1aa;
+}
+
+.permOptionCheck {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  margin-top: 2px;
+  color: #ea580c;
+}
+
+:global(body[data-ds-dark-theme]) .permOptionCheck {
+  color: #fb923c;
+}
+
+.rightControls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+/* Model Selector Pill */
+.modelPill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--codex-text-secondary, #52525b);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+:global(body[data-ds-dark-theme]) .modelPill {
+  color: #d4d4d8;
+}
+
+.modelPill:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .modelPill:hover {
+  background: #27272a;
+  color: #f4f4f5;
+}
+
+.chevronDown {
+  color: var(--codex-text-muted, #71717a);
+}
+
+/* Bare Microphone Button */
+.micBtn {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--codex-text-secondary, #52525b);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+}
+
+:global(body[data-ds-dark-theme]) .micBtn {
+  color: #a1a1aa;
+}
+
+.micBtn:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+  color: var(--codex-text-primary, #18181b);
+}
+
+:global(body[data-ds-dark-theme]) .micBtn:hover {
+  background: #27272a;
+  color: #f4f4f5;
+}
+
+.effortTag {
+  font-size: 11px;
+  color: var(--codex-text-muted, #71717a);
+  margin-left: 1px;
+}
+
+/* Blue Action Circle: Send or Audio Wave (media_1791084397752.png) */
+.actionBtn {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: var(--codex-blue-primary, #007aff);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+
+:global(body[data-ds-dark-theme]) .actionBtn {
+  background: var(--codex-blue-primary, #0a84ff);
+}
+
+.actionBtn:hover {
+  background: var(--codex-blue-hover, #0066d6);
+  transform: scale(1.04);
+}
+
+.stopBtn {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: #18181b;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+
+:global(body[data-ds-dark-theme]) .stopBtn {
+  background: #f4f4f5;
+  color: #18181b;
+}
+
+.stopBtn:hover {
+  opacity: 0.85;
+}
+
+:global(body[data-ds-dark-theme]) .stopBtn {
+  background: #f4f4f5;
+  color: #18181b;
+}
+
+.stopBtn:hover {
+  opacity: 0.85;
+}
+
+@media (max-width: 640px) {
+  .permissionBanner {
+    flex-wrap: wrap;
+  }
+
+  .bannerActions {
+    margin-left: auto;
+  }
+
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .rightControls {
+    margin-left: auto;
+    min-width: 0;
+  }
+
+  .modelPill {
+    max-width: 180px;
+  }
+
+  .topContextBar {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+}
+
+@keyframes bannerFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}

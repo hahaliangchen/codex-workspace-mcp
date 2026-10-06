@@ -139,6 +139,7 @@ impl SymbolProvider for RustSymbolProvider {
         let response = crate::rust_index::read_symbol(
             workspace.root(),
             crate::rust_index::ReadRustSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: symbol_id.to_string(),
                 include_context: false,
@@ -177,6 +178,7 @@ impl SymbolProvider for RustSymbolProvider {
         let context = crate::rust_index::read_symbol(
             workspace.root(),
             crate::rust_index::ReadRustSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: primary.id.clone(),
                 include_context: true,
@@ -220,9 +222,12 @@ impl SymbolProvider for TypeScriptSymbolProvider {
         let response = crate::ts_index::read_symbol(
             workspace.root(),
             crate::ts_index::ReadTsSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: symbol_id.to_string(),
                 include_context: false,
+                include_related_types: false,
+                include_outline: false,
             },
         )?;
         let symbol = response.symbol;
@@ -258,9 +263,12 @@ impl SymbolProvider for TypeScriptSymbolProvider {
         let context = crate::ts_index::read_symbol(
             workspace.root(),
             crate::ts_index::ReadTsSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: primary.id.clone(),
                 include_context: true,
+                include_related_types: false,
+                include_outline: false,
             },
         )?;
         let mut candidates = Vec::new();
@@ -306,6 +314,7 @@ impl SymbolProvider for PythonSymbolProvider {
         let response = crate::python_index::read_symbol(
             workspace.root(),
             crate::python_index::ReadPythonSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: symbol_id.to_string(),
                 include_context: false,
@@ -344,6 +353,7 @@ impl SymbolProvider for PythonSymbolProvider {
         let context = crate::python_index::read_symbol(
             workspace.root(),
             crate::python_index::ReadPythonSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: primary.id.clone(),
                 include_context: true,
@@ -387,6 +397,7 @@ impl SymbolProvider for GoSymbolProvider {
         let response = crate::go_index::read_symbol(
             workspace.root(),
             crate::go_index::ReadGoSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: symbol_id.to_string(),
                 include_context: false,
@@ -425,6 +436,7 @@ impl SymbolProvider for GoSymbolProvider {
         let context = crate::go_index::read_symbol(
             workspace.root(),
             crate::go_index::ReadGoSymbolRequest {
+                options: Default::default(),
                 workspace_root: root,
                 symbol_id: primary.id.clone(),
                 include_context: true,

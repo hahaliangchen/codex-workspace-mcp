@@ -179,6 +179,12 @@ fn append_response_input_item_as_chat_message(messages: &mut Vec<Value>, item: &
     }
 
     let role = normalize_openai_chat_role(item.get("role").and_then(|v| v.as_str()));
+    if let Some(parts)=item["content"].as_array().filter(|parts|parts.iter().any(|part|part["type"]=="input_image")) {
+        let content=parts.iter().filter_map(|part| {
+            if part["type"]=="input_image" {Some(json!({"type":"image_url","image_url":{"url":part["image_url"],"detail":part["detail"].as_str().unwrap_or("auto")}}))}
+            else {part["text"].as_str().map(|text|json!({"type":"text","text":text}))}
+        }).collect::<Vec<_>>();messages.push(json!({"role":role,"content":content}));return;
+    }
     let content = response_content_to_text(item.get("content").unwrap_or(item));
     if !content.trim().is_empty() {
         messages.push(json!({"role": role, "content": content}));

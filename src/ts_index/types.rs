@@ -1,21 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_TS_FILE_BYTES: u64 = 2 * 1024 * 1024;
-pub(crate) const NOISE_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".codex-workspace-mcp",
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum TsIndexError {
@@ -128,6 +113,7 @@ pub struct IndexTsWorkspaceRequest {
 
 #[derive(Debug, Serialize)]
 pub struct IndexTsWorkspaceResponse {
+    pub index: crate::symbol_index_state::IndexHealth,
     pub index_path: String,
     pub files_indexed: usize,
     pub symbols_indexed: usize,
@@ -136,6 +122,7 @@ pub struct IndexTsWorkspaceResponse {
 
 #[derive(Debug, Serialize)]
 pub struct TsIndexStatus {
+    pub index: Option<crate::symbol_index_state::IndexHealth>,
     pub index_path: String,
     pub exists: bool,
     pub workspace_root: String,
@@ -146,6 +133,8 @@ pub struct TsIndexStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct ListTsSymbolsRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::ListOptions,
     pub workspace_root: String,
     pub file_path: Option<String>,
     pub kind: Option<TsSymbolKind>,
@@ -153,11 +142,15 @@ pub struct ListTsSymbolsRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ListTsSymbolsResponse {
+    pub page: crate::symbol_query::PageInfo,
+    pub index: crate::symbol_index_state::IndexHealth,
     pub symbols: Vec<TsSymbolSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SearchTsSymbolsRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::SearchOptions,
     pub workspace_root: String,
     pub query: String,
     #[serde(default = "default_limit")]
@@ -166,30 +159,56 @@ pub struct SearchTsSymbolsRequest {
 
 #[derive(Debug, Serialize)]
 pub struct SearchTsSymbolsResponse {
+    pub terms: Vec<String>,
+    pub match_mode: crate::symbol_query::MatchMode,
+    pub page: crate::symbol_query::PageInfo,
+    pub index: crate::symbol_index_state::IndexHealth,
     pub query: String,
     pub matches: Vec<TsSymbolSummary>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ReadTsSymbolRequest {
+    #[serde(flatten)]
+    pub options: crate::symbol_query::ReadOptions,
     pub workspace_root: String,
+    #[serde(default)]
     pub symbol_id: String,
     #[serde(default)]
     pub include_context: bool,
+    #[serde(default)]
+    pub include_related_types: bool,
+    #[serde(default)]
+    pub include_outline: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReadTsSymbolResponse {
+    pub description: crate::symbol_description::Description,
+    pub index: crate::symbol_index_state::IndexHealth,
+    pub relationship_accuracy: &'static str,
     pub symbol: TsSymbol,
     pub content: String,
     pub callees: Vec<TsCallee>,
     pub callers: Vec<TsCaller>,
     pub resolved_imports: Vec<TsResolvedImport>,
     pub suggested_reads: Vec<TsSuggestedRead>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_types: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_type_issues: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TsSymbolSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<crate::symbol_description::Description>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub matched_terms: Vec<String>,
     pub id: String,
     pub name: String,
     pub kind: TsSymbolKind,
@@ -198,7 +217,9 @@ pub struct TsSymbolSummary {
     pub parent_id: Option<String>,
     pub start_line: usize,
     pub end_line: usize,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub signature: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub docstring: String,
     pub export: bool,
 }
@@ -257,6 +278,9 @@ pub(crate) fn default_limit() -> usize {
 impl From<&TsSymbol> for TsSymbolSummary {
     fn from(symbol: &TsSymbol) -> Self {
         Self {
+            description: None,
+            score: None,
+            matched_terms: Vec::new(),
             id: symbol.id.clone(),
             name: symbol.name.clone(),
             kind: symbol.kind.clone(),
@@ -265,8 +289,8 @@ impl From<&TsSymbol> for TsSymbolSummary {
             parent_id: symbol.parent_id.clone(),
             start_line: symbol.start_line,
             end_line: symbol.end_line,
-            signature: symbol.signature.clone(),
-            docstring: symbol.docstring.clone(),
+            signature: crate::symbol_query::preview(&symbol.signature, 160),
+            docstring: crate::symbol_query::preview(&symbol.docstring, 240),
             export: symbol.export,
         }
     }

@@ -2,9 +2,9 @@
 //! client can recover a task's trajectory after reconnecting.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -16,7 +16,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use futures::stream;
+use futures::{StreamExt, stream};
 use reqwest::Client;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -24,9 +24,68 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_MAX_STEPS: usize = 30;
+const DEFAULT_MAX_STEPS: usize = 100;
+const SUBAGENT_MAX_STEPS: usize = 12;
 const MAX_STEP_LIMIT: usize = 100;
 const MAX_TOOL_OUTPUT_CHARS: usize = 300_000;
+const OBSERVER_HISTORY_TASK_LIMIT: usize = 5;
+const OBSERVER_HISTORY_MESSAGE_LIMIT: i64 = 16;
+const OBSERVER_MAX_TOKENS: usize = 3072;
+#[cfg(not(test))]
+const WORKER_MESSAGE_CHARS: usize = 12_000;
+#[cfg(not(test))]
+const WORKER_RECENT_STEPS: usize = 8;
+#[cfg(not(test))]
+const WORKER_RECENT_BYTES: usize = 64_000;
+#[cfg(not(test))]
+const WORKER_LEDGER_CHARS: usize = 10_000;
+
+#[cfg(test)]
+const WORKER_MESSAGE_CHARS: usize = 12_000;
+#[cfg(test)]
+const WORKER_RECENT_STEPS: usize = 4;
+#[cfg(test)]
+const WORKER_RECENT_BYTES: usize = 20_000;
+#[cfg(test)]
+const WORKER_LEDGER_CHARS: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    #[default]
+    FullAccess,
+}
+
+impl PermissionMode {
+    fn allows(self, name: &str) -> bool {
+        match name {
+            "write_file" | "replace_range" | "edit_file" => !matches!(self, Self::ReadOnly),
+            // There is no filesystem sandbox for shell commands. Only full
+            // access may invoke them; structured writes retain path checks.
+            "run_command" | "install_dependencies" | "run_project_script" | "stop_project_process"
+                | "browser_open" | "browser_read" | "browser_wait" | "browser_diagnostics" | "browser_click" | "browser_press_key" | "browser_upload" | "browser_screenshot" => matches!(self, Self::FullAccess),
+            "browser_close" => matches!(self, Self::FullAccess),
+            _ => true,
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only: project files may be inspected, but file writes and project/shell execution are disabled. Internal index and memory storage remains available.",
+            Self::WorkspaceWrite => "workspace_write: structured file writes inside the workspace are allowed; project scripts and shell commands are disabled because they are not sandboxed.",
+            Self::FullAccess => "full_access: registered file-write, project execution and shell-command tools are allowed. Structured file tools still enforce workspace path boundaries.",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentProviderRoute {
+    pub url: String,
+    pub api_key: String,
+    pub models: HashMap<String, String>,
+}
 
 #[derive(Clone)]
 pub struct AgentServiceState {
@@ -34,9 +93,125 @@ pub struct AgentServiceState {
     pub client: Client,
     pub provider_url: String,
     pub api_key: String,
+    pub provider_name: String,
+    pub provider_routes: HashMap<String, AgentProviderRoute>,
     pub default_model: String,
     pub model_map: HashMap<String, String>,
-    pub cancellations: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub reasoning_effort: Option<String>,
+    pub fast_mode: bool,
+    pub permission_mode: PermissionMode,
+    pub enable_subagent: bool,
+    pub expert_provider_name: String,
+    pub expert_provider_url: String,
+    pub expert_api_key: String,
+    pub expert_model: String,
+    pub subagent_inherits_model: bool,
+    pub observer_enabled: bool,
+    pub observer_provider: String,
+    pub observer_provider_url: String,
+    pub observer_api_key: String,
+    pub observer_model: String,
+    pub observer_inherits_model: bool,
+    pub visual:crate::visual_artifacts::VisualSettings,
+    pub config: Option<Arc<tokio::sync::RwLock<crate::ai_proxy::AiProxyConfig>>>,
+    pub config_path: Option<std::path::PathBuf>,
+    pub tool_catalog: Option<Arc<crate::plugin_builtin::ToolCatalog>>,
+    pub plugin_cancel: CancellationToken,
+    pub cancellations: Arc<Mutex<HashMap<String, ActiveTask>>>,
+}
+
+#[derive(Clone)]
+pub struct ActiveTask {
+    run_id: String,
+    token: CancellationToken,
+    flow_node: Arc<Mutex<String>>,
+    node_interrupt: Arc<Mutex<Option<String>>>,
+}
+
+async fn clear_active_task(state: &AgentServiceState, task_id: &str, run_id: &str) {
+    let mut active = state.cancellations.lock().await;
+    if active.get(task_id).is_some_and(|entry| entry.run_id == run_id) {
+        active.remove(task_id);
+    }
+}
+
+async fn set_active_flow_node(state: &AgentServiceState, task_id: &str, turn: usize, node: &str) {
+    let active = state.cancellations.lock().await.get(task_id).cloned();
+    if let Some(active) = active {
+        *active.flow_node.lock().await = format!("turn_{turn}:{node}");
+    }
+}
+
+async fn finish_cancelled_run(
+    state: &AgentServiceState, root: &std::path::Path, task_id: &str,
+    turn: usize, active_node: &str,
+) -> anyhow::Result<()> {
+    let active = state.cancellations.lock().await.get(task_id).cloned();
+    let interrupted = if let Some(active) = active {
+        active.node_interrupt.lock().await.clone()
+    } else { None };
+    if interrupted.is_some() && !active_node.is_empty() {
+        emit(root, task_id, "flow/node_state", json!({
+            "turn": turn, "id": active_node, "status": "interrupted"
+        })).await?;
+    }
+    emit(root, task_id, "turn/end", json!({
+        "turn": turn,
+        "reason": {"kind": "aborted", "reason": if interrupted.is_some() { "node_interrupted" } else { "cancelled" }}
+    })).await?;
+    finish(state, task_id, if interrupted.is_some() { "interrupted" } else { "cancelled" }).await
+}
+
+impl AgentServiceState {
+    pub async fn with_latest_config(mut self) -> Self {
+        if let Some(shared) = self.config.clone() {
+            if let Some(path) = self.config_path.clone() {
+                if let Ok(Ok(latest)) = tokio::task::spawn_blocking(move || crate::ai_proxy::load_config(&path)).await {
+                    *shared.write().await = latest;
+                }
+            }
+            let config = shared.read().await;
+            crate::ai_proxy::apply_agent_config(&mut self, &config);
+        }
+        self
+    }
+
+    fn use_provider(&mut self, name: &str) -> bool {
+        if self.provider_routes.is_empty() { return name == self.provider_name; }
+        let Some(route) = self.provider_routes.get(name).cloned() else { return false };
+        self.provider_name = name.to_owned();
+        self.provider_url = route.url.clone();
+        self.api_key = route.api_key.clone();
+        self.model_map = route.models;
+        if self.observer_inherits_model {
+            self.observer_provider = name.to_owned();
+            self.observer_provider_url = route.url.clone();
+            self.observer_api_key = route.api_key.clone();
+        }
+        if self.subagent_inherits_model {
+            self.expert_provider_url = route.url;
+            self.expert_api_key = route.api_key;
+        }
+        true
+    }
+}
+
+fn task_provider_name(
+    routes: &HashMap<String, AgentProviderRoute>,
+    default_name: &str,
+    saved_name: Option<&str>,
+    model: &str,
+) -> Option<String> {
+    if routes.is_empty() { return Some(default_name.to_owned()); }
+    if let Some(name) = saved_name.filter(|name| !name.is_empty()) {
+        return routes.get(name).filter(|route| route.models.contains_key(model)).map(|_| name.to_owned());
+    }
+    if routes.get(default_name).is_some_and(|route| route.models.contains_key(model)) {
+        return Some(default_name.to_owned());
+    }
+    let mut matches = routes.iter().filter(|(_, route)| route.models.contains_key(model));
+    let name = matches.next()?.0.clone();
+    matches.next().is_none().then_some(name)
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,12 +221,94 @@ pub struct CreateTaskRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub max_steps: Option<usize>,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+}
+
+/// A browser session may exist before its first prompt. Its ID is also the
+/// durable Rust task ID, so reconnects do not need a client-side ID map.
+pub async fn create_draft_task(State(state): State<AgentServiceState>) -> impl IntoResponse {
+    let state = state.with_latest_config().await;
+    if state.plugin_cancel.is_cancelled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"agent task plugin is stopped"}))).into_response();
+    }
+    let task_id = format!("task_{}", uuid_like());
+    let root = state.workspace.root().to_path_buf();
+    let model = state.default_model.clone();
+    let provider_name = state.provider_name.clone();
+    let reasoning_effort = state.reasoning_effort.clone();
+    let fast_mode = state.fast_mode;
+    let id = task_id.clone();
+    let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = open_db(&root)?;
+        conn.execute(
+            "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,provider_name,reasoning_effort,fast_mode) VALUES (?1,'',?2,'draft',?3,?3,?4,?5,?6)",
+            params![id, model, now(), provider_name, reasoning_effort, fast_mode],
+        )?;
+        Ok(())
+    }).await;
+    match inserted {
+        Ok(Ok(())) => (StatusCode::CREATED, Json(json!({"task_id":task_id}))).into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"could not create session"}))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContinueTaskRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub max_steps: Option<usize>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
+    #[serde(default)]
+    pub permission_mode: Option<PermissionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTaskRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<Option<String>>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
+}
+
+enum ResumeLoad {
+    Ready {
+        model: String,
+        provider_name: String,
+        reasoning_effort: Option<String>,
+        fast_mode: bool,
+        permission_mode: PermissionMode,
+        turn: usize,
+        history: Vec<Value>,
+        subagent_used: bool,
+    },
+    NotFound,
+    ChildTask,
+    Busy,
+    ModelUnavailable,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListTasksQuery {
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamEventsQuery {
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,23 +329,34 @@ fn now() -> i64 {
         .as_millis() as i64
 }
 
-fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
+pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connection> {
     let conn = crate::database::init_db(root)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_tasks (
             id TEXT PRIMARY KEY, prompt TEXT NOT NULL, model TEXT NOT NULL,
-            status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            parent_task_id TEXT, provider_name TEXT, reasoning_effort TEXT,
+            fast_mode INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS agent_task_events (
             task_id TEXT NOT NULL, seq INTEGER NOT NULL, timestamp INTEGER NOT NULL,
             kind TEXT NOT NULL, data TEXT NOT NULL, surface_op TEXT, PRIMARY KEY(task_id, seq),
             FOREIGN KEY(task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS agent_observations (
+            task_id TEXT NOT NULL, review_id TEXT NOT NULL, request_id INTEGER NOT NULL,
+            input TEXT NOT NULL, status TEXT NOT NULL, result TEXT,
+            PRIMARY KEY(task_id,review_id), FOREIGN KEY(task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
          );",
     )?;
     let _ = conn.execute(
         "ALTER TABLE agent_task_events ADD COLUMN surface_op TEXT",
         [],
     );
+    let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN parent_task_id TEXT", []);
+    let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN provider_name TEXT", []);
+    let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN reasoning_effort TEXT", []);
+    let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0", []);
     Ok(conn)
 }
 
@@ -118,6 +386,13 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
                     params![task_id,step_seq,now(),step_data.to_string()],
                 )?;
             }
+            let turn: usize = conn.query_row(
+                "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='turn/start' ORDER BY seq DESC LIMIT 1",
+                [&task_id],
+                |row| row.get::<_, String>(0),
+            ).optional()?.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|data| data.get("turn").and_then(Value::as_u64))
+                .map(|turn| turn as usize).unwrap_or(1);
             let seq: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id=?1",
                 [&task_id],
@@ -125,7 +400,7 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
             )?;
             conn.execute(
                 "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES (?1,?2,?3,'turn/end',?4)",
-                params![task_id,seq,now(),json!({"turn":1,"reason":{"kind":"interrupted"}}).to_string()],
+                params![task_id,seq,now(),json!({"turn":turn,"reason":{"kind":"interrupted"}}).to_string()],
             )?;
             conn.execute(
                 "UPDATE agent_tasks SET status='interrupted',updated_at=?2 WHERE id=?1",
@@ -145,27 +420,39 @@ fn append_event(
     data: Value,
     surface_op: Option<&str>,
 ) -> anyhow::Result<()> {
-    let conn = open_db(root)?;
-    let seq: i64 = conn.query_row(
+    let mut conn = open_db(root)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    append_event_tx(&tx,task_id,kind,&data,surface_op)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn append_event_tx(tx:&rusqlite::Transaction,task_id:&str,kind:&str,data:&Value,surface_op:Option<&str>)->anyhow::Result<i64> {
+    let seq: i64 = tx.query_row(
         "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id = ?1",
         [task_id],
         |row| row.get(0),
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data,surface_op) VALUES (?1,?2,?3,?4,?5,?6)",
         params![task_id, seq, now(), kind, serde_json::to_string(&data)?, surface_op],
     )?;
-    conn.execute(
+    tx.execute(
         "UPDATE agent_tasks SET updated_at=?2 WHERE id=?1",
         params![task_id, now()],
     )?;
-    Ok(())
+    Ok(seq)
 }
 
 pub async fn create_task(
     State(state): State<AgentServiceState>,
     Json(request): Json<CreateTaskRequest>,
 ) -> impl IntoResponse {
+    let mut state = state.with_latest_config().await;
+    state.permission_mode = request.permission_mode;
+    if state.plugin_cancel.is_cancelled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"agent task plugin is stopped"}))).into_response();
+    }
     let prompt = request.prompt.trim().to_owned();
     if prompt.is_empty() {
         return (
@@ -181,17 +468,25 @@ pub async fn create_task(
         )
             .into_response();
     }
-    let model = request
-        .model
-        .and_then(|requested| state.model_map.get(&requested).cloned().or(Some(requested)))
-        .unwrap_or_else(|| state.default_model.clone());
+    let model = match request.model {
+        Some(requested) => match state.model_map.get(&requested).cloned().or_else(|| {
+            state.model_map.values().any(|value| value == &requested).then_some(requested)
+        }) {
+            Some(model) => model,
+            None => return (StatusCode::BAD_REQUEST, Json(json!({"error":"model is not configured"}))).into_response(),
+        },
+        None => state.default_model.clone(),
+    };
     let task_id = format!("task_{}", uuid_like());
     let root = state.workspace.root().to_path_buf();
+    let provider_name = state.provider_name.clone();
+    let reasoning_effort = state.reasoning_effort.clone();
+    let fast_mode = state.fast_mode;
     let insert = tokio::task::spawn_blocking({
         let task_id = task_id.clone(); let prompt = prompt.clone(); let model = model.clone();
         let root = root.clone(); move || -> anyhow::Result<()> {
             let conn = open_db(&root)?;
-            conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,?2,?3,'running',?4,?4)", params![task_id,prompt,model,now()])?;
+            conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,provider_name,reasoning_effort,fast_mode) VALUES (?1,?2,?3,'running',?4,?4,?5,?6,?7)", params![task_id,prompt,model,now(),provider_name,reasoning_effort,fast_mode])?;
             Ok(())
         }
     }).await;
@@ -202,31 +497,909 @@ pub async fn create_task(
         )
             .into_response();
     }
-    let cancel = CancellationToken::new();
+    let cancel = state.plugin_cancel.child_token();
+    let run_id = uuid_like();
     state
         .cancellations
         .lock()
         .await
-        .insert(task_id.clone(), cancel.clone());
+        .insert(task_id.clone(), ActiveTask { run_id: run_id.clone(), token: cancel.clone(),
+            flow_node: Arc::new(Mutex::new("turn_1:1".into())), node_interrupt: Arc::new(Mutex::new(None)) });
     let runner_state = state.clone();
     let runner_id = task_id.clone();
     let max_steps = request
         .max_steps
         .unwrap_or(DEFAULT_MAX_STEPS)
         .clamp(1, MAX_STEP_LIMIT);
-    tokio::spawn(async move {
-        run_task(
-            runner_state.clone(),
-            runner_id.clone(),
-            model,
-            prompt,
-            max_steps,
-            cancel,
-        )
-        .await;
-        runner_state.cancellations.lock().await.remove(&runner_id);
-    });
+    spawn_supervised_task(runner_state, runner_id, run_id, model, prompt,
+        max_steps, cancel, 1, Vec::new(), false, false);
     (StatusCode::ACCEPTED, Json(json!({"task_id":task_id,"status":"running","events_url":format!("/agent/tasks/{task_id}/events")}))).into_response()
+}
+
+fn model_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_owned();
+    }
+    content.as_array().map(|blocks| {
+        blocks.iter().filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>().join("\n")
+    }).unwrap_or_default()
+}
+
+fn observer_output_failed(output: &str) -> bool {
+    serde_json::from_str::<Value>(output).ok().is_some_and(|value| {
+        value["ok"] == false
+            || matches!(value["status"].as_str(),Some("failed"|"timeout"|"invalid_condition"|"invalid_selector"))
+            || value.get("status").and_then(Value::as_i64).is_some_and(|status| status != 0)
+            || value.get("error").is_some()
+            || value.get("observer_interrupted").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+fn observer_keywords(text: &str) -> Vec<String> {
+    let mut keywords = Vec::new();
+    let mut ascii_word = String::new();
+    let mut cjk_word = Vec::new();
+    let flush_ascii = |word: &mut String, out: &mut Vec<String>| {
+        if word.chars().count() >= 3 {
+            out.push(word.to_lowercase());
+        }
+        word.clear();
+    };
+    let flush_cjk = |word: &mut Vec<char>, out: &mut Vec<String>| {
+        for pair in word.windows(2) {
+            out.push(pair.iter().collect());
+        }
+        word.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            flush_cjk(&mut cjk_word, &mut keywords);
+            ascii_word.push(ch);
+        } else if ('\u{3400}'..='\u{9fff}').contains(&ch) {
+            flush_ascii(&mut ascii_word, &mut keywords);
+            cjk_word.push(ch);
+        } else {
+            flush_ascii(&mut ascii_word, &mut keywords);
+            flush_cjk(&mut cjk_word, &mut keywords);
+        }
+    }
+    flush_ascii(&mut ascii_word, &mut keywords);
+    flush_cjk(&mut cjk_word, &mut keywords);
+    let stop = ["the", "and", "for", "with", "from", "run", "command", "file", "true", "false"];
+    let mut seen = std::collections::HashSet::new();
+    keywords.retain(|word| !stop.contains(&word.as_str()) && seen.insert(word.clone()));
+    keywords.into_iter().take(12).collect()
+}
+
+pub(crate) async fn observer_memory_context(
+    workspace: Arc<crate::tools::Workspace>,
+    search_text: String,
+) -> Vec<Value> {
+    tokio::task::spawn_blocking(move || {
+        let mut found = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for query in observer_keywords(&search_text) {
+            let Ok(response) = workspace.search_work_memory(crate::memory::SearchWorkMemoryRequest {
+                workspace_root: workspace.root().display().to_string(),
+                query,
+                limit: 2,
+            }) else { continue };
+            for memory in response.matches {
+                if !crate::memory::observer_sources_current(workspace.root(),&memory) {continue;}
+                if !seen.insert((memory.time_unix, memory.summary.clone())) { continue; }
+                found.push(json!({
+                    "time_unix": memory.time_unix,
+                    "summary": memory.summary.chars().take(500).collect::<String>(),
+                    "kind": memory.kind,
+                    "applies_to": memory.applies_to.chars().take(500).collect::<String>(),
+                    "source_task_id": memory.source_task_id,
+                    "source_refs": memory.source_refs,
+                    "files_changed": memory.files_changed,
+                    "implementation": memory.implementation.chars().take(900).collect::<String>(),
+                    "tests": memory.tests.chars().take(400).collect::<String>(),
+                    "risks": memory.risks.chars().take(400).collect::<String>(),
+                }));
+                if found.len() >= 5 { return found; }
+            }
+        }
+        found
+    }).await.unwrap_or_default()
+}
+
+fn observer_excerpt(text: &str, limit: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= limit {
+        return text.to_owned();
+    }
+    let head = limit / 2;
+    let tail = limit - head;
+    format!(
+        "{}\n[...]\n{}",
+        chars[..head].iter().collect::<String>(),
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
+fn observer_history_messages(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT seq,timestamp,kind,data FROM agent_task_events \
+         WHERE task_id=?1 AND kind IN ('user/message','assistant/message') \
+         ORDER BY seq DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![task_id, limit], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (seq, time, kind, raw) = row?;
+        let Ok(data) = serde_json::from_str::<Value>(&raw) else { continue };
+        let text = model_text(data.pointer("/message/content").unwrap_or(&Value::Null));
+        if text.trim().is_empty() { continue }
+        messages.push(json!({
+            "source_id":format!("{task_id}:{seq}"),
+            "time":time,
+            "role":if kind == "user/message" { "user" } else { "assistant" },
+            "text":observer_excerpt(&text, 1600),
+        }));
+    }
+    messages.reverse();
+    Ok(messages)
+}
+
+fn load_observer_history_context(
+    root: &std::path::Path,
+    task_id: &str,
+    prompt: &str,
+) -> anyhow::Result<Value> {
+    let conn = open_db(root)?;
+    let current = observer_history_messages(&conn, task_id, 24)?;
+    let terms: Vec<String> = observer_keywords(prompt).into_iter()
+        .filter(|term| !["我的", "我们", "这个", "那个", "一下", "帮我", "现在", "分析"].contains(&term.as_str()))
+        .take(8).collect();
+    let mut related = Vec::new();
+    if !terms.is_empty() {
+        let filters = terms.iter().map(|_| {
+            "(instr(lower(t.prompt),lower(?))>0 OR EXISTS (\
+                SELECT 1 FROM agent_task_events e WHERE e.task_id=t.id \
+                AND e.kind IN ('user/message','assistant/message') \
+                AND instr(lower(CASE WHEN json_valid(e.data) \
+                    THEN json_extract(e.data,'$.message.content') ELSE '' END),lower(?))>0))"
+        }).collect::<Vec<_>>().join(" OR ");
+        let sql = format!(
+            "SELECT t.id,t.prompt,t.updated_at FROM agent_tasks t \
+             WHERE t.parent_task_id IS NULL AND t.id<>? AND ({filters}) \
+             ORDER BY t.updated_at DESC LIMIT 160"
+        );
+        let mut bindings = vec![task_id.to_owned()];
+        for term in &terms {
+            bindings.push(term.clone());
+            bindings.push(term.clone());
+        }
+        let candidates: Vec<(String, String, i64)> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(bindings.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut scored = Vec::new();
+        for (id, task_prompt, updated_at) in candidates {
+            let messages = observer_history_messages(&conn, &id, OBSERVER_HISTORY_MESSAGE_LIMIT)?;
+            let prompt_lower = task_prompt.to_lowercase();
+            let conversation_lower = messages.iter()
+                .filter_map(|message| message.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>().join(" ").to_lowercase();
+            let score: usize = terms.iter().map(|term| {
+                usize::from(prompt_lower.contains(term)) * 3
+                    + usize::from(conversation_lower.contains(term))
+            }).sum();
+            scored.push((score, updated_at, json!({
+                "task_id":id,
+                "updated_at":updated_at,
+                "prompt":observer_excerpt(&task_prompt, 800),
+                "messages":messages,
+            })));
+        }
+        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        related = scored.into_iter().take(OBSERVER_HISTORY_TASK_LIMIT)
+            .map(|(_, _, task)| task).collect();
+    }
+    let prior_notes: Vec<Value> = {
+        let mut stmt = conn.prepare(
+            "SELECT kind,data FROM agent_task_events WHERE task_id=?1 \
+             AND kind IN ('observer/consult','observer/consult_reply') ORDER BY seq DESC LIMIT 8",
+        )?;
+        let rows = stmt.query_map([task_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut notes = Vec::new();
+        for row in rows {
+            let (kind, raw) = row?;
+            if let Ok(data) = serde_json::from_str::<Value>(&raw) {
+                notes.push(json!({"kind":kind,"data":data}));
+            }
+        }
+        notes.reverse();
+        notes
+    };
+    Ok(json!({
+        "current_conversation":current,
+        "relevant_past_conversations":related,
+        "prior_observer_notes":prior_notes,
+    }))
+}
+
+fn worker_visual_context(task:&str,scheduler:&crate::work_scheduler::WorkScheduler)->crate::visual_artifacts::VisualContext {
+    let mut allowed=Vec::new();
+    if let Some(order)=scheduler.order() {
+        if let Ok(deliveries)=scheduler.resolve_dependency_deliveries(order) {
+            for delivery in deliveries {
+                for id in delivery["visual_artifact_ids"].as_array().into_iter().flatten().chain(delivery["exported_data"]["visual_artifact_ids"].as_array().into_iter().flatten()) {
+                    if let Some(id)=id.as_str() {allowed.push(id.to_owned());}
+                }
+            }
+        }
+    }
+    crate::visual_artifacts::VisualContext {identity:crate::observer_service::identity(task,scheduler,scheduler.id()),allowed_artifact_ids:allowed,
+        execution_epoch:scheduler.frame().map(|f|f.epoch).unwrap_or(0),related_source_versions:json!(scheduler.frame().map(|f|&f.versions)),
+        current_page:scheduler.frame().map(|f|f.browser_page.clone()).unwrap_or(Value::Null),
+        host_current_artifact_ids:scheduler.frame().map(|f|f.current_visual_artifact_ids.clone()).unwrap_or_default(),
+        original_artifact_ids:scheduler.frame().map(|f|f.visual_original_artifact_ids.clone()).unwrap_or_default(),..Default::default()}
+}
+
+pub(crate) async fn observer_json_response(
+    state: &AgentServiceState,
+    model: &str,
+    system: &str,
+    context: Value,
+    max_tokens: usize,
+    task_id: &str,
+    mut trace_metadata: Value,
+) -> anyhow::Result<String> {
+    let system = format!("{}\n\n{system}", include_str!("../prompts/shared_reasoning.md").trim());
+    let mut request_body = json!({"model":model,"stream":false,"max_tokens":max_tokens,
+        "messages":[{"role":"system","content":system},{"role":"user","content":context.to_string()}]});
+    let visual_context=crate::visual_artifacts::VisualContext {identity:context["identity"].clone(),execution_epoch:context["execution_epoch"].as_u64().unwrap_or(0) as usize,related_source_versions:context["related_source_versions"].clone(),current_page:context["task_page"].clone(),host_current_artifact_ids:context["host_current_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),allowed_artifact_ids:context["allowed_visual_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),..Default::default()};
+    let ids=context["visual_artifacts"].as_array().into_iter().flatten().filter_map(|item|item["artifact_id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+    let visual_dispatch=crate::visual_artifacts::prepare_request(state,"observer",model,&visual_context,&ids,context["request"]["goal"].as_str().unwrap_or("review current visual delivery"),&mut request_body).await?;
+    trace_metadata["visual_dispatch"]=visual_dispatch.clone();
+    trace_metadata["actor"] = json!("observer");
+    let trace = crate::request_context::record(state.workspace.root(),task_id,trace_metadata,&request_body).await;
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        let response = state.client.post(format!(
+            "{}/chat/completions", state.observer_provider_url.trim_end_matches('/')
+        )).bearer_auth(&state.observer_api_key).header("x-codex-visual-dispatch","task-owned").json(&request_body).send().await?;
+        let status = response.status();
+        let body: Value = response.json().await?;
+        anyhow::ensure!(status.is_success(), "observer model returned {status}: {}", body.get("error").map(Value::to_string).unwrap_or_else(|| "request failed".into()));
+        let raw = body.pointer("/choices/0/message/content").map(model_text).unwrap_or_default();
+        anyhow::ensure!(!raw.trim().is_empty(), "observer returned an empty response");
+        Ok((raw,body.get("usage").cloned().unwrap_or(Value::Null)))
+    }).await.map_err(|_| anyhow::anyhow!("observer request timed out")).and_then(|value| value);
+    match result {
+        Ok((mut raw,usage)) => {
+            if !ids.is_empty() {emit(state.workspace.root(),task_id,"visual/model_received",json!({"manifest":visual_dispatch,"actor":"observer","review_id":context["review_id"]})).await?;}
+            if !ids.is_empty() {
+                if let Ok(mut result)=serde_json::from_str::<Value>(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim()) {
+                    if let Some(check)=result.get("visual_check_result") {
+                        let requests=if matches!(visual_dispatch["status"].as_str(),Some("direct"|"fallback")) {vec![visual_dispatch.clone()]}else{vec![]};
+                        match crate::visual_artifacts::validate_check(state.workspace.root(),&visual_context,check,&requests,"observer") {
+                            Ok(check)=>{emit(state.workspace.root(),task_id,"visual/check_result",json!({"result":check,"review_id":context["review_id"]})).await?;result["visual_check_result"]=check;},
+                            Err(error)=>{result["visual_check_result"]=json!({"assessment":"uncertain","identity":visual_context.identity,"limitations":[error.to_string()],"actor":"observer"});result["assessment"]=json!("uncertain");},
+                        }
+                    }
+                    raw=result.to_string();
+                }
+            }
+            crate::request_context::finish(trace,"completed",json!({"response_chars":raw.chars().count(),"response_text":raw,"usage":usage})).await;
+            Ok(raw)
+        },
+        Err(error) => {
+            crate::request_context::finish(trace,"failed",json!({})).await;
+            Err(error)
+        },
+    }
+}
+
+async fn observer_session_context(
+    state: &AgentServiceState,
+    root: &std::path::Path,
+    task_id: &str,
+    prompt: &str,
+) -> anyhow::Result<Value> {
+    let read_root = root.to_path_buf();
+    let read_id = task_id.to_owned();
+    let read_prompt = prompt.to_owned();
+    let (history, mut memories) = tokio::join!(
+        tokio::task::spawn_blocking(move || {
+            load_observer_history_context(&read_root, &read_id, &read_prompt)
+        }),
+        observer_memory_context(state.workspace.clone(), prompt.to_owned()),
+    );
+    let mut context = history??;
+    for (index, memory) in memories.iter_mut().enumerate() {
+        memory["source_id"] = json!(format!("memory:{index}"));
+    }
+    context["current_request"] = json!(prompt);
+    context["relevant_work_memories"] = json!(memories);
+    Ok(context)
+}
+
+fn observer_string_list(value: Option<&Value>, limit: usize, char_limit: usize) -> Vec<String> {
+    value.and_then(Value::as_array).into_iter().flatten()
+        .filter_map(Value::as_str)
+        .map(|item| truncate(item.trim(), char_limit))
+        .filter(|item| !item.is_empty())
+        .take(limit)
+        .collect()
+}
+
+fn supported_source_refs(value: Option<&Value>, trace_text: &str) -> Vec<String> {
+    let normalized_trace = trace_text.replace('\\', "/").replace("//", "/");
+    observer_string_list(value, 6, 240).into_iter().filter(|reference| {
+        let path = reference.rsplit_once(':')
+            .filter(|(_, suffix)| suffix.chars().any(|ch| ch.is_ascii_digit())
+                && suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '-'))
+            .map(|(path, _)| path).unwrap_or(reference);
+        let normalized = path.replace('\\', "/");
+        let file = normalized.rsplit('/').next().unwrap_or("")
+            .split("::").next().unwrap_or("");
+        file.len() >= 4 && normalized_trace.contains(file)
+    }).collect()
+}
+
+pub(crate) fn load_observer_work_trace(root: &std::path::Path, task_id: &str) -> anyhow::Result<Vec<Value>> {
+    let conn = open_db(root)?;
+    let mut stmt = conn.prepare(
+        "SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([task_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+    })?;
+    let mut raw_events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    raw_events.reverse();
+    let mut tool_names = HashMap::<String, String>::new();
+    for (_, kind, raw) in &raw_events {
+        if kind != "tool/call" { continue; }
+        let Ok(data) = serde_json::from_str::<Value>(raw) else { continue };
+        if let (Some(id), Some(name)) = (
+            data.get("callId").and_then(Value::as_str),
+            data.get("name").and_then(Value::as_str),
+        ) {
+            tool_names.insert(id.to_owned(), name.to_owned());
+        }
+    }
+    let mut trace = Vec::new();
+    for (seq, kind, raw) in raw_events {
+        if !matches!(kind.as_str(), "flow/plan" | "worker/progress" | "tool/call" | "tool/result"
+            | "assistant/message" | "observer/consult" | "observer/consult_reply"
+            | "observer/plan_review" | "observer/progress_review"
+            | "subagent/start" | "subagent/end" | "turn/end") {
+            continue;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&raw) else { continue };
+        let mut entry = json!({"seq":seq,"type":kind});
+        for field in ["turn", "step", "nodeId", "reason"] {
+            if let Some(value) = data.get(field) { entry[field] = value.clone(); }
+        }
+        match kind.as_str() {
+            "flow/plan" => {
+                let nodes = data.get("nodes").and_then(Value::as_array).into_iter().flatten().take(128)
+                    .map(|node| json!({
+                        "id":node.get("id"),"title":node.get("title"),"kind":node.get("kind"),
+                        "status":node.get("status"),"description":node.get("description"),
+                        "parent_id":node.get("parent_id"),"objective":node.get("objective"),"done_when":node.get("done_when"),
+                    })).collect::<Vec<_>>();
+                let edges = data.get("edges").and_then(Value::as_array).into_iter().flatten().take(128)
+                    .map(|edge| json!({"source":edge.get("source"),"target":edge.get("target")}))
+                    .collect::<Vec<_>>();
+                entry["nodes"] = json!(nodes);
+                entry["edges"] = json!(edges);
+            }
+            "worker/progress" => {
+                for field in ["purpose", "knownConditions", "nextAction", "nodeResult"] {
+                    if let Some(value) = data.get(field) { entry[field] = value.clone(); }
+                }
+            }
+            "tool/call" => {
+                entry["tool"] = data.get("name").cloned().unwrap_or(Value::Null);
+                entry["input"] = json!(observer_excerpt(data.get("arguments").and_then(Value::as_str).unwrap_or(""), 700));
+            }
+            "tool/result" => {
+                let message = data.get("message").unwrap_or(&Value::Null);
+                let call_id = message.pointer("/source/callId").and_then(Value::as_str)
+                    .or_else(|| message.get("toolCallId").and_then(Value::as_str)).unwrap_or("");
+                entry["tool"] = json!(tool_names.get(call_id).cloned().unwrap_or_default());
+                let output = data.pointer("/meta/result").map(Value::to_string)
+                    .unwrap_or_else(|| model_text(message.get("content").unwrap_or(&Value::Null)));
+                entry["outcome"] = json!(observer_excerpt(&output, 700));
+                // Preserve a compact, versioned target even when the source excerpt is shortened.
+                if let Some(result)=data.pointer("/meta/result") {
+                    let tool=entry.get("tool").and_then(Value::as_str).unwrap_or("");
+                    if tool.starts_with("read_") && tool.ends_with("_symbol") {
+                        if let Some(symbol)=result.get("symbol") {
+                            entry["codeTarget"]=json!({"scope":"symbol","symbol_id":symbol.get("id"),"symbol_name":symbol.get("name"),"file_path":symbol.get("file_path"),"language":tool.trim_start_matches("read_").trim_end_matches("_symbol"),"qualified_name":result.pointer("/description/qualified_name"),"code_hash":result.pointer("/description/code_hash")});
+                        }
+                    } else if tool=="read_file" {
+                        let file=result.get("path").and_then(Value::as_str).unwrap_or("");
+                        let language=std::path::Path::new(file).extension().and_then(|ext|ext.to_str()).and_then(crate::symbol_description::language);
+                        if let Some(language)=language {entry["codeTarget"]=json!({"scope":"file","file_path":file,"language":language,"code_hash":result.get("code_hash")});}
+                    }
+                }
+                if let Some(duration) = data.pointer("/meta/durationMs") { entry["durationMs"] = duration.clone(); }
+                entry["failed"] = json!(message.get("isError").and_then(Value::as_bool) == Some(true));
+            }
+            "assistant/message" => {
+                let message = data.get("message").unwrap_or(&Value::Null);
+                let text = model_text(message.get("content").unwrap_or(&Value::Null));
+                if !text.trim().is_empty() { entry["text"] = json!(observer_excerpt(&text, 700)); }
+            }
+            "observer/consult" => entry["question"] = data.get("question").cloned().unwrap_or(Value::Null),
+            "observer/consult_reply" => entry["answer"] = data.get("answer").cloned().unwrap_or(Value::Null),
+            "observer/plan_review" | "observer/progress_review" => {
+                entry["summary"] = data.get("summary").cloned().unwrap_or(Value::Null);
+                entry["suggestions"] = data.get("suggestions").cloned().unwrap_or_else(|| json!([]));
+            }
+            "subagent/start" => entry["prompt"] = data.get("prompt").cloned().unwrap_or(Value::Null),
+            "subagent/end" => entry["status"] = data.get("status").cloned().unwrap_or(Value::Null),
+            _ => {}
+        }
+        trace.push(entry);
+    }
+    if trace.len() <= 320 { return Ok(trace); }
+
+    let important = trace.iter().filter(|entry| {
+        !matches!(entry.get("type").and_then(Value::as_str), Some("tool/call" | "tool/result"))
+    }).cloned().collect::<Vec<_>>();
+    let actions = trace.iter().filter(|entry| {
+        matches!(entry.get("type").and_then(Value::as_str), Some("tool/call" | "tool/result"))
+    }).cloned().collect::<Vec<_>>();
+    let keep_early = 24usize.min(actions.len());
+    let keep_recent = 160usize.min(actions.len().saturating_sub(keep_early));
+    let first_omitted_seq = actions.get(keep_early).and_then(|entry| entry.get("seq")).cloned().unwrap_or(Value::Null);
+    let recent_start = actions.len().saturating_sub(keep_recent);
+    let mut tool_counts = HashMap::<String, usize>::new();
+    let mut failed_results = 0usize;
+    for action in &actions[keep_early..recent_start] {
+        let kind = action.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "tool/call" {
+            if let Some(tool) = action.get("tool").and_then(Value::as_str) {
+                *tool_counts.entry(tool.to_owned()).or_default() += 1;
+            }
+        }
+        if kind == "tool/result" && action.get("failed").and_then(Value::as_bool) == Some(true) {
+            failed_results += 1;
+        }
+    }
+    let mut compact = important;
+    compact.extend(actions.iter().take(keep_early).cloned());
+    if recent_start > keep_early {
+        compact.push(json!({
+            "seq":first_omitted_seq,"type":"tool/activity_summary",
+            "omitted_tool_events":recent_start - keep_early,
+            "tool_activity_counts":tool_counts,
+            "failed_actions":failed_results,
+            "note":"Earlier tool events are summarized here; all Worker progress reports, plan revisions, Observer notes, and the earliest/latest tool events remain in sequence.",
+        }));
+    }
+    compact.extend(actions.into_iter().skip(recent_start));
+    compact.sort_by_key(|entry| entry.get("seq").and_then(Value::as_i64).unwrap_or(i64::MAX));
+    Ok(compact)
+}
+
+pub(crate) fn observer_known_read_targets(trace:&[Value],task_id:&str,limit:usize)->Vec<Value> {
+    let mut targets=trace.iter().filter(|entry|entry["failed"]!=true).filter_map(|entry| {
+        let mut target=entry.get("codeTarget")?.clone();
+        if target["code_hash"].as_str().is_none_or(str::is_empty) {return None;}
+        if let Some(seq)=entry["seq"].as_i64() {
+            target["source_event_seq"]=json!(seq);target["source_event_id"]=json!(format!("{task_id}:event:{seq}"));
+        }
+        target["source_task_id"]=json!(task_id);
+        Some(target)
+    }).collect::<Vec<_>>();
+    targets.sort_by_key(|target|std::cmp::Reverse(target["source_event_seq"].as_i64().unwrap_or(0)));
+    targets.truncate(limit);targets
+}
+
+fn observer_source_path(root:&std::path::Path,reference:&str)->Option<String> {
+    let reference=reference.split("::").next().unwrap_or(reference);
+    let file=reference.rsplit_once(':').filter(|(_,suffix)|!suffix.is_empty() && suffix.chars().all(|c|c.is_ascii_digit() || c=='-'))
+        .map(|(file,_)|file).unwrap_or(reference);
+    let path=crate::file_edit::workspace_path(root,file).ok()?.to_string_lossy().replace('\\',"/");
+    Some(if cfg!(windows){path.to_ascii_lowercase()}else{path})
+}
+
+/// A plain file reference means its latest observed read. Explicit source_reads
+/// select the exact read/hash instead. Conflicting or unordered versions remain
+/// uncertain; checking today's file bytes cannot establish which read a claim used.
+fn observer_fact_sources(root:&std::path::Path,item:&Value,refs:&[String],targets:&[Value])->Option<Vec<Value>> {
+    if refs.is_empty(){return None;}
+    let selectors=match item.get("source_reads") {
+        None|Some(Value::Null)=>None,
+        Some(Value::Array(items))=>if items.is_empty(){None}else{Some(items)},
+        _=>return None,
+    };
+    let mut sources=std::collections::BTreeMap::new();
+    for reference in refs {
+        let path=observer_source_path(root,reference)?;
+        let mut candidates=targets.iter().filter(|target|target["file_path"].as_str().and_then(|file|observer_source_path(root,file)).as_ref()==Some(&path)).collect::<Vec<_>>();
+        if let Some(selectors)=selectors {
+            let selected=selectors.iter().filter(|selector|selector["file_path"].as_str().and_then(|file|observer_source_path(root,file)).as_ref()==Some(&path)).collect::<Vec<_>>();
+            if selected.is_empty() || selected.iter().any(|selector|selector["code_hash"].as_str().is_none_or(str::is_empty) && selector["source_event_seq"].as_i64().is_none() && selector["source_event_id"].as_str().is_none_or(str::is_empty)){return None;}
+            let matches=|selector:&&Value,target:&&Value|["scope","symbol_id","qualified_name","code_hash","source_event_id","source_event_seq","source_task_id"].iter()
+                .all(|field|selector.get(*field).is_none_or(|value|value.is_null() || value==&target[*field]));
+            if selected.iter().any(|selector|!candidates.iter().any(|target|matches(selector,target))){return None;}
+            candidates.retain(|target|selected.iter().any(|selector|matches(selector,target)));
+            if candidates.iter().map(|target|target["code_hash"].as_str()).collect::<std::collections::BTreeSet<_>>().len()>1 {return None;}
+        } else {
+            let versions=candidates.iter().map(|target|target["code_hash"].as_str()).collect::<std::collections::BTreeSet<_>>();
+            if versions.len()>1 && candidates.iter().any(|target|target["source_event_seq"].as_i64().is_none()) {return None;}
+        }
+        let latest=candidates.iter().map(|target|target["source_event_seq"].as_i64().unwrap_or(0)).max()?;
+        candidates.retain(|target|target["source_event_seq"].as_i64().unwrap_or(0)==latest);
+        if candidates.iter().map(|target|target["code_hash"].as_str()).collect::<std::collections::BTreeSet<_>>().len()!=1 {return None;}
+        sources.insert(path,(*candidates.first()?).clone());
+    }
+    Some(sources.into_values().collect())
+}
+
+pub(crate) async fn save_observer_lessons(state:&AgentServiceState,task_id:&str,prompt:&str,report:&Value,trace:&[Value])->anyhow::Result<Value> {
+        let known_read_targets=observer_known_read_targets(trace,task_id,24);
+        let source_trace = serde_json::to_string(&trace.iter().filter(|entry| {
+            matches!(entry.get("type").and_then(Value::as_str), Some("tool/call" | "tool/result"))
+        }).collect::<Vec<_>>())?;
+        let action_count = trace.iter().filter(|entry| entry.get("type").and_then(Value::as_str) == Some("tool/call")).count();
+        let changed_inputs = trace.iter().filter(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("tool/call")
+                && matches!(entry.get("tool").and_then(Value::as_str), Some("write_file" | "replace_range" | "edit_file"))
+        }).filter_map(|entry| entry.get("input").and_then(Value::as_str)).collect::<Vec<_>>().join("\n");
+        let verification_command_seen = trace.iter().any(|entry| {
+            entry.get("type").and_then(Value::as_str) == Some("tool/call")
+                && matches!(entry.get("tool").and_then(Value::as_str),Some("run_command"|"run_project_script"))
+                && entry.get("input").and_then(Value::as_str).is_some_and(|input| {
+                    let lower = input.to_ascii_lowercase();
+                    lower.contains("test") || lower.contains("check") || lower.contains("build")
+                })
+        });
+        let summary = truncate(report.get("summary").and_then(Value::as_str).unwrap_or(""), 1000);
+        let path_review = truncate(report.get("path_review").and_then(Value::as_str).unwrap_or(""), 2400);
+        let shortening = observer_string_list(report.get("shortening_opportunities"), 5, 700);
+        let findings = report.get("work_findings").and_then(Value::as_array).into_iter().flatten()
+            .take(5).filter_map(|item| {
+                let finding = item.get("finding").and_then(Value::as_str)?.trim();
+                if finding.is_empty() { return None; }
+                let source_refs = supported_source_refs(item.get("source_refs"), &source_trace);
+                let requested_refs=observer_string_list(item.get("source_refs"),6,240);
+                let all_sources_observed=requested_refs.len()==source_refs.len() && item["source_refs"].as_array().is_none_or(|refs|refs.len()<=6);
+                let source_reads=if all_sources_observed {observer_fact_sources(state.workspace.root(),item,&source_refs,&known_read_targets)}else{None};
+                let confirmed = item.get("certainty").and_then(Value::as_str) == Some("confirmed")
+                    && source_reads.is_some() && !matches!(item["evidence_kind"].as_str(),Some("visual_observation"|"worker_interaction"|"inferred_cause"));
+                Some(json!({
+                    "finding":truncate(finding, 900),
+                    "relevance":truncate(item.get("relevance").and_then(Value::as_str).unwrap_or(""), 700),
+                    "watch_for":truncate(item.get("watch_for").and_then(Value::as_str).unwrap_or(""), 700),
+                    "sourceRefs":source_refs,
+                    "sourceReads":source_reads,
+                    "evidence_kind":item["evidence_kind"],"visual_artifact_ids":item["visual_artifact_ids"],
+                    "certainty":if confirmed { "confirmed" } else { "uncertain" },
+                }))
+            }).collect::<Vec<_>>();
+        let route_shortcuts = report.get("route_shortcuts").and_then(Value::as_array)
+            .into_iter().flatten().take(5).filter_map(|item| {
+                let situation = item.get("situation").and_then(Value::as_str)?.trim();
+                let look_first = item.get("look_first").and_then(Value::as_str)?.trim();
+                if situation.is_empty() || look_first.is_empty() { return None; }
+                Some(json!({
+                    "situation":truncate(situation, 350),
+                    "lookFirst":truncate(look_first, 500),
+                    "avoid":truncate(item.get("avoid").and_then(Value::as_str).unwrap_or(""), 500),
+                    "exceptions":truncate(item.get("exceptions").and_then(Value::as_str).unwrap_or(""), 500),
+                }))
+            }).collect::<Vec<_>>();
+        let memory = report.get("memory").unwrap_or(&Value::Null);
+        let mut memory_recorded = false;
+        let mut memory_path = String::new();
+        let mut memory_error = String::new();
+        let memory_summary = truncate(memory.get("summary").and_then(Value::as_str).unwrap_or(""), 500);
+        let confirmed = findings.iter().filter(|item| item.get("certainty").and_then(Value::as_str) == Some("confirmed"))
+            .collect::<Vec<_>>();
+        if memory.get("record").and_then(Value::as_bool) == Some(true)
+            && !memory_summary.trim().is_empty()
+            && (!confirmed.is_empty() || (!route_shortcuts.is_empty() && action_count >= 2))
+        {
+            let fact_entries = confirmed.iter().map(|item| {
+                let finding = item.get("finding").and_then(Value::as_str).unwrap_or("");
+                let relation = item.get("relevance").and_then(Value::as_str).unwrap_or("");
+                let watch = item.get("watch_for").and_then(Value::as_str).unwrap_or("");
+                let sources = observer_string_list(item.get("sourceRefs"), 6, 240).join(", ");
+                let versions=item["sourceReads"].as_array().unwrap();
+                let version_text=versions.iter().map(|source|format!("{}@{}",source["file_path"].as_str().unwrap_or(""),source["code_hash"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ");
+                (format!("- {finding}\n  适用：{relation}\n  来源：{sources}\n  来源版本：{version_text}\n  边界：{watch}"),item["sourceReads"].clone(),observer_string_list(item.get("sourceRefs"),6,240))
+            }).collect::<Vec<_>>();
+            let routes = route_shortcuts.iter().map(|item| format!(
+                "- 场景：{}；先看：{}；避免：{}；例外：{}",
+                item.get("situation").and_then(Value::as_str).unwrap_or(""),
+                item.get("lookFirst").and_then(Value::as_str).unwrap_or(""),
+                item.get("avoid").and_then(Value::as_str).unwrap_or(""),
+                item.get("exceptions").and_then(Value::as_str).unwrap_or(""),
+            )).collect::<Vec<_>>().join("\n");
+            let files_changed = if !changed_inputs.is_empty() {
+                observer_string_list(memory.get("files_changed"), 20, 300)
+                    .into_iter().filter(|path| changed_inputs.contains(path)).collect()
+            } else { Vec::new() };
+            let source_refs = confirmed.iter().flat_map(|item| observer_string_list(item.get("sourceRefs"), 6, 240))
+                .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+            let request = crate::memory::RecordWorkMemoryRequest {
+                workspace_root: state.workspace.root().display().to_string(),
+                summary:memory_summary.clone(),
+                files_changed,
+                implementation:String::new(),
+                tests:if verification_command_seen {
+                    truncate(memory.get("tests").and_then(Value::as_str).unwrap_or(""), 900)
+                } else { String::new() },
+                risks:truncate(memory.get("risks").and_then(Value::as_str).unwrap_or(""), 1200),
+                source_task_id:Some(task_id.to_owned()),
+                kind:"observer".to_owned(),
+                applies_to:truncate(memory.get("applies_to").and_then(Value::as_str).unwrap_or(prompt), 600),
+                source_refs,
+            };
+            let workspace = state.workspace.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut last=None;
+                let mut entries=fact_entries.into_iter().map(|(content,versions,refs)|("项目事实",content,versions,refs)).collect::<Vec<_>>();
+                entries.push(("路径经验",routes,json!([]),vec![]));
+                for (suffix,content,versions,refs) in entries {
+                    if content.is_empty(){continue;}
+                    let mut entry=request.clone();entry.summary=format!("{} · {suffix}",entry.summary);entry.implementation=truncate(&content,5000);
+                    entry.source_refs=refs;
+                    let response=workspace.record_work_memory(entry)?;
+                    crate::memory::bind_observer_sources(workspace.root(),&response.recorded.summary,&response.recorded.implementation,&versions)?;
+                    last=Some(response);
+                }
+                Ok::<_,anyhow::Error>(last)
+            }).await {
+                Ok(Ok(Some(response))) => {memory_recorded=true;memory_path=response.memory_path;},
+                Ok(Ok(None))=>{},
+                Ok(Err(error))=>memory_error=truncate(&error.to_string(),700),
+                Err(error)=>memory_error=truncate(&error.to_string(),700),
+            }
+        }
+        let mut description_requests=Vec::new();
+        for context in report.get("symbol_contexts").and_then(Value::as_array).into_iter().flatten().take(4) {
+            let file=context.get("file_path").and_then(Value::as_str).unwrap_or("");
+            let scope=context.get("scope").and_then(Value::as_str).unwrap_or("symbol");
+            let id=context.get("symbol_id").and_then(Value::as_str).unwrap_or("");
+            let qualified=context.get("qualified_name").and_then(Value::as_str).unwrap_or("");
+            let role=context.get("business_role").and_then(Value::as_str).unwrap_or("").trim();
+            let target=known_read_targets.iter().find(|target|target.get("file_path").and_then(Value::as_str)==Some(file) && target.get("scope").and_then(Value::as_str)==Some(scope) && (scope=="file" || (!id.is_empty() && target.get("symbol_id").and_then(Value::as_str)==Some(id)) || (!qualified.is_empty() && target.get("qualified_name").and_then(Value::as_str)==Some(qualified))));
+            if role.is_empty() {continue;}
+            if let Some(target)=target {
+                description_requests.push(crate::memory::RecordSymbolBusinessContextRequest {
+                    workspace_root:state.workspace.root().display().to_string(),
+                    symbol_id:target.get("symbol_id").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    symbol_name:target.get("symbol_name").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    language:target.get("language").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    file_path:file.to_owned(), belongs_to_area:truncate(context.get("belongs_to_area").and_then(Value::as_str).unwrap_or(""),160),
+                    business_role:truncate(role,500),common_tasks:Vec::new(),read_when:truncate(context.get("read_when").and_then(Value::as_str).unwrap_or(""),350),avoid_when:String::new(),risks:String::new(),confidence:0.8,
+                    description:crate::symbol_description::RecordOptions {qualified_name:target.get("qualified_name").and_then(Value::as_str).unwrap_or("").to_owned(),keywords:observer_string_list(context.get("keywords"),12,60),scope:scope.to_owned(),source:"observer".to_owned(),expected_code_hash:target.get("code_hash").and_then(Value::as_str).map(str::to_owned)},
+                });
+            }
+        }
+        let workspace=state.workspace.clone();
+        let descriptions=tokio::task::spawn_blocking(move || {
+            description_requests.into_iter().map(|request|match workspace.record_symbol_business_context(request) {Ok(response)=>json!({"recorded":true,"file":response.recorded.file_path,"name":response.recorded.qualified_name,"stale":response.recorded.stale}),Err(error)=>json!({"recorded":false,"error":truncate(&error.to_string(),400)})}).collect::<Vec<_>>()
+        }).await.unwrap_or_default();
+        Ok::<Value, anyhow::Error>(json!({
+            "status":"completed","summary":summary,"pathReview":path_review,
+            "shorteningOpportunities":shortening,"workFindings":findings,"routeShortcuts":route_shortcuts,
+            "memoryRecorded":memory_recorded,"memorySummary":if memory_recorded { memory_summary } else { String::new() },
+            "memoryPath":memory_path,"memoryError":memory_error,"codeDescriptions":descriptions,
+        }))
+}
+
+fn history_from_events(root: &std::path::Path, events: &[(String, Value)]) -> (Vec<Value>, usize, bool) {
+    let mut history = Vec::new();
+    let mut last_turn = 0;
+    let mut subagent_used = false;
+    let mut pending_calls: Vec<String> = Vec::new();
+    let close_pending = |history: &mut Vec<Value>, pending: &mut Vec<String>| {
+        for call_id in pending.drain(..) {
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":"The previous turn ended before this tool returned."}));
+        }
+    };
+    for (kind, data) in events {
+        match kind.as_str() {
+            "turn/start" => {
+                close_pending(&mut history, &mut pending_calls);
+                last_turn = last_turn.max(data.get("turn").and_then(Value::as_u64).unwrap_or(1) as usize);
+            }
+            "user/message" => {
+                let content = data.pointer("/message/content").unwrap_or(&Value::Null);
+                let model_content = data.get("model_content").and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| crate::composer_catalog::expand_skill_prompt(root, &model_text(content)));
+                history.push(json!({"role":"user","content":model_content}));
+            }
+            "assistant/message" => {
+                close_pending(&mut history, &mut pending_calls);
+                let content = data.pointer("/message/content").unwrap_or(&Value::Null);
+                let mut calls = Vec::new();
+                if let Some(blocks) = content.as_array() {
+                    for block in blocks {
+                        if block.get("type").and_then(Value::as_str) != Some("tool-call") { continue; }
+                        let Some(id) = block.get("id").and_then(Value::as_str) else { continue; };
+                        let Some(name) = block.get("name").and_then(Value::as_str) else { continue; };
+                        let arguments = block.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                        calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
+                        pending_calls.push(id.to_owned());
+                    }
+                }
+                let text = model_text(content);
+                if calls.is_empty() {
+                    history.push(json!({"role":"assistant","content":text}));
+                } else {
+                    history.push(json!({"role":"assistant","content":if text.is_empty() { Value::Null } else { json!(text) },"tool_calls":calls}));
+                }
+            }
+            "subagent/start" => subagent_used = true,
+            "tool/result" => {
+                let call_id = data.pointer("/message/source/callId").or_else(|| data.pointer("/message/toolCallId"))
+                    .and_then(Value::as_str);
+                if let Some(index) = call_id.and_then(|id| pending_calls.iter().position(|pending| pending == id)) {
+                    let call_id = pending_calls.remove(index);
+                    let content = data.pointer("/message/content").unwrap_or(&Value::Null);
+                    history.push(json!({"role":"tool","tool_call_id":call_id,"content":model_text(content)}));
+                }
+            }
+            "turn/end" => close_pending(&mut history, &mut pending_calls),
+            _ => {}
+        }
+    }
+    close_pending(&mut history, &mut pending_calls);
+    (history, last_turn + 1, subagent_used)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct FileQuery {
+    q: Option<String>,
+}
+
+pub async fn workspace_files(
+    State(state): State<AgentServiceState>,
+    Query(query): Query<FileQuery>,
+) -> impl IntoResponse {
+    let root = state.workspace.root().to_path_buf();
+    let q = query.q.unwrap_or_default();
+    let files = tokio::task::spawn_blocking(move || crate::composer_catalog::search_files(&root, &q))
+        .await
+        .unwrap_or_default();
+    Json(json!({"files": files})).into_response()
+}
+
+pub async fn slash_commands(State(state): State<AgentServiceState>) -> impl IntoResponse {
+    let root = state.workspace.root().to_path_buf();
+    let commands = tokio::task::spawn_blocking(move || crate::composer_catalog::slash_commands(&root))
+        .await
+        .unwrap_or_default();
+    Json(json!({"commands": commands})).into_response()
+}
+
+pub async fn continue_task(
+    State(state): State<AgentServiceState>,
+    Path(task_id): Path<String>,
+    Json(request): Json<ContinueTaskRequest>,
+) -> impl IntoResponse {
+    let mut state = state.with_latest_config().await;
+    if state.plugin_cancel.is_cancelled() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"agent task plugin is stopped"}))).into_response();
+    }
+    let prompt = request.prompt.trim().to_owned();
+    if prompt.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error":"prompt must not be empty"}))).into_response();
+    }
+    if state.provider_url.is_empty() || state.default_model.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"agent model provider is not configured"}))).into_response();
+    }
+    let root = state.workspace.root().to_path_buf();
+    let read_id = task_id.clone();
+    let default_model = state.default_model.clone();
+    let default_provider = state.provider_name.clone();
+    let default_effort = state.reasoning_effort.clone();
+    let default_fast_mode = state.fast_mode;
+    let routes = state.provider_routes.clone();
+    let title = prompt.clone();
+    let req_model = request.model.clone();
+    let req_provider = request.provider.clone();
+    let req_effort = request.reasoning_effort.clone();
+    let req_fast = request.fast_mode;
+    let req_permission = request.permission_mode;
+    let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<ResumeLoad> {
+        let mut conn = open_db(&root)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let task: Option<(String, String, Option<String>, Option<String>, Option<String>, i64)> = tx.query_row(
+            "SELECT model,status,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1", [&read_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional()?;
+        let Some((model, status, parent_id, saved_provider, saved_effort, saved_fast_mode)) = task else { return Ok(ResumeLoad::NotFound); };
+        if parent_id.is_some() { return Ok(ResumeLoad::ChildTask); }
+        if !matches!(status.as_str(), "draft" | "completed" | "failed" | "cancelled" | "max_steps" | "interrupted") {
+            return Ok(ResumeLoad::Busy);
+        }
+        let events = {
+            let mut stmt = tx.prepare("SELECT kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
+            let rows = stmt.query_map([&read_id], |row| {
+                let kind: String = row.get(0)?;
+                let data: String = row.get(1)?;
+                Ok((kind, data))
+            })?;
+            rows.map(|row| {
+                let (kind, data) = row?;
+                Ok((kind, serde_json::from_str::<Value>(&data)?))
+            }).collect::<anyhow::Result<Vec<_>>>()?
+        };
+        let (history, turn, subagent_used) = history_from_events(&root, &events);
+        let permission_mode = req_permission.unwrap_or_else(|| events.iter().rev()
+            .find(|(kind, _)| kind == "turn/start")
+            .and_then(|(_, data)| data.get("permission_mode"))
+            .and_then(|mode| serde_json::from_value(mode.clone()).ok())
+            .unwrap_or_default());
+        let (model, provider_name, reasoning_effort, fast_mode) = if status == "draft" {
+            let m = req_model.unwrap_or(default_model);
+            let p = req_provider.or(saved_provider).unwrap_or(default_provider);
+            let e = req_effort.or(saved_effort).or(default_effort);
+            let f = req_fast.unwrap_or_else(|| saved_fast_mode != 0 || default_fast_mode);
+            (m, p, e, f)
+        } else {
+            let target_model = req_model.unwrap_or(model);
+            let target_provider = req_provider.or(saved_provider);
+            let Some(provider_name) = task_provider_name(&routes, &default_provider, target_provider.as_deref(), &target_model)
+                else { return Ok(ResumeLoad::ModelUnavailable); };
+            let reasoning_effort = req_effort.or(saved_effort);
+            let fast_mode = req_fast.unwrap_or(saved_fast_mode != 0);
+            (target_model, provider_name, reasoning_effort, fast_mode)
+        };
+        let changed = tx.execute(
+            "UPDATE agent_tasks SET model=?2,status='running',updated_at=?3,prompt=CASE WHEN prompt='' THEN ?5 ELSE prompt END,provider_name=?6,reasoning_effort=?7,fast_mode=?8 WHERE id=?1 AND status=?4",
+            params![read_id, model, now(), status, title, provider_name, reasoning_effort, fast_mode],
+        )?;
+        if changed == 0 { return Ok(ResumeLoad::Busy); }
+        tx.commit()?;
+        Ok(ResumeLoad::Ready { model, provider_name, reasoning_effort, fast_mode, permission_mode, turn, history, subagent_used })
+    }).await;
+    let (model, provider_name, reasoning_effort, fast_mode, permission_mode, turn, history, subagent_used) = match loaded {
+        Ok(Ok(ResumeLoad::Ready { model, provider_name, reasoning_effort, fast_mode, permission_mode, turn, history, subagent_used })) => (model, provider_name, reasoning_effort, fast_mode, permission_mode, turn, history, subagent_used),
+        Ok(Ok(ResumeLoad::NotFound)) => return (StatusCode::NOT_FOUND, Json(json!({"error":"task not found"}))).into_response(),
+        Ok(Ok(ResumeLoad::ChildTask)) => return (StatusCode::BAD_REQUEST, Json(json!({"error":"subagent tasks cannot receive follow-up messages"}))).into_response(),
+        Ok(Ok(ResumeLoad::Busy)) => return (StatusCode::CONFLICT, Json(json!({"error":"task is still running"}))).into_response(),
+        Ok(Ok(ResumeLoad::ModelUnavailable)) => return (StatusCode::CONFLICT, Json(json!({"error":"task model is no longer configured"}))).into_response(),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"could not load task history"}))).into_response(),
+    };
+    if !state.use_provider(&provider_name) {
+        return (StatusCode::CONFLICT, Json(json!({"error":"task provider is no longer configured"}))).into_response();
+    }
+    state.reasoning_effort = reasoning_effort;
+    state.fast_mode = fast_mode;
+    state.permission_mode = permission_mode;
+    let cancel = state.plugin_cancel.child_token();
+    let run_id = uuid_like();
+    state.cancellations.lock().await.insert(task_id.clone(), ActiveTask { run_id: run_id.clone(), token: cancel.clone(),
+        flow_node: Arc::new(Mutex::new(format!("turn_{turn}:1"))), node_interrupt: Arc::new(Mutex::new(None)) });
+    let runner_state = state.clone();
+    let runner_id = task_id.clone();
+    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).clamp(1, MAX_STEP_LIMIT);
+    spawn_supervised_task(runner_state, runner_id, run_id, model, prompt,
+        max_steps, cancel, turn, history, subagent_used, false);
+    (StatusCode::ACCEPTED, Json(json!({"task_id":task_id,"status":"running","turn":turn}))).into_response()
 }
 
 pub async fn get_events(
@@ -259,6 +1432,7 @@ pub async fn get_events(
 pub async fn stream_events(
     State(state): State<AgentServiceState>,
     Path(task_id): Path<String>,
+    Query(query): Query<StreamEventsQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let last_event_id = headers
@@ -266,7 +1440,8 @@ pub async fn stream_events(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|seq| *seq >= 0)
-        .unwrap_or(-1);
+        .unwrap_or(-1)
+        .max(query.since.unwrap_or(-1));
     let events = stream::unfold(
         (state, task_id, last_event_id),
         |(state, task_id, mut last_seq)| async move {
@@ -317,7 +1492,7 @@ pub async fn get_task(
     let root = state.workspace.root().to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = open_db(&root)?;
-        Ok(conn.query_row("SELECT id,prompt,model,status,created_at,updated_at FROM agent_tasks WHERE id=?1", [&task_id], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?}))).optional()?)
+        Ok(conn.query_row("SELECT id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1", [&task_id], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0}))).optional()?)
     }).await;
     match result {
         Ok(Ok(Some(task))) => Json(task).into_response(),
@@ -334,6 +1509,60 @@ pub async fn get_task(
     }
 }
 
+pub async fn update_task(
+    State(state): State<AgentServiceState>,
+    Path(task_id): Path<String>,
+    Json(request): Json<UpdateTaskRequest>,
+) -> impl IntoResponse {
+    let root = state.workspace.root().to_path_buf();
+    let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+        let conn = open_db(&root)?;
+        let exists: Option<(String, String)> = conn.query_row(
+            "SELECT status, model FROM agent_tasks WHERE id=?1",
+            [&task_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let Some((status, _)) = exists else { return Ok(None); };
+        if status == "running" || status == "cancelling" {
+            anyhow::bail!("task is currently running");
+        }
+        if let Some(ref model) = request.model {
+            conn.execute("UPDATE agent_tasks SET model=?2, updated_at=?3 WHERE id=?1", params![&task_id, model, now()])?;
+        }
+        if let Some(ref provider) = request.provider {
+            conn.execute("UPDATE agent_tasks SET provider_name=?2, updated_at=?3 WHERE id=?1", params![&task_id, provider, now()])?;
+        }
+        if let Some(ref effort) = request.reasoning_effort {
+            conn.execute("UPDATE agent_tasks SET reasoning_effort=?2, updated_at=?3 WHERE id=?1", params![&task_id, effort, now()])?;
+        }
+        if let Some(fast) = request.fast_mode {
+            conn.execute("UPDATE agent_tasks SET fast_mode=?2, updated_at=?3 WHERE id=?1", params![&task_id, if fast { 1 } else { 0 }, now()])?;
+        }
+        Ok(conn.query_row(
+            "SELECT id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1",
+            [&task_id],
+            |r| Ok(json!({
+                "task_id": r.get::<_,String>(0)?,
+                "prompt": r.get::<_,String>(1)?,
+                "model": r.get::<_,String>(2)?,
+                "status": r.get::<_,String>(3)?,
+                "created_at": r.get::<_,i64>(4)?,
+                "updated_at": r.get::<_,i64>(5)?,
+                "parent_task_id": r.get::<_,Option<String>>(6)?,
+                "provider_name": r.get::<_,Option<String>>(7)?,
+                "reasoning_effort": r.get::<_,Option<String>>(8)?,
+                "fast_mode": r.get::<_,i64>(9)? != 0
+            })),
+        ).optional()?)
+    }).await;
+    match updated {
+        Ok(Ok(Some(task))) => Json(task).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({"error":"task not found"}))).into_response(),
+        Ok(Err(err)) => (StatusCode::CONFLICT, Json(json!({"error": err.to_string()}))).into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"could not update task"}))).into_response(),
+    }
+}
+
 pub async fn list_tasks(
     State(state): State<AgentServiceState>,
     Query(query): Query<ListTasksQuery>,
@@ -342,8 +1571,8 @@ pub async fn list_tasks(
     let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = open_db(&root)?;
-        let mut stmt = conn.prepare("SELECT id,prompt,model,status,created_at,updated_at FROM agent_tasks ORDER BY created_at DESC LIMIT ?1")?;
-        let rows = stmt.query_map([limit], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?})))?;
+        let mut stmt = conn.prepare("SELECT id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks ORDER BY updated_at DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0})))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }).await;
     match result {
@@ -360,8 +1589,8 @@ pub async fn cancel_task(
     State(state): State<AgentServiceState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(cancel) = state.cancellations.lock().await.get(&task_id).cloned() {
-        cancel.cancel();
+    if let Some(active) = state.cancellations.lock().await.get(&task_id).cloned() {
+        active.token.cancel();
         return Json(json!({"task_id":task_id,"status":"cancelling"})).into_response();
     }
     (
@@ -369,6 +1598,23 @@ pub async fn cancel_task(
         Json(json!({"error":"task is not running"})),
     )
         .into_response()
+}
+
+pub async fn interrupt_flow_node(
+    State(state): State<AgentServiceState>,
+    Path((task_id, node_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let active = state.cancellations.lock().await.get(&task_id).cloned();
+    let Some(active) = active else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error":"task is not running"}))).into_response();
+    };
+    let current = active.flow_node.lock().await.clone();
+    if current != node_id {
+        return (StatusCode::CONFLICT, Json(json!({"error":"node is no longer active","active_node":current}))).into_response();
+    }
+    *active.node_interrupt.lock().await = Some(node_id.clone());
+    active.token.cancel();
+    (StatusCode::ACCEPTED, Json(json!({"task_id":task_id,"node_id":node_id,"status":"interrupting"}))).into_response()
 }
 
 fn uuid_like() -> String {
@@ -383,8 +1629,29 @@ fn uuid_like() -> String {
     )
 }
 
-async fn emit(root: &std::path::Path, task_id: &str, kind: &str, data: Value) {
-    emit_surface(root, task_id, kind, data, None).await;
+async fn write_db_retry<F>(action: &str, write: F) -> anyhow::Result<()>
+where
+    F: Fn() -> anyhow::Result<()> + Send + Sync + 'static,
+{
+    let write = Arc::new(write);
+    let mut last_error = None;
+    for attempt in 0..3 {
+        let write = write.clone();
+        match tokio::task::spawn_blocking(move || write()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(error) => last_error = Some(error.into()),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(Duration::from_millis(50 * (attempt + 1))).await;
+        }
+    }
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("unknown database error"));
+    anyhow::bail!("{action} failed after retries: {error}")
+}
+
+pub(crate) async fn emit(root: &std::path::Path, task_id: &str, kind: &str, data: Value) -> anyhow::Result<()> {
+    emit_surface(root, task_id, kind, data, None).await
 }
 
 async fn emit_surface(
@@ -393,224 +1660,2455 @@ async fn emit_surface(
     kind: &str,
     data: Value,
     surface_op: Option<&'static str>,
-) {
+) -> anyhow::Result<()> {
     let root = root.to_path_buf();
     let task_id = task_id.to_owned();
     let kind = kind.to_owned();
-    let _ =
-        tokio::task::spawn_blocking(move || append_event(&root, &task_id, &kind, data, surface_op))
-            .await;
+    write_db_retry("append task event", move || {
+        append_event(&root, &task_id, &kind, data.clone(), surface_op)
+    }).await
 }
 
-async fn finish(state: &AgentServiceState, task_id: &str, status: &str) {
+async fn finish(state: &AgentServiceState, task_id: &str, status: &str) -> anyhow::Result<()> {
+    crate::browser_control::cleanup_after_finish(state.workspace.root(),task_id,status).await;
     let root = state.workspace.root().to_path_buf();
     let id = task_id.to_owned();
     let status = status.to_owned();
-    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    write_db_retry("finish task", move || {
         let conn = open_db(&root)?;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE agent_tasks SET status=?2,updated_at=?3 WHERE id=?1",
             params![id, status, now()],
         )?;
+        anyhow::ensure!(changed == 1, "task no longer exists");
         Ok(())
     })
-    .await;
+    .await
 }
 
-async fn run_task(
+fn spawn_supervised_task(
+    state: AgentServiceState,
+    task_id: String,
+    run_id: String,
+    model: String,
+    prompt: String,
+    max_steps: usize,
+    cancel: CancellationToken,
+    turn: usize,
+    history: Vec<Value>,
+    subagent_used: bool,
+    ban_run_command: bool,
+) {
+    tokio::spawn(async move {
+        let worker = tokio::spawn(run_task(state.clone(), task_id.clone(), model, prompt,
+            max_steps, cancel, false, turn, history, subagent_used, ban_run_command));
+        let failure = match worker.await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => Some(format!("task worker stopped unexpectedly: {error}")),
+        };
+        if let Some(message) = failure {
+            tracing::error!(task_id = %task_id, error = %message, "agent task failed");
+            let root = state.workspace.root();
+            if let Err(error) = emit(root, &task_id, "turn/end",
+                json!({"turn":turn,"reason":{"kind":"error","error":{"message":message,"code":"WORKER_FAILED"}}})).await {
+                tracing::error!(task_id = %task_id, error = %error, "could not record task failure");
+            }
+            if let Err(error) = finish(&state, &task_id, "failed").await {
+                tracing::error!(task_id = %task_id, error = %error, "could not finish failed task");
+            }
+        }
+        clear_active_task(&state, &task_id, &run_id).await;
+    });
+}
+
+struct PartialTool {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Read an OpenAI chat completion stream, emit coalesced `assistant/delta` events, and return the assembled message.
+pub(crate) async fn consume_model_stream(
+    response: reqwest::Response,
+    root: &std::path::Path,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+    cancel: &CancellationToken,
+) -> anyhow::Result<(Value, Value)> {
+    let stream_started = Instant::now();
+    let mut first_delta_ms: Option<u64> = None;
+    let mut usage = Value::Null;
+    let mut finish_reason = Value::Null;
+    let mut bytes = response.bytes_stream();
+    let mut pending: Vec<u8> = Vec::new();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut saw_sse = false;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tools: HashMap<usize, PartialTool> = HashMap::new();
+    let mut delta_text = String::new();
+    let mut delta_reasoning = String::new();
+    let mut last_flush = Instant::now();
+    let mut flushed = false;
+    let mut done = false;
+
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Err(anyhow::anyhow!("cancelled")),
+            next = bytes.next() => match next {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(error)) => return Err(error.into()),
+                None => break,
+            },
+        };
+        raw.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+            let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let Some(data) = line.trim().strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data.is_empty() { continue; }
+            saw_sse = true;
+            if data == "[DONE]" {
+                done = true;
+                break;
+            }
+            let Ok(event) = serde_json::from_str::<Value>(data) else { continue };
+            if let Some(value) = event.get("usage").filter(|value| !value.is_null()) { usage = value.clone(); }
+            if let Some(value) = event.pointer("/choices/0/finish_reason").filter(|value| !value.is_null()) { finish_reason = value.clone(); }
+            let Some(delta) = event.pointer("/choices/0/delta") else { continue };
+            if first_delta_ms.is_none() && (delta.get("content").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                || delta.get("reasoning_content").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                || delta.get("reasoning").and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+                || delta.get("tool_calls").and_then(Value::as_array).is_some_and(|calls| !calls.is_empty())) {
+                first_delta_ms = Some(stream_started.elapsed().as_millis() as u64);
+            }
+            if let Some(piece) = delta.get("content").and_then(Value::as_str).filter(|piece| !piece.is_empty()) {
+                text.push_str(piece);
+                delta_text.push_str(piece);
+            }
+            let piece = delta.get("reasoning_content").and_then(Value::as_str)
+                .or_else(|| delta.get("reasoning").and_then(Value::as_str))
+                .filter(|piece| !piece.is_empty());
+            if let Some(piece) = piece {
+                reasoning.push_str(piece);
+                delta_reasoning.push_str(piece);
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let entry = tools.entry(index).or_insert_with(|| PartialTool {
+                        id: String::new(), name: String::new(), arguments: String::new(),
+                    });
+                    if let Some(id) = call.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                        entry.id = id.to_owned();
+                    }
+                    if let Some(function) = call.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str).filter(|name| !name.is_empty()) {
+                            entry.name.push_str(name);
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+            let ready = !delta_text.is_empty() || !delta_reasoning.is_empty();
+            let due = !flushed || last_flush.elapsed() >= Duration::from_millis(80) || delta_text.len() + delta_reasoning.len() >= 32;
+            if ready && due {
+                emit(root, task_id, "assistant/delta", json!({"turn":turn,"step":step,"text":delta_text,"reasoning":delta_reasoning})).await?;
+                delta_text.clear();
+                delta_reasoning.clear();
+                last_flush = Instant::now();
+                flushed = true;
+            }
+        }
+        if done { break; }
+    }
+    if !delta_text.is_empty() || !delta_reasoning.is_empty() {
+        emit(root, task_id, "assistant/delta", json!({"turn":turn,"step":step,"text":delta_text,"reasoning":delta_reasoning})).await?;
+    }
+    if !saw_sse {
+        let body = String::from_utf8_lossy(&raw);
+        let value: Value = serde_json::from_str(body.trim()).map_err(|error| anyhow::anyhow!("model stream ended without a completion: {error}"))?;
+        let Some(message) = value.pointer("/choices/0/message").cloned() else {
+            anyhow::bail!("model response has no choices[0].message");
+        };
+        return Ok((message,json!({"format":"json","stream_ms":stream_started.elapsed().as_millis() as u64,
+            "usage":value.get("usage"),"finish_reason":value.pointer("/choices/0/finish_reason")})));
+    }
+    let mut indexes: Vec<usize> = tools.keys().copied().collect();
+    indexes.sort_unstable();
+    let mut tool_calls = Vec::new();
+    for index in indexes {
+        let tool = &tools[&index];
+        if tool.name.is_empty() { continue; }
+        let id = if tool.id.is_empty() { format!("call_{}", uuid_like()) } else { tool.id.clone() };
+        let arguments = if tool.arguments.is_empty() { "{}".to_owned() } else { tool.arguments.clone() };
+        tool_calls.push(json!({"id":id,"type":"function","function":{"name":tool.name,"arguments":arguments}}));
+    }
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+    });
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = Value::String(reasoning);
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    Ok((message,json!({"format":"sse","first_delta_after_headers_ms":first_delta_ms,
+        "stream_ms":stream_started.elapsed().as_millis() as u64,"usage":usage,"finish_reason":finish_reason,"received_done":done})))
+}
+
+/// File tools mentioned by name in the dynamic tool guidance.
+const FILE_GUIDANCE_TOOLS: &[&str] = &[
+    "workspace_info",
+    "list_dir",
+    "read_file",
+    "read_file_lines",
+    "write_file",
+    "replace_range",
+    "edit_file",
+];
+
+/// Memory tools that let the worker look up past work.
+const MEMORY_SEARCH_TOOLS: &[&str] = &[
+    "list_work_memory",
+    "search_work_memory",
+    "list_architecture_memory",
+    "search_architecture_memory",
+    "list_symbol_business_context",
+    "search_symbol_business_context",
+];
+
+/// Symbol index tools follow the list_*/search_*_symbols, read_*_symbol,
+/// index_*_workspace, and *_index_status naming pattern.
+fn is_symbol_index_tool(name: &str) -> bool {
+    name == "search_code_map" || ((name.starts_with("list_") || name.starts_with("search_")) && name.ends_with("_symbols"))
+        || (name.starts_with("read_") && name.ends_with("_symbol"))
+        || (name.starts_with("index_") && name.ends_with("_workspace"))
+        || name.ends_with("_index_status")
+}
+
+/// Guidance lines for the tools actually offered in one model request. The
+/// text is rebuilt per step, so a capability that disappears from the tool
+/// list (e.g. a turn-level run_command ban) also disappears from the prompt;
+/// never describe a tool that is not offered.
+fn tool_guidance(names: &[&str]) -> Vec<String> {
+    let has = |name: &str| names.contains(&name);
+    let mut lines = Vec::new();
+    let files: Vec<&str> = FILE_GUIDANCE_TOOLS.iter().copied().filter(|name| has(name)).collect();
+    if !files.is_empty() {
+        lines.push(format!(
+            "When the answer depends on current project content or a requested edit, use the file tools ({}). Tokens like @relative/path identify workspace files or directories; read referenced content before making claims about its implementation. A workspace or path mention alone does not require inspection for a general discussion.",
+            files.join(", "),
+        ));
+    }
+    if has("edit_file") || has("write_file") || has("replace_range") {
+        lines.push("For localized changes prefer edit_file: supply unique old_text/new_text anchors, combine non-overlapping edits to one file in one call, and use the file code_hash already available from a source read, notebook retrieval or the last successful write. Insertion retains its anchor in new_text; deletion uses empty new_text. write_file requires expected_code_hash when overwriting; replace_range requires expected_old_text or expected_code_hash. Conflicts apply no edits and are not permission denials: refresh only the affected material and correct the edit. All structured writes are restricted to the selected workspace, including absolute paths. changed=false is a no-op. index_refresh failures mean the file was saved but indexing failed; do not repeat the write for that reason.".to_owned());
+    }
+    if names.iter().any(|name| crate::worker_read_cache::is_source_read(name)) {
+        lines.push("Source reads return byte-preserving pages: actual start_line/end_line, complete and next_start_line. EOF clamping is explicit. Continue a partial long line with start_column=next_column. Full requested material is saved before coverage filtering. Retrieve known source via recall_work include_material=true; query_results records tool_call_ids for historical query retrieval without rerunning discovery. Historical results are not current-state proof. force_read with reread_reason bypasses metadata-based snapshot caching when required.".to_owned());
+    }
+    if names.iter().any(|name| is_symbol_index_tool(name)) {
+        lines.push(
+            "For code navigation, prefer indexed symbol tools: choose the shortest lookup for the missing fact: read a known file/range directly; use read_*_symbol with file_path + name for a known definition; search_*_symbols for an unknown definition. Multi-keyword search defaults to any-term matching, ranks before pagination, and supports file/directory/kind filters. Lists are compact pages with local symbols hidden; only request another page or detailed/context output when necessary. Freshness and coverage are returned automatically, so do not routinely call index/status tools. Call relationships are heuristic; check the relevant source for ambiguous targets."
+                .to_owned(),
+        );
+    }
+    if has("search_code_map") {
+        lines.push("For an unknown functionality, search_code_map returns responsibilities and entry points grouped by source file or saved functional area across languages. A group says what related code does; do not request call-chain context as a routine prerequisite. Read a listed definition directly when details are needed. Preserve a learned single definition/file role with record_symbol_business_context; preserve a related group of files/functions with record_architecture_memory using area, summary, key_files and key_symbols. Missing descriptions are unknown, never invented from names. Do not annotate an entire repository or add investigation solely to populate the map.".to_owned());
+    }
+    if has("record_symbol_business_context") {
+        lines.push("Symbol search/list/read results include description.text, status, source, scope, qualified_name and code_hash. Ordinary symbol searches match responsibilities and task keywords as well as identifiers; no separate business-context lookup is required. Current descriptions are navigation hints; stale ones need checking against the present source. After understanding an important entry point or module, optionally save one concise reusable responsibility with record_symbol_business_context, task-wording keywords, and expected_code_hash copied from the read result (description.code_hash for symbol reads, code_hash for file reads). Use file_path + qualified_name, or a symbol_id; scope=file describes the module rather than every function. Do not enumerate code, make extra reads, or postpone the answer just to annotate it. Obey any user restriction on saving memory; the Worker works independently of Observer descriptions.".to_owned());
+    }
+    if has("search_text") {
+        lines.push(
+            "Use search_text directly for literals, UI strings, config keys, error messages, log lines, imports and syntax patterns. Literal mode is the default: set regex=true for A|B alternatives, anchors or character classes. A zero literal match for A|B proves neither A nor B absent; fix the search mode instead of making a repository-absence claim. Do not force these through symbol search first. If symbol search finds nothing useful, inspect its coverage warnings and make one targeted text lookup; do not keep reformulating broad inventories."
+                .to_owned(),
+        );
+    }
+    let search_memory = MEMORY_SEARCH_TOOLS.iter().any(|name| has(name));
+    if search_memory {
+        lines.push("When a needed historical decision or prior project finding can shorten this task, make one focused search_work_memory query early with a small limit (for example 3). Observer memories include applicable task types, source paths, and route shortcuts. Check current code when a claim depends on the present implementation; general discussion does not require this check. Do not repeatedly list or search the same memories.".to_owned());
+    }
+    if has("install_dependencies") { lines.push("Prefer install_dependencies for npm dependencies. Use run_project_script for named package.json scripts: foreground for build/check, background=true with a local ready_url/ready_port for dev/start. Query incremental logs through get_project_process using process_id and after_seq=next_seq. Process running does not prove readiness. Stop only owned processes through stop_project_process.".to_owned()); }
+    if has("http_probe") {
+        lines.push("For a local URL, font API endpoint, or page connectivity check, call http_probe; do not build HTTP requests with PowerShell or another shell. reachable=false with http_status=null means no HTTP response arrived, never HTTP status 0 or a server error code. Any received response, including 404, has reachable=true and its real http_status; check_passed is true only for HTTP 2xx. sampled_at is UTC; reuse a same-URL sample while its age is within reuse_window_ms and service state is unchanged. If the host returns reused=true, it reused the saved sample without a network request; use that result and stop probing. Probe again only if state may have changed or the old sample cannot answer the new question, and explain that reason in the tool call. Use get_project_process for Agent-managed process ownership, status and logs; an empty managed-process list says nothing about an independently started URL.".to_owned());
+    }
+    if has("run_command") {
+        lines.push(
+            "Use run_command only for system operations without a dedicated tool. On Windows it uses PowerShell with the user profile disabled and UTF-8 process pipes. The result separates process_exit_code from command_result; a zero shell exit reports only that the PowerShell process exited successfully, so inspect JSON output for error or explicit failure fields. For multiline Python, pipe a PowerShell here-string to `python -`; `python -c $code` can lose embedded quotes."
+                .to_owned(),
+        );
+    }
+    if has("consult_observer") {
+        lines.push(
+            "The Observer reviews Organizer decisions and node deliveries in parallel. Organizer handles the recommendations and implements applicable changes in your current order. Execute that order independently; no Observer receipt or approval is required. Call consult_observer only for a specific missing historical fact that materially changes your next action, never to announce readiness or obtain permission."
+                .to_owned(),
+        );
+    }
+    if has("report_progress") {
+        lines.push(
+            "Use report_progress for concise current-work purpose, actual known conditions and new findings, batched with substantive work. Organizer owns planning and node selection; reports do not complete work. Return sufficient output, a concrete blocker or need_split with yield_work. Correct or retire earlier findings by stable ID; do not repeat investigation just to update memory. Explain the reason for a necessary lookup, without private chain-of-thought."
+                .to_owned(),
+        );
+    }
+    lines
+}
+
+fn worker_system_prompt(
+    root: &std::path::Path,
+    is_child: bool,
+    subagent_used: bool,
+    tools: &[Value],
+) -> String {
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect();
+    let role = if is_child {
+        "You are a subagent completing one delegated task. Report the result to the parent. You cannot delegate further."
+    } else if subagent_used {
+        "This task has already used its one allowed subagent. Do not delegate again."
+    } else if names.contains(&"spawn_subagent") {
+        "You may use spawn_subagent once for a focused independent task. It shares the workspace, records its own trajectory, and cannot delegate further. Wait for its result before continuing."
+    } else {
+        "You are the sole worker for this task."
+    };
+    let worker = include_str!("../prompts/worker_system.md").trim();
+    let method = include_str!("../prompts/shared_reasoning.md").trim();
+    let guidance = tool_guidance(&names);
+    let capabilities = if guidance.is_empty() {
+        String::new()
+    } else {
+        let listed = guidance
+            .iter()
+            .map(|line| format!("- {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\nTool guidance for the tools actually offered in this request:\n{listed}")
+    };
+    format!(
+        "{worker}\n\n{method}{capabilities}\n\nRuntime context:\n- Workspace: {}\n- Operating system: {}\n- Role: {}",
+        root.display(),
+        std::env::consts::OS,
+        role,
+    )
+}
+
+fn worker_execution_recovery_prompt(root:&std::path::Path,tools:&[Value],targets:&[String]) -> String {
+    let names=tools.iter().filter_map(|tool|tool.pointer("/function/name").and_then(Value::as_str)).collect::<Vec<_>>();
+    format!("You are the independent local coding Worker in {}. Follow the current human request; it supersedes earlier read-only scope when it authorizes implementation. Historical claims and Observer advice are context, not permissions.\n\nThis request is a recovery from repeated investigation. Complete ONE smallest real part of the requested change using the exact version-checked source already supplied. Start with the first relevant edit target in {}. The rest of the feature can follow in subsequent steps; you do not need every UI, export or validation dependency resolved before making that first local edit. Do not make cosmetic changes merely to count a write. Do not edit a read-only task or guess unread source. If the edit's exact definition is absent, retrieve only that definition, explaining the specific missing fact briefly in user-visible text. Do not re-inventory files, rediscover supplied interfaces, rewrite unchanged plans, consult, or promise again. Real new dependencies may justify initializing/deepening a task tree in the same batch as substantive work; changing organization does not reset investigation counters. For a discussion/analysis request, answer directly once enough is known.\n\nCurrent findings, explicit unresolved conflicts and source pages follow. Historical/replaced claims are not current facts. A corrected claim requires actual source confirmation; an unsupported newer statement cannot replace a confirmed earlier one. Selected source survives reports and action renaming; tree navigation saves/restores each node's own selection. Recall only material actually missing. You may update learned findings and clear answered questions in report_progress batched with a real project operation; never add a reporting-only round. Respect code_hash and unique anchors when editing. Tools are the only capabilities available for this request.\n\n{}",
+        root.display(),json!(targets),tool_guidance(&names).join("\n"))
+}
+
+/// Remove segments that quote or exemplify text instead of issuing an
+/// instruction: fenced code blocks, inline code spans (backtick-delimited),
+/// and text inside quote pairs (ASCII ", or the Chinese pairs “” ‘’ 「」 『』).
+/// Replaced spans leave a separator so text on either side cannot form a new command ban.
+/// Heuristic limits: ASCII single quotes/apostrophes are not treated as
+/// quotes (to avoid swallowing text after apostrophes like "don't"),
+/// quoted passages spanning multiple lines are only stripped up to end
+/// of line, and nested or unterminated fences may misclassify later lines.
+fn strip_quoted_segments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_fence = false;
+    for line in input.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push('\n');
+            continue;
+        }
+        if in_fence {
+            out.push('\n');
+            continue;
+        }
+        let mut in_code = false;
+        let mut quote: Option<char> = None;
+        for c in line.chars() {
+            if in_code {
+                if c == '`' {
+                    in_code = false;
+                }
+                continue;
+            }
+            if let Some(q) = quote {
+                let closes = match q {
+                    '"' => c == '"',
+                    '“' => c == '”',
+                    '‘' => c == '’',
+                    '「' => c == '」',
+                    '『' => c == '』',
+                    _ => false,
+                };
+                if closes {
+                    quote = None;
+                }
+                continue;
+            }
+            match c {
+                '`' => { out.push(' '); in_code = true; }
+                '"' | '“' | '‘' | '「' | '『' => { out.push(' '); quote = Some(c); }
+                _ => out.push(c),
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn user_bans_run_command(prompt: &str) -> bool {
+    let stripped = strip_quoted_segments(prompt);
+    let lower = stripped.to_lowercase();
+    lower.contains("不要运行命令")
+        || lower.contains("禁止运行命令")
+        || lower.contains("不要执行命令")
+        || lower.contains("禁止执行命令")
+        || lower.contains("do not run commands")
+        || lower.contains("don't run commands")
+        || lower.contains("ban run command")
+        || lower.contains("ban run_command")
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+fn bounded_worker_message(message: &Value) -> Value {
+    let mut bounded = message.clone();
+    if let Some(content) = bounded.get("content").and_then(Value::as_str) {
+        if content.chars().count() > WORKER_MESSAGE_CHARS {
+            bounded["content"] = json!(truncate(content, WORKER_MESSAGE_CHARS));
+        }
+    }
+    bounded
+}
+
+#[cfg(test)]
+fn worker_action_ledger(messages: &[Value]) -> String {
+    let mut calls = HashMap::<String, (String, String)>::new();
+    for message in messages {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for call in tool_calls {
+                let Some(id) = call.get("id").and_then(Value::as_str) else { continue; };
+                let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("tool");
+                if name == "report_progress" { continue; }
+                let args = call.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("");
+                calls.insert(id.to_owned(), (name.to_owned(), args.to_owned()));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut lines = Vec::new();
+    let mut remaining = WORKER_LEDGER_CHARS;
+    // Keep the newest distinct outcomes when older model steps leave context.
+    for message in messages.iter().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") { continue; }
+        let Some(id) = message.get("tool_call_id").and_then(Value::as_str) else { continue; };
+        let Some((name, args)) = calls.get(id) else { continue; };
+        let outcome = message.get("content").and_then(Value::as_str).unwrap_or("");
+        if serde_json::from_str::<Value>(outcome).ok()
+            .and_then(|value| value.get("already_seen").and_then(Value::as_bool)) == Some(true) {
+            continue;
+        }
+        let key = format!("{name}:{args}");
+        if !seen.insert(key) { continue; }
+        let line = format!("{name}({}) => {}", truncate(args, 130), truncate(outcome, 350));
+        let size = line.chars().count() + 1;
+        if size > remaining { break; }
+        lines.push(line);
+        remaining -= size;
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+#[cfg(test)]
+fn worker_progress_ledger(messages: &[Value]) -> String {
+    let mut seen = HashSet::new();
+    let mut findings = Vec::new();
+    for message in messages.iter().rev() {
+        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else { continue };
+        for call in calls.iter().rev() {
+            if call.pointer("/function/name").and_then(Value::as_str) != Some("report_progress") { continue; }
+            let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) else { continue; };
+            let Ok(report) = serde_json::from_str::<Value>(args) else { continue; };
+            let Some(conditions) = report.get("known_conditions").and_then(Value::as_array) else { continue; };
+            for condition in conditions.iter().rev().filter_map(Value::as_str) {
+                let condition = condition.trim();
+                if !condition.is_empty() && seen.insert(condition.to_owned()) {
+                    findings.push(truncate(condition, 400));
+                    if findings.len() >= 20 { break; }
+                }
+            }
+            if findings.len() >= 20 { break; }
+        }
+        if findings.len() >= 20 { break; }
+    }
+    findings.reverse();
+    truncate(&findings.into_iter().map(|finding| format!("- {finding}"))
+        .collect::<Vec<_>>().join("\n"), 5_000)
+}
+
+fn worker_task_contract(history: &[Value], current_prompt: &str) -> String {
+    // Follow-ups such as "implement that first version" need the preceding
+    // assistant proposal, not just a collection of earlier user constraints.
+    let mut recent = history.iter().rev().filter_map(|message| {
+        let role = message.get("role").and_then(Value::as_str)?;
+        if !matches!(role, "user" | "assistant") || message.get("tool_calls").is_some() {
+            return None;
+        }
+        let content = message.get("content").and_then(Value::as_str)?.trim();
+        (!content.is_empty()).then(|| format!("Previous {role}: {}", truncate(content, 1800)))
+    }).take(4).collect::<Vec<_>>();
+    recent.reverse();
+    let mut context = recent.join("\n---\n");
+    if let Some(first) = history.iter().find(|message| message["role"] == "user")
+        .and_then(|message| message.get("content")).and_then(Value::as_str) {
+        context = format!("Original request (historical context, may have been superseded): {}\n---\n{context}", truncate(first, 1200));
+    }
+    format!("Current request: {}\n\nEarlier conversation for reference, not a runtime permission policy. Apply the latest user instruction where it changes earlier scope or restrictions:\n{}",
+        truncate(current_prompt, 6000), truncate(&context, 8000))
+}
+
+#[cfg(test)]
+fn scoped_worker_messages(
+    messages: &[Value],
+    base_len: usize,
+    step_starts: &[usize],
+    task_contract: &str,
+) -> Vec<Value> {
+    scoped_worker_request(messages, base_len, step_starts, task_contract).0
+}
+
+#[cfg(test)]
+fn scoped_worker_request(
+    messages: &[Value], base_len: usize, step_starts: &[usize], task_contract: &str,
+) -> (Vec<Value>, Value) {
+    let mut recent_start = if step_starts.len() > WORKER_RECENT_STEPS {
+        step_starts[step_starts.len() - WORKER_RECENT_STEPS]
+    } else {
+        base_len
+    };
+    while serde_json::to_vec(&messages[recent_start..]).map_or(false, |data| data.len() > WORKER_RECENT_BYTES) {
+        recent_start = step_starts.iter().copied().find(|start| *start > recent_start)
+            .unwrap_or(messages.len());
+    }
+    let mut scoped = messages[..base_len].to_vec();
+    scoped.push(json!({"role":"system","content":format!(
+        "Current task and historical conversation (latest user instructions take precedence):\n{task_contract}"
+    )}));
+    let ledger = worker_action_ledger(&messages[base_len..]);
+    if !ledger.is_empty() {
+        scoped.push(json!({"role":"system","content":format!(
+            "Recent work and tool outcomes:\n{ledger}"
+        )}));
+    }
+    let findings = worker_progress_ledger(&messages[base_len..]);
+    if !findings.is_empty() {
+        scoped.push(json!({"role":"system","content":format!(
+            "Worker-reported known conditions retained across earlier steps (recheck if stale):\n{findings}"
+        )}));
+    }
+    let shortened = messages[recent_start..].iter().enumerate().filter_map(|(offset,message)| {
+        let content = message.get("content").and_then(Value::as_str)?;
+        let chars = content.chars().count();
+        (chars > WORKER_MESSAGE_CHARS).then(|| json!({"raw_index":recent_start+offset,
+            "role":message["role"],"tool_call_id":message["tool_call_id"],"original_chars":chars,
+            "sent_chars":bounded_worker_message(message)["content"].as_str().unwrap_or("").chars().count()}))
+    }).collect::<Vec<_>>();
+    scoped.extend(messages[recent_start..].iter().map(bounded_worker_message));
+    let compaction = json!({"raw_message_count":messages.len(),"base_message_count":base_len,
+        "recent_start_raw_index":recent_start,"retained_raw_message_count":base_len+messages.len()-recent_start,
+        "omitted_raw_message_count":recent_start.saturating_sub(base_len),
+        "omitted_raw_steps":step_starts.iter().enumerate().filter(|(_,start)| **start < recent_start).map(|(index,_)|index+1).collect::<Vec<_>>(),
+        "shortened_messages":shortened,"limits":{"recent_steps":WORKER_RECENT_STEPS,"recent_bytes":WORKER_RECENT_BYTES,"message_chars":WORKER_MESSAGE_CHARS},
+        "note":"Raw history outside the window is omitted. Task contract, action ledger, stable work state, Flow and Observer notes are separate synthesized messages in the actual request; retained history is not the whole request."});
+    (scoped, compaction)
+}
+fn project_symbol_details(projected: &mut Value, original: &Value, sources: &crate::task_notebook::SourceWorkingSet, budget: &mut usize, fresh: bool) {
+    let Some(raw) = projected["content"].as_str() else { return; };
+    let Ok(mut result) = serde_json::from_str::<Value>(raw) else { return; };
+    if let Some(symbol) = original.get("symbol") {
+        result["definition"] = json!({"id":symbol["id"],"name":symbol["name"],"file_path":symbol["file_path"],
+            "start_line":symbol["start_line"],"end_line":symbol["end_line"],"signature":symbol["signature"].as_str().map(|text|truncate(text,240))});
+    }
+    for field in ["edit_context", "related_type_issues"] {
+        if let Some(value) = original.get(field) {result[field]=value.clone();}
+    }
+    let mut pages=Vec::new();
+    for page in original["related_types"].as_array().into_iter().flatten() {
+        let mut selected=json!({"symbol":page["symbol"],"path":page["path"],"code_hash":page["code_hash"],
+            "start_line":page["start_line"],"end_line":page["end_line"],"notebook_material":page["notebook_material"],
+            "notebook_capture_error":page["notebook_capture_error"]});
+        let chars=page["content"].as_str().map_or(0,|text|text.chars().count());
+        if page.get("notebook_material").is_some_and(|material|sources.contains_page(material,page)) {
+            selected["context_status"]=json!("source retained in current working set");
+        } else if fresh && chars<=*budget {
+            selected["content"]=page["content"].clone();selected["complete"]=page["complete"].clone();
+            *budget-=chars;
+        } else {
+            selected["context_status"]=json!("not included: fresh source budget; recall material or read this definition directly");
+        }
+        pages.push(selected);
+    }
+    if !pages.is_empty() {result["related_types"]=json!(pages);}
+    projected["content"]=json!(result.to_string());
+}
+
+fn notebook_worker_request(messages: &[Value], base: usize, starts: &[usize], owners: &HashMap<usize,String>, contract: &str, node: &str, sources: &crate::task_notebook::SourceWorkingSet) -> (Vec<Value>, Value) {
+    // Preserve complete tool-call/result groups for provider protocol correctness.
+    // Older groups are represented by task conclusions and notebook material IDs.
+    let recent_start=if starts.len()>2 { starts[starts.len()-2] } else { base };
+    // Fresh results must have a learning window even when the retained action
+    // pages fill their separate budget. Otherwise a successful new read is
+    // replaced with an ID before the Worker ever sees its content.
+    let latest_start=starts.last().copied().unwrap_or(base);
+    let initial_source_budget=sources.fresh_source_budget();
+    let mut source_budget=initial_source_budget;
+    let mut scoped=messages[..base].to_vec();
+    // The current expanded user prompt is already present. Add only historical context.
+    if let Some((_,history))=contract.split_once("Earlier conversation for reference") {
+        if !history.trim().ends_with(':') && !history.trim().is_empty() {
+            scoped.push(json!({"role":"system","content":format!("Earlier conversation for reference{history}")}));
+        }
+    }
+    let mut owner=String::new(); let mut skipped=0usize; let mut stored_source=0usize; let mut shortened=Vec::<Value>::new();
+    let mut tool_names=HashMap::<String,String>::new();
+    for (index,message) in messages.iter().enumerate().skip(base) {
+        if let Some(actual)=owners.get(&index) {owner=actual.clone();}
+        if message["role"]=="assistant" {
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                let name=call.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
+                if let Some(id)=call["id"].as_str() { tool_names.insert(id.to_owned(),name.to_owned()); }
+                if name=="report_progress" && owners.is_empty() {
+                    if let Some(current)=call.pointer("/function/arguments").and_then(Value::as_str)
+                        .and_then(|raw|serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|args|args["current_node_id"].as_str().map(str::to_owned)) { owner=current; }
+                }
+            }
+        }
+        if index<recent_start || (!node.is_empty() && owner!=node) { skipped+=1; continue; }
+        let mut projected=message.clone();
+        if message["role"]=="assistant" {
+            if let Some(object)=projected.as_object_mut() { object.remove("reasoning_content"); object.remove("reasoning"); }
+            if let Some(calls)=projected["tool_calls"].as_array_mut() {
+                for call in calls {
+                    let name=call.pointer("/function/name").and_then(Value::as_str).unwrap_or("").to_owned();
+                    if matches!(name.as_str(),"write_file"|"replace_range"|"edit_file") {
+                        let args=call.pointer("/function/arguments").and_then(Value::as_str).and_then(|raw|serde_json::from_str::<Value>(raw).ok()).unwrap_or(json!({}));
+                        call["function"]["arguments"]=json!(json!({"current_node_id":args["current_node_id"],"path":args["path"],
+                            "start_line":args["start_line"],"end_line":args["end_line"],"recorded_in_task_notebook":true}).to_string());
+                    } else if name=="report_progress" {
+                        if let Some(mut args)=call.pointer("/function/arguments").and_then(Value::as_str).and_then(|raw|serde_json::from_str::<Value>(raw).ok()) {
+                            if let Some(object)=args.as_object_mut() {
+                                // Completed report intentions stay in UI/history,
+                                // not as repeated instructions to investigate again.
+                                for field in ["purpose","next_action","known_conditions","open_questions","plan","node_updates","resume_tree"] {object.remove(field);}
+                            }
+                            call["function"]["arguments"]=json!(args.to_string());
+                        }
+                    }
+                }
+            }
+        } else if message["role"]=="tool" {
+            let name=message["tool_call_id"].as_str().and_then(|id|tool_names.get(id)).map(String::as_str).unwrap_or("");
+            if let Some(result)=message["content"].as_str().and_then(|raw|serde_json::from_str::<Value>(raw).ok()) {
+                let material=result.get("notebook_material");
+                if material.is_some() && (!crate::worker_read_cache::is_source_read(name)
+                    || sources.contains_page(material.unwrap(),&result) || index<latest_start) {
+                    projected["content"]=json!(json!({"notebook_material":material,"stored":true,"error":result["error"],
+                        "path":result.get("path").or_else(||result.pointer("/symbol/file_path")),"changed":result["changed"],"created":result["created"],"code_hash":result.get("code_hash").or_else(||result.pointer("/description/code_hash")),
+                        "bytes_written":result["bytes_written"],"changes":result["changes"],"index_refresh":result["index_refresh"],"notebook_capture_error":result["notebook_capture_error"],
+                        "retrieve":"recall_work include_material=true with this material id when exact source is needed"}).to_string()); stored_source+=1;
+                } else if name=="recall_work" && result.get("tool_results").is_none() && result.get("tree_nodes").is_none() {
+                    let mut fresh_pages=Vec::new();
+                    for page in result.pointer("/notebook/materials").and_then(Value::as_array).into_iter().flatten() {
+                        if index<latest_start {break;}
+                        if page["available"]!=true || sources.contains_page(page,page) {continue;}
+                        let mut fresh=page.clone();
+                        if source_budget<1000 {
+                            fresh_pages.push(json!({"id":page["id"],"path":page["path"],"context_status":"deferred: fresh source budget","stored_in_notebook":true}));
+                            continue;
+                        }
+                        let original_chars=fresh["content"].as_str().map_or(0,|text|text.chars().count());
+                        let paging_ok=if original_chars<=source_budget {true}
+                            else if page["partial_line"]==true {
+                                let content=page["content"].as_str().unwrap_or("").chars().take(source_budget).collect::<String>();
+                                fresh["next_column"]=json!(page["start_column"].as_u64().unwrap_or(1)+content.chars().count() as u64);
+                                fresh["content"]=json!(content);fresh["complete"]=json!(false);fresh["next_start_line"]=page["start_line"].clone();true
+                            } else {crate::source_read::page(&mut fresh,&json!({"max_chars":source_budget})).is_ok()};
+                        if paging_ok {
+                            if let Some(object)=fresh.as_object_mut() {object.remove("lines");}
+                            source_budget=source_budget.saturating_sub(fresh["content"].as_str().map_or(0,|text|text.chars().count()));
+                            fresh["returned_chars"]=json!(fresh["content"].as_str().map_or(0,|text|text.chars().count()));
+                            if original_chars>fresh["returned_chars"].as_u64().unwrap_or(0) as usize {
+                                shortened.push(json!({"raw_index":index,"tool_call_id":message["tool_call_id"],"material_id":page["id"],"reason":"fresh source context budget","original_source_chars":original_chars,"sent_source_chars":fresh["returned_chars"],"full_material_stored":true}));
+                            }
+                            fresh_pages.push(fresh);
+                        }
+                    }
+                    projected["content"]=json!(json!({"work":result["work"],"material_status":result.pointer("/notebook/materials").and_then(Value::as_array).map(|items|items.iter().map(|item|json!({"id":item["id"],"status":item["status"],"available":item["available"]})).collect::<Vec<_>>()),
+                        "index":result.pointer("/notebook/index"),"source_context":result["source_context"],"fresh_source_pages":fresh_pages,
+                        "source":"Selected pages are retained separately; fresh unselected pages are visible for learning in this response. Select needed pages before another report-only round; full materials remain in the notebook."}).to_string());
+                } else if material.is_some() {
+                    // Keep the newest read for learning; strip duplicated JSON line wrappers.
+                    let mut compact=json!({"notebook_material":material,"path":result.get("path").or_else(||result.pointer("/symbol/file_path")),"code_hash":result.get("code_hash").or_else(||result.pointer("/description/code_hash")),"read_coverage":result["read_coverage"],
+                        "start_line":result["start_line"],"end_line":result["end_line"],"complete":result["complete"],"next_start_line":result["next_start_line"],
+                        "start_column":result["start_column"],"next_column":result["next_column"],"partial_line":result["partial_line"],"source_format":result["source_format"],
+                        "material_start_line":result["material_start_line"],"material_end_line":result["material_end_line"],"total_lines":result["total_lines"],"end_clamped_to_eof":result["end_clamped_to_eof"]});
+                    if let Some(content)=result["content"].as_str() {
+                        compact["content"]=json!(content);
+                        if source_budget<1000 {
+                            compact["content"]=Value::Null;compact["source_omitted_from_context"]=json!(true);
+                            compact["retrieve"]=json!("Source is stored in notebook_material; use recall_work include_material=true when this material is needed.");
+                        } else if content.chars().count()>source_budget {
+                            let metadata=(compact["material_start_line"].clone(),compact["material_end_line"].clone());
+                            if result["partial_line"]==true {
+                                compact["content"]=json!(content.chars().take(source_budget).collect::<String>());
+                                compact["next_column"]=json!(result["start_column"].as_u64().unwrap_or(1)+source_budget as u64);
+                                compact["next_start_line"]=result["start_line"].clone();compact["complete"]=json!(false);
+                            } else if crate::source_read::page(&mut compact,&json!({"max_chars":source_budget})).is_err() {
+                                compact["content"]=Value::Null;compact["source_omitted_from_context"]=json!(true);
+                            }
+                            compact["material_start_line"]=metadata.0;compact["material_end_line"]=metadata.1;
+                        }
+                        let sent_source_chars=compact["content"].as_str().map_or(0,|source|source.chars().count());
+                        if sent_source_chars<content.chars().count() {shortened.push(json!({"raw_index":index,"role":"tool","tool_call_id":message["tool_call_id"],"reason":"recent source context budget","original_source_chars":content.chars().count(),"sent_source_chars":sent_source_chars,"full_material_stored":true,"notebook_material":material}));}
+                        source_budget=source_budget.saturating_sub(compact["content"].as_str().map_or(0,|source|source.chars().count()));
+                    }
+                    else {
+                        let mut segments=Vec::<Value>::new();
+                        for line in result.get("lines").or_else(||result.get("new_lines")).and_then(Value::as_array).into_iter().flatten() {
+                            let number=line["line"].as_u64().unwrap_or(0); let text=line["text"].as_str().unwrap_or("");
+                            if let Some(last)=segments.last_mut().filter(|last|last["end_line"].as_u64()==Some(number.saturating_sub(1))) {
+                                let content=format!("{}\n{text}",last["content"].as_str().unwrap_or("")); last["content"]=json!(content); last["end_line"]=json!(number);
+                            } else { segments.push(json!({"start_line":number,"end_line":number,"content":text})); }
+                        }
+                        compact["segments"]=json!(segments);
+                    }
+                    projected["content"]=json!(compact.to_string());
+                }
+            }
+            if name=="read_ts_symbol" {
+                if let Some(original)=message["content"].as_str().and_then(|raw|serde_json::from_str::<Value>(raw).ok()) {
+                    project_symbol_details(&mut projected,&original,sources,&mut source_budget,index>=latest_start);
+                }
+            }
+            // Never cut a source JSON string into an apparently valid method. Oversize
+            // output is an explicit excerpt; full source remains in the notebook.
+            let protected_page=projected["content"].as_str().and_then(|raw|serde_json::from_str::<Value>(raw).ok()).is_some_and(|result|
+                (crate::worker_read_cache::is_source_read(name) && (result["content"].is_string() || result.get("related_types").is_some())) || result.get("tool_results").is_some() || result.get("fresh_source_pages").is_some());
+            if let Some(content)=projected["content"].as_str().filter(|content|content.chars().count()>24_000 && !protected_page) {
+                let original_chars=content.chars().count();
+                let parsed=serde_json::from_str::<Value>(content).unwrap_or(json!({"text":content}));
+                projected["content"]=json!(crate::source_read::bounded(&parsed,24_000,message["tool_call_id"].as_str().unwrap_or("")));
+                shortened.push(json!({"raw_index":index,"role":"tool","tool_call_id":message["tool_call_id"],"original_chars":original_chars,
+                    "sent_chars":projected["content"].as_str().unwrap_or("").chars().count(),
+                    "full_material_stored":message["content"].as_str().and_then(|raw|serde_json::from_str::<Value>(raw).ok()).is_some_and(|result|result.get("notebook_material").is_some())}));
+            }
+        }
+        scoped.push(projected);
+    }
+    let metadata=json!({"mode":"task_notebook","active_node":node,"raw_message_count":messages.len(),"base_message_count":base,
+        "retained_raw_message_count":messages.len()-skipped,"omitted_raw_message_count":skipped,
+        "omitted_raw_steps":starts.iter().enumerate().filter(|(_,start)|**start<recent_start).map(|(index,_)|index+1).collect::<Vec<_>>(),
+        "source_results_replaced_by_material_refs":stored_source,"shortened_messages":shortened,"limits":{"recent_steps":2,
+            "total_source_chars":crate::task_notebook::SOURCE_REQUEST_CHARS,"material_context_chars":crate::task_notebook::SOURCE_CONTEXT_CHARS,
+            "material_page_chars":crate::task_notebook::MATERIAL_PAGE_CHARS,"recent_source_context_chars":initial_source_budget,
+            "fresh_source_reserve_chars":crate::task_notebook::SOURCE_LEARNING_RESERVE},"recent_source_chars":initial_source_budget-source_budget,
+        "source_working_set":sources.metadata(),
+        "raw_step_nodes":starts.iter().enumerate().map(|(index,start)|json!({"step":index+1,"raw_start":start,"node_id":owners.get(start)})).collect::<Vec<_>>(),
+        "note":"All materials remain in the durable notebook. Only the current node/action's selected pages enter source context. Reports and action renaming preserve selection; tree navigation saves/restores each node's own pages. source_material_ids or replace_context explicitly narrow/replace selection. Oversize additions do not evict selected code."});
+    (scoped,metadata)
+}
+
+fn consult_observer_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "consult_observer",
+            "description": "Proactively ask the Observer for guidance, global context, or historical information from past turns, earlier nodes, or architectural decisions. The Observer has full task memory and will provide a distilled, concise answer without bloating your context.",
+            "parameters": {
+                "type": "object",
+                "required": ["question"],
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The specific question you want to ask the Observer (e.g., 'Did we already define type X in an earlier step?' or 'What did the user specify about Y?')."
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn observer_response_schema() -> Value {
+    json!({"type":"array","minItems":1,"items":{"type":"object","required":["id","disposition","reason"],"properties":{
+        "id":{"type":"string","description":"Stable ID of a delivered Observer message"},
+        "disposition":{"type":"string","enum":["accepted","adjusted","declined","resolved"]},
+        "reason":{"type":"string","description":"Concrete action you will take, why you disagree, or what actually resolved the issue"}
+    }}})
+}
+
+fn recall_work_tool() -> Value {
+    json!({"type":"function","function":{"name":"recall_work",
+        "description":"Search conclusions first, or activate only version-checked source pages needed for the current action. Use material_ids, focused line ranges and include_material=true. replace_context replaces the previous selection; action_id changes actions. All materials remain in the notebook, independently of the small active context. include_history explicitly retrieves the finding timeline. tool_call_ids recover historical original tool results; use result_field and result_offset for large pages. No Observer dependency.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string"},
+            "action_id":{"type":"string","description":"Stable ID of the next concrete operation, such as editing one definition; not the whole feature or plan. The ID is a label; use replace_context or source_material_ids explicitly to change selected pages."},
+            "replace_context":{"type":"boolean","description":"When include_material=true, replace the active pages with only the focused material pages requested by this call. Default adds without evicting existing pages."},
+            "material_ids":{"type":"array","items":{"type":"integer"}},"include_material":{"type":"boolean"},
+            "include_history":{"type":"boolean","description":"Retrieve historical finding revisions explicitly. Normal context contains only current findings and unresolved conflicts."},
+            "history_before":{"type":"integer"},"history_limit":{"type":"integer","minimum":1,"maximum":100},
+            "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},
+            "start_column":{"type":"integer","minimum":1,"description":"Continue a partial long line at next_column."},
+            "tool_call_ids":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"string"}},
+            "tree_node_ids":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string"},"description":"Retrieve full saved task-tree node results, goals and material pointers; does not load raw source or navigate the tree."},
+            "result_field":{"type":"string","description":"Field name or JSON pointer within historical result."},"result_offset":{"type":"integer","minimum":0},
+            "force_read":{"type":"boolean","default":false,"description":"Bypass source snapshot caching when retrieving materials."},
+            "max_chars":{"type":"integer","minimum":1000,"maximum":60000}}}
+    }})
+}
+
+fn report_progress_tool() -> Value {
+    json!({"type":"function","function":{
+        "name":"report_progress",
+        "description":"Report substantive work, findings or results with actual work tools. Simple tasks need no plan. Reassess direct mode when discoveries reveal separate dependent subproblems, including minimal features or changes in one file. Judge actual dependencies, not tool count or duration. Change organization and perform substantive work together. For complex tasks create plan.mode=tree with one root; split only real subproblems using node_updates and parent_id. Enter a child with current_node_id; finish with node_result and return to its parent. Switching alone never completes a tree node. Use incremental updates, not repeated whole-plan rewrites. Tool use does not wait for reporting or Observer.",
+        "parameters":{"type":"object","required":["current_node_id","purpose","known_conditions","next_action","findings","open_questions"],"properties":{
+            "current_node_id":{"type":"string","description":"Current tree node, or a short action label for direct work without a plan."},
+            "work_organization":{"type":"object","required":["mode","reason"],"description":"Optional explanation when choosing or changing work organization. Reconsider direct mode when discoveries reveal separate dependent subproblems; explain their concrete dependency. Choosing tree requires initializing plan.mode=tree in this same report if no tree exists. No extra classification round is needed.","properties":{
+                "mode":{"type":"string","enum":["direct","tree"]},"reason":{"type":"string","description":"Why a single bounded action is enough, or which actual dependent problems require separate focused nodes. Do not use tool count, duration or number of files as the reason."}
+            }},
+            "edit_targets":{"type":"array","items":{"type":"string"},"description":"Files planned for edits. Listing files does not inject their source."},
+            "action_id":{"type":"string","description":"Stable ID of this concrete operation (not the entire feature), independent of Flow nodes. Change it when moving to another operation; it does not itself clear pages. Explicitly select the smallest needed pages."},
+            "resume_tree":{"type":"boolean","description":"On a new human follow-up that continues the same complex task, explicitly restore the previous saved task tree. Do not use for a changed/unrelated task. Restored source pages are version checked."},
+            "source_material_ids":{"type":"array","items":{"type":"integer"},"description":"Keep only these already activated material pages for the action; [] clears source context. To fetch different or narrower pages, use recall_work with line ranges and replace_context=true."},
+            "carry_material_ids":{"type":"array","items":{"type":"integer"},"description":"On a tree-node switch, explicitly carry only these active old-node material pages into the new node. Other raw source stays with its owner; returning restores the parent's selected pages."},
+            "node_updates":{"type":"array","maxItems":128,"description":"Incrementally add/update tree nodes. New nodes require id, title, objective, done_when and parent_id (null only for the root). No extra planning round is required.","items":{"type":"object","required":["id"],"properties":{
+                "id":{"type":"string"},"parent_id":{"type":["string","null"]},"title":{"type":"string"},"kind":{"type":"string"},"objective":{"type":"string"},"done_when":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},"resume":{"type":"boolean","description":"Set only for a blocked or paused node; pending nodes are dispatched directly, and completed/skipped nodes are sealed and repaired with action=revisit."}
+            }}},
+            "node_result":{"type":"object","required":["node_id","status","summary"],"properties":{
+                "node_id":{"type":"string"},"status":{"type":"string","enum":["completed","blocked","skipped"]},"summary":{"type":"string","description":"Actual outcome and limits against done_when, not a promise. Completed child results are available to the parent without replaying the child's history."},
+                "material_ids":{"type":"array","items":{"type":"integer"}},"finding_ids":{"type":"array","items":{"type":"string"}}
+            }},
+            "purpose":{"type":"string","description":"Concise user-facing objective for this step; not private reasoning"},
+             "known_conditions":{"type":"array","items":{"type":"string"},"description":"Relevant user constraints, prior findings, or current state already known"},
+             "open_questions":{"type":"array","items":{"type":"string"},"description":"Current concrete unknowns and the decision each affects; supply [] when investigation is sufficient. This replaces the previous list."},
+             "findings":{"type":"array","items":{"type":"object","required":["id","text"],"properties":{
+                 "id":{"type":"string","description":"Stable short key; reuse it to correct or supersede a previous finding"},
+                 "topic":{"type":"string","description":"Stable key for the exact question/entity/scope. Related alternative claims must share this topic; do not group unrelated facts just because they share a file."},
+                 "text":{"type":"string","description":"What you learned, separate from proposed next actions"},
+                 "files":{"type":"array","items":{"type":"string"},"description":"Relevant relative source paths, when applicable"},
+                 "material_ids":{"type":"array","items":{"type":"integer"},"description":"Exact notebook materials supporting this conclusion. File-related suggestions are navigation hints only, not verification."},
+                 "conflicts_with":{"type":"array","items":{"type":"string"},"description":"IDs of incompatible earlier claims. They become unresolved conflicts, not parallel confirmed facts."},
+                 "supersedes":{"type":"array","items":{"type":"string"},"description":"IDs replaced after confirmation. Include all incompatible IDs and verification; age alone does not prove the new claim."},
+                 "verification":{"type":"object","properties":{"basis":{"type":"string","enum":["source","user"]},"summary":{"type":"string"},"material_ids":{"type":"array","items":{"type":"integer"}},"quote":{"type":"string","description":"Exact current human instruction when basis=user"}},"description":"For a correction: what was checked and which currently available material IDs support it. Runtime verifies source availability/version or that the quoted human instruction exists."},
+                 "status":{"type":"string","enum":["confirmed","assumed","needs_recheck","obsolete"]}
+             }},"description":"Persist meaningful findings across context changes; correct by stable ID instead of appending contradictory conclusions"},
+             "observer_responses":observer_response_schema(),
+            "next_action":{"type":"string","description":"The concrete action this step is about to take"},
+            "plan":{"type":"object","description":"Optional. For a complex task initialize mode=tree; then use node_updates. Direct discussion and short tasks do not need Flow.","required":["mode","nodes"],"properties":{
+                "mode":{"type":"string","enum":["tree"]},
+                "nodes":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","required":["id","title","parent_id","objective","done_when"],"properties":{
+                    "id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":["string","null"]},"objective":{"type":"string"},"done_when":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}}
+                }}},
+                "edges":{"type":"array","items":{"type":"object","required":["source","target"],"properties":{
+                    "id":{"type":"string"},"source":{"type":"string"},"target":{"type":"string"},"label":{"type":"string"}
+                }}}
+            }}
+        }}
+    }})
+}
+
+fn normalize_worker_flow_plan(
+    plan: &Value,
+    current_node_id: &str,
+    previous_status: &HashMap<String, String>,
+) -> anyhow::Result<(Vec<Value>, Vec<Value>, HashSet<String>)> {
+    let raw_nodes = plan.get("nodes").and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("plan.nodes must be an array"))?;
+    anyhow::ensure!(!raw_nodes.is_empty(), "a Flow plan must contain at least one node");
+    anyhow::ensure!(raw_nodes.len() <= 32, "a Flow plan may contain at most 32 nodes");
+    let mut ids = HashSet::new();
+    let mut nodes = Vec::new();
+    for raw in raw_nodes {
+        let id = raw.get("id").and_then(Value::as_str).unwrap_or("").trim();
+        anyhow::ensure!(!id.is_empty() && id.len() <= 80, "each Flow node needs a short nonempty id");
+        anyhow::ensure!(id.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')),
+            "Flow node ids may contain only letters, numbers, '.', '_' and '-'");
+        anyhow::ensure!(ids.insert(id.to_owned()), "duplicate Flow node id: {id}");
+        let title = raw.get("title").and_then(Value::as_str).unwrap_or("").trim();
+        anyhow::ensure!(!title.is_empty(), "Flow node {id} needs a title");
+        nodes.push(json!({
+            "id":id,
+            "title":truncate(title, 160),
+            "kind":truncate(raw.get("kind").and_then(Value::as_str).unwrap_or("step"), 48),
+            "description":truncate(raw.get("description").and_then(Value::as_str).unwrap_or(""), 1200),
+            "status":previous_status.get(id).map(String::as_str).unwrap_or("pending"),
+        }));
+    }
+    anyhow::ensure!(ids.contains(current_node_id), "current_node_id must refer to a node in the plan");
+    let raw_edges = plan.get("edges").and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("plan.edges must be an array"))?;
+    anyhow::ensure!(raw_edges.len() <= 64, "a Flow plan may contain at most 64 edges");
+    let mut edges = Vec::new();
+    for (index, raw) in raw_edges.iter().enumerate() {
+        let source = raw.get("source").and_then(Value::as_str).unwrap_or("").trim();
+        let target = raw.get("target").and_then(Value::as_str).unwrap_or("").trim();
+        anyhow::ensure!(ids.contains(source) && ids.contains(target), "Flow edges must refer to nodes in the plan");
+        edges.push(json!({
+            "id":raw.get("id").and_then(Value::as_str).filter(|id| !id.trim().is_empty())
+                .map(str::to_owned).unwrap_or_else(|| format!("edge_{index}_{source}_{target}")),
+            "source":source,
+            "target":target,
+            "label":truncate(raw.get("label").and_then(Value::as_str).unwrap_or(""), 100),
+        }));
+    }
+    let mut indegree = ids.iter().map(|id| (id.as_str(), 0usize)).collect::<HashMap<_, _>>();
+    let mut children = HashMap::<&str, Vec<&str>>::new();
+    for edge in &edges {
+        let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
+        let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
+        *indegree.get_mut(target).expect("edge target was validated") += 1;
+        children.entry(source).or_default().push(target);
+    }
+    let mut queue = indegree.iter().filter_map(|(id, degree)| (*degree == 0).then_some(*id)).collect::<Vec<_>>();
+    let mut visited = 0usize;
+    while let Some(id) = queue.pop() {
+        visited += 1;
+        for child in children.get(id).into_iter().flatten() {
+            let degree = indegree.get_mut(child).expect("edge target was validated");
+            *degree -= 1;
+            if *degree == 0 { queue.push(child); }
+        }
+    }
+    anyhow::ensure!(visited == ids.len(), "Flow plans must be acyclic");
+    Ok((nodes, edges, ids))
+}
+
+fn flow_plan_shape(nodes: &[Value], edges: &[Value]) -> Value {
+    json!({
+        "nodes":nodes.iter().map(|node| json!({
+            "id":node.get("id"),"title":node.get("title"),"kind":node.get("kind"),
+            "description":node.get("description"),"parent_id":node.get("parent_id"),
+            "objective":node.get("objective"),"done_when":node.get("done_when"),"constraints":node.get("constraints"),
+        })).collect::<Vec<_>>(),
+        "edges":edges.iter().map(|edge| json!({
+            "id":edge.get("id"),"source":edge.get("source"),"target":edge.get("target"),
+            "label":edge.get("label"),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn repeatable_read_tool(name: &str) -> bool {
+    matches!(name,
+        "workspace_info" | "list_dir" | "read_file" | "read_file_lines" | "search_text" | "search_code_map"
+        | "list_go_symbols" | "search_go_symbols" | "read_go_symbol" | "go_index_status"
+        | "list_rust_symbols" | "search_rust_symbols" | "read_rust_symbol" | "rust_index_status"
+        | "list_ts_symbols" | "search_ts_symbols" | "read_ts_symbol" | "ts_index_status"
+        | "list_python_symbols" | "search_python_symbols" | "read_python_symbol" | "python_index_status"
+        | "list_work_memory" | "search_work_memory" | "list_architecture_memory"
+        | "search_architecture_memory" | "list_symbol_business_context" | "search_symbol_business_context"
+    )
+}
+
+async fn refresh_scheduler_versions(scheduler:&mut crate::work_scheduler::WorkScheduler, workspace:&crate::tools::Workspace) -> anyhow::Result<()> {
+    let previous=scheduler.versions();let root=workspace.root().to_path_buf();
+    let versions=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut versions=std::collections::BTreeMap::new();
+        for path in previous.keys() {
+            let resolved=crate::file_edit::workspace_path(&root,path)?;
+            let hash=match std::fs::read(resolved) {
+                Ok(bytes)=>crate::symbol_description::content_hash(&bytes),
+                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>"missing".to_owned(),
+                Err(error)=>return Err(error.into()),
+            };
+            versions.insert(path.clone(),hash);
+        }
+        Ok(versions)
+    }).await??;
+    scheduler.update_versions(&versions);Ok(())
+}
+
+/// Restore only explicitly completed requests into a fresh plan. Local queue exhaustion
+/// and a blocked run must retain their deliveries and execution pointer.
+fn restore_execution_session(
+    previous_tree: &crate::flow_tree::TaskTree,
+    previous_scheduler: Option<crate::work_scheduler::WorkScheduler>,
+) -> (crate::flow_tree::TaskTree, crate::work_scheduler::WorkScheduler, bool) {
+    let scheduler_completed = previous_scheduler.as_ref().is_some_and(|s| match s.request_completed {
+        Some(completed) => completed && s.handoff.is_none(),
+        // Legacy snapshots had no request marker and retained their last output
+        // as handoff even after finish. An explicitly finished root is evidence
+        // of success; queue exhaustion alone still cannot prove completion.
+        None => s.finished && previous_tree.root_finished() && s.all_done()
+            && s.handoff.as_ref().is_none_or(|h| h["done"] == true && h["blocked"] != true
+                && h["need_split"] != true && h["upstream_problem"].is_null()),
+    });
+    let completed = if previous_tree.enabled() {
+        previous_tree.root_finished() && (previous_scheduler.is_none() || scheduler_completed)
+    } else { scheduler_completed };
+    if completed {
+        let archived_requests = previous_scheduler.map(|s| s.archived_requests).unwrap_or_default();
+        (crate::flow_tree::TaskTree::default(), crate::work_scheduler::WorkScheduler { archived_requests, ..Default::default() }, true)
+    } else {
+        let mut scheduler = previous_scheduler.unwrap_or_default();
+        scheduler.finished = false;
+        scheduler.request_completed = Some(false);
+        (previous_tree.clone(), scheduler, false)
+    }
+}
+
+/// This is the same transaction used by run_task: Scheduler and TaskTree either
+/// both accept the decision or neither state is committed.
+fn apply_organizer_decision(
+    scheduler: &crate::work_scheduler::WorkScheduler,
+    task_tree: &crate::flow_tree::TaskTree,
+    previous_tree: &crate::flow_tree::TaskTree,
+    root: &std::path::Path,
+    prompt: &str,
+    mut decision: Value,
+    can_write: bool,
+    can_check: bool,
+) -> anyhow::Result<(crate::work_scheduler::WorkScheduler, crate::flow_tree::TaskTree, Value)> {
+    let mut next=scheduler.clone();let mut tree=task_tree.clone();
+    let continuation=scheduler.pending_handoff().is_some_and(|h| h["intent"] == "session_continuation");
+    anyhow::ensure!(!continuation || decision.get("request_action").is_some(),
+        "request_action is required at a session_continuation handoff; choose continue, subtask, or replace");
+    anyhow::ensure!(decision.get("request_action").is_none_or(Value::is_string), "request_action must be a string");
+    let request_action = decision["request_action"].as_str().unwrap_or("continue").to_owned();
+    let allowed_request_actions=if continuation {&["continue","subtask","replace"][..]} else {&["continue"][..]};
+    anyhow::ensure!(allowed_request_actions.contains(&request_action.as_str()),
+        "request_action='{request_action}' is invalid in this lifecycle stage; allowed_request_actions: {}",allowed_request_actions.join(", "));
+    decision["request_action"] = json!(request_action);
+    if request_action == "replace" {
+        anyhow::ensure!(decision["action"] == "work" && scheduler.pending_handoff().is_some_and(|h| h["intent"] == "session_continuation"),
+            "replace starts a new user goal only with action=work at a new-message handoff");
+        anyhow::ensure!(decision["preserve_current"] != true, "replace cancels the old goal; preserve_current applies to subtask repair");
+        anyhow::ensure!(decision.pointer("/flow_update/resume_tree") != Some(&json!(true)), "replace cannot resume the cancelled tree");
+        next = scheduler.replace_request(&tree, decision["reason"].as_str().unwrap_or("User replaced the goal"));
+        tree = crate::flow_tree::TaskTree::default();
+    } else if request_action == "subtask" {
+        anyhow::ensure!(decision["action"] == "work", "subtask requires action=work");
+        decision["preserve_current"] = json!(true);
+    }
+    if let Some(update)=decision.get("flow_update").filter(|value|value.is_object()&&!value.as_object().unwrap().is_empty()) {
+        if update["resume_tree"]==true&&!tree.enabled(){
+            anyhow::ensure!(next.archived_requests.is_empty(), "cancelled requests stay archived; create a tree for the current request");
+            tree=previous_tree.clone();
+        }
+        if let Some(result)=update.get("node_result") {
+            anyhow::ensure!(tree.aggregate_result_allowed(result["node_id"].as_str().unwrap_or("")),"Organizer may aggregate only completed children; leaf completion belongs to the host");
+        }
+        tree.apply(update)?;
+    }
+    match decision["action"].as_str().unwrap_or("") {
+        "work"=>{
+            let mut orders:Vec<crate::work_scheduler::WorkOrder>=serde_json::from_value(decision["orders"].clone()).unwrap_or_default();
+            for order in &mut orders {
+                if let Some(spec)=order.project_observation.as_mut() {
+                    anyhow::ensure!(spec.is_object(),"project_observation must be an object with an explicit list coverage");
+                    let force=spec["force_refresh"]==true;
+                    if force {
+                        anyhow::ensure!(spec["purpose"].as_str().is_some_and(|purpose|!purpose.trim().is_empty()&&purpose.chars().count()<=300),
+                            "project_observation.force_refresh requires a concrete purpose");
+                    }
+                    let coverage=spec["coverage"].as_str().map(str::to_owned).unwrap_or_else(||if spec["project_path"].is_string(){"project_list".to_owned()}else{"workspace_list".to_owned()});
+                    anyhow::ensure!(matches!(coverage.as_str(),"workspace_list"|"project_list"),
+                        "project_observation.coverage must be workspace_list or project_list");
+                    let mut observation_args=spec.clone();
+                    observation_args.as_object_mut().unwrap().remove("purpose");
+                    observation_args.as_object_mut().unwrap().remove("force_refresh");
+                    observation_args["coverage"]=json!(coverage);
+                    if coverage=="workspace_list" {
+                        anyhow::ensure!(observation_args.get("project_path").is_none_or(Value::is_null),
+                            "workspace_list observations cannot include project_path");
+                        observation_args.as_object_mut().unwrap().remove("project_path");
+                    } else {
+                        anyhow::ensure!(observation_args["project_path"].is_string(),
+                            "project_list observations require project_path");
+                    }
+                    crate::project_process::normalize_args(root,&mut observation_args)?;
+                    if !force {
+                        if let Some(prior)=next.reusable_project_observation(root,&observation_args) {
+                            let old=prior["processes"].as_array().into_iter().flatten().filter_map(|p|p["process_id"].as_str()).collect::<Vec<_>>().join(", ");
+                            anyhow::bail!("duplicate process observation for project scope: fresh delivery from work '{}' at sampled_at={} already covers this scope (process IDs: [{}]); consume that delivery or declare force_refresh=true with a concrete new purpose",
+                                scheduler.frames.values().find(|frame|frame.project_observation==prior).map(|frame|frame.order.id.as_str()).unwrap_or("unknown"),
+                                prior["sampled_at"],old);
+                        }
+                    }
+                    spec["coverage"]=json!(coverage);
+                    if coverage=="project_list" {spec["project_path"]=observation_args["project_path"].clone();}
+                }
+            }
+            for order in &mut orders {
+                for target in &mut order.edit_targets {
+                    let resolved=crate::file_edit::workspace_path(&root,target)?;
+                    let canonical_root=root.canonicalize()?;
+                    *target=resolved.strip_prefix(canonical_root)?.to_string_lossy().replace('\\',"/");
+                }
+            }
+            let simple=orders.len()==1 && orders[0].completion==crate::work_scheduler::Completion::Output
+                && orders[0].final_answer && orders[0].checks.is_empty() && orders[0].edit_targets.is_empty();
+            if !simple {
+                tree.ensure_request_goal(&prompt)?;
+                for (order_index,order) in orders.iter_mut().enumerate() {
+                    if let Some(status)=tree.status(&order.node_id) {
+                        anyhow::ensure!(status!="completed"&&status!="skipped"&&status!="deprecated",
+                            "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}' and is sealed; use action=revisit for a defective delivery or add a new pending node under an unfinished ancestor",order.node_id);
+                        anyhow::ensure!(status!="blocked"&&status!="paused",
+                            "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}'; resume this blocked/paused node with flow_update.node_updates[{{id,resume:true}}] before dispatch",order.node_id);
+                        anyhow::ensure!(tree.work_node_ready(&order.node_id),
+                            "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}' but still has unfinished child nodes; complete those children before assigning work to the parent",order.node_id);
+                    } else {
+                        order.node_id=format!("work_{}",order.id);
+                        tree.ensure_work_child(&order.node_id,&order.goal,&order.done_when,&order.constraints)?;
+                    }
+                }
+            }
+            for order in &mut orders {
+                anyhow::ensure!(!tree.enabled()||tree.work_node_ready(&order.node_id),"assign an unfinished leaf or a parent whose children are complete");
+                if !tree.enabled() {
+                    let node_id=format!("work_{}",order.id);
+                    anyhow::ensure!(order.node_id=="direct"||order.node_id==node_id||order.node_id==order.id,"bounded work uses node_id=direct or its existing work node id");
+                    order.node_id=node_id;
+                }
+            }
+            decision["orders"] = serde_json::to_value(&orders)?;
+            let changes = next.apply(&decision,can_write,can_check)?;
+            tree.deprecate_nodes(&changes.invalidated_node_ids)?;
+            decision["execution_changes"] = json!({"invalidated_work_ids": changes.invalidated_work_ids, "invalidated_node_ids": changes.invalidated_node_ids});
+        },
+        "select"|"revisit"|"continue"|"finish"|"blocked"=>{
+            if decision["action"]=="select" {
+                let task_id=decision["task_id"].as_str().filter(|id|!id.is_empty())
+                    .ok_or_else(||anyhow::anyhow!("select requires task_id using an exact work/order ID; node IDs belong to revisit"))?;
+                anyhow::ensure!(decision.get("node_id").is_none(),"select accepts task_id only; do not substitute a Flow node ID");
+                anyhow::ensure!(scheduler.available_select_task_ids().iter().any(|id|id==task_id),
+                    "select task_id '{task_id}' is not an active unfinished work order; available task IDs: [{}]",scheduler.available_select_task_ids().join(", "));
+            }
+            if decision["action"]=="revisit" {
+                let target=decision["target_node_id"].as_str().filter(|id|!id.is_empty())
+                    .ok_or_else(||anyhow::anyhow!("revisit requires target_node_id using an exact Flow node ID"))?;
+                anyhow::ensure!(decision.get("node_id").is_none(),"revisit accepts target_node_id only");
+                let frame_exists=scheduler.frames.values().any(|frame|frame.invalidated_by_plan_revision.is_none()&&frame.order.node_id==target);
+                anyhow::ensure!(frame_exists&&(!tree.enabled()||tree.ids().contains(target)),
+                    "revisit target_node_id '{target}' is unavailable; available revisit targets: [{}]",scheduler.frames.values().filter(|frame|frame.invalidated_by_plan_revision.is_none()).map(|frame|frame.order.node_id.as_str()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", "));
+            }
+            if decision["action"]=="finish"||decision["action"]=="blocked" {
+                let blocked=decision["action"]=="blocked";
+                anyhow::ensure!(blocked||!tree.enabled()||tree.root_finished(),"aggregate the completed tree before finishing");
+            }
+            let changes = next.apply(&decision,can_write,can_check)?;
+            tree.deprecate_nodes(&changes.invalidated_node_ids)?;
+            decision["execution_changes"] = json!({"invalidated_work_ids": changes.invalidated_work_ids, "invalidated_node_ids": changes.invalidated_node_ids});
+            if decision["action"]=="revisit" && tree.enabled() {
+                if let Some(rewind)=next.rewind_records.last() {
+                    tree.revisit_node(&rewind.target_node,&rewind.invalidated_node_ids)?;
+                }
+            }
+        },_=>anyhow::bail!("invalid Organizer action"),
+    }
+    if !next.finished && tree.enabled() {tree.apply(&json!({"current_node_id":next.node()}))?;}
+    Ok((next,tree,decision))
+}
+
+fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&crate::work_scheduler::WorkScheduler,tree:&crate::flow_tree::TaskTree)->Value {
+    let message=format!("{error:#}");
+    if let Some(field_path)=message.split("field_path=").nth(1).and_then(|path|path.split(|ch:char|ch.is_whitespace()||ch==':'||ch==',').next()).filter(|path|!path.is_empty()) {
+        let rejected=decision.pointer(&organizer_field_path_pointer(field_path)).cloned().unwrap_or(Value::Null);
+        let fingerprint=format!("{}:{field_path}:{rejected}",if field_path.contains(".dependency_inputs[")||field_path.contains(".upstream_ids[") {"INVALID_DEPENDENCY_INPUT"}else if field_path.ends_with(".resume") {"INVALID_RESUME_STATUS"}else if field_path.ends_with(".node_id")&&message.contains("sealed") {"COMPLETED_NODE_IMMUTABLE"}else if field_path.ends_with(".node_id")&&message.contains("status='blocked'")||field_path.ends_with(".node_id")&&message.contains("status='paused'") {"INVALID_RESUME_STATUS"}else if field_path.ends_with(".browser_document_path")||field_path.ends_with(".completion")&&message.contains("requires_pptx") {"INVALID_PPTX_CONTRACT"}else{"INVALID_WORK_FIELD"});
+        let code=fingerprint.split(':').next().unwrap_or("INVALID_WORK_FIELD");
+        let available_deliveries=scheduler.organizer_input()["available_dependency_deliveries"].clone();
+        let node_statuses=tree.plan()["nodes"].as_array().cloned().unwrap_or_default().into_iter().map(|node|json!({"node_id":node["id"],"status":node["status"]})).collect::<Vec<_>>();
+        let (expected_shape,allowed_values)=if code=="INVALID_DEPENDENCY_INPUT" {
+            ("Use dependency_inputs with an exact work_id or node_id, optional matching revision, and only fields listed on that completed delivery.",json!({"available_dependency_deliveries":available_deliveries}))
+        } else if code=="INVALID_RESUME_STATUS" {
+            ("Pending nodes can be assigned directly. Set resume=true only for a blocked or paused node; completed nodes need action=revisit for repair.",json!({"resumable_statuses":["blocked","paused"],"current_node_statuses":node_statuses,"available_work_ids":scheduler.available_select_task_ids()}))
+        } else if code=="COMPLETED_NODE_IMMUTABLE" {
+            ("Completed work is sealed. Add a new node under an unfinished ancestor, or use action=revisit with target_node_id to repair its delivery.",json!({"available_revisit_targets":scheduler.organizer_input()["available_revisit_targets"],"immutable_completed_node_ids":scheduler.organizer_input()["immutable_completed_node_ids"]}))
+        } else if code=="INVALID_PPTX_CONTRACT" {
+            ("For requires_pptx work, set browser_document_path to the exact workspace-relative .pptx path and use completion=output. If upload and verification are separate nodes, declare the uploader's browser_upload_receipt in dependency_inputs; the host preserves it independently of the short operation log.",json!({"required_constraint":"requires_pptx","required_fields":["browser_document_path","completion=output"],"optional_dependency_field":"browser_upload_receipt","work_index":scheduler.organizer_input()["work_index"]}))
+        } else {
+            ("Correct the named work field using the current flow and active work index.",json!({"work_index":scheduler.organizer_input()["work_index"],"node_statuses":node_statuses}))
+        };
+        return json!({"error_code":code,"field_path":field_path,"rejected_value":rejected,"allowed_values":allowed_values,
+            "expected_shape":expected_shape,"relevant_node_ids":tree.ids().into_iter().collect::<Vec<_>>(),"error":message,
+            "fingerprint":fingerprint,"correction_instruction":"Make one targeted correction to this field using the listed IDs, statuses and available delivery fields. Do not repeat project investigation or discard sealed deliveries."});
+    }
+    let (error_code,field_path,expected_shape,allowed_values)=if message.contains("request_action") {
+        let continuation=scheduler.pending_handoff().is_some_and(|handoff|handoff["intent"]=="session_continuation");
+        ("INVALID_REQUEST_ACTION","request_action",if continuation {"At session_continuation use one of the supplied actions; replace requires action=work."}else{"On a normal first/current task omit request_action or set it to continue."},
+            if continuation {json!(["continue","subtask","replace"])}else{json!(["continue"])})
+    }else if message.contains("flow_update.plan.current_node_id") {
+        ("MISPLACED_FLOW_CURRENT_NODE","flow_update.plan.current_node_id","Put current_node_id beside plan inside flow_update; it is not a plan property.",json!([]))
+    }else if message.contains("flow_update.current_node_id")||message.contains("current_node_id") {
+        ("INVALID_FLOW_NODE_ID","flow_update.current_node_id","Use a node ID that exists after the Flow update; keep current_node_id beside plan/node_updates.",json!(tree.ids().into_iter().collect::<Vec<_>>()))
+    }else if message.contains("completed Flow node")||message.contains("completed node") {
+        ("COMPLETED_NODE_IMMUTABLE","flow_update.node_updates","Keep completed node goals unchanged. Add a new node under an unfinished ancestor for next work, or revisit the completed node when its delivered result is defective.",json!(["add a new child node","action=revisit with target_node_id"]))
+    }else if message.contains("target_node_id")||message.contains("revisit target") {
+        ("INVALID_REVISIT_TARGET","target_node_id","Use one exact ID from available_revisit_targets.",json!(scheduler.frames.values().filter(|frame|frame.invalidated_by_plan_revision.is_none()).map(|frame|frame.order.node_id.as_str()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>()))
+    }else if message.contains("select")||message.contains("task_id") {
+        ("INVALID_SELECT_TASK","task_id","For action=select provide an exact unfinished work/order ID from available_select_task_ids; Flow node IDs are not task IDs.",json!(scheduler.available_select_task_ids()))
+    }else if message.contains("duplicate process observation")||message.contains("project_observation") {
+        ("DUPLICATE_PROCESS_OBSERVATION","orders[].project_observation","Consume the fresh prior project_observation through dependency_inputs. To sample again, use force_refresh=true and give a concrete purpose.",json!(["reuse fresh dependency delivery","force_refresh with new purpose"]))
+    }else if message.contains("flow_update.plan")||message.contains("flow_update.node_updates")||message.contains("Flow node")||message.contains("tree node") {
+        ("INVALID_FLOW_UPDATE","flow_update","Use plan={mode:'tree',nodes:[...]}, node_updates=[...], current_node_id as a sibling, and node_result={node_id,status,summary}.",json!(["plan","node_updates","current_node_id","node_result","resume_tree"]))
+    }else {
+        ("INVALID_WORK_CONTRACT","decision","Correct only the rejected scheduling field using the host error and existing delivered work; do not re-investigate project source.",json!([]))
+    };
+    let rejected_path=match field_path {
+        "request_action"=>"/request_action",
+        "flow_update.plan.current_node_id"=>"/flow_update/plan/current_node_id",
+        "flow_update.current_node_id"=>"/flow_update/current_node_id",
+        "flow_update.node_updates"=>"/flow_update/node_updates",
+        "target_node_id"=>"/target_node_id",
+        "task_id"=>"/task_id",
+        "orders[].project_observation"=>"/orders/0/project_observation",
+        _=>"/flow_update",
+    };
+    let rejected=decision.pointer(rejected_path).cloned().unwrap_or(Value::Null);
+    let relevant_node_ids=tree.ids().into_iter().collect::<Vec<_>>();
+    let fingerprint=format!("{error_code}:{field_path}:{}",rejected);
+    json!({"error_code":error_code,"field_path":field_path,"rejected_value":rejected,"allowed_values":allowed_values,
+        "expected_shape":expected_shape,"relevant_node_ids":relevant_node_ids,"error":message,"fingerprint":fingerprint,
+        "correction_instruction":"Make one targeted correction to this field using the listed IDs and already supplied outputs. Do not repeat project investigation or discard sealed deliveries."})
+}
+
+fn organizer_field_path_pointer(path:&str)->String {
+    format!("/{}",path.replace('[',"/").replace(']',"").replace('.',"/"))
+}
+
+pub(crate) async fn run_task(
     state: AgentServiceState,
     task_id: String,
     model: String,
     prompt: String,
     max_steps: usize,
     cancel: CancellationToken,
-) {
+    is_child: bool,
+    turn: usize,
+    history: Vec<Value>,
+    subagent_used: bool,
+    ban_run_command: bool,
+) -> anyhow::Result<()> {
+    let ban_run_command = ban_run_command || user_bans_run_command(&prompt);
     let root = state.workspace.root().to_path_buf();
-    let turn = 1;
-    emit(&root, &task_id, "turn/start", json!({"turn":turn})).await;
-    emit_surface(&root, &task_id, "user/message", json!({"turn":turn,"message":{"id":uuid_like(),"role":"user","content":[{"type":"text","text":prompt}],"source":{"kind":"user"}}}), Some("append")).await;
-    let mut messages = vec![
-        json!({"role":"system","content":format!("You are a local coding agent. Work only in workspace {}. Use tools as needed and provide a concise final answer.", state.workspace.root().display())}),
-        json!({"role":"user","content":prompt}),
-    ];
-    let tools = local_tools(&state.workspace);
+    let model_prompt = crate::composer_catalog::expand_prompt(&root, &prompt);
+    let observer_model = if state.observer_inherits_model { model.clone() } else { state.observer_model.clone() };
+    emit(&root, &task_id, "turn/start", json!({
+        "turn":turn,"provider":state.provider_name,"reasoning_effort":state.reasoning_effort,
+        "fast_mode":state.fast_mode,"permission_mode":state.permission_mode,"max_steps":max_steps,
+    })).await?;
+    emit(&root, &task_id, "observer/config", json!({
+        "turn":turn,
+        "enabled":state.observer_enabled,
+        "provider":if state.observer_inherits_model { "follow-worker" } else { state.observer_provider.as_str() },
+        "model":if state.observer_enabled { observer_model.as_str() } else { "" },
+    })).await?;
+    emit_surface(&root, &task_id, "user/message", json!({
+        "turn":turn,"model_content":model_prompt,
+        "message":{"id":uuid_like(),"role":"user","content":[{"type":"text","text":prompt}],"source":{"kind":"user"}}
+    }), Some("append")).await?;
+
+    emit(&root,&task_id,"flow/plan",json!({"turn":turn,"mode":"direct","replaceCurrentTurn":true,
+        "nodes":[{"id":"request","title":truncate(&prompt,160),"kind":"worker","objective":prompt,"status":"running"}],"edges":[]})).await?;
+    let task_contract = worker_task_contract(&history, &prompt);
+    let mut messages = vec![json!({"role":"system","content":""}), json!({"role":"user","content":model_prompt})];
+    let base_messages = messages.len();
+    let mut step_starts = Vec::new();
+    let mut step_owners=HashMap::<usize,String>::new();
+    let mut subagent_spawned = subagent_used;
+    let mut active_flow_node = String::new();
+    let mut latest_worker_progress = Value::Null;
+    let mut latest_flow_plan = Value::Null;
+    let mut task_tree: crate::flow_tree::TaskTree;
+    let mut recent_actions = Vec::<Value>::new();
+    let mut observer = crate::observer_service::ObserverSession::start(state.clone(),observer_model.clone(),task_id.clone(),&cancel);
+    let mut organizer_decision=Value::Null;
+    let history_root = root.clone();
+    let history_task = task_id.clone();
+    let (mut work_state, mut observer_inbox, legacy_revisions) = tokio::task::spawn_blocking(move || -> anyhow::Result<(crate::worker_work_state::WorkState, crate::worker_work_state::ObserverInbox, Vec<Value>)> {
+        let conn = open_db(&history_root)?;
+        let previous = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/work_state' ORDER BY seq DESC LIMIT 1", [&history_task], |row| row.get::<_,String>(0)).optional()?;
+        let inbox = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='observer/inbox_state' ORDER BY seq DESC LIMIT 1", [&history_task], |row|row.get::<_,String>(0)).optional()?;
+        let mut work:crate::worker_work_state::WorkState=previous.and_then(|text|serde_json::from_str::<Value>(&text).ok())
+            .and_then(|data|serde_json::from_value(data["state"].clone()).ok()).unwrap_or_default();
+        let mut statement=conn.prepare("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='worker/progress' ORDER BY seq")?;
+        let mut observations=Vec::new();
+        for row in statement.query_map([&history_task],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))? {
+            let (seq,time,raw)=row?;
+            if let Ok(mut record)=serde_json::from_str::<Value>(&raw) {record["seq"]=json!(seq);record["time"]=json!(time);observations.push(record);}
+        }
+        let revisions=work.import_legacy(&observations);
+        Ok((work,
+            inbox.and_then(|text|serde_json::from_str::<Value>(&text).ok())
+            .and_then(|data|serde_json::from_value(data["state"].clone()).ok()).unwrap_or_default(),revisions))
+    }).await??;
+    for revision in legacy_revisions {emit(&root,&task_id,"worker/finding_revision",revision).await?;}
+    work_state.resume(&prompt);
+    emit(&root,&task_id,"worker/work_state",json!({"turn":turn,"step":0,"state":work_state.snapshot()})).await?;
+    if !state.observer_enabled { observer_inbox = crate::worker_work_state::ObserverInbox::default(); }
+    let mut repeated_read_calls = 0usize;
+    let mut successful_file_writes = 0usize;
+    let mut executed_tool_calls = 0usize;
+    let mut read_results = HashMap::<String, (String,String)>::new();
+    let mut source_coverage = crate::worker_read_cache::ReadCoverage::default();
+    let mut notebook = crate::task_notebook::Notebook::load(&root,&task_id).await?;
+    let mut source_working_set=crate::task_notebook::SourceWorkingSet::default();
+    let (source_root,source_task)=(root.clone(),task_id.clone());
+    let saved_sources=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let conn=open_db(&source_root)?;
+        let saved=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/source_working_set' ORDER BY seq DESC LIMIT 1",
+            [source_task],|row|row.get::<_,String>(0)).optional()?;
+        Ok(saved.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).map(|event|event["state"].clone()).unwrap_or(json!({})))
+    }).await??;
+    let (commit_root, commit_task) = (root.clone(), task_id.clone());
+    let restored_commit = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(crate::flow_tree::TaskTree, crate::work_scheduler::WorkScheduler)>> {
+        let conn = open_db(&commit_root)?;
+        let raw = conn.query_row(
+            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='execution/commit' ORDER BY seq DESC LIMIT 1",
+            [&commit_task], |row| row.get::<_, String>(0)
+        ).optional()?;
+        if let Some(raw_str) = raw {
+            if let Ok(data) = serde_json::from_str::<Value>(&raw_str) {
+                let tree_opt: Option<crate::flow_tree::TaskTree> = serde_json::from_value(data["task_tree"].clone()).ok();
+                let sched_opt: Option<crate::work_scheduler::WorkScheduler> = serde_json::from_value(data["scheduler"].clone()).ok();
+                if let (Some(t), Some(s)) = (tree_opt, sched_opt) {
+                    return Ok(Some((t, s)));
+                }
+            }
+        }
+        Ok(None)
+    }).await??;
+
+    let previous_tree = if let Some((ref tree, _)) = restored_commit {
+        tree.clone()
+    } else {
+        let (tree_root, tree_task) = (root.clone(), task_id.clone());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<crate::flow_tree::TaskTree> {
+            let conn = open_db(&tree_root)?;
+            let raw = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='flow/tree_state' ORDER BY seq DESC LIMIT 1",
+                [tree_task], |row| row.get::<_, String>(0)).optional()?;
+            Ok(raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|data| serde_json::from_value(data["state"].clone()).ok()).unwrap_or_default())
+        }).await??
+    };
+    let (sched_root, sched_task) = (root.clone(), task_id.clone());
+    let previous_scheduler = if let Some((_, sched)) = restored_commit {
+        Some(sched)
+    } else {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::work_scheduler::WorkScheduler>> {
+            let conn = open_db(&sched_root)?;
+            let raw = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='scheduler/state' ORDER BY seq DESC LIMIT 1",
+                [sched_task], |row| row.get::<_, String>(0)).optional()?;
+            Ok(raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|data| serde_json::from_value(data["state"].clone()).ok()))
+        }).await??
+    };
+
+    let (restored_tree, mut scheduler, is_completed_previous_session) =
+        restore_execution_session(&previous_tree, previous_scheduler);
+    task_tree = restored_tree;
+
+    if scheduler.request_started_turn == 0 {
+        scheduler.request_started_turn = if !is_completed_previous_session && turn > 1
+            && (task_tree.enabled() || !scheduler.frames.is_empty()) { turn - 1 } else { turn };
+    }
+    // Legacy unscoped advice belongs to the restored goal, never a new goal
+    // after successful completion. New inbox snapshots persist that identity.
+    if is_completed_previous_session { observer_inbox.start_request(turn.saturating_sub(1)); }
+    observer_inbox.set_scope(&scheduler);
+    observer_inbox.start_turn();
+    observer.set_scope(&scheduler,&prompt);
+    if state.observer_enabled {
+        emit(&root,&task_id,"observer/inbox_state",json!({"turn":turn,"step":0,"state":observer_inbox.snapshot()})).await?;
+    }
+    if !is_completed_previous_session && turn > 1 && !prompt.is_empty()
+        && (task_tree.enabled() || !scheduler.frames.is_empty()) {
+        // Every unfinished goal gets a request-level decision, even if its last
+        // dispatched packet already finished. Preserve that packet's delivery.
+        let resumable = scheduler.frame().filter(|f| f.status != crate::work_scheduler::WorkStatus::Done
+            && f.invalidated_by_plan_revision.is_none());
+        scheduler.handoff = Some(json!({
+            "done": false, "intent": "session_continuation",
+            "resumable_work": resumable.map(|f| &f.order.id),
+            "resumable_node": resumable.map(|f| &f.order.node_id),
+            "revision": resumable.map(|f| f.order.revision),
+            "previous_handoff": scheduler.pending_handoff(),
+            "reason": format!("User sent new input '{prompt}' before the current goal ended. Choose request_action=continue, subtask, or replace; preserve sealed deliveries when continuing.")
+        }));
+    }
+    let mut organizer_error=Value::Null;
+    let mut active_scope=String::new();
+    let mut organizer_failures=0usize;
     for step in 1..=max_steps {
         if cancel.is_cancelled() {
-            emit(
-                &root,
-                &task_id,
-                "turn/end",
-                json!({"turn":turn,"reason":{"kind":"aborted","reason":{"kind":"legacy"}}}),
-            )
-            .await;
-            finish(&state, &task_id, "cancelled").await;
-            return;
+            observer.finish("cancelled").await?;finish_cancelled_run(&state, &root, &task_id, turn, &active_flow_node).await?;
+            return Ok(());
         }
-        emit(
-            &root,
-            &task_id,
-            "step/start",
-            json!({"turn":turn,"step":step}),
-        )
-        .await;
-        let body = json!({"model":model,"messages":messages,"tools":tools,"tool_choice":"auto","stream":false});
-        let response = tokio::select! {
-            _ = cancel.cancelled() => {
-                emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await;
-                emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"aborted","reason":{"kind":"legacy"}}})).await;
-                finish(&state,&task_id,"cancelled").await;
-                return;
+        let completed_reviews = observer.reviews().await?;
+        let inbox_changed = !completed_reviews.is_empty();
+        for review in completed_reviews { observer_inbox.insert(&review); }
+        let delivered_advice = observer_inbox.deliver();
+        let inbox_changed = inbox_changed || !delivered_advice.is_empty();
+        for advice in delivered_advice {
+            emit(&root, &task_id, "observer/advice_delivered", json!({"turn":turn,"step":step,"advice":advice})).await?;
+        }
+        if inbox_changed {
+            emit(&root, &task_id, "observer/inbox_state", json!({"turn":turn,"step":step,"state":observer_inbox.snapshot()})).await?;
+        }
+        emit(&root, &task_id, "step/start", json!({"turn":turn,"step":step})).await?;
+
+        // Completed work hands off to Organizer to evaluate and choose next action; no automatic activate_next bypass.
+        if (scheduler.needs_organizer() || crate::work_executor::WorkExecutor::should_yield(&scheduler)) && (step<max_steps || scheduler.order().is_none()) {
+            scheduler.save_selection(source_working_set.snapshot());
+            emit(&root,&task_id,"organizer/start",json!({"turn":turn,"step":step,"nodeId":scheduler.node()})).await?;
+            let organizer_input=json!({"turn":turn,"human_request":model_prompt,"task_contract":task_contract,
+                "capabilities":{"permissions":state.permission_mode.guidance(),"can_write":state.permission_mode.allows("edit_file"),
+                    "available_tools":local_tools(&state.workspace,state.tool_catalog.as_deref(),ban_run_command).iter()
+                        .filter_map(|tool|tool.pointer("/function/name").and_then(Value::as_str)).filter(|name|state.permission_mode.allows(name)).collect::<Vec<_>>(),
+                    "allowed_request_actions":if scheduler.pending_handoff().is_some_and(|handoff|handoff["intent"]=="session_continuation") {vec!["continue","subtask","replace"]} else {vec!["continue"]},
+                    "can_check":can_run_check(&state,ban_run_command),"checks":"Run only human-authorized validation; do not add tests. Prefer structured tools: npm checks use npm:<project_path>:<script> (append :<args JSON> only for nonempty args), npm-install:<project_path>, or npm-start:<project_path>:<script> for managed background readiness; HTTP checks use http-probe:<exact local URL>. Use http_probe for general URL reachability, not PowerShell. Startup scripts require background=true and verified local readiness."},
+                "process":scheduler.organizer_input_with_freshness(&root),"flow":task_tree.plan(),"previous_unfinished_tree":if scheduler.archived_requests.is_empty()&&previous_tree.enabled()&&!previous_tree.root_finished(){previous_tree.context()}else{Value::Null},
+                "conclusions":work_state.request_context(scheduler.node(),&prompt,turn,&[]),
+                "material_index":notebook.context(scheduler.node(),&prompt),"previous_material_locations":saved_sources,
+                "observer_advice":observer_inbox.unhandled(),"historical_observer_advice":observer_inbox.historical(),
+                "late_delivery_review_notifications":observer_inbox.late_delivery_notifications(),"last_decision_error":organizer_error});
+            let decision=tokio::select! {
+                _=cancel.cancelled()=>{observer.finish("cancelled").await?;finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;return Ok(());},
+                result=tokio::time::timeout(Duration::from_secs(180),crate::work_organizer::decide(&state,&model,&task_id,turn,step,scheduler.node(),organizer_input))=>result.map_err(|_|anyhow::anyhow!("Organizer request timed out")).and_then(|v|v),
+            };
+            let mut attempted_decision=Value::Null;
+            let applied=decision.and_then(|mut decision| {attempted_decision=decision.clone();decision["decision_id"]=json!(format!("{task_id}:{turn}:{step}")); apply_organizer_decision(
+                &scheduler, &task_tree, &previous_tree, &root, &prompt, decision,
+                state.permission_mode.allows("edit_file"), can_run_check(&state,ban_run_command),
+            )});
+            match applied {
+                Ok((mut next,tree,decision))=>{
+                    if next.request_started_turn == 0 { next.request_started_turn = turn; }
+                    if decision["request_action"] == "replace" {
+                        let archive = next.archived_requests.last_mut().unwrap();
+                        archive.worker_state = Some(work_state.snapshot());
+                        emit(&root,&task_id,"flow/request_archived",json!({"turn":turn,"step":step,"id":archive.id,
+                            "started_turn":archive.started_turn,"plan_revision":archive.plan_revision,
+                            "node_ids":archive.flow_plan["nodes"].as_array().into_iter().flatten().map(|n|n["original_id"].clone()).collect::<Vec<_>>()})).await?;
+                        observer_inbox.start_request(next.request_started_turn);
+                        emit(&root,&task_id,"observer/inbox_state",json!({"turn":turn,"step":step,"state":observer_inbox.snapshot()})).await?;
+                        work_state = crate::worker_work_state::WorkState::default();
+                        work_state.resume(&prompt);
+                        source_working_set = crate::task_notebook::SourceWorkingSet::default();
+                        read_results.clear(); source_coverage.clear();
+                        messages.truncate(base_messages); step_starts.clear(); step_owners.clear();
+                        emit(&root,&task_id,"worker/work_state",json!({"turn":turn,"step":step,"state":work_state.snapshot()})).await?;
+                    }
+                    scheduler=next;task_tree=tree;organizer_error=Value::Null;organizer_failures=0;
+                    organizer_decision=decision.clone();
+                    observer_inbox.set_scope(&scheduler);observer.set_scope(&scheduler,&prompt);
+                    if decision["action"]=="work" || decision["action"]=="select" || decision["action"]=="revisit" || (decision["action"]=="continue" && decision["orders"].is_array()) {active_scope.clear();}
+                    if decision["action"]=="revisit" {
+                        if let Some(rewind)=scheduler.rewind_records.last() {
+                            emit(&root,&task_id,"scheduler/rewind",json!({"turn":turn,"step":step,"rewind":rewind})).await?;
+                        }
+                    }
+                    if let Some(responses)=decision.get("observer_responses") {
+                        match observer_inbox.respond_for_decision(&json!({"responses":responses}),&decision,&scheduler) {
+                            Ok(responses)=>{for advice in responses {emit(&root,&task_id,"observer/advice_response",json!({"turn":turn,"step":step,"actor":"organizer","advice":advice})).await?;}},
+                            Err(error)=>{emit(&root,&task_id,"organizer/advice_error",json!({"turn":turn,"step":step,"error":error.to_string()})).await?;},
+                        }
+                        emit(&root,&task_id,"observer/inbox_state",json!({"turn":turn,"step":step,"state":observer_inbox.snapshot()})).await?;
+                    }
+                    emit(&root,&task_id,"organizer/decision",json!({"turn":turn,"step":step,"decision":decision})).await?;
+                },
+                Err(error)=>{
+                    let feedback=organizer_contract_feedback(&error,&attempted_decision,&scheduler,&task_tree);
+                    let repeated=organizer_error["fingerprint"]==feedback["fingerprint"];
+                    organizer_failures+=1;
+                    organizer_error=feedback.clone();
+                    emit(&root,&task_id,"organizer/error",json!({"turn":turn,"step":step,"feedback":feedback,"repeated_fingerprint":repeated})).await?;
+                    emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await?;
+                    if repeated || organizer_failures>=2 {
+                        let reason=if repeated {"Organizer repeated the same invalid contract field"}else{"Organizer did not produce a valid contract after one targeted correction"};
+                        fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,format!("{reason}: {}",feedback["error"].as_str().unwrap_or("unknown contract error"))).await?;
+                        observer.finish("failed").await?;
+                        return Ok(());
+                    }
+                    continue;
+                }
             }
-            result = state.client.post(format!(
-                "{}/chat/completions",
-                state.provider_url.trim_end_matches('/')
-            ))
-            .bearer_auth(&state.api_key)
-            .json(&body)
-            .send() => result,
+        }
+        if !scheduler.finished && scheduler.current_process().is_some() && scheduler.scope()!=active_scope {
+            active_scope=scheduler.scope();active_flow_node=scheduler.node().to_owned();
+            let order=scheduler.order().unwrap().clone();
+            work_state.activate_unit(scheduler.id(),&active_flow_node,order.edit_targets.clone());
+            if task_tree.enabled(){task_tree.apply(&json!({"current_node_id":active_flow_node}))?;}
+            scheduler.set_goal_boundary(if task_tree.enabled(){task_tree.worker_boundary(&active_flow_node)}else{Value::Null});
+            source_working_set.restore(&scheduler.selection(),&mut notebook,&order.edit_targets).await?;
+            // Source is selected by the current frame, never inherited from siblings.
+            if !order.material_ids.is_empty() {
+                match notebook.recall(&json!({"material_ids":order.material_ids,"include_material":true,"max_chars":20_000})).await {
+                    Ok(pages)=>source_working_set.add(&pages["materials"],&order.edit_targets),
+                    Err(error)=>{emit(&root,&task_id,"organizer/material_unavailable",json!({"turn":turn,"step":step,"work_id":order.id,"error":error.to_string()})).await?;},
+                }
+            }
+            for range in &order.material_ranges {
+                match notebook.recall(&json!({"material_ids":[range["id"]],"include_material":true,"start_line":range["start_line"],"end_line":range["end_line"],"max_chars":20_000})).await {
+                    Ok(pages)=>source_working_set.add(&pages["materials"],&order.edit_targets),
+                    Err(error)=>{emit(&root,&task_id,"organizer/material_unavailable",json!({"turn":turn,"step":step,"work_id":order.id,"range":range,"error":error.to_string()})).await?;},
+                }
+            }
+            set_active_flow_node(&state,&task_id,turn,&active_flow_node).await;
+            latest_worker_progress=json!({
+                "turn":turn,"step":step,
+                "nodeId":active_flow_node,
+                "workId":order.id,
+                "revision":order.revision,
+                "planRevision":order.plan_revision,
+                "purpose":order.goal,
+                "knownConditions":scheduler.worker_input(&prompt)["upstream_outputs"].as_array().into_iter().flatten().filter_map(|out|out["summary"].as_str()).collect::<Vec<_>>(),
+                "nextAction":order.done_when,
+                "workOrganization":{"mode":if task_tree.enabled(){"tree"}else{"direct"},"reason":"Organizer assigns a focused work packet; host schedules actual results."}
+            });
+            emit(&root,&task_id,"organizer/assignment",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"workId":order.id,"order":order})).await?;
+            emit(&root,&task_id,"worker/progress",latest_worker_progress.clone()).await?;
+            let assignment=crate::observer_service::observation(&task_id,&scheduler,scheduler.id(),turn,step,"assignment",&prompt,&organizer_decision,
+                json!({"purpose":latest_worker_progress["purpose"]}),Value::Null,notebook.node_context(scheduler.node(),&order.edit_targets,scheduler.request_started_turn));
+            crate::observer_service::commit(&root,&task_id,json!({"commit_id":format!("{turn}:{step}:{}:assignment",scheduler.plan_revision),
+                "turn":turn,"step":step,"scheduler":scheduler.snapshot(),"task_tree":task_tree.snapshot()}),
+                if state.observer_enabled {vec![assignment]}else{vec![]}).await?;
+            observer.notify();
+        }
+        let mut next_flow_plan=scheduler.unified_flow_plan(if task_tree.enabled(){Some(&task_tree)}else{None});
+        if next_flow_plan["nodes"].as_array().is_some_and(Vec::is_empty) {
+            next_flow_plan["nodes"]=json!([{"id":"request","title":truncate(&prompt,160),"kind":"worker","objective":prompt,
+                "status":if scheduler.finished{"blocked"}else{"running"}}]);
+            next_flow_plan["active_node_id"]=json!(if scheduler.finished{""}else{"request"});
+        }
+        if latest_flow_plan!=next_flow_plan {
+            latest_flow_plan=next_flow_plan;
+            emit(&root,&task_id,"flow/plan",json!({"turn":turn,"replaceCurrentTurn":true,"nodes":latest_flow_plan["nodes"],"edges":latest_flow_plan["edges"],
+                "mode":latest_flow_plan["mode"],"active_node_id":latest_flow_plan["active_node_id"],"active_path":latest_flow_plan["active_path"],
+                "plan_revision":latest_flow_plan["plan_revision"],"rewind_records":latest_flow_plan["rewind_records"]})).await?;
+            if task_tree.enabled(){emit(&root,&task_id,"flow/tree_state",json!({"turn":turn,"step":step,"state":task_tree.snapshot(),"active_node_id":latest_flow_plan["active_node_id"],"active_path":latest_flow_plan["active_path"]})).await?;}
+        }
+        emit(&root,&task_id,"scheduler/state",json!({"turn":turn,"step":step,"state":scheduler.snapshot()})).await?;
+        emit(&root,&task_id,"execution/commit",json!({
+            "commit_id": format!("{turn}:{step}:{}", scheduler.plan_revision),
+            "turn": turn,
+            "step": step,
+            "scheduler": scheduler.snapshot(),
+            "task_tree": task_tree.snapshot(),
+            "active_node_id": latest_flow_plan["active_node_id"],
+            "active_path": latest_flow_plan["active_path"]
+        })).await?;
+        if scheduler.finished {
+            let answer=scheduler.final_result.clone();
+            emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,
+                "message":{"id":uuid_like(),"role":"assistant","content":[{"type":"text","text":answer}],
+                    "source":{"kind":"model","provider":state.provider_url,"model":model}},"stream":[]}),Some("append")).await?;
+            emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await?;
+            emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"completed"}})).await?;
+            finish(&state,&task_id,"completed").await?;
+            observer.finish("completed").await?;
+            return Ok(());
+        }
+        let mut tools = local_tools(&state.workspace, state.tool_catalog.as_deref(), ban_run_command);
+        tools.retain(|tool| tool.pointer("/function/name").and_then(Value::as_str)
+            .is_some_and(|name| state.permission_mode.allows(name)));
+        let mut progress_schema=report_progress_tool();
+        if let Some(props)=progress_schema.pointer_mut("/function/parameters/properties").and_then(Value::as_object_mut) {
+            for key in ["plan","node_updates","node_result","resume_tree","work_organization","edit_targets","observer_responses"] {props.remove(key);}
+        }
+        progress_schema["function"]["description"]=json!("Report current work purpose, known conditions and new findings together with actual work. Organizer owns the plan and node; reports never complete work. No separate readiness promises.");
+        tools.push(progress_schema);tools.push(recall_work_tool());tools.push(crate::work_organizer::yield_tool());
+        if state.observer_enabled {tools.push(consult_observer_tool());}
+        if state.enable_subagent
+            && !state.expert_provider_url.is_empty()
+            && !state.expert_model.is_empty()
+            && !is_child
+            && !subagent_spawned
+        {
+            tools.push(subagent_tool());
+        }
+        crate::work_executor::WorkExecutor::filter_tools(&scheduler, &mut tools);
+        if step == 1 {
+            emit(&root, &task_id, "worker/capabilities", json!({
+                "turn":turn,"permission_mode":state.permission_mode,"command_banned_by_user":ban_run_command,
+                "tools":tools.iter().filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str)).collect::<Vec<_>>(),
+            })).await?;
+        }
+        // Keep the ordinary capability description even when the final request
+        // deliberately offers no tools so a budget limit is not a permission denial.
+        let capability_tools = tools.clone();
+        let final_step = step == max_steps && max_steps > 1;
+        if final_step || scheduler.finished {
+            tools.clear();
+        }
+        messages[0]["content"]=json!(format!("{}\n{}",worker_system_prompt(state.workspace.root(),is_child,subagent_spawned,&capability_tools),include_str!("../prompts/worker_unit.md")));
+        source_working_set.refresh(&mut notebook,work_state.edit_targets()).await?;
+        scheduler.input_versions(source_working_set.materials());
+        for revision in work_state.refresh_source_refs(source_working_set.materials(),&source_working_set.metadata(),turn,step) {
+            emit(&root,&task_id,"worker/finding_revision",revision).await?;
+        }
+        let context_node=scheduler.node().to_owned();
+        messages[1]["content"]=json!(format!("Current work packet:\n{}",scheduler.worker_input(&model_prompt)));
+        let (mut scoped_messages,mut compaction)=notebook_worker_request(&messages,base_messages,&step_starts,&step_owners,"",&scheduler.scope(),&source_working_set);
+        compaction["pinned_material_ids"]=json!(source_working_set.materials().iter().map(|material|material["id"].clone()).collect::<Vec<_>>());
+        compaction["pinned_source_chars"]=json!(source_working_set.materials().iter().filter_map(|material|material["returned_chars"].as_u64()).sum::<u64>());
+        compaction["work_unit"]=json!({"id":scheduler.id(),"scope":scheduler.scope(),"input":scheduler.worker_input(&prompt)});
+        scoped_messages.push(json!({"role":"system","content":format!("Runtime permissions: {}. A completed work unit is sealed by the host; a new unit has its own inputs.",state.permission_mode.guidance())}));
+        let source_files=source_working_set.materials().iter().filter_map(|page|page["path"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        let request_work=notebook.link_findings(work_state.unit_context(scheduler.id(),scheduler.order().map_or(&[],|o|o.finding_ids.as_slice())));
+        compaction["work_projection"]=request_work["projection"].clone();
+        scoped_messages.push(json!({"role":"system","content":format!(
+            "Task notebook conclusions and current work:\n{}\nHistorical records are not automatically invalid. Take the next action from these conclusions; retrieve exact notebook materials only when needed. A file version change is not proof that all conclusions about it are wrong.", request_work
+        )}));
+        let material_index=notebook.node_context(&context_node,&source_files,scheduler.request_started_turn);
+        scoped_messages.push(json!({"role":"system","content":format!("Task notebook material index (only locations, retrieve focused pages when necessary):\n{}",material_index)}));
+        if !source_working_set.materials().is_empty() { scoped_messages.push(json!({"role":"system","content":format!("Exact source working set for the current action; only selected pages, checked against current files. All other materials remain in the notebook. Reports preserve this selection; tree navigation saves/restores each node's own selected pages:\n{}",json!(source_working_set.materials()))})); }
+        if scheduler.finished {
+            scoped_messages=vec![json!({"role":"system","content":"Deliver the verified process result below to the human concisely. Tools are omitted because execution finished. Do not investigate or promise more work; preserve actual checks and limitations."}),
+                json!({"role":"user","content":format!("Human request: {}\nFinal result: {}",model_prompt,scheduler.final_result)})];
+        }
+        if final_step {
+            scoped_messages.push(json!({"role":"system","content":format!("Actual process results and unfinished work at budget limit:\n{}",scheduler.organizer_input_with_freshness(&root))}));
+            scoped_messages.push(json!({"role":"system","content":
+                format!("The execution step limit ({max_steps}) has been reached. Tools are intentionally omitted from this final response request for budget reasons; this is NOT a filesystem or permission denial and does NOT mean prior tools were read-only. Report what was actually done and what remains unfinished. State that this run stopped at the step limit; do not report implementation completed unless writes actually succeeded. Answer now without requesting more tools.")
+            }));
+        }
+        step_starts.push(messages.len());
+        let mut body = json!({
+            "model":model,"messages":scoped_messages,"tools":tools,"tool_choice":"auto","stream":true
+        });
+        compaction["request_sizes"]=json!({
+            "message_chars":body["messages"].as_array().into_iter().flatten().map(|message|message["content"].as_str().map_or(0,|text|text.chars().count())).sum::<usize>(),
+            "system_chars":body["messages"].as_array().into_iter().flatten().filter(|message|message["role"]=="system").map(|message|message["content"].as_str().map_or(0,|text|text.chars().count())).sum::<usize>(),
+            "tool_schema_chars":body["tools"].to_string().chars().count(),
+            "work_state_chars":request_work.to_string().chars().count(),
+            "tool_count":body["tools"].as_array().map_or(0,Vec::len),
+        });
+        if final_step || scheduler.finished {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("tools");
+                object.remove("tool_choice");
+            }
+        }
+        if let Some(effort) = state.reasoning_effort.as_deref() {
+            body["reasoning_effort"] = json!(effort);
+        }
+        if state.fast_mode {
+            body["service_tier"] = json!("fast");
+        }
+        let visual_context=worker_visual_context(&task_id,&scheduler);
+        let mut visual_ids=scheduler.frame().map(|f|f.visual_artifact_ids.iter().rev().filter(|id|!f.seen_visual_artifact_ids.contains(id)).take(crate::visual_artifacts::MAX_IMAGES).cloned().collect::<Vec<_>>()).unwrap_or_default();
+        visual_ids.reverse(); // Select the newest materials, present before/after in selection order.
+        let visual_dispatch=crate::visual_artifacts::prepare_request(&state,"worker",&model,&visual_context,&visual_ids,scheduler.order().map(|o|o.visual_goal.as_deref().unwrap_or(&o.goal)).unwrap_or(&prompt),&mut body).await?;
+        compaction["visual_dispatch"]=visual_dispatch.clone();
+        let process_identity = crate::work_executor::WorkExecutor::capture_identity(&scheduler, step);
+        let order_rev = process_identity.revision;
+        let work_id = process_identity.work_id.clone();
+        let mut request_trace = crate::request_context::record(&root,&task_id,json!({
+            "actor":"worker","stage":"execution","turn":turn,"step":step,"nodeId":context_node,
+            "workId":work_id,"request_id":scheduler.request_started_turn,"revision":order_rev,"plan_revision":process_identity.plan_revision,
+            "permission_mode":state.permission_mode,"final_step":final_step,"compaction":compaction,
+            "visual_dispatch":visual_dispatch,
+            "work":{"tool_calls":executed_tool_calls,"successful_file_writes":successful_file_writes,"repeated_read_calls":repeated_read_calls},
+        }),&body).await;
+        let executor_runtime = crate::work_executor::WorkExecutorRuntime {
+            client: &state.client,
+            provider_url: &state.provider_url,
+            api_key: &state.api_key,
+            root: &root,
+            task_id: &task_id,
+            turn,
+            step,
+            cancel: &cancel,
+            visual_dispatch:&visual_dispatch,
         };
-        let value = match response {
-            Ok(response) if response.status().is_success() => {
-                match response.json::<Value>().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        fail_turn(&state, &root, &task_id, turn, step, e.to_string()).await;
-                        return;
+        let mut end_text = None;
+        let round = crate::work_executor::WorkExecutor::next(
+            &mut scheduler, &mut task_tree, &mut work_state, &mut source_working_set,
+            &process_identity, &executor_runtime, &body, &mut request_trace,
+            async |scheduler, task_tree, work_state, source_working_set, step_res| {
+                let message = step_res.message;
+                let text = step_res.text;
+                let calls = step_res.tool_calls;
+                if !visual_ids.is_empty() {emit(&root,&task_id,"visual/model_received",json!({"turn":turn,"step":step,"manifest":visual_dispatch})).await?;}
+
+                let mut observer_response_results = HashMap::<String, String>::new();
+                let mut observer_receipts_changed = false;
+                for call in calls.iter().filter(|call|call.name == "respond_observer"
+                    || (call.name == "report_progress" && serde_json::from_str::<Value>(&call.arguments).ok().is_some_and(|args|args.get("observer_responses").is_some()))) {
+                    let args = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_|json!({}));
+                    let response_args = if call.name == "report_progress" { json!({"responses":args["observer_responses"]}) } else { args };
+                    let response = match observer_inbox.respond(&response_args) {
+                        Ok(responses) => {
+                            observer_receipts_changed |= !responses.is_empty();
+                            for advice in &responses {
+                                emit(&root, &task_id, "observer/advice_response", json!({"turn":turn,"step":step,"advice":advice})).await?;
+                            }
+                            if responses.is_empty() {
+                                json!({"acknowledged":true,"already_acknowledged":true,"responses":[],
+                                    "guidance":"No new advice decision was recorded. These messages were already read. Continue the task with a substantive action; do not repeat this receipt."})
+                            } else {
+                                json!({"acknowledged":true,"responses":responses})
+                            }
+                        }
+                        Err(error) => json!({"error":error.to_string()}),
+                    };
+                    observer_response_results.insert(call.call_id.clone(), response.to_string());
+                }
+                if observer_receipts_changed {
+                    emit(&root, &task_id, "observer/inbox_state", json!({"turn":turn,"step":step,"state":observer_inbox.snapshot()})).await?;
+                }
+                // Reviews completed while the model was responding are kept for the
+                // next request. Never block a tool on advice the model has not seen.
+                let late_reviews = observer.reviews().await?;
+                if !late_reviews.is_empty() {
+                    for review in late_reviews { observer_inbox.insert(&review); }
+                    emit(&root, &task_id, "observer/inbox_state", json!({"turn":turn,"step":step,"state":observer_inbox.snapshot()})).await?;
+                }
+                let progress_calls=calls.iter().filter(|call|call.name=="report_progress").collect::<Vec<_>>();
+                let mut progress_results=HashMap::<String,String>::new();
+                for call in progress_calls {
+                    let mut args=serde_json::from_str::<Value>(&call.arguments).unwrap_or(json!({}));
+                    let invalid=["plan","node_updates","node_result","resume_tree","work_organization","edit_targets"].iter().any(|key|args.get(*key).is_some());
+                    if invalid || args["current_node_id"].as_str().is_some_and(|id|id!=scheduler.node()) {
+                        progress_results.insert(call.call_id.clone(),json!({"error":"Organizer owns planning and node selection. Report only the current work; yield_work returns an output or need_split."}).to_string());continue;
+                    }
+                    args["current_node_id"]=json!(scheduler.node());
+                    for revision in work_state.report_at(&args,turn,step,source_working_set.materials(),&prompt) {emit(&root,&task_id,"worker/finding_revision",revision).await?;}
+                    source_working_set.select_action(&args);
+                    latest_worker_progress=json!({
+                        "turn": turn,
+                        "step": step,
+                        "workId": scheduler.id(),
+                        "nodeId": scheduler.node(),
+                        "revision": scheduler.revision(),
+                        "planRevision": scheduler.plan_revision,
+                        "purpose": args["purpose"],
+                        "knownConditions": args["known_conditions"],
+                        "nextAction": args["next_action"],
+                        "findings": args["findings"]
+                    });
+                    emit(&root,&task_id,"worker/progress",latest_worker_progress.clone()).await?;
+                    progress_results.insert(call.call_id.clone(),json!({"reported":true,"finding_updates":work_state.finding_receipts(&args),"done":scheduler.done()}).to_string());
+                }
+
+                let mut visible_content = Vec::new();
+                if !text.is_empty() {
+                    visible_content.push(json!({"type":"text","text":text}));
+                }
+                for call in calls.iter().filter(|call| call.name != "report_progress") {
+                    visible_content.push(json!({
+                        "type":"tool-call","id":call.call_id,"name":call.name,"arguments":call.arguments
+                    }));
+                }
+                messages.push(message);
+                if let Some(start)=step_starts.last() {
+                    step_owners.insert(*start,scheduler.scope());
+                }
+
+                if calls.is_empty() {
+                    if !final_step {
+                        scheduler.return_work(&json!({"summary":if text.trim().is_empty(){"Worker returned no concrete output"}else{&text},
+                            "blocked":text.trim().is_empty()||scheduler.order().is_some_and(|o|o.completion!=crate::work_scheduler::Completion::Output)}))?;
+                        let direct_final = scheduler.order().is_some_and(|o|o.final_answer)
+                            && scheduler.all_done() && !task_tree.enabled();
+                        if !direct_final {
+                            emit(&root,&task_id,"worker/yield",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"output":scheduler.output()})).await?;
+                            return Ok(crate::work_executor::ToolRoundOutput::stop(crate::work_executor::RoundDisposition::Yield));
+                        }
+                        scheduler.finish(&text,false)?;
+                    }
+                    if !visible_content.is_empty() {
+                        emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,
+                            "message":{"id":uuid_like(),"role":"assistant","content":visible_content,
+                                "source":{"kind":"model","provider":state.provider_url,"model":model}},"stream":[]}),Some("append")).await?;
+                    }
+                    if !task_tree.enabled() && !active_flow_node.is_empty() {
+                        emit(&root,&task_id,"flow/node_state",json!({"turn":turn,"id":active_flow_node,
+                            "status":if final_step {"interrupted"} else {"completed"}})).await?;
+                    }
+                    end_text = Some(text);
+                    return Ok(crate::work_executor::ToolRoundOutput::stop(crate::work_executor::RoundDisposition::End));
+                }
+
+                if !visible_content.is_empty() {
+                    emit_surface(&root,&task_id,"assistant/message",json!({
+                        "turn":turn,"step":step,
+                        "message":{"id":uuid_like(),"role":"assistant","content":visible_content,
+                            "source":{"kind":"model","provider":state.provider_url,"model":model}},
+                        "stream":[]
+                    }),Some("append")).await?;
+                }
+
+                let repeats_at_start=repeated_read_calls;
+                let mut project_operations=0;
+                let mut step_tools = calls.iter().map(|call|call.name.clone()).collect::<Vec<String>>();
+                for call in calls {
+                    if call.name == "report_progress" {
+                        let mut result: Value = progress_results.get(&call.call_id).and_then(|text|serde_json::from_str(text).ok())
+                            .unwrap_or_else(|| json!({"error":"progress report was not accepted"}));
+                        if let Some(response) = observer_response_results.get(&call.call_id) {
+                            result["observer_response"] = serde_json::from_str(response).unwrap_or(Value::Null);
+                        }
+                        messages.push(crate::format_translate::openai_chat_tool_result_message(&call, &result.to_string()));
+                        continue;
+                    }
+
+                    let mut args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
+                    if matches!(call.name.as_str(),"edit_file"|"replace_range"|"write_file") {
+                        if let Some(path)=args["path"].as_str() {
+                            if let Ok(resolved)=crate::file_edit::workspace_path(&root,path) {
+                                if let Ok(relative)=resolved.strip_prefix(root.canonicalize()?) {args["path"]=json!(relative.to_string_lossy().replace('\\',"/"));}
+                            }
+                        }
+                    }
+                    let read_key = (repeatable_read_tool(&call.name) && !crate::worker_read_cache::is_source_read(&call.name))
+                        .then(|| format!("{}:{}", call.name, args));
+                    let cached_read = read_key.as_ref().and_then(|key| read_results.get(key)).cloned();
+                    emit(&root,&task_id,"tool/call",json!({
+                        "turn":turn,"step":step,"callId":call.call_id,"name":call.name,
+                        "arguments":call.arguments,"flowNodeId":active_flow_node
+                    })).await?;
+                    let started = Instant::now();
+                    // Run a check against the exact recorded versions, including changes
+                    // made by an external editor since the previous model round.
+                    if crate::project_process::is_check(&call.name) {refresh_scheduler_versions(&mut *scheduler,&state.workspace).await?;}
+                    let project_args_error=if matches!(call.name.as_str(),"install_dependencies"|"run_project_script"|"get_project_process") {crate::project_process::normalize_args(state.workspace.root(),&mut args).err()} else {None};
+                    let order_requests_process_refresh=scheduler.order().and_then(|order|order.project_observation.as_ref())
+                        .is_some_and(|spec|spec["force_refresh"]==true);
+                    let reused_process_observation=if call.name=="get_project_process"&&!order_requests_process_refresh
+                        &&crate::project_process::can_reuse_process_observation(&args) {
+                        scheduler.reusable_project_observation(state.workspace.root(),&args)
+                    }else{None};
+                    let reused_http_probe=if call.name=="http_probe" {scheduler.reusable_http_probe(&args)} else {None};
+                    let http_probe_reused=reused_http_probe.is_some();
+                    let command_versions=scheduler.versions();
+                    let output: anyhow::Result<Value> = if (call.name == "run_command" || crate::project_process::is_execution(&call.name)) && ban_run_command {
+                        Err(anyhow::anyhow!("project execution is blocked because the current turn explicitly prohibits command execution"))
+                    } else if !tools.iter().any(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some(call.name.as_str())) {
+                        Err(anyhow::anyhow!("tool_unavailable: {} was not offered in this step",call.name))
+                    } else if let Some(error)=project_args_error {
+                        Err(error)
+                    } else if let Err(error)=crate::work_executor::WorkExecutor::check_permits(&scheduler,&call.name,&args) {
+                        Err(error)
+                    } else if let Some(observation)=reused_process_observation {
+                        Ok(json!({"processes":observation["processes"],"process_observation":observation,"reused":true,
+                            "guidance":"Reused a fresh scoped process observation from an earlier work packet; no new host process query was run."}))
+                    } else if let Some(observation)=reused_http_probe {
+                        Ok(observation)
+                    } else if call.name=="yield_work" {
+                        if args["findings"].is_array() {
+                            let report=json!({"current_node_id":scheduler.node(),"purpose":scheduler.order().map(|o|&o.goal),"findings":args["findings"]});
+                            for revision in work_state.report_at(&report,turn,step,source_working_set.materials(),&prompt) {emit(&root,&task_id,"worker/finding_revision",revision).await?;}
+                        }
+                        let ret = if let Some(check)=args.get("visual_check_result") {
+                            let context=worker_visual_context(&task_id,scheduler);
+                            match crate::visual_artifacts::validate_check(&root,&context,check,scheduler.frame().map(|f|f.visual_requests.as_slice()).unwrap_or(&[]),"worker") {
+                                Ok(verified)=>{scheduler.frame_mut().unwrap().visual_check_result=verified.clone();emit(&root,&task_id,"visual/check_result",json!({"turn":turn,"step":step,"result":verified})).await?;
+                                    crate::work_executor::WorkExecutor::handle_yield_work(&mut *scheduler,&args)},
+                                Err(error)=>Err(error),
+                            }
+                        }else{crate::work_executor::WorkExecutor::handle_yield_work(&mut *scheduler, &args)};
+                        if let Ok(ref output) = ret {
+                            emit(&root,&task_id,"worker/yield",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"output":output})).await?;
+                        }
+                        ret
+                    } else if call.name == "respond_observer" {
+                        Ok(observer_response_results.get(&call.call_id).and_then(|text|serde_json::from_str(text).ok())
+                            .unwrap_or_else(||json!({"error":"Observer response was not processed"})))
+                    } else if crate::worker_read_cache::is_source_read(&call.name)
+                        && args.get("force_read").and_then(Value::as_bool) == Some(true)
+                        && args.get("reread_reason").and_then(Value::as_str).is_none_or(|reason| reason.trim().is_empty()) {
+                        Err(anyhow::anyhow!("force_read requires a concrete reread_reason, such as exact source needed for an edit or source no longer available in current context"))
+                    } else if !state.permission_mode.allows(&call.name) {
+                        Err(anyhow::anyhow!("permission_denied: {:?} does not allow {}", state.permission_mode, call.name))
+                    } else if !tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some(call.name.as_str())) {
+                        Err(anyhow::anyhow!("tool_unavailable: {} was not offered in this step", call.name))
+                    } else if call.name == "recall_work" {
+                        if args["tree_node_ids"].as_array().is_some_and(|ids|!ids.is_empty()) {
+                            if task_tree.enabled() {task_tree.recall_nodes(&args)}else{previous_tree.recall_nodes(&args)}
+                        } else if args["tool_call_ids"].as_array().is_some_and(|ids|!ids.is_empty()) {
+                            notebook.recall_results(&args).await
+                        } else {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+                        if query.is_empty() && args["material_ids"].as_array().is_none_or(|ids|ids.is_empty()) { Err(anyhow::anyhow!("recall_work requires a focused query or material_ids")) }
+                        else {
+                            let mut recalled_work=notebook.link_findings(work_state.recall(query));
+                            if args["include_history"]==true {recalled_work["history"]=notebook.history(&args).await?;}
+                            let mut material_args=args.clone();
+                            material_args["related_files"]=json!(recalled_work["findings"].as_array().into_iter().flatten()
+                                .flat_map(|finding|finding["files"].as_array().into_iter().flatten()).cloned().collect::<Vec<_>>());
+                            match notebook.recall(&material_args).await {
+                                Ok(materials) => {
+                                    if args["include_material"] == true {
+                                        source_working_set.select_action(&args);
+                                        source_working_set.add(&materials["materials"],work_state.edit_targets());
+                                    }
+                                    Ok(json!({"work":recalled_work,"notebook":materials,"source_context":source_working_set.metadata()}))
+                                }, Err(error)=>Err(error),
+                            }
+                        }
+                        }
+                    } else if call.name == "consult_observer" {
+                        if !state.observer_enabled {
+                            Err(anyhow::anyhow!("Observer assistance is not enabled for this task. Continue with your own judgment."))
+                        } else {
+                            let question = args.get("question").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                            emit(&root, &task_id, "observer/consult", json!({
+                                "turn":turn,"step":step,"callId":call.call_id,"question":question,
+                            })).await?;
+                            let observer_query = format!("{prompt}\n{question}");
+                            let observer_context = tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    return Ok(crate::work_executor::ToolRoundOutput { operations_count: project_operations,
+                                        repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start), disposition: crate::work_executor::RoundDisposition::Cancelled });
+                                }
+                                result = observer_session_context(&state, &root, &task_id, &observer_query) => result
+                            };
+                            let observer_context = observer_context.unwrap_or_else(|error| json!({
+                                "context_unavailable":error.to_string(),"current_request":prompt,
+                            }));
+                            let obs_system = "You are an optional read-only Observer. The Worker is independent and asked for help. Use relevant project memories and prior task conversations when available, but follow the current request. Give concise, concrete guidance for the exact question. Do not inspect code syntax or try to take over execution. Return JSON: {\"answer\":\"...\"}.";
+                            let consult_identity=crate::observer_service::identity(&task_id,&scheduler,scheduler.id());
+                            let mut consult_metadata=consult_identity.clone();
+                            consult_metadata["turn"]=json!(turn);consult_metadata["step"]=json!(step);
+                            consult_metadata["nodeId"]=json!(active_flow_node);consult_metadata["workId"]=json!(scheduler.id());
+                            consult_metadata["stage"]=json!("consult");consult_metadata["source_event_id"]=json!(call.call_id);
+                            let obs_request = observer_json_response(
+                                &state, &observer_model, obs_system,
+                                json!({
+                                    "identity":consult_identity,"question":question,"user_task":prompt,
+                                    "observer_context":observer_context,
+                                    "current_worker_step":latest_worker_progress,
+                                    "recent_tool_activity":recent_actions.iter().rev().take(5).rev().cloned().collect::<Vec<_>>(),
+                                }),
+                                OBSERVER_MAX_TOKENS,
+                                &task_id, consult_metadata,
+                            );
+                            let obs_raw = tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    return Ok(crate::work_executor::ToolRoundOutput { operations_count: project_operations,
+                                        repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start), disposition: crate::work_executor::RoundDisposition::Cancelled });
+                                }
+                                result = tokio::time::timeout(Duration::from_secs(12),async {
+                                    let _permit=observer.model_permit().await?;
+                                    obs_request.await
+                                }) => result.map_err(|_|anyhow::anyhow!("Observer consultation timed out")).and_then(|result|result),
+                            };
+                            match obs_raw {
+                                Ok(raw) => {
+                                    let answer = serde_json::from_str::<Value>(&raw).ok()
+                                        .and_then(|value| value.get("answer").and_then(Value::as_str).map(str::to_owned))
+                                        .unwrap_or(raw);
+                                    emit(&root, &task_id, "observer/consult_reply", json!({
+                                        "turn":turn,"step":step,"callId":call.call_id,"answer":answer,
+                                    })).await?;
+                                    Ok(json!({"answer":answer}))
+                                }
+                                Err(error) => {
+                                    let answer = format!("Observer consultation unavailable ({error}); proceed with your best judgment.");
+                                    emit(&root, &task_id, "observer/consult_reply", json!({
+                                        "turn":turn,"step":step,"callId":call.call_id,"answer":answer,
+                                    })).await?;
+                                    Ok(json!({"answer":answer}))
+                                }
+                            }
+                        }
+                    } else if call.name == "spawn_subagent" {
+                        if !state.enable_subagent
+                            || state.expert_provider_url.is_empty()
+                            || state.expert_model.is_empty()
+                            || is_child
+                            || subagent_spawned
+                        {
+                            Err(anyhow::anyhow!("subagent is unavailable: only one child per parent task, with no nesting"))
+                        } else {
+                            run_subagent(&state, &task_id, &model, args.clone(), &cancel, &mut subagent_spawned, ban_run_command).await
+                        }
+                    } else if (call.name == "run_command" || crate::project_process::is_execution(&call.name)) && ban_run_command {
+                        Err(anyhow::anyhow!("project execution is blocked because the current turn explicitly prohibits command execution"))
+                    } else {
+                        let workspace = state.workspace.clone();
+                        let catalog = state.tool_catalog.clone();
+                        let name = call.name.clone();
+                        let tool_args = args.clone();
+                        let mut visual_context=worker_visual_context(&task_id,scheduler);visual_context.source_tool_call_id=call.call_id.clone();visual_context.source_event_id=format!("{task_id}:tool:{}",call.call_id);
+                        let tracked = crate::workspace_changes::is_mutation(&name);
+                        let tracking_state = state.clone();
+                        let tracking_task = task_id.clone();
+                        let tracking_cancel = cancel.clone();
+                        let mut tool_worker = tokio::spawn(async move {
+                            if tracked {
+                                crate::workspace_changes::execute_tracked(tracking_state, tracking_task, turn, name, tool_args, tracking_cancel).await
+                            } else if crate::browser_control::is_tool(&name) {
+                                crate::browser_control::execute_scoped(&workspace,&visual_context,&name,&tool_args).await
+                            } else {
+                                execute_tool(workspace, catalog.as_deref(), &name, tool_args).await
+                            }
+                        });
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                if tracked { let _ = tool_worker.await; } else { tool_worker.abort(); }
+                                let cancelled_message = json!({
+                                    "id":uuid_like(),"role":"tool","source":{"kind":"tool","callId":call.call_id},
+                                    "toolCallId":call.call_id,"content":[{"type":"text","text":"Tool execution cancelled."}],
+                                    "isError":true
+                                });
+                                emit_surface(&root,&task_id,"tool/result",json!({
+                                    "turn":turn,"step":step,"message":cancelled_message,
+                                }),Some("append")).await?;
+                                return Ok(crate::work_executor::ToolRoundOutput { operations_count: project_operations,
+                                    repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start), disposition: crate::work_executor::RoundDisposition::Cancelled });
+                            }
+                            result = &mut tool_worker => match result {
+                                Ok(result) => result,
+                                Err(error) => return Err(anyhow::anyhow!("tool {} stopped unexpectedly: {error}", call.name)),
+                            },
+                        }
+                    };
+                    let (mut result, execution_error) = match output {
+                        Ok(value) => {
+                            let failed_child = call.name == "spawn_subagent" && value["status"] != "completed";
+                            (value, failed_child)
+                        }
+                        Err(error) => (if crate::project_process::is_tool(&call.name) {
+                            crate::project_process::failure_result(&call.name,&args,&error)
+                        } else {json!({"error":error.to_string()})}, true),
+                    };
+                    let is_error = execution_error || if call.name=="run_command" {
+                        result["process_success"]!=true || result["command_result_reports_failure"]==true
+                    } else if crate::project_process::is_tool(&call.name) {
+                        result.get("error").is_some() || result["termination_reason"]=="wait_error"
+                            || result["status"].as_i64().is_some_and(|code|code!=0) && result["termination_reason"]!="requested_stop"
+                    } else {observer_output_failed(&result.to_string())};
+                    let material_recalled = !is_error && call.name=="recall_work" && result.pointer("/notebook/materials").and_then(Value::as_array)
+                        .is_some_and(|materials|materials.iter().any(|material|material["available"]==true));
+                    let query_result_recalled=!is_error && result.get("tool_results").is_some();
+                    if material_recalled { step_tools.push("notebook/source".to_owned()); }
+                    if query_result_recalled {step_tools.push("notebook/query_result".to_owned());}
+                    executed_tool_calls += 1;
+                    if !matches!(call.name.as_str(),"report_progress"|"respond_observer"|"consult_observer"|"yield_work") { project_operations += 1; }
+                    if !is_error && result["changed"] != false && matches!(call.name.as_str(), "write_file" | "replace_range" | "edit_file") {
+                        successful_file_writes += 1;
+                    }
+                    if !is_error && crate::worker_read_cache::is_source_read(&call.name) {
+                        // Related type bodies are independent notebook materials. They
+                        // must survive after the parent symbol's tool message leaves.
+                        match notebook.save(turn,step,&active_flow_node,&call.name,&result).await {
+                            Ok(Some(material)) => {
+                                result["notebook_material"] = material.clone();
+                                let source_args=json!({"material_ids":[material["id"]],"include_material":true,
+                                    "start_line":result.get("start_line").or_else(||result.pointer("/symbol/start_line")),
+                                    "end_line":result.get("end_line").or_else(||result.pointer("/symbol/end_line")),
+                                    "start_column":result["start_column"],
+                                    "max_chars":result["returned_chars"].as_u64().unwrap_or(24_000).clamp(1000,58_000)});
+                                match notebook.recall(&source_args).await {
+                                    Ok(pages)=>{source_working_set.add(&pages["materials"],work_state.edit_targets());result["source_context"]=source_working_set.metadata();},
+                                    Err(error)=>tracing::warn!(%task_id,%error,"could not retain read page in source working set"),
+                                }
+                            },
+                            Ok(None) => {},
+                            Err(error) => { tracing::warn!(%task_id,%error,"could not retain source material"); result["notebook_capture_error"]=json!("Source material could not be saved; this result is still usable."); },
+                        }
+                        let mut related=result.get("related_types").and_then(Value::as_array).cloned().unwrap_or_default();
+                        for page in &mut related {
+                            match notebook.save(turn,step,&active_flow_node,"read_ts_symbol",page).await {
+                                Ok(Some(material))=>{
+                                    page["notebook_material"]=material.clone();
+                                    let source_args=json!({"material_ids":[material["id"]],"include_material":true,
+                                        "start_line":page["start_line"],"end_line":page["end_line"],"max_chars":12_000});
+                                    if let Ok(pages)=notebook.recall(&source_args).await {source_working_set.add(&pages["materials"],work_state.edit_targets());}
+                                },
+                                Ok(None)=>{},
+                                Err(error)=>{page["notebook_capture_error"]=json!(error.to_string());},
+                            }
+                        }
+                        if !related.is_empty() {result["related_types"]=json!(related);}
+                        result["source_context"]=source_working_set.metadata();
+                    }
+                    if !is_error && matches!(call.name.as_str(), "write_file" | "replace_range" | "edit_file") {
+                        // Release invalid old pages before adding the edited definition.
+                        // Otherwise the old and new versions compete for the same budget.
+                        source_working_set.refresh(&mut notebook,work_state.edit_targets()).await?;
+                        for revision in work_state.refresh_source_refs(source_working_set.materials(),&source_working_set.metadata(),turn,step) {
+                            emit(&root,&task_id,"worker/finding_revision",revision).await?;
+                        }
+                        if let Some(path) = args["path"].as_str() {
+                            let (workspace,path) = (state.workspace.clone(),path.to_owned());
+                            let post_edit = tokio::task::spawn_blocking(move || workspace.read_file(crate::tools::ReadFileRequest {workspace_root:None,path,max_bytes:16*1024*1024})).await;
+                            if let Ok(Ok(source))=post_edit {
+                                match notebook.save(turn,step,&active_flow_node,"read_file",&serde_json::to_value(&source)?).await {
+                                    Ok(Some(material))=>{
+                                        result["notebook_material"]=material.clone();
+                                        let source=source.content.as_str();
+                                        let mut ranges=Vec::<(u64,u64)>::new();
+                                        let anchors=args["edits"].as_array().into_iter().flatten().filter_map(|edit|edit["new_text"].as_str())
+                                            .chain(args["replacement"].as_str()).filter(|text|!text.is_empty());
+                                        for text in anchors {
+                                            for (offset,_) in source.match_indices(text).take(8) {
+                                                let start=source[..offset].bytes().filter(|byte|*byte==b'\n').count() as u64+1;
+                                                let end=start+text.bytes().filter(|byte|*byte==b'\n').count() as u64;
+                                                ranges.push((start.saturating_sub(12).max(1),end+12));
+                                            }
+                                        }
+                                        if ranges.is_empty(){let start=args["start_line"].as_u64().unwrap_or(1);ranges.push((start.saturating_sub(12).max(1),start+160));}
+                                        ranges.sort_unstable();
+                                        let mut merged=Vec::<(u64,u64)>::new();
+                                        for (start,end) in ranges {if let Some(last)=merged.last_mut().filter(|last|start<=last.1+1){last.1=last.1.max(end);}else{merged.push((start,end));}}
+                                        merged.truncate(16);
+                                        result["changes"]=json!(merged.iter().map(|(start,end)|json!({"path":args["path"],"start_line":start,"end_line":end,"material_id":material["id"],"code_hash":result["code_hash"]})).collect::<Vec<_>>());
+                                        for (start,end) in merged {
+                                            let pages=notebook.recall(&json!({"material_ids":[material["id"]],"include_material":true,"start_line":start,"end_line":end,"max_chars":24_000})).await;
+                                            if let Ok(pages)=pages {source_working_set.add(&pages["materials"],work_state.edit_targets());}
+                                        }
+                                    },
+                                    Ok(None)=>{},
+                                    Err(error)=>{tracing::warn!(%task_id,%error,"could not capture post-edit notebook source");result["notebook_capture_error"]=json!("File changed, but its post-edit material snapshot could not be saved.");},
+                                }
+                            } else {
+                                result["notebook_capture_error"]=json!("File changed, but its post-edit material snapshot is unavailable or exceeds 16 MiB. Use a focused source read if exact code is needed.");
+                            }
+                        }
+                    }
+                    let overlap_read=if !is_error {source_coverage.filter(&call.name,&args,&mut result)} else {false};
+                    let query_fingerprint=crate::source_read::query_fingerprint(&result);
+                    let repeated_query=!is_error && cached_read.as_ref().is_some_and(|previous|previous.0==query_fingerprint);
+                    if repeated_query {
+                        result["repeated_query"]=json!({"previous_tool_call_id":cached_read.as_ref().unwrap().1,"freshly_executed":true,
+                            "guidance":"This query was checked against current state and returned the same information. Use the known findings unless a concrete unanswered question requires more discovery."});
+                    }
+                    if overlap_read || repeated_query || http_probe_reused {repeated_read_calls=repeated_read_calls.saturating_add(1);}
+                    if !is_error {
+                        if crate::project_process::may_change_files(&call.name) {source_coverage.clear();crate::source_read::clear();}
+                        else if result["changed"]!=false && matches!(call.name.as_str(),"write_file"|"replace_range"|"edit_file") {
+                            if let Some(path)=result["path"].as_str().or_else(||args["path"].as_str()){source_coverage.forget(path);}
+                        }
+                    }
+                    if crate::project_process::is_check(&call.name) {refresh_scheduler_versions(&mut *scheduler,&state.workspace).await?;}
+                    if crate::project_process::is_check(&call.name) && call.name!="install_dependencies" && call.name!="http_probe" && command_versions!=scheduler.versions() {result["verification_inputs_changed"]=json!(true);}
+                    let bounded=crate::source_read::bounded(&result,MAX_TOOL_OUTPUT_CHARS,&call.call_id);
+                    if let Some(key)=read_key {
+                        if !is_error {if read_results.len()>=128 {read_results.clear();}read_results.insert(key,(query_fingerprint,call.call_id.clone()));}
+                    }
+                    let result_message = json!({
+                        "id":uuid_like(),"role":"tool","source":{"kind":"tool","callId":call.call_id},
+                        "toolCallId":call.call_id,"content":[{"type":"text","text":bounded}],"isError":is_error
+                    });
+                    emit_surface(&root,&task_id,"tool/result",json!({
+                        "turn":turn,"step":step,"message":result_message,
+                        "meta":{"durationMs":started.elapsed().as_millis(),"result":result},
+                    }),Some("append")).await?;
+                    messages.push(crate::format_translate::openai_chat_tool_result_message(&call, &bounded));
+
+                    scheduler.observe(&call.name,&args,&result,is_error);
+                    scheduler.close_if_satisfied();
+                    // A failed check returns to this Worker's next implementation/check
+                    // round in the same frame. Only explicit blockers/splits hand off.
+                    work_state.observe(step, &call.name, &args, &result, is_error, repeated_query || overlap_read || http_probe_reused);
+                    if !is_error && repeatable_read_tool(&call.name) && !crate::worker_read_cache::is_source_read(&call.name) {work_state.record_query(step,&call.name,&args,&result,&call.call_id);}
+                    if crate::worker_read_cache::is_source_read(&call.name) || crate::project_process::is_tool(&call.name) || matches!(call.name.as_str(), "write_file" | "replace_range" | "edit_file" | "run_command") {
+                        emit(&root, &task_id, "worker/work_state", json!({"turn":turn,"step":step,"state":work_state.snapshot()})).await?;
+                    }
+                    recent_actions.push(json!({
+                        "tool":call.name,"arguments":args,"failed":is_error,
+                        "repeated":repeated_query || overlap_read || http_probe_reused,"outcome":truncate(&bounded, 900),
+                    }));
+                    if recent_actions.len() > 12 {
+                        recent_actions.drain(..recent_actions.len() - 12);
+                    }
+                    if state.observer_enabled && (repeated_query || overlap_read || http_probe_reused) {
+                        observer.progress(crate::observer_service::observation(&task_id,scheduler,scheduler.id(),turn,step,"progress",&prompt,&organizer_decision,
+                            json!({"tools":recent_actions.iter().map(|a|json!({"tool":a["tool"],"failed":a["failed"],"repeated":a["repeated"]})).collect::<Vec<_>>(),
+                                "purpose":latest_worker_progress["purpose"],"repeated_reads":repeated_read_calls,"actual_operations":scheduler.frame().map(|f|&f.operations),"findings":work_state.unit_context(scheduler.id(),&[])}),
+                            Value::Null,Value::Null));
+                    }
+                    if cancel.is_cancelled() {
+                        return Ok(crate::work_executor::ToolRoundOutput { operations_count: project_operations,
+                            repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start), disposition: crate::work_executor::RoundDisposition::Cancelled });
                     }
                 }
+                work_state.finish_step(&step_tools.iter().map(String::as_str).collect::<Vec<_>>());
+                Ok(crate::work_executor::ToolRoundOutput {
+                    operations_count: project_operations,
+                    repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start),
+                    disposition: crate::work_executor::RoundDisposition::Continue,
+                })
+            },
+        ).await;
+        let round = match round {
+            Ok(round) => round,
+            Err(_error) if cancel.is_cancelled() => {
+                emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await?;
+                observer.finish("cancelled").await?;finish_cancelled_run(&state, &root, &task_id, turn, &active_flow_node).await?;
+                return Ok(());
             }
-            Ok(response) => {
-                let status = response.status();
-                let message = response.text().await.unwrap_or_default();
-                fail_turn(
-                    &state,
-                    &root,
-                    &task_id,
-                    turn,
-                    step,
-                    format!("model returned {status}: {message}"),
-                )
-                .await;
-                return;
-            }
-            Err(e) => {
-                fail_turn(&state, &root, &task_id, turn, step, e.to_string()).await;
-                return;
+            Err(error) => {
+                crate::request_context::finish(request_trace.take(),"execution_error",json!({})).await;
+                fail_turn(&state, &root, &task_id, turn, step, &observer_model, &prompt, error.to_string()).await?;
+                observer.finish("failed").await?;
+                return Ok(());
             }
         };
-        let Some(message) = value.pointer("/choices/0/message").cloned() else {
-            fail_turn(
-                &state,
-                &root,
-                &task_id,
-                turn,
-                step,
-                "model response has no choices[0].message".into(),
-            )
-            .await;
-            return;
-        };
-        let text = message
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        let calls = crate::format_translate::collect_all_tool_calls_from_openai_chat(&message);
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(json!({"type":"text","text":text}));
+        emit(&root,&task_id,"execution/tick",json!({"turn":turn,"step":step,"tick":round.tick})).await?;
+        emit(&root,&task_id,"scheduler/state",json!({"turn":turn,"step":step,"state":scheduler.snapshot()})).await?;
+        if task_tree.enabled() {
+            if task_tree.active()==scheduler.node(){task_tree.remember_sources(source_working_set.snapshot(),work_state.edit_targets());}
+            emit(&root,&task_id,"flow/tree_state",json!({"turn":turn,"step":step,"state":task_tree.snapshot(),"active_node_id":latest_flow_plan["active_node_id"],"active_path":latest_flow_plan["active_path"]})).await?;
         }
-        for call in &calls {
-            content.push(json!({"type":"tool-call","id":call.call_id,"name":call.name,"arguments":call.arguments}));
-        }
-        emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,"message":{"id":uuid_like(),"role":"assistant","content":content,"source":{"kind":"model","provider":state.provider_url,"model":model}},"stream":[]}),Some("append")).await;
-        messages.push(message);
-        if calls.is_empty() {
-            emit(
-                &root,
-                &task_id,
-                "step/end",
-                json!({"turn":turn,"step":step}),
-            )
-            .await;
-            emit(
-                &root,
-                &task_id,
-                "turn/end",
-                json!({"turn":turn,"reason":{"kind":"completed"}}),
-            )
-            .await;
-            finish(&state, &task_id, "completed").await;
-            return;
-        }
-        for call in calls {
-            let args: Value = serde_json::from_str(&call.arguments).unwrap_or_else(|_| json!({}));
-            emit(&root,&task_id,"tool/call",json!({"turn":turn,"step":step,"callId":call.call_id,"name":call.name,"arguments":call.arguments})).await;
-            let started = std::time::Instant::now();
-            let output = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let cancelled_message = json!({"id":uuid_like(),"role":"tool","source":{"kind":"tool","callId":call.call_id},"toolCallId":call.call_id,"content":[{"type":"text","text":"Tool execution cancelled."}],"isError":true});
-                    emit_surface(&root,&task_id,"tool/result",json!({"turn":turn,"step":step,"message":cancelled_message}),Some("append")).await;
-                    emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await;
-                    emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"aborted","reason":{"kind":"legacy"}}})).await;
-                    finish(&state,&task_id,"cancelled").await;
-                    return;
+        let delivery_boundary=matches!(round.disposition,crate::work_executor::RoundDisposition::Yield|crate::work_executor::RoundDisposition::End)
+            || scheduler.frames.get(&process_identity.work_id).is_some_and(|f|f.status==crate::work_scheduler::WorkStatus::Done);
+        let observations=if state.observer_enabled && delivery_boundary {
+            let frame=scheduler.frames.get(&process_identity.work_id);
+            vec![crate::observer_service::observation(&task_id,&scheduler,&process_identity.work_id,turn,step,"handoff",&prompt,&organizer_decision,
+                json!({"tool_calls":executed_tool_calls,"writes":successful_file_writes,"repeated_reads":repeated_read_calls,
+                    "operations":frame.map(|f|&f.operations),"checks":frame.map(|f|&f.checked),"check_failures":frame.map(|f|&f.check_errors)}),
+                json!({"summary":frame.and_then(|f|f.output.as_ref()).and_then(|o|o.get("summary")).cloned().unwrap_or_else(||json!(end_text)),
+                    "handoff":scheduler.pending_handoff(),"status":frame.map(|f|f.status),"exported_fields":frame.and_then(|f|f.output.as_ref()).and_then(|o|o["exported_data"].as_object()).map(|m|m.keys().collect::<Vec<_>>())}),Value::Null)]
+        }else{vec![]};
+        crate::observer_service::commit(&root,&task_id,json!({
+            "commit_id":format!("{turn}:{step}:{}:sealed",scheduler.plan_revision),"turn":turn,"step":step,
+            "scheduler":scheduler.snapshot(),"task_tree":task_tree.snapshot(),
+            "active_node_id":latest_flow_plan["active_node_id"],"active_path":latest_flow_plan["active_path"]
+        }),observations).await?;
+        observer.set_scope(&scheduler,&prompt);observer.notify();
+        emit(&root,&task_id,"worker/source_working_set",json!({"turn":turn,"step":step,"state":source_working_set.snapshot(),"retention":source_working_set.metadata()})).await?;
+        emit(&root, &task_id, "worker/work_state", json!({"turn":turn,"step":step,"state":work_state.snapshot()})).await?;
+        emit(&root, &task_id, "step/end", json!({"turn":turn,"step":step})).await?;
+        match round.disposition {
+            crate::work_executor::RoundDisposition::End => {
+                let status = if final_step { "max_steps" } else { "completed" };
+                if !observer_inbox.all_unread().is_empty() {
+                    emit(&root,&task_id,"observer/advice_unanswered",json!({"turn":turn,"step":step,"ids":observer_inbox.all_unread(),
+                        "reason":if final_step {"step_limit"} else {"worker_finished"}})).await?;
                 }
-                result = execute_tool(&state.workspace, &call.name, args) => result,
-            };
-            let (result, is_error) = match output {
-                Ok(v) => (v, false),
-                Err(e) => (json!({"error":e.to_string()}), true),
-            };
-            let content = serde_json::to_string(&result).unwrap_or_else(|_| "null".into());
-            let bounded: String = content.chars().take(MAX_TOOL_OUTPUT_CHARS).collect();
-            let result_message = json!({"id":uuid_like(),"role":"tool","source":{"kind":"tool","callId":call.call_id},"toolCallId":call.call_id,"content":[{"type":"text","text":bounded}],"isError":is_error});
-            emit_surface(&root,&task_id,"tool/result",json!({"turn":turn,"step":step,"message":result_message,"meta":{"durationMs":started.elapsed().as_millis(),"result":result}}),Some("append")).await;
-            messages.push(crate::format_translate::openai_chat_tool_result_message(
-                &call, &bounded,
-            ));
+                let reason = if final_step {
+                    json!({"kind":"error","error":{"message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"}})
+                } else { json!({"kind":"completed"}) };
+                emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":reason})).await?;
+                finish(&state,&task_id,status).await?;
+                observer.finish(status).await?;
+                return Ok(());
+            },
+            crate::work_executor::RoundDisposition::Cancelled => {
+                observer.finish("cancelled").await?;finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;
+                return Ok(());
+            },
+            crate::work_executor::RoundDisposition::Yield => continue,
+            _ => {},
         }
-        emit(
-            &root,
-            &task_id,
-            "step/end",
-            json!({"turn":turn,"step":step}),
-        )
-        .await;
-    }
-    emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"error","error":{"message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"}}})).await;
-    finish(&state, &task_id, "max_steps").await;
-}
 
+    }
+
+    emit(&root,&task_id,"turn/end",json!({
+        "turn":turn,"reason":{"kind":"error","error":{
+            "message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"
+        }}
+    })).await?;
+    finish(&state, &task_id, "max_steps").await?;
+    observer.finish("max_steps").await?;
+    Ok(())
+}
 async fn fail_turn(
     state: &AgentServiceState,
     root: &std::path::Path,
     task_id: &str,
     turn: usize,
     step: usize,
+    _observer_model: &str,
+    _prompt: &str,
     message: String,
-) {
-    emit(root, task_id, "step/end", json!({"turn":turn,"step":step})).await;
+) -> anyhow::Result<()> {
+    emit(root, task_id, "step/end", json!({"turn":turn,"step":step})).await?;
     emit(
         root,
         task_id,
         "turn/end",
         json!({"turn":turn,"reason":{"kind":"error","error":{"message":message,"code":"UNKNOWN"}}}),
     )
-    .await;
-    finish(state, task_id, "failed").await;
+    .await?;
+    finish(state, task_id, "failed").await?;
+    Ok(())
 }
 
-fn local_tools(_workspace: &crate::tools::Workspace) -> Vec<Value> {
+fn subagent_tool() -> Value {
+    json!({"type":"function","function":{
+        "name":"spawn_subagent",
+        "description":"Delegate one focused task to a single subagent. The parent waits for completion. The child shares workspace tools, memory, and code indexes, records its own steps, and cannot spawn another agent. At most one child may be started per parent task.",
+        "parameters":{"type":"object","required":["prompt"],"properties":{
+            "prompt":{"type":"string","description":"Self-contained work request and expected report for the subagent"}
+        }}
+    }})
+}
+
+fn run_subagent<'a>(
+    state: &'a AgentServiceState,
+    parent_id: &'a str,
+    parent_model: &'a str,
+    args: Value,
+    parent_cancel: &'a CancellationToken,
+    spawned: &'a mut bool,
+    ban_run_command: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Value>> + Send + 'a>> {
+    Box::pin(async move {
+        let prompt = args
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        anyhow::ensure!(
+            !prompt.is_empty(),
+            "spawn_subagent requires a nonempty prompt"
+        );
+        let child_id = format!("task_{}", uuid_like());
+        let root = state.workspace.root().to_path_buf();
+        let insert_id = child_id.clone();
+        let insert_parent = parent_id.to_owned();
+        let child_model = if state.subagent_inherits_model { parent_model.to_owned() } else { state.expert_model.clone() };
+        let child_provider_name = if state.subagent_inherits_model { state.provider_name.clone() } else { state.expert_provider_name.clone() };
+        let child_reasoning_effort = state.subagent_inherits_model.then(|| state.reasoning_effort.clone()).flatten();
+        let child_fast_mode = state.subagent_inherits_model && state.fast_mode;
+        let insert_model = child_model.clone();
+        let insert_provider_name = child_provider_name.clone();
+        let insert_reasoning_effort = child_reasoning_effort.clone();
+        let child_prompt = prompt.to_owned();
+        let insert_prompt = child_prompt.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let conn = open_db(&root)?;
+        conn.execute(
+            "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode) VALUES (?1,?2,?3,'running',?4,?4,?5,?6,?7,?8)",
+            params![insert_id,insert_prompt,insert_model,now(),insert_parent,insert_provider_name,insert_reasoning_effort,child_fast_mode],
+        )?;
+        Ok(())
+    }).await??;
+
+        let root = state.workspace.root().to_path_buf();
+        if let Err(error) = emit(
+            &root,
+            parent_id,
+            "subagent/start",
+            json!({"child_task_id":child_id,"prompt":prompt}),
+        )
+        .await {
+            finish(state, &child_id, "failed").await?;
+            return Err(error);
+        }
+        *spawned = true;
+        let child_cancel = parent_cancel.child_token();
+        let child_run_id = uuid_like();
+        state
+            .cancellations
+            .lock()
+            .await
+            .insert(child_id.clone(), ActiveTask { run_id: child_run_id.clone(), token: child_cancel.clone(),
+                flow_node: Arc::new(Mutex::new("turn_1:1".into())), node_interrupt: Arc::new(Mutex::new(None)) });
+        let mut child_state = state.clone();
+        child_state.provider_name = child_provider_name;
+        child_state.provider_url = state.expert_provider_url.clone();
+        child_state.api_key = state.expert_api_key.clone();
+        child_state.default_model = child_model.clone();
+        child_state.reasoning_effort = child_reasoning_effort;
+        child_state.fast_mode = child_fast_mode;
+        let runner_id = child_id.clone();
+        let runner_run_id = child_run_id.clone();
+        let runner_model = child_model;
+        let handle = tokio::spawn(async move {
+            let result = Box::pin(run_task(
+                child_state.clone(),
+                runner_id.clone(),
+                runner_model,
+                child_prompt,
+                SUBAGENT_MAX_STEPS,
+                child_cancel,
+                true,
+                1,
+                Vec::new(),
+                false,
+                ban_run_command,
+            ))
+            .await;
+            clear_active_task(&child_state, &runner_id, &runner_run_id).await;
+            result
+        });
+        if let error @ (Err(_) | Ok(Err(_))) = handle.await {
+            clear_active_task(state, &child_id, &child_run_id).await;
+            finish(state, &child_id, "failed").await?;
+            emit(
+                &root,
+                parent_id,
+                "subagent/end",
+                json!({"child_task_id":child_id,"status":"failed"}),
+            )
+            .await?;
+            anyhow::bail!("subagent {child_id} stopped unexpectedly: {error:?}");
+        }
+
+        let read_id = child_id.clone();
+        let root = state.workspace.root().to_path_buf();
+        let (status, answer) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+        let conn = open_db(&root)?;
+        let status: String = conn.query_row("SELECT status FROM agent_tasks WHERE id=?1", [&read_id], |r| r.get(0))?;
+        let raw: Option<String> = conn.query_row(
+            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='assistant/message' ORDER BY seq DESC LIMIT 1",
+            [&read_id], |r| r.get(0),
+        ).optional()?;
+        let answer = raw.and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            .and_then(|data| data.pointer("/message/content").and_then(Value::as_array).cloned())
+            .map(|blocks| blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
+            .unwrap_or_default();
+        Ok((status, answer))
+    }).await??;
+        emit(
+            &state.workspace.root().to_path_buf(),
+            parent_id,
+            "subagent/end",
+            json!({"child_task_id":child_id,"status":status}),
+        )
+        .await?;
+        Ok(json!({"child_task_id":child_id,"status":status,"answer":answer}))
+    })
+}
+
+fn local_tools(
+    _workspace: &crate::tools::Workspace,
+    catalog: Option<&crate::plugin_builtin::ToolCatalog>,
+    ban_run_command: bool,
+) -> Vec<Value> {
     let definitions = crate::mcp::tool_definitions();
     let allowed = [
         "workspace_info",
+        "install_dependencies",
+        "run_project_script",
+        "get_project_process",
+        "http_probe",
+        "stop_project_process",
+        "browser_open",
+        "browser_read",
+        "browser_wait",
+        "browser_diagnostics",
+        "browser_click",
+        "browser_press_key",
+        "browser_upload",
+        "browser_screenshot",
+        "browser_close",
         "list_dir",
         "read_file",
         "read_file_lines",
         "search_text",
         "write_file",
         "replace_range",
+        "edit_file",
+        "search_code_map",
         "index_go_workspace",
         "go_index_status",
         "list_go_symbols",
@@ -641,42 +4139,41 @@ fn local_tools(_workspace: &crate::tools::Workspace) -> Vec<Value> {
         "list_symbol_business_context",
         "search_symbol_business_context",
     ];
-    definitions.as_array().into_iter().flatten().filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|n| allowed.contains(&n))).map(|tool| {
+    definitions.as_array().into_iter().flatten().filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|n| (!ban_run_command || (n != "run_command" && !crate::project_process::is_execution(n))) && catalog.map_or(allowed.contains(&n), |catalog| catalog.contains(n)))).map(|tool| {
         let name=tool["name"].as_str().unwrap_or_default(); let description=tool["description"].as_str().unwrap_or_default();
         let mut schema=tool.get("inputSchema").cloned().unwrap_or_else(||json!({"type":"object","properties":{}}));
         if let Some(props)=schema.get_mut("properties").and_then(Value::as_object_mut) {props.remove("workspace_root");}
         if let Some(required)=schema.get_mut("required").and_then(Value::as_array_mut) {required.retain(|name| name.as_str()!=Some("workspace_root"));}
+        if crate::worker_read_cache::is_source_read(name) {
+            if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                props.insert("force_read".into(), json!({"type":"boolean","default":false,"description":"Return the exact requested source even if previously read. Use when preparing an edit or when needed source is no longer in current context; requires reread_reason."}));
+                props.insert("reread_reason".into(), json!({"type":"string","description":"Concrete reason the previously read source is needed again. Required when force_read=true."}));
+            }
+        }
         json!({"type":"function","function":{"name":name,"description":description,"parameters":schema}})
-    }).chain(std::iter::once(json!({"type":"function","function":{"name":"run_command","description":"Run a shell command inside the workspace. The command is stopped after its timeout.","parameters":{"type":"object","required":["command"],"properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","default":30}}}}}))).collect()
+    }).chain((!ban_run_command && catalog.is_none_or(|catalog| catalog.contains("run_command"))).then(|| json!({"type":"function","function":{"name":"run_command","description":"Run a shell command inside the workspace for operations without a dedicated tool. On Windows PowerShell runs without the user profile and with UTF-8 process pipes. The result separates process_exit_code from command_result; a zero PowerShell exit reports only process completion, so inspect returned JSON for an error or explicit failure field.","parameters":{"type":"object","required":["command"],"properties":{"command":{"type":"string"},"timeout_seconds":{"type":"integer","default":30}}}}}))).collect()
 }
 
-async fn execute_tool(
-    workspace: &crate::tools::Workspace,
+fn can_run_check(state: &AgentServiceState, ban_run_command: bool) -> bool {
+    local_tools(&state.workspace, state.tool_catalog.as_deref(), ban_run_command).iter()
+        .any(|tool| tool.pointer("/function/name").and_then(Value::as_str)
+            .is_some_and(|name| crate::project_process::is_check(name) && state.permission_mode.allows(name)))
+}
+
+pub(crate) async fn execute_tool(
+    workspace: Arc<crate::tools::Workspace>,
+    catalog: Option<&crate::plugin_builtin::ToolCatalog>,
     name: &str,
     mut args: Value,
 ) -> anyhow::Result<Value> {
+    if let Some(catalog) = catalog {
+        return catalog.execute(workspace, name, args).await;
+    }
+    if crate::browser_control::is_tool(name) {return crate::browser_control::execute(&workspace,name,&args).await;}
+    if crate::http_probe::is_tool(name) {return crate::http_probe::execute(&args).await;}
+    if crate::project_process::is_tool(name) {return crate::project_process::execute(&workspace,name,args).await;}
     if name == "run_command" {
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("run_command requires command"))?;
-        let timeout = args
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(30)
-            .clamp(1, 120);
-        let child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(workspace.root())
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(timeout), child)
-            .await
-            .map_err(|_| anyhow::anyhow!("command timed out after {timeout}s"))??;
-        return Ok(
-            json!({"status":output.status.code(),"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr)}),
-        );
+        return execute_run_command(&workspace, &args).await;
     }
     if let Some(object) = args.as_object_mut() {
         object.insert(
@@ -684,23 +4181,787 @@ async fn execute_tool(
             json!(workspace.root().display().to_string()),
         );
     }
-    let response = crate::mcp::call_tool(workspace, json!({"name":name,"arguments":args})).await?;
+    let response = crate::mcp::call_tool(&workspace, json!({"name":name,"arguments":args})).await?;
     Ok(response
         .get("structuredContent")
         .cloned()
         .unwrap_or(response))
 }
 
+pub(crate) async fn execute_run_command(
+    workspace: &crate::tools::Workspace,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    let command = args.get("command").and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("run_command requires command"))?;
+    let timeout = args.get("timeout_seconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
+    let windows = cfg!(windows);
+    let mut process = if windows {
+        let mut process = tokio::process::Command::new("powershell.exe");
+        process.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        process.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
+        process
+    } else {
+        let mut process = tokio::process::Command::new("sh");
+        process.arg("-c");
+        process
+    };
+    let shell_command = if windows {
+        format!("$utf8 = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = $utf8; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8; {command}")
+    } else {
+        command.to_owned()
+    };
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout),
+        process.arg(shell_command).current_dir(workspace.root()).kill_on_drop(true).output(),
+    ).await.map_err(|_| anyhow::anyhow!("command timed out after {timeout}s"))??;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let command_result = match serde_json::from_str::<Value>(stdout.trim()) {
+        Ok(value) => json!({"format":"json","value":value}),
+        Err(_) if stdout.trim().is_empty() => json!({"format":"empty","value":Value::Null}),
+        Err(_) => json!({"format":"text","value":stdout}),
+    };
+    let returned_value = &command_result["value"];
+    let error_field = returned_value.get("error").is_some_and(|value| match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    });
+    let command_result_reports_failure = command_result["format"] == "json"
+        && (error_field || returned_value["ok"] == false || returned_value["success"] == false
+            || matches!(returned_value["status"].as_str(), Some("error" | "failed")));
+    Ok(json!({
+        "process_exit_code":output.status.code(),
+        "process_success":output.status.success(),
+        "command_result":command_result,
+        "command_result_reports_failure":command_result_reports_failure,
+        "stdout":stdout,
+        "stderr":stderr
+    }))
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::{extract::State, routing::post};
 
-    async fn fake_chat(State(calls): State<Arc<std::sync::atomic::AtomicUsize>>) -> Json<Value> {
+    #[test]
+    fn scoped_context_keeps_an_action_ledger_after_old_steps_are_dropped() {
+        let mut messages = vec![
+            json!({"role":"system","content":"worker"}),
+            json!({"role":"user","content":"inspect the project"}),
+        ];
+        let mut starts = Vec::new();
+        for index in 0..6 {
+            starts.push(messages.len());
+            let name = if index == 0 { "list_work_memory" } else { "search_text" };
+            let call_id = format!("call_{index}");
+            messages.push(json!({"role":"assistant","content":Value::Null,"tool_calls":[{
+                "id":call_id,"type":"function","function":{"name":name,"arguments":"{}"}
+            }]}));
+            messages.push(json!({"role":"tool","tool_call_id":call_id,"content":"x".repeat(5_000)}));
+        }
+        let scoped = scoped_worker_messages(&messages, 2, &starts, "inspect the project");
+        assert!(scoped.iter().any(|message| message.get("role") == Some(&json!("system"))
+            && message.get("content").and_then(Value::as_str).is_some_and(|text| text.contains("list_work_memory"))));
+        assert!(!scoped.iter().any(|message| message.get("tool_call_id") == Some(&json!("call_0"))));
+    }
+
+    #[test]
+    fn command_ban_matches_instructions_without_matching_examples() {
+        assert!(user_bans_run_command("不要运行命令"));
+        assert!(user_bans_run_command("禁止执行命令"));
+        assert!(user_bans_run_command("Do Not Run Commands"));
+        assert!(!user_bans_run_command("请解释“不要运行命令”这句话"));
+        assert!(!user_bans_run_command("请解释‘不要运行命令’这句话"));
+        assert!(!user_bans_run_command("`不要运行命令` 是一个示例"));
+        assert!(!user_bans_run_command("```text\n不要运行命令\n```"));
+        assert!(!user_bans_run_command("不要“示例”运行命令"));
+        assert!(!user_bans_run_command("请说明如何运行命令"));
+    }
+
+    #[derive(Clone, Default)]
+    struct CommandBanMock {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        offered_commands: Arc<Mutex<Vec<bool>>>,
+    }
+
+    async fn fake_command_ban_chat(
+        State(mock): State<CommandBanMock>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("organize_work"))
+        });
+        if is_organizer {
+            let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
+            let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
+            let turn_num = input_json.get("turn").and_then(Value::as_u64).unwrap_or(1);
+            let id = if turn_num <= 1 { "task".to_string() } else { format!("task_turn_{turn_num}") };
+            let node_id = id.clone();
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_work",
+                            "type": "function",
+                            "function": {
+                                "name": "organize_work",
+                                "arguments": json!({
+                                    "action": "work",
+                                    "reason": "Process probe command",
+                                    "orders": [{
+                                        "id": id,
+                                        "node_id": node_id,
+                                        "goal": "Check the requested task",
+                                        "done_when": "Run the requested command if available",
+                                        "completion": "output",
+                                        "final_answer": true
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }
+                }]
+            }));
+        }
+        let offered = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("run_command"))
+        });
+        mock.offered_commands.lock().await.push(offered);
+        let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let message = if call == 0 {
+            json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_progress","type":"function","function":{
+                    "name":"report_progress","arguments":json!({
+                        "current_node_id":"task","purpose":"Check the requested task","known_conditions":[],
+                        "next_action":"Run the requested command if available",
+                        "plan":{"nodes":[{"id":"task","title":"Check task","kind":"worker"}],"edges":[]}
+                    }).to_string()
+                }},
+                {"id":"call_blocked","type":"function","function":{
+                    "name":"run_command","arguments":"{\"command\":\"echo guard_probe\"}"
+                }}
+            ]})
+        } else {
+            json!({"role":"assistant","content":"done"})
+        };
+        Json(json!({"choices":[{"message":message}]}))
+    }
+
+    #[tokio::test]
+    async fn command_ban_hides_tool_rejects_forced_call_and_resets_next_turn() {
+        let root = std::env::temp_dir().join(format!("agent-command-ban-test-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = Arc::new(crate::tools::Workspace::new(root.clone()).unwrap());
+        let mock = CommandBanMock::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(fake_command_ban_chat))
+            .with_state(mock.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = AgentServiceState {
+            workspace,
+            client: Client::new(),
+            provider_url: format!("http://{address}/v1"),
+            api_key: "fake".into(),
+            provider_name: String::new(),
+            provider_routes: HashMap::new(),
+            default_model: "fake-model".into(),
+            model_map: HashMap::new(),
+            reasoning_effort: None,
+            fast_mode: false,
+            permission_mode: PermissionMode::default(),
+            enable_subagent: false,
+            expert_provider_name: String::new(),
+            expert_provider_url: String::new(),
+            expert_api_key: String::new(),
+            expert_model: String::new(),
+            subagent_inherits_model: true,
+            observer_enabled: false,
+            observer_provider: String::new(),
+            observer_provider_url: String::new(),
+            observer_api_key: String::new(),
+            observer_model: String::new(),
+            observer_inherits_model: true,
+            visual:Default::default(),
+            config: None,
+            config_path: None,
+            tool_catalog: None,
+            plugin_cancel: CancellationToken::new(),
+            cancellations: Arc::default(),
+        };
+        let task_id = format!("task_{}", uuid_like());
+        {
+            let conn = open_db(&root).unwrap();
+            conn.execute(
+                "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'test','fake-model','running',?2,?2)",
+                params![task_id, now()],
+            ).unwrap();
+        }
+
+        run_task(state.clone(), task_id.clone(), "fake-model".into(), "不要运行命令".into(),
+            3, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
+        let conn = open_db(&root).unwrap();
+        let raw: String = conn.query_row(
+            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' ORDER BY seq LIMIT 1",
+            [&task_id], |row| row.get(0),
+        ).unwrap();
+        let result: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(result["message"]["isError"], true);
+        assert!(result["message"]["content"][0]["text"].as_str().unwrap().contains("blocked"));
+        drop(conn);
+
+        run_task(state.clone(), task_id.clone(), "fake-model".into(), "继续回答".into(),
+            1, CancellationToken::new(), false, 2, Vec::new(), false, false).await.unwrap();
+        let child_id = format!("task_{}", uuid_like());
+        {
+            let conn = open_db(&root).unwrap();
+            conn.execute(
+                "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,parent_task_id) VALUES (?1,'child','fake-model','running',?2,?2,?3)",
+                params![child_id, now(), task_id],
+            ).unwrap();
+        }
+        run_task(state, child_id, "fake-model".into(), "读取工作区".into(),
+            1, CancellationToken::new(), true, 1, Vec::new(), false, true).await.unwrap();
+        assert_eq!(*mock.offered_commands.lock().await, vec![false, false, true, false]);
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn offered_tools(names: &[&str]) -> Vec<Value> {
+        names
+            .iter()
+            .map(|name| json!({"type":"function","function":{"name":name,"description":"","parameters":{"type":"object"}}}))
+            .collect()
+    }
+
+    #[test]
+    fn worker_prompt_lists_only_offered_capabilities() {
+        let root = std::path::Path::new("/ws");
+        let full = [
+            "list_dir",
+            "read_file",
+            "read_file_lines",
+            "write_file",
+            "replace_range",
+        "edit_file",
+            "search_text",
+            "list_go_symbols",
+            "search_rust_symbols",
+            "read_ts_symbol",
+            "index_python_workspace",
+            "rust_index_status",
+            "list_work_memory",
+            "search_work_memory",
+            "record_work_memory",
+            "run_command",
+            "spawn_subagent",
+        ];
+        let prompt = worker_system_prompt(root, false, false, &offered_tools(&full));
+        assert!(prompt.contains("You are a local coding agent"));
+        assert!(prompt.contains("run_command"));
+        assert!(prompt.contains("PowerShell"));
+        assert!(prompt.contains("@relative/path"));
+        assert!(prompt.contains("indexed symbol tools"));
+        assert!(prompt.contains("search_text"));
+        assert!(prompt.contains("one focused search_work_memory query"));
+        assert!(!prompt.contains("record a work memory"));
+        assert!(prompt.contains("You may use spawn_subagent once"));
+
+        // A turn-level command ban removes run_command from the offered
+        // tools, so the prompt must not suggest it either.
+        let banned: Vec<&str> = full.iter().copied().filter(|name| *name != "run_command").collect();
+        let prompt = worker_system_prompt(root, false, false, &offered_tools(&banned));
+        assert!(!prompt.contains("run_command"));
+        assert!(prompt.contains("indexed symbol tools"));
+
+        // Delegation guidance only appears when spawn_subagent is offered.
+        let no_subagent: Vec<&str> =
+            full.iter().copied().filter(|name| *name != "spawn_subagent").collect();
+        let prompt = worker_system_prompt(root, false, false, &offered_tools(&no_subagent));
+        assert!(!prompt.contains("spawn_subagent"));
+        assert!(prompt.contains("sole worker"));
+        let prompt = worker_system_prompt(root, true, false, &offered_tools(&no_subagent));
+        assert!(prompt.contains("cannot delegate further"));
+        assert!(!prompt.contains("may use spawn_subagent once"));
+        let prompt = worker_system_prompt(root, false, true, &offered_tools(&no_subagent));
+        assert!(prompt.contains("already used its one allowed subagent"));
+        assert!(!prompt.contains("may use spawn_subagent once"));
+    }
+
+    #[test]
+    fn worker_prompt_tracks_tool_set_changes() {
+        let root = std::path::Path::new("/ws");
+        let first = worker_system_prompt(root, false, false, &offered_tools(&["list_dir", "read_file", "run_command"]));
+        assert!(first.contains("run_command"));
+        // Next step the command ban hides run_command: guidance must follow.
+        let second = worker_system_prompt(root, false, false, &offered_tools(&["list_dir", "read_file"]));
+        assert!(!second.contains("run_command"));
+        // A file-only tool set must not claim search, index, or memory tools.
+        assert!(second.contains("list_dir"));
+        assert!(!second.contains("search_text"));
+        assert!(!second.contains("symbol tools"));
+        assert!(!second.contains("work memory"));
+        // Delegation guidance disappears once the one allowed child is used.
+        let delegating = worker_system_prompt(root, false, false, &offered_tools(&["read_file", "spawn_subagent"]));
+        assert!(delegating.contains("may use spawn_subagent once"));
+        let after_spawn = worker_system_prompt(root, false, true, &offered_tools(&["read_file"]));
+        assert!(!after_spawn.contains("may use spawn_subagent once"));
+        assert!(after_spawn.contains("already used its one allowed subagent"));
+        // A tool set with no known capabilities omits the guidance section.
+        let empty = worker_system_prompt(root, false, false, &offered_tools(&[]));
+        assert!(!empty.contains("Tool guidance for the tools actually offered"));
+    }
+
+    #[test]
+    fn local_tools_and_prompt_follow_plugin_catalog() {
+        let root = std::env::temp_dir().join(format!("agent-catalog-prompt-test-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace = crate::tools::Workspace::new(root.clone()).unwrap();
+        let catalog = crate::plugin_builtin::ToolCatalog::default();
+        let handler: crate::plugin_builtin::ToolHandler =
+            Arc::new(|_workspace, _name, _args| Box::pin(async { Ok(json!({"ok":true})) }));
+        catalog.register(&["list_dir", "read_file", "run_command"], handler).unwrap();
+        let tools = local_tools(&workspace, Some(&catalog), false);
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"list_dir"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"run_command"));
+        assert!(!names.contains(&"search_text"));
+        assert!(!names.contains(&"record_work_memory"));
+        let prompt = worker_system_prompt(std::path::Path::new("/ws"), false, false, &tools);
+        assert!(prompt.contains("list_dir, read_file"));
+        assert!(prompt.contains("run_command"));
+        assert!(!prompt.contains("search_text"));
+        assert!(!prompt.contains("work memory"));
+        assert!(!prompt.contains("symbol tools"));
+        // The command ban applies on top of the catalog-filtered set.
+        let tools = local_tools(&workspace, Some(&catalog), true);
+        let prompt = worker_system_prompt(std::path::Path::new("/ws"), false, false, &tools);
+        assert!(!prompt.contains("run_command"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Default)]
+    struct PromptCaptureMock {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        system_prompts: Arc<Mutex<Vec<String>>>,
+        guidance_leaked: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn fake_prompt_capture_chat(
+        State(mock): State<PromptCaptureMock>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("organize_work"))
+        });
+        if is_organizer {
+            let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
+            let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
+            let turn_num = input_json.get("turn").and_then(Value::as_u64).unwrap_or(1);
+            let id = if turn_num <= 1 { "inspect".to_string() } else { format!("inspect_turn_{turn_num}") };
+            let node_id = id.clone();
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_work",
+                            "type": "function",
+                            "function": {
+                                "name": "organize_work",
+                                "arguments": json!({
+                                    "action": "work",
+                                    "reason": "Capture prompt",
+                                    "orders": [{
+                                        "id": id,
+                                        "node_id": node_id,
+                                        "goal": "Read the requested note",
+                                        "done_when": "Open note.txt",
+                                        "completion": "output",
+                                        "final_answer": true
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }
+                }]
+            }));
+        }
+        let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(content) = messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+        {
+            mock.system_prompts.lock().await.push(content.to_owned());
+        }
+        let leaked = messages
+            .iter()
+            .skip(1)
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("Tool guidance for the tools actually offered"));
+        if leaked {
+            mock.guidance_leaked.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let call = mock.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let message = if call == 0 {
+            json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"call_progress","type":"function","function":{
+                    "name":"report_progress","arguments":json!({
+                        "current_node_id":"inspect","purpose":"Read the requested note","known_conditions":[],
+                        "next_action":"Open note.txt",
+                        "plan":{"nodes":[{"id":"inspect","title":"Read note","kind":"research"}],"edges":[]}
+                    }).to_string()
+                }},
+                {"id":"call_read","type":"function","function":{
+                    "name":"read_file","arguments":"{\"path\":\"note.txt\"}"
+                }}
+            ]})
+        } else {
+            json!({"role":"assistant","content":"done"})
+        };
+        Json(json!({"choices":[{"message":message}]}))
+    }
+
+    #[tokio::test]
+    async fn worker_prompt_rebuilds_per_step_and_stays_out_of_history() {
+        let root = std::env::temp_dir().join(format!("agent-prompt-test-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "note").unwrap();
+        let workspace = Arc::new(crate::tools::Workspace::new(root.clone()).unwrap());
+        let mock = PromptCaptureMock::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(fake_prompt_capture_chat))
+            .with_state(mock.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = AgentServiceState {
+            workspace,
+            client: Client::new(),
+            provider_url: format!("http://{address}/v1"),
+            api_key: "fake".into(),
+            provider_name: String::new(),
+            provider_routes: HashMap::new(),
+            default_model: "fake-model".into(),
+            model_map: HashMap::new(),
+            reasoning_effort: None,
+            fast_mode: false,
+            permission_mode: PermissionMode::default(),
+            enable_subagent: false,
+            expert_provider_name: String::new(),
+            expert_provider_url: String::new(),
+            expert_api_key: String::new(),
+            expert_model: String::new(),
+            subagent_inherits_model: true,
+            observer_enabled: false,
+            observer_provider: String::new(),
+            observer_provider_url: String::new(),
+            observer_api_key: String::new(),
+            observer_model: String::new(),
+            observer_inherits_model: true,
+            visual:Default::default(),
+            config: None,
+            config_path: None,
+            tool_catalog: None,
+            plugin_cancel: CancellationToken::new(),
+            cancellations: Arc::default(),
+        };
+        let task_id = format!("task_{}", uuid_like());
+        {
+            let conn = open_db(&root).unwrap();
+            conn.execute(
+                "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'test','fake-model','running',?2,?2)",
+                params![task_id, now()],
+            )
+            .unwrap();
+        }
+
+        run_task(state.clone(), task_id.clone(), "fake-model".into(), "不要运行命令".into(),
+            3, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
+        run_task(state, task_id.clone(), "fake-model".into(), "继续回答".into(),
+            1, CancellationToken::new(), false, 2, Vec::new(), false, false).await.unwrap();
+
+        let prompts = mock.system_prompts.lock().await;
+        assert_eq!(prompts.len(), 3);
+        // Turn 1 bans commands: both steps' prompts must omit run_command.
+        assert!(!prompts[0].contains("run_command"));
+        assert!(!prompts[1].contains("run_command"));
+        // Turn 2 lifts the ban: the rebuilt prompt mentions run_command again.
+        assert!(prompts[2].contains("run_command"));
+        for prompt in prompts.iter() {
+            assert!(prompt.contains("You are a local coding agent"));
+            assert!(prompt.contains("Tool guidance for the tools actually offered"));
+        }
+        drop(prompts);
+        // Tool guidance stays in the single leading system message; it is
+        // never appended to the chat history as a user message.
+        assert!(!mock.guidance_leaked.load(std::sync::atomic::Ordering::Relaxed));
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone, Default)]
+    struct ObserverMock {
+        observer_calls: Arc<std::sync::atomic::AtomicUsize>,
+        worker_calls: Arc<std::sync::atomic::AtomicUsize>,
+        saw_both_histories: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    async fn fake_observer_chat(
+        State(mock): State<ObserverMock>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("organize_work"))
+        });
+        if is_organizer {
+            let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
+            let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
+            let has_work = input_json.pointer("/process/current_work").is_some_and(|w| !w.is_null());
+            let arguments = if has_work {
+                json!({
+                    "action": "continue",
+                    "reason": "Wait for worker to deliver findings after consultation"
+                })
+            } else {
+                json!({
+                    "action": "work",
+                    "reason": "Assign initial inquiry task",
+                    "orders": [{
+                        "id": "analysis",
+                        "node_id": "analysis",
+                        "goal": "Handle observer task",
+                        "done_when": "Task completed",
+                        "completion": "output",
+                        "final_answer": true
+                    }]
+                })
+            };
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_organize",
+                            "type": "function",
+                            "function": {
+                                "name": "organize_work",
+                                "arguments": arguments.to_string()
+                            }
+                        }]
+                    }
+                }]
+            }));
+        }
+        let answer = if body.get("stream").and_then(Value::as_bool) == Some(false) {
+            mock.observer_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let context = body.pointer("/messages/1/content").and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok()).unwrap_or(Value::Null);
+            let conversations = context.pointer("/observer_context/relevant_past_conversations")
+                .and_then(Value::as_array).cloned().unwrap_or_default();
+            let saw_old = conversations.iter().any(|task| task.get("prompt").and_then(Value::as_str)
+                .is_some_and(|prompt| prompt.contains("旧翻墙服务器")));
+            let saw_new = conversations.iter().any(|task| task.get("prompt").and_then(Value::as_str)
+                .is_some_and(|prompt| prompt.contains("新翻墙服务器")));
+            mock.saw_both_histories.store(saw_old && saw_new, std::sync::atomic::Ordering::Relaxed);
+            json!({"answer":"历史任务显示旧服务器已经废弃，新服务器仍在使用。"})
+        } else {
+            let call = mock.worker_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call == 0 {
+                json!({"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_progress","type":"function","function":{
+                        "name":"report_progress","arguments":json!({
+                            "current_node_id":"analysis",
+                            "purpose":"结合当前要求确认服务器范围",
+                            "known_conditions":["这是只读分析","当前任务应聚焦仍在使用的服务器"],
+                            "next_action":"询问观察者是否有相关历史决策",
+                            "plan":{"nodes":[{"id":"analysis","title":"分析服务器状态","kind":"analysis"}],"edges":[]}
+                        }).to_string()
+                    }},
+                    {"id":"call_consult","type":"function","function":{
+                        "name":"consult_observer","arguments":"{\"question\":\"之前的任务里，旧服务器和新服务器分别是什么状态？\"}"
+                    }}
+                ]})
+            } else {
+                json!({"role":"assistant","content":"历史显示旧服务器已废弃，因此只分析仍在使用的新服务器。"})
+            }
+        };
+        let message = if body.get("stream").and_then(Value::as_bool) == Some(false) {
+            json!({"role":"assistant","content":answer.to_string()})
+        } else {
+            answer
+        };
+        Json(json!({"choices":[{"message":message}]}))
+    }
+
+    #[tokio::test]
+    async fn observer_reviews_the_plan_consults_history_and_performs_a_retrospective() {
+        let root = std::env::temp_dir().join(format!("observer-history-test-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let old_id = format!("task_{}", uuid_like());
+        let new_id = format!("task_{}", uuid_like());
+        let current_id = format!("task_{}", uuid_like());
+        {
+            let conn = open_db(&root).unwrap();
+            for (id, prompt, status) in [
+                (&old_id, "旧翻墙服务器", "completed"),
+                (&new_id, "新翻墙服务器", "completed"),
+                (&current_id, "请分析我的翻墙服务器", "running"),
+            ] {
+                conn.execute(
+                    "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,?2,'fake-model',?3,?4,?4)",
+                    params![id, prompt, status, now()],
+                ).unwrap();
+            }
+        }
+        append_event(&root, &old_id, "user/message", json!({"message":{"content":[{"type":"text","text":"旧翻墙服务器还在用吗？"}]}}), None).unwrap();
+        append_event(&root, &old_id, "assistant/message", json!({"message":{"content":[{"type":"text","text":"旧翻墙服务器已经废弃，后续只用新服务器。"}]}}), None).unwrap();
+        append_event(&root, &new_id, "user/message", json!({"message":{"content":[{"type":"text","text":"新翻墙服务器现在正在使用。"}]}}), None).unwrap();
+
+        let mock = ObserverMock::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/v1/chat/completions", post(fake_observer_chat))
+            .with_state(mock.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let workspace = Arc::new(crate::tools::Workspace::new(root.clone()).unwrap());
+        let state = AgentServiceState {
+            workspace,
+            client: Client::new(),
+            provider_url: format!("http://{address}/v1"),
+            api_key: "fake".into(),
+            provider_name: String::new(),
+            provider_routes: HashMap::new(),
+            default_model: "fake-model".into(),
+            model_map: HashMap::new(),
+            reasoning_effort: None,
+            fast_mode: false,
+            permission_mode: PermissionMode::default(),
+            enable_subagent: false,
+            expert_provider_name: String::new(),
+            expert_provider_url: String::new(),
+            expert_api_key: String::new(),
+            expert_model: String::new(),
+            subagent_inherits_model: true,
+            observer_enabled: true,
+            observer_provider: "fake".into(),
+            observer_provider_url: format!("http://{address}/v1"),
+            observer_api_key: "fake".into(),
+            observer_model: String::new(),
+            observer_inherits_model: true,
+            visual:Default::default(),
+            config: None,
+            config_path: None,
+            tool_catalog: None,
+            plugin_cancel: CancellationToken::new(),
+            cancellations: Arc::default(),
+        };
+        run_task(
+            state, current_id.clone(), "fake-model".into(),
+            "请分析我的翻墙服务器".into(), 4, CancellationToken::new(),
+            false, 1, Vec::new(), false, false,
+        ).await.unwrap();
+        // Worker completion no longer waits for the independent Observer.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let completed: i64 = open_db(&root).unwrap().query_row(
+                    "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/retrospective'",
+                    [&current_id], |row| row.get(0),
+                ).unwrap();
+                if completed > 0 { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        let conn = open_db(&root).unwrap();
+        let status: String = conn.query_row(
+            "SELECT status FROM agent_tasks WHERE id=?1", [&current_id], |row| row.get(0),
+        ).unwrap();
+        let consult_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/consult'",
+            [&current_id], |row| row.get(0),
+        ).unwrap();
+        let reply_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/consult_reply'",
+            [&current_id], |row| row.get(0),
+        ).unwrap();
+        let plan_review_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/node_review' AND json_extract(data,'$.stage')='assignment' AND json_extract(data,'$.status')='completed'",
+            [&current_id], |row| row.get(0),
+        ).unwrap();
+        let retrospective_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/retrospective'",
+            [&current_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(consult_count, 1);
+        assert_eq!(reply_count, 1);
+        assert!(plan_review_count<=1);
+        assert_eq!(retrospective_count, 1);
+        assert!(mock.saw_both_histories.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(mock.worker_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!((1..=3).contains(&mock.observer_calls.load(std::sync::atomic::Ordering::Relaxed)));
+        server.abort();
+        drop(conn);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    async fn fake_chat(State(calls): State<Arc<std::sync::atomic::AtomicUsize>>, Json(body): Json<Value>) -> Json<Value> {
+        let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str) == Some("organize_work"))
+        });
+        if is_organizer {
+            return Json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_work",
+                            "type": "function",
+                            "function": {
+                                "name": "organize_work",
+                                "arguments": json!({
+                                    "action": "work",
+                                    "reason": "Inspect workspace",
+                                    "orders": [{
+                                        "id": "inspect",
+                                        "node_id": "inspect",
+                                        "goal": "Inspect workspace and index state",
+                                        "done_when": "Read both status tools",
+                                        "completion": "output",
+                                        "final_answer": true
+                                    }]
+                                }).to_string()
+                            }
+                        }]
+                    }
+                }]
+            }));
+        }
         let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if call == 0 {
             Json(
                 json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_progress","type":"function","function":{
+                        "name":"report_progress","arguments":json!({
+                            "current_node_id":"inspect","purpose":"Inspect workspace and index state",
+                            "known_conditions":[],"next_action":"Read both status tools",
+                            "plan":{"nodes":[{"id":"inspect","title":"Inspect task state","kind":"analysis"}],"edges":[]}
+                        }).to_string()
+                    }},
                     {"id":"call_info","type":"function","function":{"name":"workspace_info","arguments":"{}"}},
                     {"id":"call_index","type":"function","function":{"name":"rust_index_status","arguments":"{}"}}
                 ]}}]}),
@@ -716,6 +4977,7 @@ mod tests {
     async fn fake_model_runs_sequential_tools_and_records_dsh_events() {
         let root = std::env::temp_dir().join(format!("agent-service-test-{}", uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("note.txt"), "SNAPSHOT_BEFORE_EDIT").unwrap();
         let workspace = Arc::new(crate::tools::Workspace::new(root.clone()).unwrap());
         let model_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -732,8 +4994,30 @@ mod tests {
             client,
             provider_url: format!("http://{address}/v1"),
             api_key: "fake".into(),
+            provider_name: String::new(),
+            provider_routes: HashMap::new(),
             default_model: "fake-model".into(),
             model_map: HashMap::new(),
+            reasoning_effort: None,
+            fast_mode: false,
+            permission_mode: PermissionMode::default(),
+            enable_subagent: false,
+            expert_provider_name: String::new(),
+            expert_provider_url: String::new(),
+            expert_api_key: String::new(),
+            expert_model: String::new(),
+            subagent_inherits_model: true,
+            observer_enabled: false,
+            observer_provider: String::new(),
+            observer_provider_url: String::new(),
+            observer_api_key: String::new(),
+            observer_model: String::new(),
+            observer_inherits_model: true,
+            visual:Default::default(),
+            config: None,
+            config_path: None,
+            tool_catalog: None,
+            plugin_cancel: CancellationToken::new(),
             cancellations: Arc::default(),
         };
         let task_id = format!("task_{}", uuid_like());
@@ -746,11 +5030,17 @@ mod tests {
             state,
             task_id.clone(),
             "fake-model".into(),
-            "inspect the project".into(),
+            "inspect @note.txt".into(),
             4,
             CancellationToken::new(),
+            false,
+            1,
+            Vec::new(),
+            false,
+            false,
         )
-        .await;
+        .await
+        .unwrap();
 
         let conn = open_db(&root).unwrap();
         let types: Vec<String> = {
@@ -764,7 +5054,8 @@ mod tests {
         };
         assert_eq!(model_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(types.first().map(String::as_str), Some("turn/start"));
-        assert_eq!(types.get(1).map(String::as_str), Some("user/message"));
+        assert_eq!(types.get(1).map(String::as_str), Some("observer/config"));
+        assert_eq!(types.get(2).map(String::as_str), Some("user/message"));
         let first_tool = types.iter().position(|t| t == "tool/call").unwrap();
         assert_eq!(
             &types[first_tool..first_tool + 4],
@@ -772,20 +5063,978 @@ mod tests {
         );
         assert_eq!(types.last().map(String::as_str), Some("turn/end"));
 
+        let ticks: Vec<Value> = {
+            let mut stmt = conn.prepare("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='execution/tick' ORDER BY seq").unwrap();
+            stmt.query_map([&task_id], |row| row.get::<_,String>(0)).unwrap()
+                .map(|row| serde_json::from_str::<Value>(&row.unwrap()).unwrap()).collect()
+        };
+        assert_eq!(ticks.len(),2);
+        assert_eq!(ticks[0]["tick"]["operations_count"],2);
+        assert_eq!(ticks[0]["tick"]["work_id"],"inspect");
+        assert_eq!(ticks[1]["tick"]["done"],true);
+        assert_eq!(ticks[1]["tick"]["output"]["summary"],"Finished after checking both tools.");
+
         let user_event: Value = conn.query_row(
             "SELECT json_object('type',kind,'seq',seq,'time',timestamp,'data',json(data),'surfaceOp',surface_op) FROM agent_task_events WHERE task_id=?1 AND kind='user/message'",
             [&task_id], |r| r.get(0),
         ).map(|raw: String| serde_json::from_str(&raw).unwrap()).unwrap();
         assert_eq!(user_event["type"], "user/message");
-        assert_eq!(user_event["seq"], 1);
+        assert_eq!(user_event["seq"], 2);
         assert_eq!(user_event["data"]["message"]["role"], "user");
+        assert!(user_event["data"]["model_content"].as_str().unwrap().contains("SNAPSHOT_BEFORE_EDIT"));
         assert_eq!(user_event["surfaceOp"], "append");
+
+        std::fs::write(root.join("note.txt"), "CONTENT_AFTER_EDIT").unwrap();
+        let history_events: Vec<(String, Value)> = {
+            let mut stmt = conn.prepare("SELECT kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq").unwrap();
+            stmt.query_map([&task_id], |row| {
+                let kind: String = row.get(0)?;
+                let data: String = row.get(1)?;
+                Ok((kind, serde_json::from_str::<Value>(&data).unwrap()))
+            }).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        let (history, _, _) = history_from_events(&root, &history_events);
+        assert!(history[0]["content"].as_str().unwrap().contains("SNAPSHOT_BEFORE_EDIT"));
+        assert!(!history[0]["content"].as_str().unwrap().contains("CONTENT_AFTER_EDIT"));
 
         let (status, surface_op): (String, Option<String>) = conn.query_row("SELECT status,(SELECT surface_op FROM agent_task_events WHERE task_id=?1 AND kind='assistant/message' ORDER BY seq DESC LIMIT 1) FROM agent_tasks WHERE id=?1", [&task_id], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
         assert_eq!(status, "completed");
         assert_eq!(surface_op.as_deref(), Some("append"));
         server.abort();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+
+    #[derive(Default)]
+    struct FlowScript {
+        replies: std::sync::Mutex<std::collections::VecDeque<(bool, Value)>>,
+        requests: std::sync::Mutex<Vec<Value>>,
+        observer_gate: Option<(std::path::PathBuf, String)>,
+    }
+
+    async fn scripted_flow_chat(State(script): State<Arc<FlowScript>>, Json(body): Json<Value>) -> Json<Value> {
+        let organizer = body.pointer("/tool_choice/function/name").and_then(Value::as_str) == Some("organize_work");
+        script.requests.lock().unwrap().push(body.clone());
+        if !organizer && script.observer_gate.is_some() && body["stream"] == false {
+            let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+            if input["request"]["goal"].as_str().is_some_and(|goal|goal.contains("Observer unavailable")) {
+                return Json(json!({"choices":[{"message":{"role":"assistant","content":"invalid-observer-json"}}]}));
+            }
+            let answer = if input.get("stage").is_some() {
+                let old = input["request"]["goal"].as_str().is_some_and(|goal|goal.contains("CANCELLED_DRAG_GOAL"));
+                json!({"assessment":"needs_adjustment","issue_key":"direction","category":"sufficiency",
+                    "summary":if old {"CANCELLED_DRAG_ADVICE"} else {"CURRENT_REQUEST_ADVICE"},
+                    "suggestions":[if old {"CANCELLED_DRAG_ADVICE: inspect the drag source ID"} else {"CURRENT_REQUEST_ADVICE: use the sealed inputs and shorten repeated investigation"}]})
+            } else { json!({"summary":"No reusable experience","memory":{"record":false}}) };
+            return Json(json!({"choices":[{"message":{"role":"assistant","content":answer.to_string()}}]}));
+        }
+        let (expected_organizer, mut message) = script.replies.lock().unwrap().pop_front().expect("unexpected model round");
+        assert_eq!(organizer, expected_organizer, "model round reached the wrong actor");
+        if organizer {
+            let mut decision:Value=serde_json::from_str(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+            if decision["auto_apply_observer"]==true {
+                let input:Value=serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+                let mut responses=Vec::new();
+                for advice in input["observer_advice"].as_array().into_iter().flatten() {
+                    let application=if decision["action"]=="revisit" {json!({"field":"revisit","value":decision["target_node_id"]})}
+                        else {
+                            let order=&mut decision["orders"][0];
+                            order["constraints"]=json!(["Use sealed inputs; do not repeat investigation"]);
+                            json!({"work_id":order["id"],"field":"constraints","value":order["constraints"]})
+                        };
+                    responses.push(json!({"id":advice["id"],"disposition":"accepted","reason":"implemented in this actual decision",
+                        "adopt_to_current_plan":decision["action"]=="revisit","application":application}));
+                }
+                decision["observer_responses"]=json!(responses);decision.as_object_mut().unwrap().remove("auto_apply_observer");
+                message["tool_calls"][0]["function"]["arguments"]=json!(decision.to_string());
+            }
+        }
+
+        if !organizer {
+            if let Some((root, task_id)) = &script.observer_gate {
+                let packet:Value=body["messages"].as_array().unwrap().iter().filter_map(|m|m["content"].as_str())
+                    .find_map(|text|text.strip_prefix("Current work packet:\n")).map(|text|serde_json::from_str(text).unwrap()).unwrap();
+                if packet["current_work"]["final_answer"]==true {return Json(json!({"choices":[{"message":message}]}));}
+                let request_id=packet["request_id"].as_u64().unwrap();
+                let expected_status=if packet["human_request"].as_str().is_some_and(|p|p.contains("Observer unavailable")){"failed"}else{"completed"};
+                let work=packet["current_work"]["id"].as_str().unwrap();let revision=packet["current_work"]["revision"].as_u64().unwrap();
+                // Keep the actual model round open until the asynchronous review
+                // has entered the guidance queue. No timing-based race in the test.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let observed = {
+                            let conn = open_db(root).unwrap();
+                            conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='observer/node_review' AND json_extract(data,'$.identity.request_id')=?2 AND json_extract(data,'$.status')=?5 AND json_extract(data,'$.identity.work_id')=?3 AND json_extract(data,'$.identity.revision')=?4 AND json_extract(data,'$.stage')='assignment'",
+                                params![task_id,request_id,work,revision,expected_status], |row| row.get::<_,i64>(0)).unwrap() > 0
+                        };
+                        if observed { break; }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("Observer did not complete the plan review");
+            }
+        }
+        Json(json!({"choices":[{"message":message}]}))
+    }
+
+    pub(crate) fn flow_test_state(root: &std::path::Path, address: std::net::SocketAddr) -> AgentServiceState {
+        AgentServiceState {
+            workspace: Arc::new(crate::tools::Workspace::new(root.to_path_buf()).unwrap()),
+            client: Client::new(),
+            provider_url: format!("http://{address}/v1"),
+            api_key: "fake".into(),
+            provider_name: String::new(),
+            provider_routes: HashMap::new(),
+            default_model: "fake-model".into(),
+            model_map: HashMap::new(),
+            reasoning_effort: None,
+            fast_mode: false,
+            permission_mode: PermissionMode::default(),
+            enable_subagent: false,
+            expert_provider_name: String::new(),
+            expert_provider_url: String::new(),
+            expert_api_key: String::new(),
+            expert_model: String::new(),
+            subagent_inherits_model: true,
+            observer_enabled: false,
+            observer_provider: String::new(),
+            observer_provider_url: String::new(),
+            observer_api_key: String::new(),
+            observer_model: String::new(),
+            observer_inherits_model: true,
+            visual:Default::default(),
+            config: None,
+            config_path: None,
+            tool_catalog: None,
+            plugin_cancel: CancellationToken::new(),
+            cancellations: Arc::default(),
+        }
+
+    }
+
+    fn scheduling_reply(decision: Value) -> (bool, Value) {
+        (true, json!({"role":"assistant","content":null,"tool_calls":[{"id":"organize","type":"function",
+            "function":{"name":"organize_work","arguments":decision.to_string()}}]}))
+    }
+
+    fn text_reply(text: &str) -> (bool, Value) {
+        (false, json!({"role":"assistant","content":text}))
+    }
+
+    #[test]
+    fn structured_browser_failures_are_marked_failed_by_the_host_scheduler_path() {
+        use crate::work_scheduler::{WorkOrder,WorkScheduler};
+        let upload_failure=json!({"ok":false,"status":"failed","error_code":"multiple_file_inputs","stage":"select_input","needed":"Choose one input."});
+        let visibility_failure=json!({"ok":false,"error_code":"browser_visibility_locked","stage":"session_start"});
+        let wait_timeout=json!({"ok":false,"status":"timeout","matched":false,"error_code":"wait_timeout"});
+        let wait_invalid=json!({"ok":false,"status":"invalid_condition","error_code":"wait_condition_required"});
+        for result in [&upload_failure,&visibility_failure,&wait_timeout,&wait_invalid] {
+            assert!(observer_output_failed(&result.to_string()),"{result}");
+        }
+        assert!(!observer_output_failed(r#"{"ok":true,"status":"matched","matched":true}"#));
+
+        let mut scheduler=WorkScheduler::default();let mut order=WorkOrder::default();
+        order.id="browser_upload".into();order.node_id="browser_upload".into();order.goal="Upload presentation".into();order.done_when="Presentation loaded".into();
+        order.constraints=vec!["requires_browser".into()];scheduler.enqueue(vec![order],false,false).unwrap();scheduler.activate_next().unwrap();
+        scheduler.observe("browser_open",&json!({}),&json!({"page":{"browser_session_id":"s","page_id":"p","page_epoch":1}}),false);
+        scheduler.observe("browser_read",&json!({"expect_text":"Welcome"}),&json!({"matched":true,"expect_text":"Welcome","page":{"browser_session_id":"s","page_id":"p","page_epoch":1}}),false);
+        scheduler.observe("browser_upload",&json!({"path":"deck.pptx"}),&upload_failure,observer_output_failed(&upload_failure.to_string()));
+        assert_eq!(scheduler.frame().unwrap().operations.last().unwrap()["failed"],true);
+        assert!(scheduler.return_work(&json!({"summary":"upload completed"})).is_err());
+    }
+
+    #[test]
+    fn missing_pptx_target_gets_a_precise_organizer_correction() {
+        let scheduler=crate::work_scheduler::WorkScheduler::default();let tree=crate::flow_tree::TaskTree::default();
+        let decision=json!({"orders":[{"constraints":["requires_pptx"]}]});
+        let error=anyhow::anyhow!("field_path=orders[0].browser_document_path: requires_pptx needs the exact workspace-relative target file path");
+        let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
+        assert_eq!(feedback["error_code"],"INVALID_PPTX_CONTRACT");
+        assert_eq!(feedback["field_path"],"orders[0].browser_document_path");
+        assert!(feedback["expected_shape"].as_str().unwrap().contains("exact workspace-relative .pptx path"));
+    }
+
+    fn yield_reply(outcome: &str, summary: &str, exported: Value) -> (bool, Value) {
+        (false, json!({"role":"assistant","content":null,"tool_calls":[{"id":"yield","type":"function",
+            "function":{"name":"yield_work","arguments":json!({"outcome":outcome,"summary":summary,"exported_data":exported}).to_string()}}]}))
+    }
+
+    fn flow_order(id: &str, node: &str) -> Value {
+        json!({"id":id,"node_id":node,"goal":format!("Do {id}"),"done_when":format!("{id} delivered"),"completion":"output"})
+    }
+
+    fn finish_flow_reply() -> (bool, Value) {
+        scheduling_reply(json!({"action":"finish","reason":"all requested work is delivered","summary":"Request complete",
+            "flow_update":{"current_node_id":"goal","node_result":{"node_id":"goal","status":"completed","summary":"All requested parts complete"}}}))
+    }
+
+    async fn run_flow_script(replies: Vec<(bool, Value)>, turns: &[(&str, usize)]) -> (Vec<(String, Value)>, Vec<Value>) {
+        run_flow_script_with_observer(replies,turns,false).await
+    }
+
+    async fn remove_flow_test_directory(root: &std::path::Path) -> std::io::Result<()> {
+        for attempt in 0..10 {
+            match std::fs::remove_dir_all(root) {
+                Ok(()) => return Ok(()),
+                Err(error) if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) && attempt < 9 => {
+                    tokio::time::sleep(Duration::from_millis(25 * (attempt + 1))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn agent_flow_cleanup_waits_for_windows_share_lock_and_preserves_other_errors() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root=std::env::temp_dir().join(format!("agent-flow-review-cleanup-{}",uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let lock=std::fs::OpenOptions::new().write(true).create_new(true).share_mode(0).open(root.join("locked.db")).unwrap();
+        let release=tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(lock);
+        });
+        remove_flow_test_directory(&root).await.unwrap();
+        release.await.unwrap();
+        assert!(!root.exists());
+        assert_eq!(remove_flow_test_directory(&root).await.unwrap_err().kind(),std::io::ErrorKind::NotFound);
+    }
+
+    #[derive(Default)]
+    struct LateObserverScript {
+        old_started: tokio::sync::Notify,
+        release_old: tokio::sync::Notify,
+        calls:std::sync::atomic::AtomicUsize,
+    }
+
+    async fn late_observer_chat(State(script):State<Arc<LateObserverScript>>,Json(body):Json<Value>) -> Json<Value> {
+        script.calls.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        let input:Value=serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        if input["identity"]["request_id"]==1 {
+            script.old_started.notify_one();
+            script.release_old.notified().await;
+        }
+        Json(json!({"choices":[{"message":{"role":"assistant","content":json!({
+            "issue_key":"same_issue","category":"sufficiency","summary":format!("request {} advice",input["identity"]["request_id"]),
+            "suggestions":["complete this request"]}).to_string()}}]}))
+    }
+
+    #[tokio::test]
+    async fn observer_inflight_review_keeps_original_request_identity_after_snapshot_replacement() {
+        let root=std::env::temp_dir().join(format!("agent-flow-review-observer-race-{}",uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task_id=format!("task_{}",uuid_like());
+        {
+            let conn=open_db(&root).unwrap();
+            conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'old goal','fake-model','running',?2,?2)",params![task_id,now()]).unwrap();
+        }
+        let script=Arc::new(LateObserverScript::default());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state=flow_test_state(&root,listener.local_addr().unwrap());
+        state.observer_provider_url=state.provider_url.clone();
+        let app=axum::Router::new().route("/v1/chat/completions",post(late_observer_chat)).with_state(script.clone());
+        let shutdown=CancellationToken::new();
+        let server_shutdown=shutdown.clone();
+        let server=tokio::spawn(async move {axum::serve(listener,app).with_graceful_shutdown(server_shutdown.cancelled_owned()).await.unwrap();});
+        state.observer_enabled=true;
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();
+        scheduler.request_started_turn=1;
+        scheduler.apply(&json!({"action":"work","reason":"old","orders":[flow_order("reused","reused_node")]}),true,true).unwrap();
+        let mut observer=crate::observer_service::ObserverSession::start(state.clone(),"fake-model".into(),task_id.clone(),&CancellationToken::new());
+        observer.set_scope(&scheduler,"old goal");
+        let input=crate::observer_service::observation(&task_id,&scheduler,"reused",1,1,"assignment","old goal",&json!({"reason":"old"}),Value::Null,Value::Null,Value::Null);
+        crate::observer_service::commit(&root,&task_id,json!({"commit_id":"old"}),vec![input]).await.unwrap();observer.notify();
+        tokio::time::timeout(Duration::from_secs(5),script.old_started.notified()).await.unwrap();
+        scheduler.request_started_turn=2;
+        observer.set_scope(&scheduler,"new goal");
+        let input=crate::observer_service::observation(&task_id,&scheduler,"reused",2,1,"assignment","new goal",&json!({"reason":"new"}),Value::Null,Value::Null,Value::Null);
+        crate::observer_service::commit(&root,&task_id,json!({"commit_id":"new"}),vec![input]).await.unwrap();observer.notify();
+        script.release_old.notify_one();
+        let reviews=tokio::time::timeout(Duration::from_secs(5),async {
+            let mut reviews=Vec::new();
+            while reviews.len()<2 {reviews.extend(observer.reviews().await.unwrap());tokio::time::sleep(Duration::from_millis(10)).await;}
+            reviews
+        }).await.unwrap();
+        observer.finish("completed").await.unwrap();
+        let mut inbox=crate::worker_work_state::ObserverInbox::default();inbox.set_scope(&scheduler);
+        for review in reviews {inbox.insert(&review);}
+        assert_eq!(inbox.deliver().len(),1);assert_eq!(inbox.pending()[0]["request_id"],2);
+        assert!(inbox.snapshot()["items"].as_object().unwrap().values().any(|item|item["request_id"]==1 && item["archived"]==true && item["delivered"]==false));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5),server).await.unwrap().unwrap();
+        drop(state);
+        remove_flow_test_directory(&root).await.unwrap();
+    }
+
+    async fn run_flow_script_with_observer(replies: Vec<(bool, Value)>, turns: &[(&str, usize)], observer_enabled: bool) -> (Vec<(String, Value)>, Vec<Value>) {
+        run_flow_script_with_options(replies,turns,observer_enabled,false).await
+    }
+
+    async fn run_flow_script_with_organizer_errors(replies: Vec<(bool, Value)>, turns: &[(&str, usize)]) -> (Vec<(String, Value)>, Vec<Value>) {
+        run_flow_script_with_options(replies,turns,false,true).await
+    }
+
+    async fn run_flow_script_with_options(replies: Vec<(bool, Value)>, turns: &[(&str, usize)], observer_enabled: bool, allow_organizer_errors:bool) -> (Vec<(String, Value)>, Vec<Value>) {
+        let root = std::env::temp_dir().join(format!("agent-flow-review-{}", uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task_id = format!("task_{}", uuid_like());
+        let script = Arc::new(FlowScript { replies: std::sync::Mutex::new(replies.into()),
+            observer_gate:observer_enabled.then(||(root.clone(),task_id.clone())), ..Default::default() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = flow_test_state(&root, listener.local_addr().unwrap());
+        state.observer_enabled = observer_enabled;
+        state.observer_provider_url = state.provider_url.clone();
+        let app = axum::Router::new().route("/v1/chat/completions", post(scripted_flow_chat)).with_state(script.clone());
+        let shutdown = CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).with_graceful_shutdown(server_shutdown.cancelled_owned()).await.unwrap();
+        });
+        {
+            let conn = open_db(&root).unwrap();
+            conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'test','fake-model','running',?2,?2)", params![task_id,now()]).unwrap();
+        }
+        {
+            for (turn, (prompt, steps)) in turns.iter().enumerate() {
+                run_task(state.clone(),task_id.clone(),"fake-model".into(),prompt.to_string(),*steps,
+                    CancellationToken::new(),false,turn+1,Vec::new(),false,false).await.unwrap();
+            }
+        }
+        let events = {
+            let conn = open_db(&root).unwrap();
+            let mut stmt = conn.prepare("SELECT kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq").unwrap();
+            stmt.query_map([&task_id], |row| {
+                let data: String = row.get(1)?;
+                Ok((row.get::<_,String>(0)?,serde_json::from_str::<Value>(&data).unwrap()))
+            }).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        let errors = events.iter().filter(|(kind,_)| kind == "organizer/error" || kind == "worker/error").collect::<Vec<_>>();
+        assert!(allow_organizer_errors||errors.is_empty(), "Agent rejected decisions: {errors:?}");
+        assert!(script.replies.lock().unwrap().is_empty(), "Agent stopped before consuming the scenario");
+        let requests = std::mem::take(&mut *script.requests.lock().unwrap());
+        if observer_enabled {
+            if let Ok(directory)=std::env::var("OBSERVER_REVIEW_RECORD_DIR") {
+                let directory=std::path::PathBuf::from(directory);std::fs::create_dir_all(&directory).unwrap();
+                let name=turns[0].0.chars().map(|c|if c.is_ascii_alphanumeric(){c.to_ascii_lowercase()}else{'_'}).take(70).collect::<String>();
+                let worker_calls=requests.iter().filter(|b|b["stream"]==true).count();
+                let organizer_calls=requests.iter().filter(|b|b.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work")).count();
+                let observer_calls=requests.len()-worker_calls-organizer_calls;
+                let tools=events.iter().filter(|(k,_)|k=="tool/call").count();
+                let evaluated=events.iter().filter(|(k,v)|k=="observer/node_review" && v["status"]=="completed").count();
+                let elapsed:u64=events.iter().filter(|(k,v)|k=="observer/node_review" && v["status"]=="completed").map(|(_,v)|v["result"]["elapsed_ms"].as_u64().unwrap_or(0)).sum();
+                let data=json!({"scenario":turns[0].0,"model":"scripted-local-http","worker_model_calls":worker_calls,"worker_tool_calls":tools,
+                    "organizer_model_calls":organizer_calls,"observer_model_calls":observer_calls,"completed_reviews":evaluated,"observer_elapsed_ms":elapsed,
+                    "extra_worker_receipt_rounds":0,"events":events,"model_requests":requests});
+                std::fs::write(directory.join(format!("{name}.json")),serde_json::to_vec_pretty(&data).unwrap()).unwrap();
+            }
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5),server).await.expect("mock model server did not exit").unwrap();
+        drop(state);
+        remove_flow_test_directory(&root).await.unwrap();
+        (events, requests)
+    }
+
+    fn committed_turn(events: &[(String, Value)], turn: usize) -> &Value {
+        &events.iter().rev().find(|(kind,data)| kind == "execution/commit" && data["turn"] == turn).unwrap().1
+    }
+
+    fn cancelled_drag_reply() -> (bool, Value) {
+        let (actor,mut reply)=yield_reply("blocked","CANCELLED_DRAG_GOAL is unfinished",json!({}));
+        reply["tool_calls"].as_array_mut().unwrap().insert(0,json!({"id":"drag_progress","type":"function",
+            "function":{"name":"report_progress","arguments":json!({"purpose":"CANCELLED_DRAG_GOAL",
+                "findings":[{"id":"drag_fact","text":"CANCELLED_DRAG_FACT","status":"confirmed"}]}).to_string()}}));
+        (actor,reply)
+    }
+
+    fn worker_packets(requests: &[Value]) -> Vec<Value> {
+        requests.iter().filter_map(|body| body["messages"].as_array().into_iter().flatten()
+            .filter_map(|m| m["content"].as_str()).find_map(|content| content.strip_prefix("Current work packet:\n"))
+            .map(|packet| serde_json::from_str(packet).unwrap())).collect()
+    }
+
+    #[tokio::test]
+    async fn agent_flow_observer_failure_leaves_worker_and_organizer_independent() {
+        let (events,requests)=run_flow_script_with_observer(vec![
+            scheduling_reply(json!({"action":"work","reason":"independent work","orders":[flow_order("work","direct")]})),
+            text_reply("Work delivered despite Observer failure"),finish_flow_reply(),
+        ],&[("Observer unavailable",4)],true).await;
+        assert_eq!(requests.iter().filter(|b|b["stream"]==true).count(),1);
+        assert_eq!(committed_turn(&events,1)["scheduler"]["request_completed"],true);
+        assert!(events.iter().any(|(kind,v)|kind=="observer/node_review" && v["status"]=="failed" && v["result"]["assessment"]=="uncertain"));
+    }
+
+    #[tokio::test]
+    async fn observer_restored_session_resumes_valid_boundary_once_and_merges_assignment() {
+        let root=std::env::temp_dir().join(format!("agent-flow-review-resume-{}",uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task="task";
+        {let conn=open_db(&root).unwrap();conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();}
+        let script=Arc::new(LateObserverScript::default());
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state=flow_test_state(&root,listener.local_addr().unwrap());state.observer_enabled=true;state.observer_provider_url=state.provider_url.clone();
+        let app=axum::Router::new().route("/v1/chat/completions",post(late_observer_chat)).with_state(script.clone());
+        let shutdown=CancellationToken::new();let server_shutdown=shutdown.clone();
+        let server=tokio::spawn(async move{axum::serve(listener,app).with_graceful_shutdown(server_shutdown.cancelled_owned()).await.unwrap();});
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=2;
+        scheduler.apply(&json!({"action":"work","reason":"restore same request","orders":[flow_order("w","n")]}),false,false).unwrap();
+        for stage in ["assignment","handoff"] {
+            let input=crate::observer_service::observation(task,&scheduler,"w",2,1,stage,"same goal",&json!({"reason":"restore"}),Value::Null,json!({"summary":"sealed before interruption"}),Value::Null);
+            let data=json!({"commit_id":input["source_event_id"],"scheduler":scheduler.snapshot()});
+            crate::observer_service::commit(&root,task,data.clone(),vec![input.clone()]).await.unwrap();
+            crate::observer_service::commit(&root,task,data,vec![input]).await.unwrap();
+        }
+        // A process stopped while the handoff was being assessed; it has no result.
+        {let conn=open_db(&root).unwrap();conn.execute("UPDATE agent_observations SET status='reviewing' WHERE json_extract(input,'$.stage')='handoff'",[]).unwrap();}
+        let mut observer=crate::observer_service::ObserverSession::start(state.clone(),"fake".into(),task.into(),&CancellationToken::new());
+        let consultation_permit=observer.model_permit().await.unwrap();
+        observer.set_scope(&scheduler,"same goal");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(script.calls.load(std::sync::atomic::Ordering::Relaxed),0);
+        drop(consultation_permit);
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {let ready=open_db(&root).unwrap().query_row("SELECT COUNT(*) FROM agent_observations WHERE status='completed'",[],|row|row.get::<_,i64>(0)).unwrap()==1;
+                if ready{break;}tokio::time::sleep(Duration::from_millis(10)).await;}
+        }).await.unwrap();
+        let reviews=observer.reviews().await.unwrap();assert_eq!(reviews.len(),1);
+        assert_eq!(reviews[0]["turn"],2);assert_eq!(reviews[0]["step"],1);
+        assert!(reviews[0]["source_event_seq"].as_u64().is_some_and(|seq|seq>0));
+        observer.notify();observer.notify();observer.finish("completed").await.unwrap();
+        assert!(observer.reviews().await.unwrap().is_empty());
+        assert_eq!(script.calls.load(std::sync::atomic::Ordering::Relaxed),1);
+        {let conn=open_db(&root).unwrap();assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_observations",[],|row|row.get::<_,i64>(0)).unwrap(),2);
+            assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_observations WHERE status='merged'",[],|row|row.get::<_,i64>(0)).unwrap(),1);}
+        shutdown.cancel();tokio::time::timeout(Duration::from_secs(5),server).await.unwrap().unwrap();
+        drop(observer);drop(state);remove_flow_test_directory(&root).await.unwrap();
+    }
+
+    async fn record_observer_source_read(state:&AgentServiceState,task:&str,file:&str) {
+        let call_id=format!("read_{}",uuid_like());
+        let result=state.workspace.read_file(crate::tools::ReadFileRequest {workspace_root:None,path:file.into(),max_bytes:1024}).unwrap();
+        emit(state.workspace.root(),task,"tool/call",json!({"turn":1,"step":1,"callId":call_id,"name":"read_file","arguments":json!({"path":file}).to_string()})).await.unwrap();
+        emit(state.workspace.root(),task,"tool/result",json!({"turn":1,"step":1,"message":{"toolCallId":call_id,"source":{"callId":call_id},"content":"source read","isError":false},"meta":{"result":result}})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observer_latest_fact_after_source_edit_uses_one_version_and_remains_searchable() {
+        let root=std::env::temp_dir().join(format!("agent-observer-fact-versions-{}",uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let task="task";let state=flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
+        {let conn=open_db(&root).unwrap();conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','mapping','fake','running',0,0)",[]).unwrap();}
+        let report=|finding:&str|json!({"work_findings":[{"finding":finding,"source_refs":["source.rs"],"certainty":"confirmed"}],
+            "memory":{"record":true,"summary":"Mapping fact","applies_to":"mapping"}});
+        std::fs::write(root.join("source.rs"),"old source").unwrap();record_observer_source_read(&state,task,"source.rs").await;
+        let old_trace=load_observer_work_trace(&root,task).unwrap();
+        let old_report=report("old mapping is present");
+        assert_eq!(save_observer_lessons(&state,task,"mapping",&old_report,&old_trace).await.unwrap()["memoryRecorded"],true);
+        std::fs::write(root.join("source.rs"),"new source").unwrap();record_observer_source_read(&state,task,"source.rs").await;
+        let trace=load_observer_work_trace(&root,task).unwrap();let new_report=report("latest mapping is present");
+        let saved=save_observer_lessons(&state,task,"mapping",&new_report,&trace).await.unwrap();
+        assert_eq!(saved["memoryRecorded"],true);assert_eq!(saved["workFindings"][0]["sourceReads"].as_array().unwrap().len(),1);
+        let read=&saved["workFindings"][0]["sourceReads"][0];
+        assert_eq!(read["code_hash"],crate::symbol_description::content_hash(b"new source"));
+        assert_eq!(read["source_event_seq"].as_i64(),trace.iter().filter(|e|e.get("codeTarget").is_some()).filter_map(|e|e["seq"].as_i64()).max());
+        assert!(read["source_event_id"].as_str().unwrap().starts_with("task:event:"));
+        let list=||state.workspace.list_work_memory(crate::memory::ListWorkMemoryRequest {workspace_root:root.to_string_lossy().into_owned(),limit:10}).unwrap().memories;
+        let search=|query:&str|state.workspace.search_work_memory(crate::memory::SearchWorkMemoryRequest {workspace_root:root.to_string_lossy().into_owned(),query:query.into(),limit:10}).unwrap().matches;
+        assert_eq!(list().len(),2);let current=search("mapping");assert_eq!(current.len(),1);assert!(current[0].implementation.contains("latest mapping"));
+        let manifest:String=crate::database::init_db(&root).unwrap().query_row("SELECT sources FROM observer_memory_sources WHERE summary=?1 AND implementation=?2",params![current[0].summary,current[0].implementation],|row|row.get(0)).unwrap();
+        let manifest:Value=serde_json::from_str(&manifest).unwrap();assert_eq!(manifest.as_array().unwrap().len(),1);assert_eq!(manifest[0],*read);
+        save_observer_lessons(&state,task,"mapping",&new_report,&trace).await.unwrap();assert_eq!(list().len(),2,"same fact and version stay deduplicated");
+        // Two facts may deliberately cite different versions; do not combine
+        // their manifests into one memory that can never match a current file.
+        let mut both=new_report.clone();let mut old_finding=old_report["work_findings"][0].clone();
+        old_finding["source_reads"]=json!(observer_known_read_targets(&old_trace,task,8));
+        both["work_findings"]=json!([old_finding,new_report["work_findings"][0]]);
+        save_observer_lessons(&state,task,"mapping",&both,&trace).await.unwrap();assert_eq!(list().len(),2);assert_eq!(search("mapping").len(),1);
+        // Multi-file facts retain one matching observed version for each file.
+        std::fs::write(root.join("other.rs"),"other source").unwrap();record_observer_source_read(&state,task,"other.rs").await;
+        let trace=load_observer_work_trace(&root,task).unwrap();let mut multiple=report("cross mapping is consistent");
+        multiple["work_findings"][0]["source_refs"]=json!(["source.rs","other.rs"]);
+        let saved=save_observer_lessons(&state,task,"mapping",&multiple,&trace).await.unwrap();assert_eq!(saved["workFindings"][0]["sourceReads"].as_array().unwrap().len(),2);assert_eq!(search("cross mapping").len(),1);
+        std::fs::write(root.join("other.rs"),"changed other source").unwrap();assert!(search("cross mapping").is_empty());assert_eq!(list().len(),3);
+        // Conflicting reads with no event order cannot prove which version a
+        // fact refers to; keep it uncertain instead of choosing today's bytes.
+        let mut unordered=trace.clone();for entry in &mut unordered {entry.as_object_mut().unwrap().remove("seq");}
+        let unknown=save_observer_lessons(&state,task,"mapping",&report("unversioned mapping"),&unordered).await.unwrap();
+        assert_eq!(unknown["workFindings"][0]["certainty"],"uncertain");assert_eq!(unknown["memoryRecorded"],false);
+        let mut wrong=report("unsupported mapping");wrong["work_findings"][0]["source_reads"]=json!([{"file_path":"source.rs","code_hash":"unobserved"}]);
+        let unknown=save_observer_lessons(&state,task,"mapping",&wrong,&trace).await.unwrap();assert_eq!(unknown["workFindings"][0]["certainty"],"uncertain");assert_eq!(unknown["memoryRecorded"],false);assert_eq!(list().len(),3);
+        wrong["work_findings"][0]["source_reads"]=json!([read,{"file_path":"source.rs","code_hash":"unobserved"}]);
+        let unknown=save_observer_lessons(&state,task,"mapping",&wrong,&trace).await.unwrap();assert_eq!(unknown["workFindings"][0]["certainty"],"uncertain");assert_eq!(unknown["memoryRecorded"],false);
+        wrong["work_findings"][0]["source_reads"]=json!(observer_known_read_targets(&trace,task,24).into_iter().filter(|target|target["file_path"].as_str().unwrap().ends_with("source.rs")).collect::<Vec<_>>());
+        let unknown=save_observer_lessons(&state,task,"mapping",&wrong,&trace).await.unwrap();assert_eq!(unknown["workFindings"][0]["certainty"],"uncertain");assert_eq!(unknown["memoryRecorded"],false);assert_eq!(list().len(),3);
+        let mut incomplete=report("partially evidenced mapping");incomplete["work_findings"][0]["source_refs"]=json!(["source.rs","unread.rs"]);
+        let unknown=save_observer_lessons(&state,task,"mapping",&incomplete,&trace).await.unwrap();assert_eq!(unknown["workFindings"][0]["certainty"],"uncertain");assert_eq!(unknown["memoryRecorded"],false);assert_eq!(list().len(),3);
+        drop(state);remove_flow_test_directory(&root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observer_timeout_and_cancel_leave_explicit_unassessed_history_without_new_calls() {
+        for timeout in [false,true] {
+            let root=std::env::temp_dir().join(format!("agent-flow-review-stop-{}",uuid_like()));std::fs::create_dir_all(&root).unwrap();
+            let task="task";
+            {let conn=open_db(&root).unwrap();conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();}
+            let script=Arc::new(LateObserverScript::default());let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut state=flow_test_state(&root,listener.local_addr().unwrap());state.observer_enabled=true;state.observer_provider_url=state.provider_url.clone();
+            let app=axum::Router::new().route("/v1/chat/completions",post(late_observer_chat)).with_state(script.clone());
+            let shutdown=CancellationToken::new();let server_shutdown=shutdown.clone();
+            let server=tokio::spawn(async move{axum::serve(listener,app).with_graceful_shutdown(server_shutdown.cancelled_owned()).await.unwrap();});
+            let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+            scheduler.apply(&json!({"action":"work","reason":"work independently","orders":[flow_order("w","n")]}),false,false).unwrap();
+            let cancel=CancellationToken::new();let mut observer=crate::observer_service::ObserverSession::start(state.clone(),"fake".into(),task.into(),&cancel);
+            observer.set_scope(&scheduler,"goal");let input=crate::observer_service::observation(task,&scheduler,"w",1,1,"assignment","goal",&json!({"reason":"work"}),Value::Null,Value::Null,Value::Null);
+            crate::observer_service::commit(&root,task,json!({"commit_id":input["source_event_id"]}),vec![input]).await.unwrap();observer.notify();
+            tokio::time::timeout(Duration::from_secs(5),script.old_started.notified()).await.unwrap();
+            if timeout {
+                tokio::time::timeout(Duration::from_secs(15),async{
+                    loop {let expired=open_db(&root).unwrap().query_row("SELECT COUNT(*) FROM agent_observations WHERE status='timeout'",[],|row|row.get::<_,i64>(0)).unwrap()>0;
+                        if expired{break;}tokio::time::sleep(Duration::from_millis(20)).await;}
+                }).await.unwrap();
+            }else{cancel.cancel();}
+            let started=Instant::now();observer.finish(if timeout{"completed"}else{"cancelled"}).await.unwrap();assert!(started.elapsed()<Duration::from_secs(3));
+            let conn=open_db(&root).unwrap();let status:String=conn.query_row("SELECT status FROM agent_observations",[],|row|row.get(0)).unwrap();
+            assert_eq!(status,if timeout{"timeout"}else{"cancelled"});
+            assert!(observer.reviews().await.unwrap().is_empty());drop(conn);
+            assert_eq!(script.calls.load(std::sync::atomic::Ordering::Relaxed),1);
+            script.release_old.notify_one();shutdown.cancel();tokio::time::timeout(Duration::from_secs(5),server).await.unwrap().unwrap();
+            drop(state);remove_flow_test_directory(&root).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_flow_observer_normal_path_consumes_advice_without_worker_receipt_rounds() {
+        let mut b=flow_order("b","direct");b["upstream_ids"]=json!(["a"]);
+        let mut c=flow_order("c","direct");c["upstream_ids"]=json!(["b"]);
+        let replies=vec![
+            scheduling_reply(json!({"action":"work","reason":"produce A","orders":[flow_order("a","direct")]})),
+            yield_reply("completed","A sealed",json!({"answer":"use this"})),
+            scheduling_reply(json!({"action":"work","auto_apply_observer":true,"reason":"use A in B","orders":[b]})),
+            yield_reply("completed","B sealed",json!({"answer":"B"})),
+            scheduling_reply(json!({"action":"work","auto_apply_observer":true,"reason":"use B in C","orders":[c]})),
+            text_reply("C delivered"),finish_flow_reply(),
+        ];
+        let (_,baseline)=run_flow_script(replies.clone(),&[("Observer normal A B C",8)]).await;
+        let (events,requests)=run_flow_script_with_observer(replies,&[("Observer normal A B C",8)],true).await;
+        assert_eq!(baseline.iter().filter(|b|b["stream"]==true).count(),requests.iter().filter(|b|b["stream"]==true).count());
+
+        assert_eq!(requests.iter().filter(|b|b["stream"]==true).count(),3);
+        assert!(requests.iter().filter(|b|b["stream"]==true).all(|b|!b["messages"][0]["content"].as_str().unwrap_or("").contains("observer_responses")));
+        assert_eq!(requests.iter().filter(|b|b.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work")).count(),4);
+        assert!(!events.iter().any(|(kind,_)|kind=="organizer/advice_error"));
+        assert!(events.iter().any(|(kind,v)|kind=="observer/advice_response" && v["actor"]=="organizer" && v["advice"]["application"]["field"]=="constraints"));
+        for work in ["a","b","c"] {assert!(events.iter().any(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff" && v["identity"]["work_id"]==work));}
+        let observer_inputs:Vec<Value>=requests.iter().filter(|b|b["stream"]==false && b.get("tools").is_none())
+            .map(|b|serde_json::from_str(b["messages"][1]["content"].as_str().unwrap()).unwrap()).collect();
+        assert!(observer_inputs.iter().any(|i|i["identity"]["work_id"]=="b" && i["resolved_inputs"].to_string().contains("A sealed")));
+        assert!(observer_inputs.iter().all(|i|i.get("complete_worker_trace").is_none() && i.to_string().chars().count()<=crate::observer_service::INPUT_BUDGET));
+        assert!(worker_packets(&requests)[1]["current_work"]["constraints"].to_string().contains("Use sealed inputs"));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_observer_repeated_investigation_applies_shorter_order() {
+        let (_,mut repeated)=yield_reply("need_split","Investigation stalled; known findings suffice for synthesis",json!({}));
+        for index in 0..3 {repeated["tool_calls"].as_array_mut().unwrap().insert(index,json!({"id":format!("same_query_{index}"),"type":"function",
+            "function":{"name":"workspace_info","arguments":"{}"}}));}
+        let (events,requests)=run_flow_script_with_observer(vec![
+            scheduling_reply(json!({"action":"work","reason":"bounded inquiry","orders":[flow_order("inquiry","direct")]})),(false,repeated),
+            scheduling_reply(json!({"action":"work","auto_apply_observer":true,"reason":"use known facts without repeating queries","orders":[flow_order("synthesis","direct")]})),
+            text_reply("Known findings synthesized"),scheduling_reply(json!({"action":"select","reason":"return synthesis to suspended parent","task_id":"inquiry"})),
+            text_reply("Inquiry completed from synthesis"),finish_flow_reply(),
+        ],&[("Observer repeated investigation",10)],true).await;
+        assert_eq!(events.iter().filter(|(kind,v)|kind=="tool/call" && v["name"]=="workspace_info").count(),3);
+        assert_eq!(requests.iter().filter(|b|b["stream"]==true).count(),3);
+        assert!(events.iter().any(|(kind,v)|kind=="observer/advice_response" && v["advice"]["application"]["work_id"]=="synthesis"));
+        assert!(!events.iter().any(|(kind,_)|kind=="organizer/advice_error"));
+        assert!(events.iter().any(|(kind,v)|kind=="observer/node_review" && v["stage"]=="progress"));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_observer_simple_answer_has_one_handoff_and_no_extra_model_round() {
+        let mut order=flow_order("answer","direct");order["final_answer"]=json!(true);
+        let (events,requests)=run_flow_script_with_observer(vec![scheduling_reply(json!({"action":"work","reason":"answer directly","orders":[order]})),text_reply("A closure captures its environment")],&[("Explain closures directly",3)],true).await;
+        assert_eq!(requests.iter().filter(|b|b["stream"]==true).count(),1);
+        assert!(requests.iter().filter(|b|b["stream"]==false && b.get("tools").is_none()).count()<=1);
+        let ids:std::collections::HashSet<_>=events.iter().filter(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff").map(|(_,v)|v["review_id"].clone()).collect();
+        assert_eq!(ids.len(),1);
+        assert!(events.iter().any(|(kind,v)|kind=="observer/retrospective" && v["extraWorkerRounds"]==0));
+        assert!(!events.iter().any(|(kind,_)|kind=="observer/retrospective_start"));
+        let organizer=requests.iter().find(|body|body.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work")).unwrap();
+        assert_eq!(organizer.pointer("/tools/0/function/parameters/properties/request_action/enum"),Some(&json!(["continue"])));
+        let input:Value=serde_json::from_str(organizer["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(input["capabilities"]["allowed_request_actions"],json!(["continue"]));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_replacement_archives_unresolved_observer_advice_and_uses_new_request_advice() {
+        let (events,requests) = run_flow_script_with_observer(vec![
+            scheduling_reply(json!({"action":"work","reason":"implement drag","orders":[flow_order("task_a","direct"),flow_order("queued","queued")]})),
+            cancelled_drag_reply(),
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"new human goal","orders":[flow_order("task_a","direct")]})),
+            yield_reply("done","New request delivered",json!({})),
+            finish_flow_reply(),
+        ],&[("CANCELLED_DRAG_GOAL",1),("Cancel drag and explain the export format",4)],true).await;
+        let inputs:Vec<Value> = requests.iter().filter(|body|body.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work"))
+            .map(|body|serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap()).collect();
+        let lifecycle_schemas=requests.iter().filter(|body|body.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work"))
+            .map(|body|body.pointer("/tools/0/function/parameters/properties/request_action/enum").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>();
+        assert!(lifecycle_schemas.iter().any(|schema|schema==&json!(["continue","subtask","replace"])));
+        // The lifecycle decision sees the unresolved advice belonging to the
+        // old goal. Once replacement commits, only the new goal's advice enters.
+        assert!(inputs[1]["observer_advice"].to_string().contains("CANCELLED_DRAG_ADVICE"));
+        assert!(inputs[2]["observer_advice"].to_string().contains("CURRENT_REQUEST_ADVICE"));
+        assert!(!inputs[2]["observer_advice"].to_string().contains("CANCELLED_DRAG_ADVICE"));
+        assert_eq!(inputs[2]["observer_advice"][0]["request_id"],2);
+        let inbox = &events.iter().rev().find(|(kind,_)|kind=="observer/inbox_state").unwrap().1["state"];
+        assert_eq!(inbox["request_id"],2);
+        let items:Vec<_> = inbox["items"].as_object().unwrap().values().collect();
+        assert!(items.iter().any(|item|item["request_id"]==1 && item["archived"]==true && item["disposition"]=="unread"));
+        assert!(items.iter().any(|item|item["request_id"]==2 && item["archived"]==false));
+        assert!(events.iter().any(|(kind,data)|kind=="observer/node_review" && data["identity"]["request_id"]==1 && data["status"]=="completed"));
+        assert!(events.iter().any(|(kind,data)|kind=="observer/node_review" && data["identity"]["request_id"]==2 && data["status"]=="completed"));
+        let packets=worker_packets(&requests);
+        assert_eq!(packets.len(),2);
+        let new_worker=requests.iter().find(|body|body["stream"]==true && body.to_string().contains("Cancel drag and explain")).unwrap();
+        assert!(!new_worker.to_string().contains("CANCELLED_DRAG_ADVICE"));
+        assert_eq!(committed_turn(&events,2)["scheduler"]["request_completed"],true);
+    }
+
+    #[tokio::test]
+    async fn agent_flow_replaces_unfinished_complex_goal_with_simple_question_without_old_context() {
+        let mut queued=flow_order("queued","direct");queued["upstream_ids"]=json!(["task_a"]);
+        let mut answer=flow_order("task_a","direct");answer["goal"]=json!("Explain closures");answer["final_answer"]=json!(true);
+        let mut another=flow_order("another","direct");another["final_answer"]=json!(true);
+        let (events,requests)=run_flow_script(vec![
+            scheduling_reply(json!({"action":"work","reason":"implement drag","orders":[flow_order("task_a","direct"),queued]})),
+            cancelled_drag_reply(),
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"human cancelled the feature","orders":[answer]})),
+            text_reply("Closures capture their environment"),
+            scheduling_reply(json!({"action":"work","reason":"another new question","orders":[another]})),text_reply("Another answer"),
+        ],&[("CANCELLED_DRAG_GOAL",1),("不用做拖拽了，先解释闭包",3),("Another new question",3)]).await;
+        let first=committed_turn(&events,1);assert_eq!(first["scheduler"]["frames"]["task_a"]["status"],"running");
+        let second=committed_turn(&events,2);
+        assert_eq!(second["scheduler"]["frames"].as_object().unwrap().len(),1);
+        assert!(second["task_tree"]["nodes"].as_object().unwrap().is_empty());
+        assert_eq!(second["scheduler"]["request_completed"],true);
+        let archive=&second["scheduler"]["archived_requests"][0];
+        assert_eq!(archive["task_tree"]["nodes"]["goal"]["status"],"deprecated");
+        assert_eq!(archive["task_tree"]["nodes"]["goal"]["objective"],"CANCELLED_DRAG_GOAL");
+        assert!(archive["scheduler"]["frames"]["task_a"]["invalidated_by_plan_revision"].is_number());
+        assert!(archive["scheduler"]["frames"]["queued"]["invalidated_by_plan_revision"].is_number());
+        assert!(archive["worker_state"].to_string().contains("CANCELLED_DRAG_FACT"));
+        assert_eq!(archive["scheduler"]["archived_requests"],json!([]));
+        let packets=worker_packets(&requests);
+        assert_eq!(packets[1]["human_request"],"不用做拖拽了，先解释闭包");
+        assert!(packets[1]["goal_boundary"].is_null());assert_eq!(packets[1]["upstream_outputs"],json!([]));
+        let replacement_worker=&requests[3];
+        assert!(!replacement_worker["messages"].to_string().contains("CANCELLED_DRAG_"));
+        assert!(events.iter().any(|(kind,data)| kind=="flow/request_archived" && data["turn"]==2 && data["started_turn"]==1));
+        let third=committed_turn(&events,3);assert_eq!(third["scheduler"]["archived_requests"].as_array().unwrap().len(),1);
+        assert!(third["scheduler"]["frames"].get("task_a").is_none());
+        let restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(second["scheduler"].clone()).unwrap();
+        let plan=restored.unified_flow_plan(None);let nodes=plan["nodes"].as_array().unwrap();
+        assert!(nodes.iter().any(|n|n["id"]=="task_a"&&n["status"]=="completed"));
+        assert!(nodes.iter().any(|n|n["id"]=="request_1:task_a"&&n["status"]=="deprecated"));
+        assert!(nodes.iter().filter(|n|n["id"].as_str().unwrap().starts_with("request_1:")).all(|n|n["status"]=="deprecated"));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_replaces_unfinished_complex_goal_with_new_complex_goal() {
+        let new_goal="不用做拖拽了，改为建立新的导出流程";
+        let (events,requests)=run_flow_script(vec![
+            scheduling_reply(json!({"action":"work","reason":"implement old feature","orders":[flow_order("task_a","direct")]})),
+            cancelled_drag_reply(),
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"human changed the goal","orders":[flow_order("task_a","direct")]})),
+            text_reply("New export facts delivered"),finish_flow_reply(),
+        ],&[("CANCELLED_DRAG_GOAL",1),(new_goal,5)]).await;
+        let commit=committed_turn(&events,2);
+        let tree:crate::flow_tree::TaskTree=serde_json::from_value(commit["task_tree"].clone()).unwrap();
+        assert!(tree.root_finished());assert_eq!(commit["task_tree"]["nodes"]["goal"]["objective"],new_goal);
+        assert_eq!(commit["scheduler"]["request_started_turn"],2);assert_eq!(commit["scheduler"]["request_completed"],true);
+        assert_eq!(commit["scheduler"]["frames"].as_object().unwrap().len(),1);
+        let packets=worker_packets(&requests);
+        assert_eq!(packets[1]["goal_boundary"]["request_goal"],new_goal);
+        assert_eq!(packets[1]["human_request"],new_goal);
+        assert!(!requests[3]["messages"].to_string().contains("CANCELLED_DRAG_"));
+        let final_organizer:Value=serde_json::from_str(requests[4]["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert!(final_organizer["previous_unfinished_tree"].is_null());
+        assert!(!final_organizer["process"].to_string().contains("CANCELLED_DRAG_"));
+    }
+
+    #[test]
+    fn request_lifecycle_replacement_is_atomic_and_subtasks_preserve_original_goal() {
+        use crate::{flow_tree::TaskTree,work_scheduler::WorkScheduler};
+        let root=std::env::current_dir().unwrap();
+        let (mut scheduler,tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
+            "Original goal",json!({"action":"work","orders":[flow_order("task_a","direct")]}),false,false).unwrap();
+        let replacement=json!({"action":"work","request_action":"replace","orders":[flow_order("new","direct")]});
+        assert!(apply_organizer_decision(&scheduler,&tree,&tree,&root,"New goal",replacement.clone(),false,false).is_err());
+        scheduler.handoff=Some(json!({"intent":"session_continuation"}));
+        let before=scheduler.snapshot();let tree_before=tree.snapshot();
+        assert!(apply_organizer_decision(&scheduler,&tree,&tree,&root,"New goal",
+            json!({"action":"work","orders":[flow_order("new","direct")]}),false,false).is_err());
+        assert!(apply_organizer_decision(&scheduler,&tree,&tree,&root,"New goal",json!({"action":"work","request_action":"replace",
+            "orders":[{"id":"bad","node_id":"direct","goal":"missing done_when"}]}),false,false).is_err());
+        assert_eq!(scheduler.snapshot(),before);assert_eq!(tree.snapshot(),tree_before);
+        let (subtask,subtree,_)=apply_organizer_decision(&scheduler,&tree,&tree,&root,"Do a repair first",
+            json!({"action":"work","request_action":"subtask","orders":[flow_order("repair","direct")]}),false,false).unwrap();
+        assert!(subtask.archived_requests.is_empty());assert!(subtask.frames["task_a"].invalidated_by_plan_revision.is_none());
+        assert_eq!(subtree.worker_boundary(subtask.node())["request_goal"],"Original goal");
+        let (replacement,_,_)=apply_organizer_decision(&scheduler,&tree,&tree,&root,"New goal",replacement,false,false).unwrap();
+        assert!(replacement.frames.get("task_a").is_none());
+        assert!(apply_organizer_decision(&replacement,&TaskTree::default(),&tree,&root,"New goal",
+            json!({"action":"select","flow_update":{"resume_tree":true,"current_node_id":"work_task_a"}}),false,false).is_err());
+        assert!(!replacement.organizer_input().to_string().contains("Original goal"));
+    }
+
+    #[test]
+    fn organizer_dispatches_pending_node_directly_and_rejects_completed_node_assignment() {
+        use crate::{flow_tree::TaskTree,work_scheduler::WorkScheduler};
+        let root=std::env::current_dir().unwrap();let initial=json!({"action":"work","reason":"assign the pending upload node",
+            "flow_update":{"plan":{"mode":"tree","nodes":[
+                {"id":"goal","parent_id":null,"title":"Load deck","kind":"goal","objective":"Load a presentation","done_when":"The presentation is visible"},
+                {"id":"upload","parent_id":"goal","title":"Upload deck","kind":"worker","objective":"Upload the real PPTX","done_when":"Slide list is nonempty"}
+            ]},"current_node_id":"upload"},"orders":[flow_order("upload","upload")]});
+        let (mut scheduler,mut tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,"Load a deck",initial,false,false).unwrap();
+        assert_eq!(scheduler.id(),"upload");assert_eq!(scheduler.node(),"upload");assert_eq!(tree.status("upload"),Some("running"));
+        let output=scheduler.return_work(&json!({"summary":"File assigned"})).unwrap();tree.complete_work(&output).unwrap();
+        assert_eq!(tree.status("upload"),Some("completed"));
+        let decision=json!({"action":"work","reason":"try to reopen the completed node","orders":[flow_order("upload_again","upload")]});
+        let error=apply_organizer_decision(&scheduler,&tree,&tree,&root,"Load a deck",decision.clone(),false,false).err().unwrap();
+        assert!(error.to_string().contains("field_path=orders[0].node_id")&&error.to_string().contains("status='completed'"));
+        let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
+        assert_eq!(feedback["error_code"],"COMPLETED_NODE_IMMUTABLE");assert_eq!(feedback["field_path"],"orders[0].node_id");
+    }
+
+    #[test]
+    fn duplicate_fresh_process_observation_is_rejected_with_structured_feedback() {
+        use crate::{flow_tree::TaskTree,work_scheduler::WorkScheduler};
+        let root=std::env::current_dir().unwrap();
+        let (mut scheduler,tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
+            "Start the project",json!({"action":"work","reason":"record process state","orders":[flow_order("probe","direct")]}),false,false).unwrap();
+        let scope=json!({"project_path":".","script":"dev"});
+        let sample=crate::project_process::build_process_observation(&root,&scope,&[]).unwrap();
+        scheduler.frames.get_mut("probe").unwrap().project_observation=sample;
+        let before=scheduler.snapshot();
+        let decision=json!({"action":"work","reason":"repeat process check","orders":[{
+            "id":"probe_again","node_id":"direct","goal":"Check process state again","done_when":"state checked","completion":"output",
+            "project_observation":scope
+        }]});
+        let error=apply_organizer_decision(&scheduler,&tree,&tree,&root,"Start the project",decision.clone(),false,false).err().unwrap();
+        assert!(error.to_string().contains("duplicate process observation"));
+        assert_eq!(scheduler.snapshot(),before);
+        let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
+        assert_eq!(feedback["error_code"],"DUPLICATE_PROCESS_OBSERVATION");
+        assert_eq!(feedback["field_path"],"orders[].project_observation");
+        assert!(feedback["expected_shape"].as_str().unwrap().contains("dependency_inputs"));
+
+        let workspace_scope=json!({"coverage":"workspace_list"});
+        scheduler.frames.get_mut("probe").unwrap().project_observation=
+            crate::project_process::build_process_observation(&root,&workspace_scope,&[]).unwrap();
+        let workspace_decision=json!({"action":"work","reason":"repeat workspace process listing","orders":[{
+            "id":"workspace_probe_again","node_id":"direct","goal":"Check all workspace processes again","done_when":"workspace list checked","completion":"output",
+            "project_observation":workspace_scope
+        }]});
+        let error=apply_organizer_decision(&scheduler,&tree,&tree,&root,"Start the project",workspace_decision,false,false).err().unwrap();
+        assert!(error.to_string().contains("duplicate process observation"));
+    }
+
+    #[test]
+    fn organizer_contract_feedback_preserves_dependency_and_flow_status_paths() {
+        use crate::{flow_tree::TaskTree,work_scheduler::{WorkFrame,WorkOrder,WorkScheduler,WorkStatus}};
+        let mut scheduler=WorkScheduler::default();
+        let order=WorkOrder{id:"backend_work".into(),node_id:"backend".into(),revision:2,goal:"Start backend".into(),done_when:"API ready".into(),..Default::default()};
+        scheduler.frames.insert("backend_work".into(),WorkFrame{order,status:WorkStatus::Done,output:Some(json!({"id":"backend_work","node_id":"backend","revision":2,"done":true,"summary":"API ready","exported_data":{"font_api":"/api/fonts"}})),..Default::default()});
+        let mut tree=TaskTree::default();tree.apply(&json!({"plan":{"mode":"tree","nodes":[
+            {"id":"goal","parent_id":null,"title":"Load presentation","kind":"goal","objective":"Load a presentation","done_when":"Slides loaded"},
+            {"id":"upload","parent_id":"goal","title":"Upload presentation","kind":"worker","objective":"Upload a presentation","done_when":"Slides loaded"}
+        ]},"current_node_id":"goal"})).unwrap();
+        let dependency_decision=json!({"orders":[{"dependency_inputs":[{"work_id":"backend_work","fields":["missing"]}]}]});
+        let dependency_error=anyhow::anyhow!("field_path=orders[0].dependency_inputs[0].fields: missing required field");
+        let feedback=organizer_contract_feedback(&dependency_error,&dependency_decision,&scheduler,&tree);
+        assert_eq!(feedback["error_code"],"INVALID_DEPENDENCY_INPUT");
+        assert_eq!(feedback["field_path"],"orders[0].dependency_inputs[0].fields");
+        assert_eq!(feedback["rejected_value"],json!(["missing"]));
+        assert_eq!(feedback["allowed_values"]["available_dependency_deliveries"][0]["exported_fields"],json!(["font_api"]));
+
+        let resume_decision=json!({"flow_update":{"node_updates":[{"id":"upload","resume":true}],"current_node_id":"upload"}});
+        let resume_error=anyhow::anyhow!("field_path=flow_update.node_updates[0].resume: node_id='upload' has status='pending'");
+        let feedback=organizer_contract_feedback(&resume_error,&resume_decision,&scheduler,&tree);
+        assert_eq!(feedback["error_code"],"INVALID_RESUME_STATUS");
+        assert_eq!(feedback["field_path"],"flow_update.node_updates[0].resume");
+        assert_eq!(feedback["allowed_values"]["resumable_statuses"],json!(["blocked","paused"]));
+        assert!(feedback["allowed_values"]["current_node_statuses"].as_array().unwrap().iter().any(|node|node["node_id"]=="upload"&&node["status"]=="pending"));
+    }
+
+    #[tokio::test]
+    async fn organizer_gets_one_targeted_contract_correction_and_stops_on_repeat() {
+        let mut answer=flow_order("answer","direct");answer["final_answer"]=json!(true);
+        let (events,requests)=run_flow_script_with_organizer_errors(vec![
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"initial decision","orders":[answer.clone()]})),
+            scheduling_reply(json!({"action":"work","request_action":"continue","reason":"correct lifecycle field","orders":[answer]})),
+            text_reply("The answer is ready"),
+        ],&[("Answer this question",5)]).await;
+        let errors=events.iter().filter(|(kind,_)|kind=="organizer/error").collect::<Vec<_>>();
+        assert_eq!(errors.len(),1);
+        assert_eq!(errors[0].1["feedback"]["field_path"],"request_action");
+        let organizer_inputs=requests.iter().filter(|body|body.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work"))
+            .filter_map(|body|body["messages"][1]["content"].as_str()).map(|raw|serde_json::from_str::<Value>(raw).unwrap()).collect::<Vec<_>>();
+        assert_eq!(organizer_inputs.len(),2);
+        assert_eq!(organizer_inputs[1]["last_decision_error"]["error_code"],"INVALID_REQUEST_ACTION");
+        assert!(organizer_inputs[1]["last_decision_error"]["correction_instruction"].as_str().unwrap().contains("one targeted correction"));
+
+        let (repeat_events,repeat_requests)=run_flow_script_with_organizer_errors(vec![
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"invalid first decision","orders":[flow_order("answer","direct")]})),
+            scheduling_reply(json!({"action":"work","request_action":"replace","reason":"same invalid correction","orders":[flow_order("answer","direct")]})),
+        ],&[("Answer this question",5)]).await;
+        let repeated=repeat_events.iter().filter(|(kind,_)|kind=="organizer/error").collect::<Vec<_>>();
+        assert_eq!(repeated.len(),2);
+        assert_eq!(repeated[1].1["repeated_fingerprint"],true);
+        assert_eq!(repeat_requests.iter().filter(|body|body.pointer("/tool_choice/function/name").and_then(Value::as_str)==Some("organize_work")).count(),2);
+        assert!(!repeat_events.iter().any(|(kind,_)|kind=="tool/call"));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_preserves_completed_child_at_budget_limit_then_starts_fresh_after_goal_completion() {
+        let mut b = flow_order("task_b","work_task_b");
+        b["upstream_ids"] = json!(["work_task_a"]);
+        let mut answer = flow_order("answer","direct");
+        answer["final_answer"] = json!(true);
+        let (events, requests) = run_flow_script(vec![
+            scheduling_reply(json!({"action":"work","reason":"first part","orders":[flow_order("task_a","direct")]})),
+            text_reply("A delivered"), text_reply("Stopped at the round limit; B remains"),
+            scheduling_reply(json!({"action":"work","request_action":"continue","reason":"continue with B using A","orders":[b]})),
+            text_reply("B delivered"), finish_flow_reply(),
+            scheduling_reply(json!({"action":"work","reason":"new simple request","orders":[answer]})), text_reply("Simple answer"),
+            scheduling_reply(json!({"action":"work","reason":"another simple request","orders":[{
+                "id":"next_answer","node_id":"direct","goal":"Answer next question","done_when":"Answer delivered","completion":"output","final_answer":true}]})),
+            text_reply("Next simple answer"),
+        ], &[("Complete A and B",2),("继续",5),("A new simple question",3),("Another simple question",3)]).await;
+        let first = committed_turn(&events,1);
+        assert_eq!(first["scheduler"]["frames"]["task_a"]["status"], "done");
+        assert_eq!(first["scheduler"]["request_completed"], false);
+        let first_tree: crate::flow_tree::TaskTree = serde_json::from_value(first["task_tree"].clone()).unwrap();
+        assert!(!first_tree.root_finished());
+        let second = committed_turn(&events,2);
+        assert_eq!(second["scheduler"]["frames"]["task_b"]["order"]["upstream_ids"], json!(["task_a"]));
+        assert_eq!(second["scheduler"]["request_completed"], true);
+        let third = committed_turn(&events,3);
+        assert_eq!(third["scheduler"]["frames"].as_object().unwrap().len(),1);
+        assert!(third["task_tree"]["nodes"].as_object().unwrap().is_empty());
+        assert_eq!(third["scheduler"]["request_completed"],true);
+        assert!(third["scheduler"]["handoff"].is_null());
+        let fourth = committed_turn(&events,4);
+        assert_eq!(fourth["scheduler"]["frames"].as_object().unwrap().len(),1);
+        assert!(fourth["scheduler"]["frames"].get("next_answer").is_some());
+        let b_request = requests.iter().find(|body| body["messages"][1]["content"].as_str().is_some_and(|s|s.contains("Current work packet")&&s.contains("task_b"))).unwrap();
+        assert!(b_request["messages"][1]["content"].as_str().unwrap().contains("A delivered"));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_deprecates_replaced_blocked_node_before_aggregating() {
+        let (events, _) = run_flow_script(vec![
+            scheduling_reply(json!({"action":"work","reason":"try A","orders":[flow_order("task_a","direct")]})),
+            yield_reply("blocked","A cannot proceed",json!({})),
+            scheduling_reply(json!({"action":"work","reason":"replace A with B","orders":[flow_order("task_b","direct")]})),
+            text_reply("B delivered"), finish_flow_reply(),
+        ], &[("Achieve the goal",6)]).await;
+        let commit = committed_turn(&events,1);
+        let tree: crate::flow_tree::TaskTree = serde_json::from_value(commit["task_tree"].clone()).unwrap();
+        assert_eq!(tree.status("work_task_a"),Some("deprecated"));
+        assert_eq!(tree.status("work_task_b"),Some("completed"));
+        assert!(tree.root_finished());
+        assert!(commit["scheduler"]["frames"]["task_a"]["invalidated_by_plan_revision"].is_number());
+        assert!(events.iter().any(|(kind,data)| kind=="organizer/decision" && data["decision"]["execution_changes"]["invalidated_node_ids"] == json!(["work_task_a"])));
+        assert!(events.iter().any(|(kind,data)| kind=="execution/tick" && data["tick"]["work_id"]=="task_b" && data["tick"]["done"]==true));
+    }
+
+    #[tokio::test]
+    async fn agent_flow_node_dependency_uses_revisited_delivery_not_lexically_later_old_work() {
+        let mut c = flow_order("task_c","direct");
+        c["upstream_ids"] = json!(["node_b"]);
+        c["dependency_inputs"] = json!([{"node_id":"node_b","revision":2,"fields":["url"]}]);
+        let (events, requests) = run_flow_script_with_observer(vec![
+            scheduling_reply(json!({"action":"work","reason":"produce B","orders":[flow_order("task_b","node_b")],
+                "flow_update":{"current_node_id":"node_b","node_updates":[
+                    {"id":"goal","parent_id":null,"title":"Request","objective":"Use repaired B","done_when":"all results delivered"},
+                    {"id":"node_b","parent_id":"goal","title":"B","objective":"Produce B","done_when":"B delivered"}]}})),
+            text_reply("B initial delivery"),
+            scheduling_reply(json!({"action":"revisit","auto_apply_observer":true,"reason":"repair initial B","target_node_id":"node_b","repair_goal":"Repair B"})),
+            yield_reply("completed","B revision 2 delivered",json!({"url":"http://127.0.0.1:4321"})),
+            scheduling_reply(json!({"action":"work","reason":"consume repaired B","orders":[c]})),
+            text_reply("C consumed revision 2"), finish_flow_reply(),
+        ], &[("Use repaired B",8)],true).await;
+        let commit = committed_turn(&events,1);
+        assert_eq!(commit["scheduler"]["frames"]["task_c"]["order"]["upstream_ids"],json!(["node_b_r2"]));
+        assert_eq!(commit["scheduler"]["frames"]["task_c"]["order"]["dependency_inputs"][0]["work_id"],"node_b_r2");
+        let c_request = requests.iter().find(|body|body["messages"][1]["content"].as_str().is_some_and(|s|s.contains("Current work packet")&&s.contains("task_c"))).unwrap();
+        assert!(c_request["messages"][1]["content"].as_str().unwrap().contains("http://127.0.0.1:4321"));
+        let tree: crate::flow_tree::TaskTree = serde_json::from_value(commit["task_tree"].clone()).unwrap();
+        assert!(tree.root_finished());
+    }
+
+    #[test]
+    fn agent_decision_keeps_split_and_temporary_repair_nodes_resumable_and_is_atomic() {
+        use crate::{flow_tree::TaskTree, work_scheduler::WorkScheduler};
+        let root = std::env::current_dir().unwrap();
+        for outcome in ["need_split","upstream_problem"] {
+            let (mut scheduler,tree,_) = apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
+                "Complete the original goal",json!({"action":"work","orders":[flow_order("task_a","direct")]}),false,false).unwrap();
+            scheduler.return_work(&json!({"outcome":outcome,"summary":"Need focused repair"})).unwrap();
+            let (mut scheduler,mut tree,_) = apply_organizer_decision(&scheduler,&tree,&TaskTree::default(),&root,
+                "Complete the original goal",json!({"action":"work","orders":[flow_order("repair","direct")]}),false,false).unwrap();
+            assert!(scheduler.frames["task_a"].invalidated_by_plan_revision.is_none());
+            assert_eq!(tree.status("work_task_a"),Some("paused"));
+            scheduler.return_work(&json!({"summary":"repair delivered"})).unwrap();
+            tree.complete_work(scheduler.output().unwrap()).unwrap();
+            let (scheduler,tree,_) = apply_organizer_decision(&scheduler,&tree,&TaskTree::default(),&root,
+                "Complete the original goal",json!({"action":"select","task_id":"task_a"}),false,false).unwrap();
+            assert_eq!(scheduler.id(),"task_a");
+            assert_eq!(tree.status("work_task_a"),Some("running"));
+            let scheduler_before=scheduler.snapshot(); let tree_before=tree.snapshot();
+            assert!(apply_organizer_decision(&scheduler,&tree,&TaskTree::default(),&root,"Complete the original goal",
+                json!({"action":"work","orders":[{"id":"bad","node_id":"direct","goal":"missing completion contract"}]}),false,false).is_err());
+            assert_eq!(scheduler.snapshot(),scheduler_before); assert_eq!(tree.snapshot(),tree_before);
+        }
+    }
+
+    #[test]
+    fn direct_request_needs_explicit_success_and_blocked_runs_remain_resumable() {
+        use crate::{flow_tree::TaskTree, work_scheduler::{WorkScheduler,WorkOrder}};
+        let mut scheduler=WorkScheduler::default();
+        scheduler.apply(&json!({"action":"work","orders":[WorkOrder {id:"simple".into(),node_id:"direct".into(),goal:"Answer".into(),done_when:"Answer delivered".into(),..Default::default()}]}),false,false).unwrap();
+        scheduler.return_work(&json!({"summary":"local result"})).unwrap();
+        assert!(scheduler.all_done());
+        assert!(!restore_execution_session(&TaskTree::default(),Some(scheduler.clone())).2);
+        scheduler.finish("Still blocked on remaining requirement",true).unwrap();
+        let (_,resumed,completed)=restore_execution_session(&TaskTree::default(),Some(scheduler.clone()));
+        assert!(!completed); assert!(!resumed.finished); assert!(resumed.frames.contains_key("simple"));
+        scheduler.finish("Request complete",false).unwrap();
+        assert!(restore_execution_session(&TaskTree::default(),Some(scheduler)).2);
+    }
+
+    #[test]
+    fn legacy_execution_snapshot_requires_finished_root_not_just_finished_packets() {
+        use crate::{flow_tree::TaskTree,work_scheduler::WorkScheduler};
+        let root=std::env::current_dir().unwrap();
+        let (mut scheduler,mut tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
+            "Finish the whole goal",json!({"action":"work","orders":[flow_order("legacy","direct")]}),false,false).unwrap();
+        scheduler.return_work(&json!({"summary":"legacy child delivered"})).unwrap();
+        tree.complete_work(scheduler.output().unwrap()).unwrap();
+        let legacy_handoff=scheduler.handoff.clone();
+        scheduler.finish("legacy request finished",false).unwrap();
+        scheduler.handoff=legacy_handoff;
+        let mut snapshot=scheduler.snapshot();
+        snapshot.as_object_mut().unwrap().remove("request_completed");
+        let legacy:WorkScheduler=serde_json::from_value(snapshot).unwrap();
+        assert_eq!(legacy.request_completed,None);
+        assert!(!restore_execution_session(&tree,Some(legacy.clone())).2);
+        tree.apply(&json!({"current_node_id":"goal","node_result":{"node_id":"goal","status":"completed","summary":"legacy root complete"}})).unwrap();
+        assert!(restore_execution_session(&tree,Some(legacy)).2);
+        // A newly recorded blocked finish cannot use the legacy compatibility rule.
+        scheduler.request_completed=Some(false);
+        assert!(!restore_execution_session(&tree,Some(scheduler)).2);
     }
 
     #[tokio::test]
@@ -829,5 +6078,219 @@ mod tests {
         assert_eq!(status, "interrupted");
         assert_eq!(&kinds[2..], ["step/end", "turn/end"]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn organizer_flow_lifecycle_and_dispatch_superseding_test() {
+        use crate::flow_tree::TaskTree;
+        use crate::work_scheduler::{WorkScheduler, WorkOrder, Completion};
+
+        // 1. F02: Verify completed tree lifecycle: when previous tree is finished, subsequent turn starts with a fresh empty tree
+        let mut previous_tree = TaskTree::default();
+        previous_tree.ensure_request_goal("Turn 1 Goal").unwrap();
+        previous_tree.ensure_work_child("work_t1", "child 1", "done", &[]).unwrap();
+        previous_tree.complete_work(&json!({
+            "id": "work_t1", "node_id": "work_t1", "revision": 1, "plan_revision": 1, "done": true, "summary": "done"
+        })).unwrap();
+        previous_tree.apply(&json!({
+            "current_node_id": "goal",
+            "node_result": { "node_id": "goal", "status": "completed", "summary": "Turn 1 Goal achieved" }
+        })).unwrap();
+        assert!(previous_tree.root_finished());
+
+        let mut previous_scheduler = WorkScheduler::default();
+        previous_scheduler.finished = true;
+        previous_scheduler.request_completed = Some(true);
+
+        // Turn 2 start check:
+        let (_, _, is_completed_previous_session) = restore_execution_session(&previous_tree, Some(previous_scheduler));
+        assert!(is_completed_previous_session);
+
+        let mut turn2_tree = if is_completed_previous_session {
+            TaskTree::default()
+        } else {
+            previous_tree.clone()
+        };
+        assert!(!turn2_tree.enabled());
+
+        // Now Turn 2 can cleanly create a new goal without being rejected by Turn 1's finished root!
+        turn2_tree.ensure_request_goal("Turn 2 New Goal").unwrap();
+        assert!(turn2_tree.enabled());
+        turn2_tree.ensure_work_child("work_t2", "child 2", "done", &[]).unwrap();
+        assert!(turn2_tree.work_node_ready("work_t2"));
+
+        // 2. F01 & F04: Session continuation superseding and dependency normalization via apply("work")
+        let mut scheduler = WorkScheduler::default();
+        let order_1 = WorkOrder {
+            id: "task_1".into(),
+            node_id: "work_1".into(),
+            goal: "original requirement".into(),
+            done_when: "done".into(),
+            completion: Completion::Output,
+            ..WorkOrder::default()
+        };
+        scheduler.apply(&json!({
+            "action": "work",
+            "orders": [order_1]
+        }), false, false).unwrap();
+        assert_eq!(scheduler.current, "task_1");
+
+        // Simulate session interruption / continuation handoff
+        scheduler.handoff = Some(json!({
+            "done": false,
+            "intent": "session_continuation",
+            "resumable_work": "task_1",
+            "resumable_node": "work_1",
+            "revision": 1
+        }));
+
+        // User gave new requirements: Organizer responds with action: "work" and a new order replacing task_1,
+        // and order_3 which depends on order_2 via dependency_inputs (omitting upstream_ids)
+        let order_2 = WorkOrder {
+            id: "task_2".into(),
+            node_id: "work_2".into(),
+            goal: "new requirement replacing task_1".into(),
+            done_when: "done".into(),
+            completion: Completion::Output,
+            ..WorkOrder::default()
+        };
+        let order_3 = WorkOrder {
+            id: "task_3".into(),
+            node_id: "work_3".into(),
+            goal: "followup step with dependency".into(),
+            done_when: "done".into(),
+            completion: Completion::Output,
+            dependency_inputs: vec![json!({"work_id": "task_2", "revision": 1, "fields": ["app_url"]})],
+            ..WorkOrder::default()
+        };
+        scheduler.apply(&json!({
+            "action": "work",
+            "orders": [order_2, order_3]
+        }), false, false).unwrap();
+
+        // task_1 must be marked invalidated by plan_revision
+        assert!(scheduler.frames["task_1"].invalidated_by_plan_revision.is_some());
+        // task_2 must be current
+        assert_eq!(scheduler.current, "task_2");
+        // task_3 must have normalized upstream_ids to include task_2
+        assert_eq!(scheduler.frames["task_3"].order.upstream_ids, vec!["task_2"]);
+
+        // Complete task_2 with exported field
+        scheduler.return_work(&json!({
+            "summary": "task_2 done",
+            "exported_data": {"app_url": "http://127.0.0.1:3000"}
+        })).unwrap();
+
+        // task_3 should now activate
+        scheduler.activate_next().unwrap();
+        assert_eq!(scheduler.current, "task_3");
+
+        // Worker input for task_3 gets the resolved delivery!
+        let w_input = scheduler.worker_input("run task 3");
+        let upstream = w_input["upstream_outputs"].as_array().unwrap();
+        assert_eq!(upstream[0]["app_url"], "http://127.0.0.1:3000");
+
+        // Complete task_3
+        scheduler.return_work(&json!({"summary": "task_3 done"})).unwrap();
+        assert!(scheduler.all_done());
+    }
+
+    #[test]
+    fn test_agent_scenarios_continuity_and_revisit() {
+        use crate::flow_tree::TaskTree;
+        use crate::work_scheduler::{WorkScheduler, WorkOrder, WorkStatus, Completion};
+
+        // Scenario A: Interrupted then continue (without superseding)
+        let mut scheduler = WorkScheduler::default();
+        let mut tree = TaskTree::default();
+        tree.ensure_request_goal("Goal").unwrap();
+        tree.ensure_work_child("work_1", "step 1", "done", &[]).unwrap();
+
+        let order = WorkOrder {
+            id: "task_1".into(),
+            node_id: "work_1".into(),
+            goal: "step 1".into(),
+            done_when: "done".into(),
+            completion: Completion::Output,
+            ..WorkOrder::default()
+        };
+        scheduler.apply(&json!({
+            "action": "work",
+            "orders": [order]
+        }), false, false).unwrap();
+        assert_eq!(scheduler.current, "task_1");
+
+        // Interrupt happens
+        let (_, _, is_completed_previous_session) = restore_execution_session(&tree, Some(scheduler.clone()));
+        assert!(!is_completed_previous_session);
+
+        // Turn 2 resume handoff
+        scheduler.handoff = Some(json!({
+            "done": false,
+            "intent": "session_continuation",
+            "resumable_work": "task_1",
+            "resumable_node": "work_1",
+            "revision": 1
+        }));
+
+        // Organizer decides to continue the existing work
+        scheduler.apply(&json!({
+            "action": "continue",
+            "task_id": "task_1"
+        }), false, false).unwrap();
+
+        assert_eq!(scheduler.current, "task_1");
+        assert_eq!(scheduler.frames["task_1"].status, WorkStatus::Running);
+        assert!(scheduler.handoff.is_none());
+
+        // Scenario B: Revisit and new version progress reporting
+        scheduler.return_work(&json!({"summary": "task_1 done initial"})).unwrap();
+        assert_eq!(scheduler.frames["task_1"].status, WorkStatus::Done);
+
+        // Enqueue task 2
+        let order_2 = WorkOrder {
+            id: "task_2".into(),
+            node_id: "work_2".into(),
+            goal: "step 2".into(),
+            done_when: "done".into(),
+            completion: Completion::Output,
+            upstream_ids: vec!["task_1".into()],
+            ..WorkOrder::default()
+        };
+        tree.ensure_work_child("work_2", "step 2", "done", &[]).unwrap();
+        scheduler.apply(&json!({
+            "action": "work",
+            "orders": [order_2]
+        }), false, false).unwrap();
+        assert_eq!(scheduler.current, "task_2");
+
+        // Revisit task_1 because upstream problem found
+        scheduler.apply(&json!({
+            "action": "revisit",
+            "target_node_id": "work_1",
+            "reason": "upstream fix required",
+            "repair_goal": "fix output in step 1"
+        }), false, false).unwrap();
+
+        // task_2 must be marked invalidated
+        assert!(scheduler.frames["task_2"].invalidated_by_plan_revision.is_some());
+        // task_1 activated with new instance id "work_1_r2", revision 2 and plan_revision 2
+        assert_eq!(scheduler.current, "work_1_r2");
+        assert_eq!(scheduler.node(), "work_1");
+        assert_eq!(scheduler.revision(), 2);
+        assert_eq!(scheduler.plan_revision, 2);
+
+        // Simulated worker/progress payload generated for new version
+        let progress = json!({
+            "workId": scheduler.id(),
+            "nodeId": scheduler.node(),
+            "revision": scheduler.revision(),
+            "planRevision": scheduler.plan_revision,
+            "purpose": scheduler.order().unwrap().goal.clone(),
+        });
+        assert_eq!(progress["workId"], "work_1_r2");
+        assert_eq!(progress["nodeId"], "work_1");
+        assert_eq!(progress["revision"], 2);
+        assert_eq!(progress["planRevision"], 2);
     }
 }
