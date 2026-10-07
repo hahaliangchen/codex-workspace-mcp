@@ -256,7 +256,7 @@ AI Proxy（默认 `127.0.0.1:3001`）新增独立任务接口，不依赖 Codex 
 - `DELETE /agent/tasks/{task_id}`：取消运行中的任务。
 - `POST /agent/tasks/{task_id}/flow/nodes/{node_id}/interrupt`：中断当前活动节点并结束本轮，任务进入可继续的 `interrupted` 状态；`node_id` 使用 Worker 计划里的节点 ID 加轮次前缀（例如 `turn_2:inspect_shapes`）。
 
-事件使用 dsh 的 `turn/start`、`user/message`、`step/start`、`assistant/delta`、`assistant/message`、`tool/call`、`tool/result`、`step/end` 和 `turn/end` 类型；Flow 记录 Worker 的 `flow/plan`、`flow/node_state` 和 `worker/progress`，委派时还记录 `subagent/start`、`subagent/end`。Observer 另记录计划/进度观察、历史咨询和任务结束复盘事件；复盘结论会在有可复用发现时写入工作记忆。Agent 顺序调用本地文件、索引和记忆工具，并提供工作区 cwd 与最长 120 秒超时的 `run_command`。历史保存在工作区 `.codex-workspace-mcp/codex_state.db` 中。模型文字增量、最终回复、步骤汇报和普通工具调用均记录为事件；续聊从事件重建历史。Flow 图由 Worker 当前计划和执行轨迹生成。旧轮次中断的工具调用会补一条中断结果。
+事件使用 dsh 的 `turn/start`、`user/message`、`step/start`、`assistant/delta`、`assistant/message`、`tool/call`、`tool/result`、`step/end` 和 `turn/end` 类型；Flow 记录 Worker 的 `flow/plan`、`flow/node_state` 和 `worker/progress`，委派时还记录 `subagent/start`、`subagent/end`。Observer 另记录计划/进度观察、历史咨询和任务结束复盘事件；复盘结论会在有可复用发现时写入工作记忆。Agent 顺序调用本地文件、索引和记忆工具，并提供工作区内的原生 `run_program`（仅 cargo、git、node、python，argv 参数数组，无 shell），以及独立的 loopback HTTP 探测。历史保存在工作区 `.codex-workspace-mcp/codex_state.db` 中。模型文字增量、最终回复、步骤汇报和普通工具调用均记录为事件；续聊从事件重建历史。Flow 图由 Worker 当前计划和执行轨迹生成。旧轮次中断的工具调用会补一条中断结果。
 
 ```powershell
 cargo run
@@ -275,7 +275,7 @@ http://127.0.0.1:3000/mcp
 
 ## 设计原则
 
-- 优先使用结构化 MCP 工具，shell 只做 fallback
+- 优先使用专用结构化工具；确需运行已安装的开发 CLI 时使用 allowlist 原生程序工具，不提供通用 shell fallback
 - 优先借当前上下文和上游原生能力，不急着维护代理状态
 - 能文本化沉淀的结果就文本化，避免长期保存一次性资源
 - 工具调用历史要尽量自愈，不能让异常历史拖垮后续请求
@@ -307,7 +307,7 @@ Observer 存在时，意见自动进入下一次 Worker 请求，并保留稳定
 
 ### 每轮文件改动、Diff 与撤销
 
-Agent 的 `write_file`、`replace_range`、`edit_file` 保存真实修改前后内容；`run_command` 对工作区文件进行操作前后的对比。同一文件的多次操作合并为本轮净变化，不根据调用参数或失败状态伪造统计。聊天和右侧面板消费 `workspace/changes`，使用原版 DSH `DiffBlock` 展示对比。详情支持文件切换、复制补丁、折叠、关闭按钮和 Escape。对应接口为 `GET /agent/tasks/{id}/changes/{turn}`、`GET /agent/tasks/{id}/changes/{turn}/files/{index}` 和 `POST /agent/tasks/{id}/changes/{turn}/undo`。
+Agent 的 `write_file`、`replace_range`、`edit_file` 保存真实修改前后内容；`run_program` 对工作区文件进行操作前后的对比。同一文件的多次操作合并为本轮净变化，不根据调用参数或失败状态伪造统计。聊天和右侧面板消费 `workspace/changes`，使用原版 DSH `DiffBlock` 展示对比。详情支持文件切换、复制补丁、折叠、关闭按钮和 Escape。对应接口为 `GET /agent/tasks/{id}/changes/{turn}`、`GET /agent/tasks/{id}/changes/{turn}/files/{index}` 和 `POST /agent/tasks/{id}/changes/{turn}/undo`。
 
 撤销需用户点击确认；运行中任务存在时拒绝撤销。操作前检查所有文件仍与记录的修改后版本一致，发现后续编辑时返回冲突，不强行覆盖；本轮新建的文件只删除该文件，本轮删除的文件恢复原内容。撤销同步更新界面与 Worker 工作记录。快照保存在工作区 SQLite 中；功能启用前的历史任务没有完整快照，无法补出准确 Diff 或撤销。
 
@@ -335,7 +335,7 @@ Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息
 
 ### 写入工具的前置校验与返回值
 
-结构化写入（`write_file`、`replace_range`、`edit_file`）统一限制在选定的工作区，绝对路径也必须位于该目录内；父级跳转及符号链接/junction 指向工作区外的路径会拒绝。完全访问允许 shell 命令，结构化文件工具仍保留目录边界。
+结构化写入（`write_file`、`replace_range`、`edit_file`）统一限制在选定的工作区，绝对路径也必须位于该目录内；父级跳转及符号链接/junction 指向工作区外的路径会拒绝。完全访问允许工作区项目工具和 allowlist 原生程序执行；原生程序必须在工作区目录内运行，直接参数传递且不启动 shell。结构化文件工具仍保留路径边界。
 
 - `write_file`：新建文件无需版本；覆盖已有文件必须传 `expected_code_hash`，从源码读取、记事本取回或上一次写入结果复制。
 - `replace_range`：行号从 1 开始，首尾包含；必须提供 `expected_old_text` 或 `expected_code_hash`。未修改部分保持字节不变，替换区沿用换行格式，不裁掉额外末尾空行。

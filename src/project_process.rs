@@ -52,11 +52,11 @@ pub struct ProcessObservationScope {
     pub script_args: Vec<String>,
 }
 
-fn host_instance_id() -> &'static str {
+pub(crate) fn host_instance_id() -> &'static str {
     HOST_INSTANCE_ID.get_or_init(|| format!("host_{}_{}", std::process::id(), now()))
 }
 
-fn process_event_generation() -> u64 {
+pub(crate) fn process_event_generation() -> u64 {
     PROCESS_EVENT_GENERATION.load(Ordering::Relaxed)
 }
 
@@ -204,19 +204,19 @@ pub fn is_tool(name: &str) -> bool {
 pub fn is_execution(name: &str) -> bool {
     matches!(
         name,
-        "install_dependencies" | "run_project_script" | "stop_project_process"
+        "run_program" | "install_dependencies" | "run_project_script" | "stop_project_process"
     )
 }
 pub fn is_check(name: &str) -> bool {
     matches!(
         name,
-        "run_command" | "install_dependencies" | "run_project_script" | "get_project_process" | "http_probe"
+        "run_program" | "install_dependencies" | "run_project_script" | "get_project_process" | "http_probe"
     )
 }
 pub fn may_change_files(name: &str) -> bool {
     matches!(
         name,
-        "run_command" | "install_dependencies" | "run_project_script"
+        "run_program" | "install_dependencies" | "run_project_script"
     )
 }
 pub fn normalize_args(root: &Path, args: &mut Value) -> Result<()> {
@@ -236,12 +236,8 @@ pub fn check_key(name: &str, args: &Value) -> String {
     if name == "http_probe" {
         return crate::http_probe::check_key(args);
     }
-    if name == "run_command" {
-        return args["command"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .replace("\r\n", "\n");
+    if name == "run_program" {
+        return crate::program_execution::check_key(args);
     }
     let project = args["project_path"]
         .as_str()
@@ -564,16 +560,23 @@ fn external_runtime_path(path:&Path)->Result<OsString> {
 #[cfg(not(windows))]
 fn external_runtime_path(path:&Path)->Result<OsString> { Ok(path.as_os_str().to_owned()) }
 
-fn node_npm() -> Result<(PathBuf, PathBuf)> {
+fn node_executable() -> Result<PathBuf> {
     let paths = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
         .unwrap_or_default();
     let executable = if cfg!(windows) { "node.exe" } else { "node" };
-    let node = paths
+    paths
         .iter()
         .map(|dir| dir.join(executable))
         .find(|path| path.is_file())
-        .context("Node.js is not installed or not visible in the host PATH")?;
+        .context("Node.js is not installed or not visible in the host PATH")
+}
+
+fn node_npm() -> Result<(PathBuf, PathBuf)> {
+    let paths = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let node = node_executable()?;
     let mut directories = vec![node.parent().unwrap().to_path_buf()];
     if let Ok(actual) = node.canonicalize() {
         if let Some(parent) = actual.parent() {
@@ -601,14 +604,73 @@ fn node_npm() -> Result<(PathBuf, PathBuf)> {
     )
 }
 
+fn script_invokes_powershell(script: &str) -> bool {
+    script.split(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '.' | '-')
+    }).any(|token| {
+        let token = token.to_ascii_lowercase();
+        matches!(token.as_str(),
+            "powershell" | "powershell.exe" | "powershell_ise" | "powershell_ise.exe" | "pwsh" | "pwsh.exe")
+            || token.ends_with(".ps1")
+    })
+}
+
+fn powershell_script_shell(configured: &str) -> bool {
+    let configured = configured.trim();
+    let token = match configured.chars().next() {
+        Some(quote @ ('\'' | '"')) => configured[quote.len_utf8()..]
+            .split_once(quote).map_or(configured, |(path, _)| path),
+        Some(_) => configured.split_whitespace().next().unwrap_or(configured),
+        None => return false,
+    };
+    let executable = token.rsplit(['\\', '/']).next().unwrap_or(token);
+    script_invokes_powershell(executable) || script_invokes_powershell(configured)
+}
+
+/// Ask the same npm CLI to resolve project, user, and environment config before
+/// spawning a package lifecycle process. This is a config read, not a shell call.
+async fn effective_npm_script_shell(
+    node: &Path,
+    npm: &Path,
+    dir: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    let mut command = Command::new(external_runtime_path(node)?);
+    command.arg(external_runtime_path(npm)?).args(["config", "get", "script-shell"])
+        .current_dir(external_runtime_path(dir)?)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let output = tokio::select! {
+        _ = cancel.cancelled() => anyhow::bail!("project execution cancelled before checking npm script-shell"),
+        result = tokio::time::timeout(Duration::from_secs(15), command.output()) =>
+            result.context("runtime_bootstrap: timed out reading effective npm script-shell")?
+                .context("runtime_bootstrap: could not read effective npm script-shell")?,
+    };
+    ensure!(output.status.success(),
+        "runtime_bootstrap: could not verify effective npm script-shell; refusing to start package scripts ({} {})",
+        output.status, String::from_utf8_lossy(&output.stderr).trim());
+    let configured = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let unwrapped = configured.trim_matches(['\'', '"']).trim();
+    Ok((!configured.is_empty() && unwrapped != "null").then(|| configured.to_owned()))
+}
+
+pub(crate) fn resolve_node_executable() -> Result<PathBuf> {
+    node_executable()
+}
+
+pub(crate) fn native_runtime_path(path: &Path) -> Result<OsString> {
+    external_runtime_path(path)
+}
+
 pub fn failure_result(name:&str,args:&Value,error:&anyhow::Error)->Value {
     let message=format!("{error:#}");
-    let failure_stage=if message.contains("runtime_bootstrap:") {"runtime_bootstrap"}else{"unknown"};
-    let diagnosis=if failure_stage=="runtime_bootstrap" {"host_runtime"}else{"unknown"};
+    let failure_stage=if message.contains("unsupported_script_shell:") {"unsupported_script_shell"}else if message.contains("runtime_bootstrap:") {"runtime_bootstrap"}else{"unknown"};
+    let diagnosis=match failure_stage {"unsupported_script_shell"=>"unsupported_script_shell","runtime_bootstrap"=>"host_runtime",_=>"unknown"};
     json!({"error":message,"failure_stage":failure_stage,"diagnosis":diagnosis,
         "project_path":args["project_path"],"script":args["script"],"check_key":check_key(name,args),
         "exit_code":Value::Null,"stderr":"","host_fix_guidance":if diagnosis=="host_runtime" {
             "npm CLI or the host Node/npm runtime failed before project script execution. Do not infer project dependency damage from this error; preserve the original diagnostic and check the runtime path/installation."
+        } else if diagnosis=="unsupported_script_shell" {
+            "The host refused to execute a PowerShell npm script or script-shell. Report the named script and the unsupported PowerShell requirement; do not route it through another runtime."
         } else {"The failure stage is unknown. Use the structured result and original error before deciding what to repair."}})
 }
 
@@ -912,6 +974,57 @@ mod tests {
     #[cfg(not(windows))]
     use std::path::Path;
 
+    #[test]
+    fn powershell_script_detection_covers_direct_commands_and_configured_paths() {
+        assert!(super::script_invokes_powershell(r#"powershell.exe -NoProfile -Command "exit 0""#));
+        assert!(super::script_invokes_powershell(r#"pwsh -File scripts/build.ps1"#));
+        assert!(super::powershell_script_shell(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile"#));
+        assert!(super::powershell_script_shell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert!(super::powershell_script_shell(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"));
+        assert!(!super::powershell_script_shell(r"C:\Windows\System32\cmd.exe"));
+        assert!(!super::script_invokes_powershell("node scripts/build.js"));
+    }
+
+    #[tokio::test]
+    async fn explicitly_invoked_powershell_package_script_is_rejected_before_launch() {
+        let root=std::env::current_dir().unwrap().join("target")
+            .join(format!("test-powershell-script-{}-{}",std::process::id(),super::now()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"),r#"{"scripts":{"bad":"powershell.exe -NoProfile -Command \"exit 0\""}}"#).unwrap();
+        let args=serde_json::json!({"project_path":".","script":"bad"});
+        let error=launch(&root,&args,false,
+            &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
+        assert!(error.to_string().contains("unsupported_script_shell"),"{error:#}");
+        assert!(error.to_string().contains("bad"),"{error:#}");
+        let structured=super::failure_result("run_project_script",&args,&error);
+        assert_eq!(structured["failure_stage"],"unsupported_script_shell");
+        assert_eq!(structured["diagnosis"],"unsupported_script_shell");
+        for hook in ["prebad","postbad"] {
+            let mut scripts=serde_json::Map::new();
+            scripts.insert("bad".into(),serde_json::json!("node -e \"console.log('safe')\""));
+            scripts.insert(hook.into(),serde_json::json!("powershell.exe -NoProfile -Command \"exit 0\""));
+            std::fs::write(root.join("package.json"),serde_json::to_vec(&serde_json::json!({"scripts":scripts})).unwrap()).unwrap();
+            let error=launch(&root,&args,false,&tokio_util::sync::CancellationToken::new()).await.unwrap_err();
+            assert!(error.to_string().contains(hook),"{error:#}");
+        }
+        let _=std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn effective_npm_script_shell_is_checked_before_launch() {
+        if node_npm().is_err() || std::env::var_os("NPM_CONFIG_SCRIPT_SHELL").is_some() { return; }
+        let root=std::env::current_dir().unwrap().join("target")
+            .join(format!("test-powershell-shell-{}-{}",std::process::id(),super::now()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"),r#"{"scripts":{"safe":"node -e \"console.log('must not run')\""}}"#).unwrap();
+        std::fs::write(root.join(".npmrc"),"script-shell=powershell.exe\n").unwrap();
+        let error=launch(&root,&serde_json::json!({"project_path":".","script":"safe"}),false,
+            &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
+        let _=std::fs::remove_dir_all(&root);
+        assert!(error.to_string().contains("effective npm script-shell"),"{error:#}");
+        assert!(error.to_string().contains("PowerShell"),"{error:#}");
+    }
+
     fn fixture_record(root:&std::path::Path,id:&str,project_path:&str,args:&[&str])->std::sync::Arc<super::Record> {
         let (stop,_receiver)=tokio::sync::mpsc::unbounded_channel();
         let meta=super::Meta {
@@ -1133,11 +1246,21 @@ mod tests {
     }
 }
 
+pub(crate) fn prepare_process_group(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+}
+
 #[cfg(windows)]
-struct ProcessGroup(std::os::windows::io::OwnedHandle);
+pub(crate) struct ProcessGroup(std::os::windows::io::OwnedHandle);
 #[cfg(windows)]
 impl ProcessGroup {
-    fn attach(child: &Child) -> Result<Self> {
+    pub(crate) fn attach(child: &Child) -> Result<Self> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle};
         use windows_sys::Win32::{
             Foundation::INVALID_HANDLE_VALUE,
@@ -1204,7 +1327,7 @@ impl ProcessGroup {
             anyhow::bail!("suspended process thread not found")
         }
     }
-    fn terminate(&self) -> Result<()> {
+    pub(crate) fn terminate(&self) -> Result<()> {
         use std::os::windows::io::AsRawHandle;
         ensure!(
             unsafe {
@@ -1220,13 +1343,13 @@ impl ProcessGroup {
     }
 }
 #[cfg(unix)]
-struct ProcessGroup(i32);
+pub(crate) struct ProcessGroup(i32);
 #[cfg(unix)]
 impl ProcessGroup {
-    fn attach(child: &Child) -> Result<Self> {
+    pub(crate) fn attach(child: &Child) -> Result<Self> {
         Ok(Self(child.id().context("missing process id")? as i32))
     }
-    fn terminate(&self) -> Result<()> {
+    pub(crate) fn terminate(&self) -> Result<()> {
         let status = unsafe { libc::kill(-self.0, libc::SIGKILL) };
         ensure!(
             status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
@@ -1345,6 +1468,17 @@ async fn launch(
                 .unwrap_or_default()
                 .join(", ")
         );
+        for invoked_script in [format!("pre{script}"),script.clone(),format!("post{script}")] {
+            if manifest["scripts"][&invoked_script].as_str().is_some_and(script_invokes_powershell) {
+                anyhow::bail!("unsupported_script_shell: package script '{invoked_script}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled");
+            }
+        }
+    } else if let Some(scripts) = manifest["scripts"].as_object() {
+        for lifecycle in ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"] {
+            if scripts.get(lifecycle).and_then(Value::as_str).is_some_and(script_invokes_powershell) {
+                anyhow::bail!("unsupported_script_shell: npm lifecycle script '{lifecycle}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled");
+            }
+        }
     }
     let extra: Vec<String> = args
         .get("args")
@@ -1366,6 +1500,11 @@ async fn launch(
         "dependency installation has an exit result, not a server readiness endpoint"
     );
     let (node, npm) = tokio::task::spawn_blocking(node_npm).await.map_err(runtime_bootstrap)?.map_err(runtime_bootstrap)?;
+    let configured_shell = effective_npm_script_shell(&node, &npm, &dir, cancel).await.map_err(runtime_bootstrap)?;
+    if configured_shell.as_deref().is_some_and(powershell_script_shell) {
+        anyhow::bail!("unsupported_script_shell: effective npm script-shell '{}' is PowerShell; PowerShell execution is disabled",
+            configured_shell.as_deref().unwrap_or_default());
+    }
     let node_arg=external_runtime_path(&node).map_err(runtime_bootstrap)?;
     let npm_arg=external_runtime_path(&npm).map_err(runtime_bootstrap)?;
     let cwd_arg=external_runtime_path(&dir).map_err(runtime_bootstrap)?;
@@ -1488,15 +1627,7 @@ async fn launch(
     if !install {
         command.env("FORCE_COLOR", "0");
     }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
-        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
-    }
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
+    prepare_process_group(&mut command);
     ensure!(!cancel.is_cancelled(), "project execution cancelled");
     let mut child = command.spawn().context("runtime_bootstrap: could not launch Node/npm")?;
     let group = match ProcessGroup::attach(&child) {
@@ -1785,8 +1916,8 @@ pub fn definitions() -> Vec<Value> {
     let port = json!({"type":"integer","minimum":1,"maximum":65535,"description":"Local TCP readiness port, used when ready_url is omitted."});
     let logs = json!({"type":"integer","minimum":4096,"maximum":60000,"default":12000});
     vec![
-        json!({"name":"install_dependencies","description":"Install this npm project's dependencies through Node/npm directly. auto uses ci with an npm lockfile, otherwise install. Returns check_key=npm-install:<project_path>, exit code or a managed background process. No shell command or terminal window required.","inputSchema":{"type":"object","properties":{"project_path":project,"mode":{"type":"string","enum":["auto","install","ci"],"default":"auto"},"background":background,"timeout_seconds":{"type":"integer","minimum":1,"maximum":1800,"default":600},"max_chars":logs}}}),
-        json!({"name":"run_project_script","description":"Run a named package.json npm script via Node/npm. Use foreground for build/check and background=true for dev/start. A running process is NOT proof of readiness: supply ready_url/ready_port to verify that this Agent-managed listener belongs to the process group, or query get_project_process later. Use http_probe for generic URL/API reachability independent of process ownership. Returns check_key=npm:<project_path>:<script> for foreground or npm-start:<project_path>:<script> for background (args append their JSON), exit code/logs or process_id.","inputSchema":{"type":"object","required":["script"],"properties":{"project_path":project,"script":{"type":"string"},"args":{"type":"array","maxItems":32,"items":{"type":"string"}},"background":background,"timeout_seconds":{"type":"integer","minimum":1,"maximum":1800,"default":120},"ready_url":url,"ready_port":port,"wait_seconds":wait,"max_chars":logs}}}),
+        json!({"name":"install_dependencies","description":"Install this npm project's dependencies through Node/npm directly. auto uses ci with an npm lockfile, otherwise install. Before starting, reject direct PowerShell calls in project lifecycle scripts and reject an effective npm script-shell configured as PowerShell. Returns check_key=npm-install:<project_path>, exit code or a managed background process. No shell command or terminal window required.","inputSchema":{"type":"object","properties":{"project_path":project,"mode":{"type":"string","enum":["auto","install","ci"],"default":"auto"},"background":background,"timeout_seconds":{"type":"integer","minimum":1,"maximum":1800,"default":600},"max_chars":logs}}}),
+        json!({"name":"run_project_script","description":"Run a named package.json npm script via Node/npm. Before starting, reject direct PowerShell or .ps1 invocation in the selected script and its npm pre/post hooks, and reject an effective npm script-shell configured as PowerShell. Use foreground for build/check and background=true for dev/start. A running process is NOT proof of readiness: supply ready_url/ready_port to verify that this Agent-managed listener belongs to the process group, or query get_project_process later. Use http_probe for generic URL/API reachability independent of process ownership. Returns check_key=npm:<project_path>:<script> for foreground or npm-start:<project_path>:<script> for background (args append their JSON), exit code/logs or process_id.","inputSchema":{"type":"object","required":["script"],"properties":{"project_path":project,"script":{"type":"string"},"args":{"type":"array","maxItems":32,"items":{"type":"string"}},"background":background,"timeout_seconds":{"type":"integer","minimum":1,"maximum":1800,"default":120},"ready_url":url,"ready_port":port,"wait_seconds":wait,"max_chars":logs}}}),
         json!({"name":"get_project_process","description":"List/query only Agent-managed process status, ownership and incremental logs. Without project_path this lists managed processes across the workspace, including subprojects; with project_path it lists that project. An empty list means no process is managed here; it does not establish whether any URL is reachable. Use http_probe for general local URL/API reachability, including services started outside Agent. Every list result carries an observation whose coverage distinguishes workspace_list from project_list; a single_process result cannot stand in for either list. ready_url/ready_port performs a process-scoped startup readiness check and verifies listener ownership; it is not a generic endpoint probe. Reuse a fresh matching list observation from an earlier work packet for status-only queries; set force_refresh=true only when a new process observation is needed for a concrete reason. Pass after_seq=previous next_seq for incremental logs. Old process IDs after host restart are historical and never used to terminate reused OS PIDs.","inputSchema":{"type":"object","properties":{"process_id":{"type":"string"},"project_path":process_project,"script":{"type":"string"},"after_seq":{"type":"integer","minimum":0},"max_chars":logs,"ready_url":url,"ready_port":port,"wait_seconds":wait,"force_refresh":{"type":"boolean","default":false,"description":"Bypass fresh process state reuse only for a concrete new observation purpose."},"observation_purpose":{"type":"string","maxLength":300,"description":"Why this is a new process observation rather than reuse, required when force_refresh=true."}}}}),
         json!({"name":"stop_project_process","description":"Stop only an owned project process by process_id, including its descendant processes. Repeating stop on an exited process returns its actual exit state.","inputSchema":{"type":"object","required":["process_id"],"properties":{"process_id":{"type":"string"},"max_chars":logs}}}),
     ]

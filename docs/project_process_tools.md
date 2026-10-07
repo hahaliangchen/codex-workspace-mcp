@@ -9,10 +9,11 @@ Agent 和 MCP 都提供以下项目执行、进程管理和本机 HTTP 检查工
 | `get_project_process` | 列进程、查询状态、增量读日志、探测就绪 | `process_id`、`after_seq`、`ready_url` / `ready_port` |
 | `http_probe` | 独立检查本机 HTTP(S) 地址，可探测非 Agent 启动的服务 | `url`、`timeout_ms`、`reason` |
 | `stop_project_process` | 停止受管理的进程及其子进程 | `process_id` |
+| `run_program` | 直接运行受支持的前台原生程序，不经过 shell | `program`、`args`、`project_path`、`timeout_seconds` |
 
-`project_path` 默认 `.`。安装的 `mode=auto` 默认有 npm 锁文件就用 `npm ci`，否则用 `npm install`；也可以明确选择 `install` 或 `ci`。不能用这些工具安装单个包或执行任意命令字符串，pnpm/yarn 尚未接入。
+`project_path` 默认 `.`。安装的 `mode=auto` 默认有 npm 锁文件就用 `npm ci`，否则用 `npm install`；也可以明确选择 `install` 或 `ci`。不能用结构化 npm 工具安装单个包或执行任意命令字符串，pnpm/yarn 尚未接入。需要其他受支持的前台 CLI 时可用 `run_program`，其 `program` 仅允许 `cargo`、`git`、`node`、`python`，`args` 数组的每项作为一个独立 argv 传递；没有 shell、PowerShell 或脚本字符串入口。npm 脚本和后台进程继续使用项目工具。
 
-Agent 的安装、运行、停止操作需要“完全访问”；状态和日志查询可在只读模式使用。用户明确禁止执行命令时，同样关闭安装、运行和停止工具。MCP 入口沿用受信任工作区工具的调用方式。
+Agent 的原生程序、安装、脚本运行和停止操作需要“完全访问”；状态和日志查询可在只读模式使用。用户明确禁止执行命令时，同样关闭原生程序、安装、运行和停止工具。MCP 入口沿用受信任工作区工具的调用方式。
 
 `get_project_process` 只报告 Agent 管理的进程、归属和日志。无受管进程不代表 URL 不可达。通用 URL、字体接口和页面连通性检查使用 `http_probe`：它仅连接 loopback 地址，禁用代理与自动重定向；任何 HTTP 响应（包括 404）都表示 `reachable=true` 并返回实际状态码，未收到响应则 `http_status=null` 并返回结构化 `error_kind`。返回的 `sampled_at` 是 UTC RFC3339 时间，`reuse_window_ms` 为 30000；在窗口内且服务状态未改变时复用已有结果，`reused=true` 表示没有再次发出网络请求。重新探测时在 `reason` 中说明状态可能变化或旧结果无法回答新问题的原因。
 
@@ -48,7 +49,7 @@ Agent 的安装、运行、停止操作需要“完全访问”；状态和日�
 
 ## 执行与日志
 
-宿主直接启动 `node npm-cli.js`，参数按数组传递，不拼接 PowerShell 命令，也不打开终端窗口。npm 运行 package.json 脚本和生命周期脚本时，仍会使用 npm 自己的脚本执行机制；脚本拥有宿主账户权限。
+宿主直接启动 `node npm-cli.js`，参数按数组传递，不拼接 PowerShell 命令，也不打开终端窗口。启动前会检查所选 package.json 脚本及 npm 会运行的 `pre<name>`、`post<name>` 脚本是否直接调用 PowerShell 或 `.ps1` 文件，并用相同的 Node/npm、项目目录和继承环境读取 npm 实际生效的 `script-shell`；如果该 shell 是 PowerShell，宿主拒绝运行。依赖安装还会检查项目的 `preinstall`、`install`、`postinstall`、`prepublish`、`preprepare`、`prepare`、`postprepare` 脚本，检查发生在启动 npm 之前，适用于 `install` 和 `ci`。Agent 不得把 PowerShell 脚本改由 Node/Python 转发；遇到拒绝结果时报告具体脚本名和能力缺口。`run_program` 本身始终直接启动 allowlist 程序，不调用 npm shell。
 
 前台默认安装超时 600 秒、普通脚本 120 秒，最大 1800 秒。超时或所属 Agent 请求取消时终止进程组。后台执行成功返回后由宿主继续管理，同一工作区、目录、脚本和参数的重复后台请求复用运行中的进程。后台服务明确停止或宿主退出时结束，不因为 Worker 完成当前回答自动停止。
 
@@ -60,4 +61,10 @@ Windows 使用 Job Object 管理完整进程组，关闭作业时杀掉子进程
 
 ## Flow 完成条件
 
-组织者声明检查标识：`npm-install:.`、`npm:frontend:build`。带参数的启动标识例如 `npm-start:frontend:dev:["--port","5173"]`。前台退出码为 0，或后台脚本的 `running=true && ready=true`，才能产生成功检查记录；仅创建进程不计入完成。源码版本变动会使旧检查失效。尚未就绪的查询保留当前单元，失败则把真实日志返回给 Worker 处理。
+组织者声明检查标识：`npm-install:.`、`npm:frontend:build`，以及 `program:cargo:.:["check"]` 这类原生程序检查。带参数的启动标识例如 `npm-start:frontend:dev:["--port","5173"]`。前台程序只有实际退出码为 0 才通过；stderr 有内容不自动判失败。后台脚本要求 `running=true && ready=true` 才能产生成功检查记录；仅创建进程不计入完成。源码版本或托管进程事件变动会使样本不再可复用，并影响当前未完成单元的检查；`git status` 等未改变源码的原生只读命令不会因调用本身使 HTTP 样本失效。尚未就绪的查询保留当前单元，失败则把真实日志返回给 Worker 处理。
+
+恢复旧任务时，仍未完成且保留任意 shell 字符串检查键的工作会被标记为待迁移，旧通过记录会被清除。组织者必须通过 `revisit` 创建该节点的新 revision，并用 `replacement_checks` 声明受支持的检查键；宿主不会解释或执行旧字符串。已经完成的上游节点保持封存，不会因迁移重跑。
+
+每个节点实际取得的 HTTP 样本会自动写入 `exported_data.http_observations`，包含稳定 `sample_id` 和生产 work/node/revision。组织者用 `http_observation_catalog` 选择样本；下游通过 `dependency_inputs` 声明 `fields:["http_observations"]`，并可用 `http_urls` 精确筛选 URL。Worker 只收到当前节点样本和显式绑定的上游样本；宿主在交付时计算 `age_ms`、`fresh` 和 `invalidation_reason`。正文摘要仅留在样本及原始工具结果中，默认跨节点上下文不附带正文。若下游声明相同 URL 的纯 2xx 检查，绑定的有效样本可直接满足检查，不发出第二次网络请求。
+
+HTTP 检查通过记录绑定具体 `sample_id`。当前未完成单元在完成判定时核验样本是否仍可复用；过期时撤销该单元的通过记录。已完成单元保留采样时的完成事实、检查凭据和产出，样本过期只改变交付中的 `fresh`、`invalidation_reason`，不自动重开节点或阻止下游读取历史产出。只有当前工作需要新的服务状态时才重新探测，并说明原因；真实上游问题由组织者显式 `revisit` 处理。

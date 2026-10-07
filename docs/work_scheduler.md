@@ -1,44 +1,62 @@
-# 工作组织与交接
+# Dynamic work scheduling
 
-## 职责
+## Execution and result are separate
 
-程序调度器负责就绪依赖、当前工作包、工具范围、客观完成条件、结果封存及交接。组织者继承 Worker 的 provider、model、推理配置，使用独立的浓缩上下文；不增加模型配置选项。Worker 执行当前工作，Observer 并行观察、提供建议和历史知识。
+Work nodes retain the three execution states `ready`, `running`, and `done`. `done` means the current task invocation returned and the host sealed its TaskReturn. It does not mean the declared expectation passed or the user's overall goal was achieved.
 
-执行单元仅有三个状态：`ready → running → done`。Worker 在同一单元内循环“实现 → 检查 → 修复 → 再检查”；普通检查失败仍保持 `running`，错误作为下一轮输入，不新增状态或节点，也不自动调用组织者。只有实际阻塞、需要扩大范围或拆分时才交接。验证是完成条件，不是另外一套流程状态。已有 Flow 的历史状态保持兼容。
+The host records `expectation_met` separately from execution state. A connection refusal, HTTP 404, unavailable image input, blocker, split request, or upstream problem can be a valid `done` result with a negative outcome. The Organizer uses that result to schedule follow-up work or deliver an honest unresolved answer. Flow completion records the actual outcome and expectation fact so a completed node is not displayed as proof of business success.
 
-## 输入与返回
+Write and check facts remain host-owned. A write is recorded only after a real file change; a check is successful only for the current input version and according to that tool's result. `check` work can return a non-2xx observation as a finished result, while `expectation_met=false` preserves that the declared condition did not pass.
 
-组织者收到人类当前需求、历史任务摘要、浓缩结论、材料索引、工作队列、真实操作和 Observer 建议，返回一个 `organize_work` 决策：安排工作、继续当前工作、结束或说明阻塞。决策在副本上校验，成功后提交，避免半份计划改变现场。
+## Organizer scheduling methods
 
-工作包包含目标、完成条件、约束、上游工作 ID、结论 ID、材料 ID/具体行范围、允许修改的文件和必要检查命令。Worker 的原始工具历史按“节点 + 执行单元”隔离；仅保留本单元最近完整的工具调用组、指定结论和选中的当前源码。上一单元的操作聊天不传入下一单元。材料正文仍留在任务记事本，切换保存材料选择，恢复时检查文件版本。
+The Organizer sees the current user goal, the current result once, a concise execution path, exact available delivery fields, relevant facts, browser upload availability and Observer advice. The complete source, logs, screenshots and old execution details remain in the task notebook and event log. They are retrieved only when a concrete task needs them.
 
-Worker 用 `yield_work` 返回实际结论、阻塞或拆分请求；普通文字回答也作为输出单元的返回。`report_progress` 记录目的、条件和发现，不能改变任务树或宣告完成。组织者掌握 Flow 规划，宿主根据单元返回将节点完成，并回到父节点。父节点的汇总要等待子节点完成。
+Each scheduling decision uses one method:
 
-## 完成条件
+- `schedule_task` creates one concrete next task. The host generates work/node IDs, appends Flow state and resolves dependencies. Pass upstream data as exact `inputs` referencing an available `work_id` or `node_id` and listed fields.
+- `read_task_result` reads selected fields from an active sealed delivery when those fields are absent from the concise context. `current_result` is already present and should not be fetched again.
+- `revisit_task` creates a new execution revision for a defective upstream node, preserves its old result and deprecates the old downstream branch.
+- `finish_request` returns the user-facing summary, whether the overall goal was achieved, and unresolved conditions. Completed nodes or an empty queue alone do not establish goal completion.
 
-- `output`：返回实际答案或结论；明确阻塞或需要拆分时保持未完成。
-- `write`：指定文件出现真实写入，`changed=false` 不计入。
-- `check`：指定命令退出码为 0；后台服务则要求受管理进程仍运行且本地就绪探测通过。
-- `write_check`：指定文件真实写入，指定检查在当前文件版本上通过。
+The Organizer request streams (`stream=true`). The host assembles the SSE frames, including tool arguments split across frames and UTF-8 characters split across network chunks. It applies exactly one scheduling method, and only after `[DONE]` or a `finish_reason` arrives. A truncated stream, an upstream error frame, multiple methods or invalid arguments produce a contract or request error and no scheduler or Flow change. A complete JSON response is accepted as `response_format=json`. Timings are milliseconds after request start, and `null` means not received: `response_headers_ms`, `first_chunk_ms`, `first_delta_ms`, `first_tool_delta_ms`, `response_complete_ms`. They are stored with the request record. `organizer/progress` events (at most one per second plus phase changes) drive the frontend's "等待响应 / 正在接收决策 / 决策已完成" display. Cancellation and the overall deadline end the request while reading; keepalives do not extend the deadline.
 
-写入、已读取文件的版本变化会清除旧检查。执行检查前后重新核对记录的文件版本；检查期间输入发生变化，结果不记为通过。通过的相同检查禁止再次执行。完成单元不能恢复或被普通建议重新打开；新的问题使用新的单元。
+`process.execution_narrative` is a short text in the order tasks actually ran. It shows which tasks returned and what they returned, which are history only (deprecated), the latest report of the running task (intent, not a result), and the latest known facts with sample times. Earlier observations that a later sample superseded are listed separately as history. A last section lists the remaining limitations. `process.current_facts` carries the same current HTTP and browser facts as structured data.
 
-完成条件针对组织者声明的具体小任务。一次写入和编译通过不会自动证明整个产品功能正确。整轮结束需所有已安排单元完成；阻塞结束必须明确描述未完成条件。不自动执行测试，不自动回滚用户的工作区。
+A Worker `report_progress` records intent on the current node and continues the same task; it never creates a TaskReturn or an Organizer call. Only rounds with no actual project operation count toward a stall. After `REPORT_ONLY_ROUND_LIMIT` such rounds, the host hands off with `handoff.stall` and `task_returned=false`. A goal that stalled twice is not accepted again (`STALLED_GOAL_REPEATED`).
 
-npm 安装、构建、启动使用结构化项目工具。检查标识为 `npm:<工作区相对目录>:<脚本>`，根目录用 `.`；非空脚本参数追加 `:<参数 JSON>`。后台脚本用 `npm-start:<工作区相对目录>:<脚本>`，安装用 `npm-install:.`。HTTP 检查使用 `http-probe:<完整本机 URL>`，只有 HTTP 2xx 作为通过条件，实际状态码与连通性仍分开记录。当前 Scheduler 的不同工作包共享 `reuse_window_ms` 内的同 URL 样本；源码版本或项目执行状态改变会使样本失效。服务状态改变或旧样本不足时，填写 `reason` 再探测。普通 shell 检查仍使用原有完整命令。启动返回 `running=true` 但 `ready=false` 时不算完成，也不重新启动同一进程；继续查询它的就绪状态。参见 [项目执行工具](project_process_tools.md)。
+A successor that references an unreturned task is rejected with `TASK_NOT_RETURNED`, and the running task, the queue and other results are left unchanged. Scheduling unrelated new work while a task is unreturned deprecates that task explicitly, recording the reason, the replacement and its last report. Other dependency errors are `TASK_DEPRECATED`, `REVISION_MISMATCH`, `FIELD_NOT_EXPORTED`, `INVALID_REFERENCE_TYPE` and `UNKNOWN_TASK`.
 
-## 防止空转
+Simple knowledge questions use one answer task. Composite requests grow Flow one task at a time. A task that needs splitting returns its concrete child suggestions, dependencies and completion conditions; the Organizer schedules the next suitable child rather than receiving a model-authored task tree.
 
-无项目操作的汇报轮、连续重复读取、连续 12 轮没有真实修改或新检查通过会返回组织者。真实写入和新检查通过会重置无进展计数，重写结论不会。普通失败检查由 Worker 自行修复后重试；检查错误记录携带源码版本序号，旧版本的错误不会作为新代码仍然出错的证明。组织者只在首次安排、工作返回、完成或需要重新组织时调用，不在每次工具调用后插入。已安排且依赖满足的下一单元由程序直接启动。
+## Task contract combinations
 
-所有工作包都显示为 Flow 节点。简单讨论或短任务使用一个节点，程序由工作包目标和实际状态直接生成，不增加规划调用；复杂任务才创建递归任务树。多个直接工作包各有独立节点，按显式上游依赖连接。直接最终文字回答立即结束；组织者完成汇总后直接交付答案，不再增加 Worker 收尾轮。
+| Work type | `completion` | `checks` |
+| --- | --- | --- |
+| Service startup, HTTP/API endpoint check | `check` | Required supported identifiers |
+| PPTX upload/load, in-browser font-request inspection, screenshot/image inspection | `output` | Must be empty |
+| Source writing | `write` or `write_check` | `write_check` also needs supported checks |
 
-`continue` 的最新决策会进入 Worker 的 `organizer_handoff`。它可更新当前工作包的约束、材料、结论及直接答复标记；沿用原目标和客观完成条件，不清除已有操作或检查。输入更新会重新应用材料选择，禁止静默忽略组织者提供的工作包。新目标需要安排新工作，不能靠继续执行更换原契约。
+Keep mixed tasks separate and pass the startup/check result to the later browser task as an explicit input. The host validates these combinations before scheduling and returns the exact rejected field path with a correction instruction.
 
-组织者能看到实际可用工具列表，不能把 shell 打开 URL 当成可点击、上传文件的浏览器工具。停滞审查记录已审查的计数位置；总无进展计数保留，再发生 12 轮无进展才重复同类审查，避免超过阈值后每一轮都调用组织者。纯汇报和重复读取仍保留独立检测，不因重写结论清零。
+Supported check keys are `npm:<project>:<script>`, `npm-start:<project>:<script>`, `npm-install:<project>`, `program:<cargo|git|node|python>:<project>:<args-json>`, and `http-probe:<exact-local-url>`. Shell command strings are not check identifiers. Permissions and task scope must authorize each operation; do not add unrelated tests, builds or installs.
 
-## 日志与界面
+## Browser and other live resources
 
-`scheduler/state` 保存工作状态、输入、真实操作和返回；`organizer/start`、`organizer/decision`、`organizer/assignment`、`organizer/error` 记录组织与交接。状态快照随任务事件保存到 SQLite；新的人类回合重新安排工作，可引用历史结论和未完成任务树，不自动加载旧源码。
+Task completion and live resource availability are independent. Upload evidence stays in the completed node's history. Before scheduling a consumer, the host checks that the associated browser session, page identity and upload attempt are still active. An active receipt can be reused. An expired or mismatched receipt is reported unavailable and marked `historical`; it describes only that receipt, for example an earlier browser session. The current session, page, upload attempt and load state are host resource facts in `process.current_facts.browser`, together with the producing task. A deprecated producer does not mean the page lost its document, and a later `browser_read` showing the deck loaded with its page count becomes a current fact. The Organizer schedules a fresh open/upload only when the current facts show the document is missing, the file differs, or the session closed. A stale receipt never changes the historical node back to `ready` or proves that the current page loaded the deck. `browser_document_path` is a workspace-relative `.pptx` path; a URL there is rejected with a correction.
 
-Flow 详情显示单元目标、完成条件、上游工作、检查结果和返回摘要。开启上下文调试后可分别查看 Organizer / Worker / Observer 的实际请求，Worker 请求记录执行单元 ID 和工作包。
+`browser_diagnostics` returns the page's recorded requests: every fetch/XHR call with method, URL, status, time, duration and failure, plus font and resource timing entries, filterable by `url_contains` and `category`. `request_coverage` states what the record cannot see. An empty result explains that nothing matched in the observed scope, not that no request happened. A browser-observed `/api/fonts` 200 and a server-side `http_probe` 200 are separate facts.
+
+Network, font-request and diagnostic tasks may not set `visual_goal`. When image input is unavailable, the Worker is told it did not see the screenshot and returns an `unavailable` visual result that cites the screenshot. The task is sealed with `expectation_met=false`, and the same visual goal is not accepted again (`VISUAL_INPUT_UNAVAILABLE`).
+
+HTTP samples and project process observations also retain source identity, time and validity. Expiry or process changes affect whether a new task may reuse a sample, not whether a completed observation happened. New sampling is tied to a real state change or current-state question; it does not rewrite the old fact. A fresh sample is reused with its age. Once the host has marked the latest sample invalid (expired, process change, superseded), a new probe needs no extra reason. Its result includes `previous_sample` with that sample's time, status, age, invalidation reason and whether it was taken before or after the managed service was observed running.
+
+## Recovery and persistence
+
+Organizer network/timeout failures have their own bounded retry counter and do not consume contract correction attempts. Contract errors include a rule ID, field path, submitted value, expected shape and correction guidance. Only repeating the same rule, field and rejected value triggers the repeated-contract stop.
+
+When retries are exhausted, the host persists the failure stage alongside the existing handoff. It retains split suggestions, upstream-problem details, session continuation and other prior handoff data. The saved scheduler is resumable without rerunning completed nodes. Scheduling decisions carry a host-generated call ID and are idempotent across request replay.
+
+New scheduler and Flow snapshots include `schema_version`. Legacy snapshots deserialize with version 0, preserve their saved statuses/results, and are stamped with the current version when restored. Migration never changes an old unfinished node into a successful result.
+
+The Observer reviews the same host input and outputs in parallel. Its suggestions are advisory, never approval gates, and are considered during a normal Organizer decision. There is no additional acknowledgement round. Its input is the node's actual state (`node_state`): reports, returned result, exported values, check outcomes, HTTP samples with URL/status/error/time, process IDs and running state, and browser page/upload/load facts. It also receives the shared current facts. Long lists are shortened, but no object key is dropped by position. Each piece of advice carries the node identity, revision and `observed_at`. Advice written before the node's newer facts reaches the Organizer marked `based_on_older_facts` and cannot override them.

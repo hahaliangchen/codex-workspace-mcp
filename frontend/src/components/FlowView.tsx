@@ -13,6 +13,8 @@ import type { AgentEvent, Task } from '../api.ts'
 import {
   flowState,
   formatDuration,
+  organizerPhaseLabel,
+  organizerProgressTimings,
   reviewMatchesNode,
   type FlowNodeData,
   type FlowObserverNote,
@@ -199,6 +201,9 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
   }, [flow, selectedNodeId])
 
   const durationInfo = useTaskDuration(events, task, running)
+  const organizerProgress = flow.organizerProgress
+    && (debug || (durationInfo.isRunning && !['completed', 'failed', 'cancelled', 'timeout'].includes(flow.organizerProgress.phase)))
+    ? flow.organizerProgress : undefined
 
   const selectedNode = useMemo(() => {
     if (!selectedNodeId) return null
@@ -266,6 +271,12 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
           <button type="button" className={styles.topBarPillBtn} disabled={debugBusy || !task} aria-pressed={debug} onClick={() => { void toggleDebug() }} title="记录此会话后续发送给模型的完整请求；关闭后停止记录并隐藏上下文视图">{debug ? '调试：开' : '调试：关'}</button>
           {debug && <button type="button" className={styles.topBarPillBtn} onClick={() => setShowRequests(true)}>全部请求</button>}
           {debugError && <span role="alert" title={debugError}>调试设置失败</span>}
+          {organizerProgress && (
+            <div className={styles.timeBadge} role="status" title={organizerProgressTimings(organizerProgress)}>
+              <span>组织者：{organizerPhaseLabel(organizerProgress.phase)}</span>
+              {debug && <span className={styles.flowSubtext}>{organizerProgressTimings(organizerProgress)}</span>}
+            </div>
+          )}
           {activeNode && (
             <button
               type="button"
@@ -391,7 +402,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <div className={styles.nodeMetaBar}>
                 <span className={`${styles.nodeStatusBadge} ${styles['status_' + selectedNode.status] ?? ''}`}>
                   {selectedNode.status === 'running' && '⟳ 进行中'}
-                  {selectedNode.status === 'completed' && '✓ 已完成'}
+                  {selectedNode.status === 'completed' && (selectedNode.workUnit?.expectationMet === false ? '⚠ 执行已结束 · 预期未满足' : '✓ 执行已结束')}
                   {selectedNode.status === 'pending' && '○ 待执行'}
                   {selectedNode.status === 'waiting_children' && '⏳ 等待子问题'}
                   {selectedNode.status === 'paused' && '⏸ 待继续'}
@@ -474,13 +485,20 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
                 {!!selectedNode.constraints?.length && <><div className={styles.fieldLabel}>约束</div><ul>{selectedNode.constraints.map((constraint, index) => <li key={index}>{constraint}</li>)}</ul></>}
                 {selectedNode.parentId && <button type="button" className={styles.topBarPillBtn} onClick={() => setSelectedNodeId(selectedNode.parentId ?? null)}>查看父任务</button>}
               </div>}
-              {selectedNode.result && <div className={styles.section}><div className={styles.sectionTitle}>节点结果</div><p>{selectedNode.result.summary}</p>{selectedNode.result.materialIds.length > 0 && <p className={styles.flowSubtext}>材料编号：{selectedNode.result.materialIds.join('、')}</p>}</div>}
+              {selectedNode.result && <div className={styles.section}>
+                <div className={styles.sectionTitle}>节点结果{selectedNode.result.expectationMet === false ? ' · 预期条件未满足' : selectedNode.result.expectationMet === true ? ' · 预期条件满足' : ''}</div>
+                {selectedNode.result.outcome && <p className={styles.flowSubtext}>返回类型：{selectedNode.result.outcome}</p>}
+                <p>{selectedNode.result.summary}</p>
+                {!!selectedNode.result.limitations?.length && <><div className={styles.fieldLabel}>限制与未完成项</div><ul>{selectedNode.result.limitations.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
+                {selectedNode.result.materialIds.length > 0 && <p className={styles.flowSubtext}>材料编号：{selectedNode.result.materialIds.join('、')}</p>}
+              </div>}
               {selectedNode.workUnit && <div className={styles.section}>
                 <div className={styles.sectionTitle}>当前执行单元 · {selectedNode.workUnit.done ? '已完成' : selectedNode.workUnit.status === 'running' ? '执行中' : '待执行'}</div>
                 <p>{selectedNode.workUnit.goal}</p><div className={styles.fieldLabel}>完成条件</div><p>{selectedNode.workUnit.doneWhen}</p>
                 {!!selectedNode.workUnit.upstreamIds.length && <p>上游结果：{selectedNode.workUnit.upstreamIds.join('、')}</p>}
                 {!!selectedNode.workUnit.checks.length && <ul>{selectedNode.workUnit.checks.map(check => <li key={check}>{selectedNode.workUnit?.completedChecks.includes(check) ? '✓ ' : selectedNode.workUnit?.failedChecks?.includes(check) ? '✕ ' : '○ '}{check}</li>)}</ul>}
                 {selectedNode.workUnit.outputSummary && <p>{selectedNode.workUnit.outputSummary}</p>}
+                {selectedNode.workUnit.done && selectedNode.workUnit.expectationMet === false && <p className={styles.flowSubtext}>执行已结束，但预期条件未满足 · {selectedNode.workUnit.outcome ?? '结果待判断'}</p>}
               </div>}
 
               <VisualMaterials events={events} node={selectedNode} />

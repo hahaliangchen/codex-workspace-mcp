@@ -15,7 +15,7 @@ use tokio::net::lookup_host;
 pub const TOOLS: &[&str] = &["http_probe"];
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const MAX_TIMEOUT_MS: u64 = 30_000;
-const REUSE_WINDOW_MS: u64 = 30_000;
+pub const REUSE_WINDOW_MS: u64 = 30_000;
 const MAX_BODY_SUMMARY_BYTES: usize = 2_048;
 
 #[derive(Debug, Deserialize)]

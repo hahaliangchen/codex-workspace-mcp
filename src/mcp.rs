@@ -494,6 +494,16 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    if name == "run_command" {
+        let disabled=json!({"outcome":"disabled","error":"run_command has been removed and was not executed. Use run_program with a supported program and an args array, or use a dedicated project, file, HTTP, or browser tool."});
+        return Ok(json!({"content":[{"type":"text","text":disabled.to_string()}],"structuredContent":disabled}));
+    }
+
+    if crate::program_execution::is_tool(name) {
+        let value=crate::program_execution::execute(workspace,&arguments).await?;
+        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+    }
+
     if crate::http_probe::is_tool(name) {
         let value=crate::http_probe::execute(&arguments).await?;
         return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
@@ -1420,6 +1430,7 @@ pub fn tool_definitions() -> Value {
     ]);
     definitions.as_array_mut().unwrap().extend(crate::project_process::definitions());
     definitions.as_array_mut().unwrap().extend(crate::http_probe::definitions());
+    definitions.as_array_mut().unwrap().extend(crate::program_execution::definitions());
     definitions.as_array_mut().unwrap().extend(crate::browser_control::definitions());
     for tool in definitions.as_array_mut().into_iter().flatten() {
         let name=tool["name"].as_str().unwrap_or("");
@@ -1434,4 +1445,22 @@ pub fn tool_definitions() -> Value {
         }
     }
     definitions
+}
+
+#[cfg(test)]
+mod native_tool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_run_command_is_disabled_and_native_tool_is_advertised() {
+        let root=std::env::current_dir().unwrap();
+        let workspace=Workspace::new(&root).unwrap();
+        let result=call_tool(&workspace,json!({"name":"run_command","arguments":{"command":"echo should-not-run"}})).await.unwrap();
+        assert_eq!(result["structuredContent"]["outcome"],"disabled");
+        assert!(result["structuredContent"]["error"].as_str().unwrap().contains("run_program"));
+        let definitions=tool_definitions();
+        let names=definitions.as_array().unwrap().iter().filter_map(|tool|tool["name"].as_str()).collect::<Vec<_>>();
+        assert!(names.contains(&"run_program"));
+        assert!(!names.contains(&"run_command"));
+    }
 }

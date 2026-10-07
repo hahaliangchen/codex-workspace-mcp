@@ -245,15 +245,18 @@ impl WorkState {
         if investigation {
             self.investigation_streak += 1;
             self.repeated_streak = if repeated { self.repeated_streak + 1 } else { 0 };
-        } else if name=="run_command" || crate::project_process::is_execution(name) || (matches!(name, "write_file" | "replace_range" | "edit_file") && result["changed"]!=false) {
+        } else if crate::project_process::is_execution(name) || (matches!(name, "write_file" | "replace_range" | "edit_file") && result["changed"]!=false) {
             self.investigation_streak = 0;
             self.repeated_streak = 0;
             self.execution_this_step = true;
             self.completed_actions.push(json!({"step":step,"tool":name,
                 "historical":false,
                 "node_id":self.current_node,
-                "work_id":self.current_unit,"process_id":result["process_id"],"script":result["script"],"ready":result["ready"],"changes":result["changes"],"exit_code":result["status"],"changed":result["changed"],
-                "target":args.get("path").or_else(||args.get("command")).and_then(Value::as_str).map(|text|short(text, 200)),
+                "work_id":self.current_unit,"process_id":result["process_id"],"script":result["script"],"program":result["program"],"args":result["args"],"ready":result["ready"],"changes":result["changes"],
+                "exit_code":if name=="run_program" {result["process_exit_code"].clone()} else {result["status"].clone()},
+                "process_success":result["process_success"],"outcome":result["outcome"],"changed":result["changed"],
+                "target":if name=="run_program" {Some(short(&format!("{} {}",result["program"].as_str().unwrap_or(""),result["args"]),200))}
+                    else {args.get("path").or_else(||args.get("command")).and_then(Value::as_str).map(|text|short(text,200))},
                 "result":short(&result.to_string(), 400)}));
             let changed_path = result.get("path").or_else(||args.get("path")).and_then(Value::as_str).map(|path|path.replace('\\', "/"));
             for (path, file) in &mut self.files {
@@ -499,7 +502,7 @@ impl ObserverInbox {
             if !identity.is_null() && !crate::observer_service::applies(identity,&self.scope) {item["archived"]=json!(true);}
         }
     }
-    pub fn unhandled(&self)->Vec<Value> {self.pending().into_iter().filter(|item|item["disposition"]=="unread").collect()}
+    pub fn unhandled(&self)->Vec<Value> {self.pending().into_iter().filter(|item|item["disposition"]=="unread"&&item["organizer_consumption"].is_null()).collect()}
     pub fn historical(&self)->Vec<Value> {
         self.items.values().filter(|item|item["request_id"]==self.request_id && item["archived"]==true).rev().take(4).cloned().collect()
     }
@@ -614,6 +617,7 @@ impl ObserverInbox {
         }
         self.items.insert(id.clone(), json!({"id":id,"issue_key":short(key, 80),
             "request_id":request_id,"identity":review["identity"],"review_id":review["review_id"],"source_event_id":review["source_event_id"],"source_event_seq":review["source_event_seq"],"turn":review["turn"],"stage":review["stage"],
+            "observed_at":review["observed_at"],"execution_revision":review["execution_revision"],
             "archived":request_id != self.request_id || (!review["identity"].is_null() && !self.scope.is_null() && !crate::observer_service::applies(&review["identity"],&self.scope)),
             "category":category,"visual_artifacts":review["visual_artifacts"],"visual_check_result":review["visual_check_result"],
             "summary":review["summary"],"suggestions":review["suggestions"],"findings":review["findings"],"target":review["target"],"supersedes_advice_id":previous,
@@ -633,8 +637,26 @@ impl ObserverInbox {
     }
 
     pub fn all_unread(&self) -> Vec<String> {
-        self.items.values().filter(|item|self.is_current(item) && item["disposition"] == "unread")
+        self.items.values().filter(|item|self.is_current(item) && item["disposition"] == "unread" && item["organizer_consumption"].is_null())
             .filter_map(|item|item["id"].as_str().map(str::to_owned)).collect()
+    }
+
+    /// The next normal Organizer decision is the consumption point for delivered
+    /// Observer advice. Recording it on the host avoids a separate acknowledge
+    /// round and keeps the original advice plus the consuming decision auditable.
+    pub fn record_organizer_consumption(&mut self, advice_ids:&[String],decision:&Value,turn:usize,step:usize)->Vec<Value> {
+        if !matches!(decision["action"].as_str(),Some("work"|"select"|"continue"|"revisit"|"finish"|"blocked")) {return Vec::new();}
+        let action=decision["action"].as_str().unwrap_or("");
+        let work_ids=decision["orders"].as_array().into_iter().flatten().filter_map(|order|order["id"].as_str()).collect::<Vec<_>>();
+        let mut consumed=Vec::new();
+        for id in advice_ids {
+            let Some(item)=self.items.get_mut(id) else {continue;};
+            if item["delivered"]!=true||item["disposition"]!="unread"||!item["organizer_consumption"].is_null() {continue;}
+            item["organizer_consumption"]=json!({"turn":turn,"step":step,"decision_id":decision["decision_id"],
+                "action":action,"work_ids":work_ids});
+            consumed.push(item.clone());
+        }
+        consumed
     }
 
     pub fn snapshot(&self) -> Value { serde_json::to_value(self).unwrap_or_else(|_|json!({})) }
@@ -709,6 +731,21 @@ mod observer_request_tests {
         restored.start_turn();
         assert_eq!(restored.pending().len(),1);
         assert_eq!(restored.snapshot()["items"].as_object().unwrap().len(),4);
+    }
+
+    #[test]
+    fn organizer_decision_consumes_delivered_advice_without_a_response_round() {
+        let mut inbox=ObserverInbox::default();inbox.start_request(7);
+        inbox.insert(&review(7,"scope","Pass the service URL to the font check"));
+        let delivered=inbox.deliver();let ids=delivered.iter().filter_map(|item|item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        assert_eq!(inbox.unhandled().len(),1);
+        let decision=json!({"decision_id":"task:7:2","action":"work","orders":[{"id":"work_7_2"}]});
+        let consumed=inbox.record_organizer_consumption(&ids,&decision,7,2);
+        assert_eq!(consumed.len(),1);
+        assert_eq!(consumed[0]["organizer_consumption"]["decision_id"],"task:7:2");
+        assert!(inbox.unhandled().is_empty());
+        assert!(inbox.all_unread().is_empty());
+        assert_eq!(inbox.snapshot()["items"][ids[0].as_str()]["summary"],"Pass the service URL to the font check");
     }
 
     #[test]

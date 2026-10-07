@@ -7,6 +7,9 @@ use serde_json::{Value, json};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskTree {
+    /// Legacy snapshots omit this field and deserialize as version 0.
+    #[serde(default)]
+    schema_version: u32,
     nodes: BTreeMap<String, TaskNode>,
     active: String,
     source_sets: BTreeMap<String, Value>,
@@ -39,7 +42,12 @@ impl TaskTree {
     pub fn focus(&self) -> &str {
         if !self.active.is_empty(){&self.active}else{self.nodes.values().find(|node|node.parent_id.is_none()).map_or("",|node|node.id.as_str())}
     }
-    pub fn snapshot(&self) -> Value { serde_json::to_value(self).unwrap_or(json!({})) }
+    pub fn snapshot(&self) -> Value {
+        let mut snapshot=serde_json::to_value(self).unwrap_or(json!({}));
+        snapshot["schema_version"]=json!(1);
+        snapshot
+    }
+    pub fn normalize_snapshot_version(&mut self) { self.schema_version=1; }
     pub fn remember_sources(&mut self, mut snapshot: Value, targets: &[String]) {
         snapshot["edit_targets"]=json!(targets);
         if !self.active.is_empty() {self.source_sets.insert(self.active.clone(),snapshot);}
@@ -185,11 +193,31 @@ impl TaskTree {
     pub fn root_finished(&self) -> bool {
         self.enabled() && self.nodes.values().filter(|node|node.parent_id.is_none()).all(|node|terminal(&node.status))
     }
+    /// Record the request-level delivery from the host's finish_request call.
+    /// Work nodes already carry their own sealed outcomes; this only closes
+    /// the grouping root and never rewrites child results.
+    pub fn finish_request(&mut self,summary:&str,achieved:bool)->Result<()> {
+        let root_id=self.nodes.values().find(|node|node.parent_id.is_none()).map(|node|node.id.clone());
+        let Some(root_id)=root_id else {return Ok(());};
+        if achieved {
+            let unfinished=self.nodes.values().filter(|node|node.id!=root_id&&!terminal(&node.status))
+                .map(|node|node.id.clone()).collect::<Vec<_>>();
+            ensure!(unfinished.is_empty(),"cannot mark the request goal achieved while Flow nodes remain unfinished: {}",unfinished.join(", "));
+        }
+        let root=self.nodes.get_mut(&root_id).unwrap();
+        root.status=if achieved{"completed"}else{"blocked"}.to_owned();
+        root.result=Some(json!({"summary":text(&json!({"summary":summary}),"summary",1800),
+            "outcome":if achieved{"completed"}else{"blocked"},"expectation_met":achieved,"material_ids":[],"finding_ids":[]}));
+        self.active=root_id;
+        Ok(())
+    }
     pub fn complete_work(&mut self, output:&Value) -> Result<()> {
         let id=output["node_id"].as_str().unwrap_or("");
         ensure!(output["done"]==true && self.active==id,"host completion must concern the active work node");
         self.apply(&json!({"current_node_id":id,"node_result":{"node_id":id,"status":"completed",
-            "summary":output["summary"],"material_ids":output["material_ids"],"finding_ids":output["finding_ids"]}}))
+            "summary":output["summary"],"material_ids":output["material_ids"],"finding_ids":output["finding_ids"],
+            "outcome":output["outcome"],"expectation_met":output["expectation_met"],
+            "limitations":output["limitations"],"exported_data":output["exported_data"]}}))
     }
     pub fn work_node_ready(&self, id:&str) -> bool {
         self.nodes.get(id).is_some_and(|node|!terminal(&node.status)&&node.status!="blocked") &&
@@ -257,7 +285,7 @@ impl TaskTree {
             ensure!(result["node_id"].as_str().is_some()&&result["status"].as_str().is_some()&&result["summary"].as_str().is_some(),
                 "flow_update.node_result requires string node_id, status and summary fields");
             for key in result.as_object().into_iter().flatten().map(|(key, _)|key.as_str()) {
-                ensure!(matches!(key,"node_id"|"status"|"summary"|"material_ids"|"finding_ids"),
+                ensure!(matches!(key,"node_id"|"status"|"summary"|"material_ids"|"finding_ids"|"outcome"|"expectation_met"|"limitations"|"exported_data"),
                     "flow_update.node_result.{key} is unsupported");
             }
         }
@@ -335,7 +363,11 @@ impl TaskTree {
             let material_ids=result["material_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).take(16).collect::<Vec<_>>();
             let finding_ids=result["finding_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).take(16)
                 .map(|id|id.chars().take(80).collect::<String>()).collect::<Vec<_>>();
-            node.status=status;node.result=Some(json!({"summary":summary,"material_ids":material_ids,"finding_ids":finding_ids}));
+            let mut delivery=json!({"summary":summary,"material_ids":material_ids,"finding_ids":finding_ids,
+                "outcome":result["outcome"],"expectation_met":result["expectation_met"],
+                "limitations":result["limitations"],"exported_data":result["exported_data"]});
+            if result["expectation_met"].is_boolean() {delivery["expectation_met"]=result["expectation_met"].clone();}
+            node.status=status;node.result=Some(delivery);
         }
         let mut target=text(args,"current_node_id",80);
         let legal_ids=self.nodes.keys().cloned().collect::<Vec<_>>().join(", ");

@@ -181,16 +181,14 @@ pub async fn execute_tracked(state: AgentServiceState, task: String, turn: usize
     let before = tokio::task::spawn_blocking(move || capture(&capture_root,&capture_name,&capture_args)).await?;
     let result = if crate::project_process::is_tool(&name) {
         crate::project_process::execute_cancellable(&state.workspace,&name,args.clone(),&cancel).await
-    } else if name != "run_command" {
+    } else if crate::program_execution::is_tool(&name) {
+        crate::program_execution::execute_cancellable(&state.workspace,&args,&cancel).await
+    } else {
         // A started blocking file commit cannot be aborted. Await completion
         // before recording its after-image or releasing the mutation lock.
         if cancel.is_cancelled() { Err(anyhow::anyhow!("Tool execution cancelled")) }
         else { crate::agent_service::execute_tool(state.workspace.clone(),state.tool_catalog.as_deref(),&name,args.clone()).await }
-    } else { tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(anyhow::anyhow!("Tool execution cancelled")),
-        result = crate::agent_service::execute_tool(state.workspace.clone(), state.tool_catalog.as_deref(), &name, args.clone()) => result,
-    } };
+    };
     let background_running=result.as_ref().is_ok_and(|value|value["running"]==true);
     let saved_root=root.clone(); let saved_task=task.clone();
     let changes = tokio::task::spawn_blocking(move || {

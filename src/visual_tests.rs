@@ -68,6 +68,12 @@ async fn visual_dispatch_capability_budget_restore_and_result_binding_are_explic
     let mut body=json!({"model":"fake-model","messages":[]});
     let unknown=visual::prepare_request(&state,"worker","fake-model",&ctx,&ids,"check slide",&mut body).await.unwrap();
     assert_eq!(unknown["status"],"unknown_capability");assert!(images(&body).is_empty());assert!(unknown["images"].as_array().unwrap().is_empty());
+    assert!(body["messages"].to_string().contains("Image input is unavailable"),"the Worker is told it did not see the screenshot");
+    let mut unavailable=json!({"request_trace_id":unknown["request_trace_id"],"checked_goal":"check slide","artifact_ids":[ids[0]],"assessment":"unavailable",
+        "observed_facts":[],"issues":[],"limitations":["image input unavailable"]});
+    assert!(visual::validate_check(&root.0,&ctx,&unavailable,&[unknown.clone()],"worker").is_ok(),"an unavailable result may cite the undelivered screenshot");
+    unavailable["assessment"]=json!("pass");
+    assert!(visual::validate_check(&root.0,&ctx,&unavailable,&[unknown.clone()],"worker").is_err(),"a pass still needs a delivered image");
     supported(&mut state);let mut body=json!({"model":"fake-model","messages":[]});
     let sent=visual::prepare_request(&state,"worker","fake-model",&ctx,&ids,"check slide",&mut body).await.unwrap();
     assert_eq!(images(&body).len(),2);assert_eq!(sent["omitted_by_image_budget"],1);
@@ -179,7 +185,7 @@ async fn visual_fallback_uncertain_or_incomplete_results_cannot_be_promoted_to_p
 }
 
 #[tokio::test]
-async fn saved_visual_pass_expires_when_source_versions_change_before_delivery() {
+async fn saved_visual_pass_does_not_satisfy_delivery_after_source_versions_change() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
     scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"current slide visible","completion":"output","visual_goal":"check slide"}]}),false,false).unwrap();
@@ -191,19 +197,23 @@ async fn saved_visual_pass_expires_when_source_versions_change_before_delivery()
     let mut versions=scheduler.versions();versions.insert("renderer.ts".into(),"changed-source-hash".into());scheduler.update_versions(&versions);
     assert!(scheduler.frame().unwrap().visual_check_result.is_null(),"source version update clears the cached visual result");
     scheduler.frame_mut().unwrap().visual_check_result=saved;
-    assert!(scheduler.return_work(&json!({"summary":"rendering verified"})).is_err(),"delivery rejects a result bound to the previous source version");
+    let returned=scheduler.return_work(&json!({"summary":"A visual result exists, but it predates the current renderer source version",
+        "limitations":["The current renderer version has not been visually verified"]})).unwrap();
+    assert_eq!(scheduler.frame().unwrap().status,crate::work_scheduler::WorkStatus::Done);
+    assert_eq!(returned["expectation_met"],false,"a stale visual pass cannot satisfy current delivery conditions");
+    assert_eq!(returned["visual_check_result"]["assessment"],"pass","the previous result remains historical evidence");
 }
 
 #[derive(Default)]
 struct Script {requests:Mutex<Vec<Value>>,worker_calls:AtomicUsize,organizer_calls:AtomicUsize,url:String}
 fn tool(id:&str,name:&str,args:Value)->Value {json!({"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}})}
 async fn chat(State(script):State<Arc<Script>>,Json(body):Json<Value>)->Json<Value> {
-    let is_organizer=body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="organize_work");
+    let is_organizer=body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="schedule_task"||tool["function"]["name"]=="finish_request");
     let worker=body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="yield_work");
     let dispatch=manifest(&body);script.requests.lock().unwrap().push(body.clone());
     let message=if is_organizer {
         let first=script.organizer_calls.fetch_add(1,Ordering::Relaxed)==0;
-        json!({"role":"assistant","content":null,"tool_calls":[tool("organize","organize_work",if first {json!({"action":"work","reason":"verify pixels","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"bound visual result","completion":"output","visual_goal":"check slide"}]})}else{json!({"action":"finish","reason":"delivered verified transport","summary":"visual transport complete"})})]})
+        json!({"role":"assistant","content":null,"tool_calls":[if first {tool("schedule","schedule_task",json!({"goal":"check slide","return_when":"bound visual result","reason":"verify pixels","completion":"output","execution_scope":{"visual_goal":"check slide"}}))}else{tool("finish","finish_request",json!({"summary":"visual transport complete","achieved":true}))}]})
     }else if worker {
         let first=script.worker_calls.fetch_add(1,Ordering::Relaxed)==0;
         json!({"role":"assistant","content":null,"tool_calls":if first {vec![tool("open","browser_open",json!({"url":script.url})),tool("shot","browser_screenshot",json!({}))]}else{vec![tool("yield","yield_work",json!({"summary":"visual transport checked","visual_check_result":check(&dispatch)}))]}})

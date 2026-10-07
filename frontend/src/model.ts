@@ -386,7 +386,8 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
   for (const event of events) {
     if (event.type === 'tool/call') calls.set(stringOf(event.data.callId) ?? '', event)
   }
-  return events.filter((event) => event.type !== 'assistant/delta' && event.type !== 'observer/config' && !event.type.startsWith('debug/')).map((event) => {
+  return events.filter((event) => event.type !== 'assistant/delta' && event.type !== 'observer/config' && !event.type.startsWith('debug/')
+    && (event.type !== 'organizer/progress' || terminalOrganizerPhases.has(String(event.data.phase)))).map((event) => {
     const data = event.data
     const base = {
       key: `${event.type}:${event.seq}`,
@@ -409,6 +410,13 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         return { ...base, detail: assistantDisplay(textOf(messageOf(event).content), '').text }
       case 'tool/call':
         return { ...base, name: stringOf(data.name), detail: argumentsOf(data.arguments) }
+      case 'organizer/progress': {
+        const phase = stringOf(data.phase) ?? ''
+        const progress: FlowOrganizerProgress = { phase, turn: numberOf(data.turn) ?? 0, time: event.time, elapsedMs: numberOf(data.elapsed_ms),
+          responseHeadersMs: numberOf(data.response_headers_ms), firstChunkMs: numberOf(data.first_chunk_ms), firstDeltaMs: numberOf(data.first_delta_ms),
+          firstToolDeltaMs: numberOf(data.first_tool_delta_ms), receivedBytes: numberOf(data.received_bytes) }
+        return { ...base, name: organizerPhaseLabel(phase), detail: organizerProgressTimings(progress), durationMs: progress.elapsedMs, failed: phase !== 'completed' }
+      }
       case 'tool/result': {
         const result = resultOf(event)
         const call = calls.get(callIdOfResult(event) ?? '')
@@ -632,6 +640,8 @@ export interface FlowWorkUnit {
   readonly completedChecks: readonly string[]
   readonly failedChecks?: readonly string[] | undefined
   readonly outputSummary?: string | undefined
+  readonly outcome?: string | undefined
+  readonly expectationMet?: boolean | undefined
 }
 
 export interface FlowRewindRecord {
@@ -660,7 +670,7 @@ export interface FlowNodeData {
   readonly doneWhen?: string | undefined
   readonly workUnit?: FlowWorkUnit | undefined
   readonly constraints?: readonly string[] | undefined
-  readonly result?: { readonly summary: string; readonly materialIds: readonly number[] } | undefined
+  readonly result?: { readonly summary: string; readonly materialIds: readonly number[]; readonly outcome?: string | undefined; readonly expectationMet?: boolean | undefined; readonly limitations?: readonly string[] | undefined } | undefined
   readonly progress: readonly FlowProgressReport[]
   readonly tools: readonly FlowToolExecution[]
   readonly consults: readonly FlowObserverConsult[]
@@ -683,7 +693,51 @@ export interface FlowEdgeData {
   readonly deprecated?: boolean | undefined
 }
 
+export type OrganizerPhase = 'waiting_response' | 'waiting_first_delta' | 'reasoning' | 'receiving_decision' | 'completed' | 'failed' | 'cancelled' | 'timeout'
+
+const organizerPhaseLabels: Record<OrganizerPhase, string> = {
+  waiting_response: '等待响应',
+  waiting_first_delta: '已连接，等待首个增量',
+  reasoning: '正在推理',
+  receiving_decision: '正在接收决策',
+  completed: '决策已完成',
+  failed: '决策请求失败',
+  cancelled: '已取消',
+  timeout: '请求超时',
+}
+
+const terminalOrganizerPhases = new Set<string>(['completed', 'failed', 'cancelled', 'timeout'])
+
+export function organizerPhaseLabel(phase: string): string {
+  return organizerPhaseLabels[phase as OrganizerPhase] ?? phase
+}
+
+/** Latest Organizer request state; all times are milliseconds after the request started, null when not received. */
+export interface FlowOrganizerProgress {
+  readonly phase: string
+  readonly turn: number
+  readonly step?: number | undefined
+  readonly nodeId?: string | undefined
+  readonly time: number
+  readonly elapsedMs?: number | undefined
+  readonly responseHeadersMs?: number | undefined
+  readonly firstChunkMs?: number | undefined
+  readonly firstDeltaMs?: number | undefined
+  readonly firstToolDeltaMs?: number | undefined
+  readonly receivedBytes?: number | undefined
+  readonly reasoningChars?: number | undefined
+  readonly toolArgumentBytes?: number | undefined
+}
+
+export function organizerProgressTimings(progress: FlowOrganizerProgress): string {
+  const ms = (label: string, value: number | undefined) => `${label} ${value === undefined ? '—' : `${value}ms`}`
+  return [ms('响应头', progress.responseHeadersMs), ms('首块', progress.firstChunkMs), ms('首增量', progress.firstDeltaMs),
+    ms('首个工具增量', progress.firstToolDeltaMs), ms('已用', progress.elapsedMs),
+    `接收 ${progress.receivedBytes ?? 0} 字节`].join(' · ')
+}
+
 export interface FlowState {
+  readonly organizerProgress?: FlowOrganizerProgress | undefined
   readonly nodeReviews: readonly FlowNodeReview[]
   readonly currentWork?: FlowWorkUnit | undefined
   readonly nodes: readonly FlowNodeData[]
@@ -761,7 +815,7 @@ function createFlowNode(
   doneWhen?: string | undefined
   workUnit?: FlowWorkUnit | undefined
   constraints?: string[] | undefined
-  result?: { summary: string; materialIds: number[] } | undefined
+  result?: { summary: string; materialIds: number[]; outcome?: string | undefined; expectationMet?: boolean | undefined; limitations?: readonly string[] | undefined } | undefined
   progress: FlowProgressReport[]
   tools: FlowToolExecution[]
   consults: FlowObserverConsult[]
@@ -797,6 +851,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
   const observerNotes: FlowObserverNote[] = []
   const nodeReviews = new Map<string, FlowNodeReview>()
   let observerRetrospective: FlowObserverRetrospective | undefined
+  let organizerProgress: FlowOrganizerProgress | undefined
   const nodeKey = (id: string, turn = currentTurn) => 'turn_' + turn + ':' + id
   const nodeMap = new Map<string, ReturnType<typeof createFlowNode>>()
   const edges: FlowEdgeData[] = []
@@ -819,7 +874,10 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     node.constraints = observerStringList(raw.constraints)
     const result = raw.result as Record<string, unknown> | null | undefined
     node.result = result && typeof result.summary === 'string' ? { summary: result.summary,
-      materialIds: Array.isArray(result.material_ids) ? result.material_ids.filter((id): id is number => typeof id === 'number') : [] } : undefined
+      materialIds: Array.isArray(result.material_ids) ? result.material_ids.filter((id): id is number => typeof id === 'number') : [],
+      outcome: stringOf(result.outcome),
+      expectationMet: typeof result.expectation_met === 'boolean' ? result.expectation_met : undefined,
+      limitations: observerStringList(result.limitations) } : undefined
   }
 
   for (const event of events) {
@@ -829,7 +887,19 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
       case 'turn/start':
         currentTurn = Math.max(currentTurn, turn)
         currentWork = undefined
+        organizerProgress = undefined
         organizedMode = 'direct'; activePath = []; unfinishedTree = false
+        break
+      case 'organizer/start':
+        organizerProgress = { phase: 'waiting_response', turn, step: numberOf(data.step), nodeId: stringOf(data.nodeId), time: event.time }
+        break
+      case 'organizer/progress':
+        organizerProgress = {
+          phase: stringOf(data.phase) ?? 'waiting_response', turn, step: numberOf(data.step), nodeId: stringOf(data.nodeId), time: event.time,
+          elapsedMs: numberOf(data.elapsed_ms), responseHeadersMs: numberOf(data.response_headers_ms), firstChunkMs: numberOf(data.first_chunk_ms),
+          firstDeltaMs: numberOf(data.first_delta_ms), firstToolDeltaMs: numberOf(data.first_tool_delta_ms), receivedBytes: numberOf(data.received_bytes),
+          reasoningChars: numberOf(data.reasoning_chars), toolArgumentBytes: numberOf(data.tool_argument_bytes),
+        }
         break
       case 'user/message': {
         currentTurn = Math.max(currentTurn, turn)
@@ -1133,6 +1203,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
             done: frame.status === 'done', goal: stringOf(order.goal) ?? '', doneWhen: stringOf(order.done_when) ?? '',
             upstreamIds: observerStringList(order.upstream_ids), checks: observerStringList(order.checks),
             completedChecks: Object.keys(checked ?? {}), outputSummary: stringOf(output?.summary),
+            outcome: stringOf(output?.outcome), expectationMet: typeof output?.expectation_met === 'boolean' ? output.expectation_met : undefined,
             failedChecks: Object.keys((frame.check_errors as Record<string, unknown> | undefined) ?? {}),
           }
           if (order.id === state?.current) currentWork = work
@@ -1151,7 +1222,8 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           if (!treeTurns.has(turn)) {
             node.title = (numberOf(order.revision) ?? 1) > 1 ? `${work.goal} (r${order.revision})` : (work.goal || node.title)
             node.status = isInvalidated ? 'deprecated' : work.done ? 'completed' : state?.finished === true || output?.blocked === true ? 'blocked' : work.status === 'running' ? 'running' : 'pending'
-            if (work.outputSummary) node.result = { summary: work.outputSummary, materialIds: [] }
+            if (work.outputSummary) node.result = { summary: work.outputSummary, materialIds: [], outcome: work.outcome,
+              expectationMet: work.expectationMet }
           } else if (isInvalidated) {
             node.status = 'deprecated'
           }
@@ -1410,7 +1482,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     planRevision: node.planRevision,
     invalidatedByPlanRevision: node.invalidatedByPlanRevision,
   }))
-  return { nodes, edges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, currentWork,
+  return { nodes, edges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, organizerProgress, currentWork,
     organizedMode, organizedTurn: currentTurn, activePath, unfinishedTree,
     planRevision: currentPlanRevision,
     rewindRecords: Array.from(rewindRecordsMap.values()),

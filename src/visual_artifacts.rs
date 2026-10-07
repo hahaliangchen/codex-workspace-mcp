@@ -233,7 +233,13 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
         manifest["visual_service_result"]=result.clone();manifest["visual_service_route"]=fallback_metadata["model_route"].clone();
         messages.push(json!({"role":"system","content":format!("Host visual service result (the current role did not receive images): {}. Source images: {}. Preserve this provenance; do not claim your own direct image inspection.",result,manifest["images"])}));
         crate::agent_service::emit(state.workspace.root(),context.task_id(),"visual/service_result",json!({"manifest":manifest,"result":result,"elapsed_ms":started.elapsed().as_millis()})).await?;
-    } else {manifest["status"]=json!(if capability==ImageCapability::Unknown {"unknown_capability"}else{"unavailable"});manifest["selected_images"]=manifest["images"].take();manifest["images"]=json!([]);}
+    } else {
+        manifest["status"]=json!(if capability==ImageCapability::Unknown {"unknown_capability"}else{"unavailable"});manifest["selected_images"]=manifest["images"].take();manifest["images"]=json!([]);
+        let captured=manifest["selected_images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>();
+        manifest["image_input_unavailable"]=json!({"reason":if capability==ImageCapability::Unknown {"image capability of this model is unknown and no fallback visual service is configured"}else{"this model does not accept images and no fallback visual service is configured"},
+            "captured_artifact_ids":captured});
+        messages.push(json!({"role":"system","content":format!("Image input is unavailable for this request: {}. The screenshots {captured:?} exist and can be delivered to the user, but you did not see them. Do not capture again or claim any visual observation. Return now with yield_work: cite these artifact IDs, set visual_check_result.assessment=\"unavailable\", and list the missing visual inspection under limitations.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or(""))}));
+    }
     let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
         "checked_goal":goal,"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
         "observed_facts":[{"artifact_id":manifest["images"][0]["artifact_id"],"region":"describe the inspected region","fact":"replace this with actual visible evidence"}],"issues":[],"limitations":[]});
@@ -261,8 +267,13 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
             && request["related_source_versions"]==context.related_source_versions
             && request["current_page"]==context.current_page,
             "project files or the current page changed after the image request; perform current visual verification");
+        // An unavailable/uncertain result may cite the screenshots that were
+        // selected but could not be delivered to the model.
+        let undelivered_allowed=!matches!(assessment,"pass"|"issue");
         for id in ids {
-            ensure!(request["images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==*id),"visual result cites an image never sent in the referenced request");
+            let sent=request["images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==*id);
+            let selected=undelivered_allowed&&request["selected_images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==*id);
+            ensure!(sent||selected,"visual result cites an image never sent in the referenced request");
         }
     }
     if matches!(assessment,"pass"|"issue") {

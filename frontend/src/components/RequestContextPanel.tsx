@@ -7,7 +7,7 @@ import { foldImageData } from '../visual.ts'
 function text(value: unknown): string { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '' }
 function messageLabel(message: Record<string, unknown>): string {
   const content = text(message.content)
-  if (content.startsWith('Current work packet')) return '当前工作入参 · 目标、上游结果、完成条件'
+  if (content.startsWith('Current work packet')) return '当前工作入参 · 目标、上游结果、HTTP 观测、完成条件'
   if (content.startsWith('Current task-tree node')) return '当前节点 · 祖先目标与子问题结果'
   if (content.startsWith('Previous unfinished task-tree summary')) return '可恢复的任务树摘要'
   if (content.startsWith('Current task and historical')) return '当前任务与历史摘要'
@@ -26,6 +26,18 @@ function messageLabel(message: Record<string, unknown>): string {
   if (content.startsWith('Current live Flow plan')) return '当前任务流与进度'
   return String(message.role ?? 'message') + (message.tool_call_id ? ` · ${String(message.tool_call_id)}` : '')
 }
+/** Times are relative to the request start; a missing value means it was not received. */
+function streamTimings(outcome: unknown): string {
+  if (!outcome || typeof outcome !== 'object') return ''
+  const value = outcome as Record<string, unknown>
+  if (value.response_format === undefined && value.format === undefined) return ''
+  const ms = (label: string, key: string) => `${label} ${typeof value[key] === 'number' ? `${value[key] as number}ms` : '未收到'}`
+  return [`格式 ${String(value.response_format ?? value.format)}`, ms('响应头', 'response_headers_ms'), ms('首块', 'first_chunk_ms'),
+    ms('首增量', 'first_delta_ms'), ms('首个工具增量', 'first_tool_delta_ms'), ms('完成', 'response_complete_ms'),
+    `finish_reason ${String(value.finish_reason ?? '—')}`, `[DONE] ${value.received_done === true ? '已收到' : '未收到'}`,
+    `${String(value.received_bytes ?? 0)} 字节`].join(' · ')
+}
+
 const statuses: Record<string, string> = { pending: '请求中', completed: '已收到完整响应', interrupted: '请求中断或超时', failed: '失败', http_error: 'HTTP 错误', transport_error: '连接失败', stream_error: '流响应失败' }
 
 const JsonDetails = memo(function JsonDetails({ title, value }: { title: string; value: unknown }) {
@@ -163,6 +175,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
       {active.compaction && <JsonDetails title={`历史裁剪：移除 ${active.compaction.omitted_raw_message_count} 条原始消息，截短 ${active.compaction.shortened_messages.length} 条`} value={active.compaction} />}
       {predecessor && <label className={css.compare}><input type="checkbox" checked={compare} onChange={event => setCompare(event.target.checked)} />与上一条同角色请求比较（轮 {predecessor.turn} / 步骤 {predecessor.step}）</label>}
       {changes && <p>新增或变更消息 {changes.added.filter(Boolean).length} 条 · 上一请求中移除或被替换的消息 {changes.removed} 条。按完整消息匹配，摘要更新也算变更。</p>}
+      {streamTimings(context.metadata.outcome) && <p className={css.hint}>{streamTimings(context.metadata.outcome)}</p>}
       <div className={css.actions}>
         <button type="button" onClick={() => { void navigator.clipboard.writeText(JSON.stringify(context, null, 2)).then(() => setCopied(true)).catch(reason => setError(String(reason))) }}>{copied ? '已复制' : '复制请求及调试信息'}</button>
       </div>

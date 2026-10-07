@@ -25,10 +25,10 @@ import type { ToolResult } from '../model.ts'
 import { VisualArtifactPreview } from './VisualMaterials.tsx'
 import type { VisualRecord } from '../visual.ts'
 
-const SUMMARY_FIELDS = ['path', 'file_path', 'TargetFile', 'AbsolutePath', 'query', 'pattern', 'command', 'CommandLine', 'symbol', 'symbol_id', 'name', 'prompt', 'area']
+const SUMMARY_FIELDS = ['path', 'file_path', 'TargetFile', 'AbsolutePath', 'query', 'pattern', 'command', 'CommandLine', 'program', 'symbol', 'symbol_id', 'name', 'prompt', 'area']
 
 function iconFor(name: string): ReactNode {
-  if (name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) {
+  if (name === 'run_program' || name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) {
     return (
       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
         <rect x="1.5" y="1.5" width="13" height="13" rx="3" stroke="currentColor" />
@@ -70,6 +70,7 @@ function iconFor(name: string): ReactNode {
 }
 
 function titleFor(name: string): string {
+  if (name === 'run_program') return '运行了程序'
   if (name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) return '运行了命令'
   if (/write|edit|replace|apply|patch/.test(name)) return '编辑了文件'
   if (/read|view_file/.test(name)) return '读取了文件'
@@ -248,12 +249,34 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
   const args = useMemo(() => parse(rawArguments), [rawArguments])
   const state = result === undefined ? (stopped ? 'stopped' : 'running') : result.isError ? 'error' : 'ok'
   const running = state === 'running'
+  const nativeParsed = name === 'run_program' && result ? parse(result.text) : undefined
+  const nativeResult = typeof nativeParsed === 'object' && nativeParsed !== null ? nativeParsed as Record<string, unknown> : undefined
+  const nativeDiagnostics = nativeResult
+    ? [
+        ...(['stdout', 'stderr'] as const).flatMap((stream) => {
+          const decodeError = nativeResult[`${stream}_decode_error`]
+          const readError = nativeResult[`${stream}_read_error`]
+          return [
+            typeof decodeError === 'string' && decodeError.length > 0
+              ? `${stream} UTF-8 解码失败：${decodeError}（原始字节保留在 ${stream}_raw_base64）`
+              : undefined,
+            nativeResult[`${stream}_truncated`] === true ? `${stream} 输出已截断` : undefined,
+            typeof readError === 'string' && readError.length > 0 ? `${stream} 管道读取失败：${readError}` : undefined,
+          ]
+        }),
+      ].filter((message): message is string => typeof message === 'string')
+    : []
   const visualArtifact = useMemo(() => {
     const value = result ? parse(result.text) as VisualRecord : null
     return value && typeof value === 'object' && value.visual_artifact ? value.visual_artifact as VisualRecord : undefined
   }, [result])
   const errorLine = result?.isError === true ? result.text.split('\n')[0] ?? '' : ''
-  const summaryText = errorLine !== '' ? errorLine : summaryOf(args)
+  const nativeSummary = nativeResult
+    ? nativeResult.outcome === 'exited'
+      ? `退出码 ${String(nativeResult.process_exit_code ?? '未知')}${nativeDiagnostics.length > 0 ? ` · ${nativeDiagnostics.length} 项输出诊断` : ''}`
+      : `${String(nativeResult.outcome ?? '未启动')}${nativeResult.error_message ? ` · ${String(nativeResult.error_message)}` : ''}${nativeDiagnostics.length > 0 ? ` · ${nativeDiagnostics.length} 项输出诊断` : ''}`
+    : ''
+  const summaryText = name === 'run_program' ? nativeSummary : errorLine !== '' ? errorLine : summaryOf(args)
   const duration = result?.durationMs === undefined ? null : `${result.durationMs} ms`
 
   const diffs = useMemo(() => extractDiffHunks(name, args, result), [name, args, result])
@@ -344,14 +367,25 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
   )
 
   const childTaskId = result?.childTaskId
-  const isCommand = name === 'run_command' || /bash|shell|exec/.test(name)
+  const isCommand = name === 'run_program' || name === 'run_command' || /bash|shell|exec/.test(name)
   const cmdRecord = typeof args === 'object' && args !== null ? (args as Record<string, unknown>) : {}
-  const commandStr = String(cmdRecord.command ?? cmdRecord.CommandLine ?? summaryText)
-  const cwdStr = typeof cmdRecord.cwd === 'string'
+  const nativeArgs = Array.isArray(cmdRecord.args) ? cmdRecord.args.map(value => JSON.stringify(String(value))).join(' ') : ''
+  const commandStr = name === 'run_program'
+    ? `${String(cmdRecord.program ?? '')}${nativeArgs ? ` ${nativeArgs}` : ''}`
+    : String(cmdRecord.command ?? cmdRecord.CommandLine ?? summaryText)
+  const cwdStr = typeof cmdRecord.project_path === 'string'
+    ? cmdRecord.project_path
+    : typeof cmdRecord.cwd === 'string'
     ? cmdRecord.cwd
     : typeof cmdRecord.Cwd === 'string'
       ? cmdRecord.Cwd
       : undefined
+  const nativeOutput = nativeResult
+    ? [nativeResult.stdout, nativeResult.stderr, nativeResult.error_message ? `Error: ${String(nativeResult.error_message)}` : undefined,
+        ...nativeDiagnostics.map((message) => `Output diagnostic: ${message}`)]
+      .filter((part): part is string => typeof part === 'string' && part.length > 0).join('\n')
+    : undefined
+  const nativeExitCode = typeof nativeResult?.process_exit_code === 'number' ? nativeResult.process_exit_code : null
 
   return (
     <div className={css.root} data-variant="generic" data-tool={name} data-state={state}>
@@ -379,8 +413,8 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
                   <TerminalBlock
                     command={commandStr}
                     cwd={cwdStr}
-                    output={result?.text}
-                    exitCode={result === undefined ? undefined : result.isError ? 1 : 0}
+                    output={name === 'run_program' ? nativeOutput : result?.text}
+                    exitCode={name === 'run_program' ? nativeExitCode : result === undefined ? undefined : result.isError ? 1 : 0}
                     running={running}
                     labels={terminalLabels}
                   />

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -38,24 +39,67 @@ fn valid_instance(identity: &Value, scope: &Value) -> bool {
 fn short(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
+const ARRAY_ITEMS: usize = 12;
+
+/// Shortens long text and long lists but keeps every object key: a status code
+/// or sample time must not vanish because it sorts after other fields.
 fn compact(value: &Value, limit: usize) -> Value {
     match value {
         Value::String(text) => json!(short(text, limit)),
-        Value::Array(items) => json!(
-            items
+        Value::Array(items) => {
+            let mut kept = items
                 .iter()
-                .take(8)
-                .map(|v| compact(v, limit / 2))
-                .collect::<Vec<_>>()
-        ),
+                .take(ARRAY_ITEMS)
+                .map(|v| compact(v, (limit / 2).max(160)))
+                .collect::<Vec<_>>();
+            if items.len() > ARRAY_ITEMS {
+                kept.push(json!({"omitted_items":items.len()-ARRAY_ITEMS}));
+            }
+            json!(kept)
+        }
         Value::Object(map) => Value::Object(
             map.iter()
-                .take(16)
-                .map(|(k, v)| (k.clone(), compact(v, limit / 2)))
+                .map(|(k, v)| (k.clone(), compact(v, (limit / 2).max(160))))
                 .collect(),
         ),
         _ => value.clone(),
     }
+}
+
+/// Late or replayed advice is matched against the node's newer facts. It stays
+/// visible, but the Organizer is told the current facts take precedence.
+pub fn annotate_advice(items: Vec<Value>, scheduler: &crate::work_scheduler::WorkScheduler) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            let work = item["identity"]["work_id"].as_str().unwrap_or("");
+            let latest = scheduler.latest_fact_at(work);
+            if let Some(observed) = item["observed_at"].as_u64() {
+                if latest > observed {
+                    item["based_on_older_facts"] = json!(true);
+                    item["newer_facts_at"] = json!(latest);
+                }
+            }
+            item
+        })
+        .collect()
+}
+
+fn fact_texts(facts: &Value) -> Value {
+    json!(facts.as_array().into_iter().flatten().filter_map(|fact|fact["text"].as_str()).map(|text|short(text,400)).collect::<Vec<_>>())
+}
+
+/// The node's actual state: status, reports (intent), returned result and the
+/// recorded HTTP/process/browser/check values with their times.
+fn node_state(facts: &Value) -> Value {
+    if facts.is_null() {
+        return Value::Null;
+    }
+    let mut state = compact(facts, 1200);
+    if let Some(object) = state.as_object_mut() {
+        object.remove("operations");
+    }
+    state
 }
 
 /// Goal, decision and delivery summary are protected. Optional fields are
@@ -64,12 +108,17 @@ pub fn pack(mut input: Value, path: &[Value], memories: &[Value]) -> Value {
     let mut packed = json!({"identity":input["identity"],"review_id":input["review_id"],"source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],
         "organizer_decision_id":input["organizer_decision_id"],"stage":input["stage"],"request":input["request"],
         "organizer_decision":compact(&input["organizer_decision"],1500),"delivery":{"summary":input["delivery"]["summary"],
-            "status":input["delivery"]["status"],"exported_fields":input["delivery"]["exported_fields"],
+            "status":input["delivery"]["status"],"exported_data":compact(&input["delivery"]["exported_data"],1200),
             "handoff_summary":input["delivery"]["handoff"]["summary"],"intent":input["delivery"]["handoff"]["intent"],
+            "stall":input["delivery"]["handoff"]["stall"],
             "upstream_problem":compact(&input["delivery"]["handoff"]["upstream_problem"],800)},
         "current_node":{"goal":input["current_node"]["goal"],"done_when":input["current_node"]["done_when"]},
+        "observed_at":input["observed_at"],"node_state":node_state(&input["node_facts"]),
+        "current_facts":{"http":fact_texts(&input["current_facts"]["http"]),"browser":compact(&input["current_facts"]["browser"],600),
+            "earlier_observations":fact_texts(&input["current_facts"]["historical_observations"])},
         "visual_artifacts":input["visual_artifacts"],"visual_check_result":input["visual_check_result"],"visual_capture":input["visual_capture"],"allowed_visual_artifact_ids":input["allowed_visual_artifact_ids"]});
     let optional = [
+        ("node_operations", compact(&input["node_facts"]["operations"], 1600)),
         ("activity_summary", compact(&input["activity_summary"], 700)),
         ("resolved_inputs", compact(&input["resolved_inputs"], 1200)),
         ("materials", compact(&input["materials"], 400)),
@@ -153,7 +202,9 @@ pub fn observation(
         "execution_epoch":frame.map(|f|f.epoch),"related_source_versions":frame.map(|f|&f.versions),
         "visual_required":order.is_some_and(|o|o.visual_goal.is_some() || o.constraints.iter().any(|c|c=="requires_visual")),
         "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
-        "resolved_inputs":packet["upstream_outputs"],"materials":materials,"activity_summary":activity,
+        "resolved_inputs":packet["upstream_outputs"],"http_observations":packet["http_observations"],"materials":materials,"activity_summary":activity,
+        "node_facts":scheduler.observer_facts(work),"current_facts":scheduler.current_facts(),
+        "observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
         "delivery":delivery,"plan_overview":scheduler.frames.values().filter(|f|f.invalidated_by_plan_revision.is_none()).take(16)
             .map(|f|json!({"work_id":f.order.id,"node_id":f.order.node_id,"goal":short(&f.order.goal,180),"status":f.status})).collect::<Vec<_>>(),
         "defer_until_handoff":stage=="assignment" && order.is_some_and(|o|o.final_answer && o.completion==crate::work_scheduler::Completion::Output)})
@@ -170,7 +221,25 @@ pub async fn commit(root: &Path, task: &str, data: Value, observations: Vec<Valu
         let kind=if data["observation_only"]==true {"observer/progress_committed"}else{"execution/commit"};
         let existing=tx.query_row("SELECT seq FROM agent_task_events WHERE task_id=?1 AND kind=?2 AND json_extract(data,'$.commit_id')=?3",
             params![task,kind,data["commit_id"].as_str()],|row|row.get::<_,i64>(0)).optional()?;
-        let source_seq=if let Some(seq)=existing{seq}else{agent_service::append_event_tx(&tx,&task,kind,&data,None)?};
+        let source_seq=if let Some(seq)=existing{seq}else{
+            let source_seq=agent_service::append_event_tx(&tx,&task,kind,&data,None)?;
+            if let Some(scheduler)=data.get("scheduler").filter(|value|value.is_object()) {
+                agent_service::append_event_tx(&tx,&task,"scheduler/state",&json!({"commit_id":data["commit_id"],
+                    "turn":data["turn"],"step":data["step"],"state":scheduler}),None)?;
+            }
+            if let Some(plan)=data.get("flow_plan").filter(|value|value.is_object()) {
+                agent_service::append_event_tx(&tx,&task,"flow/plan",&json!({"commit_id":data["commit_id"],
+                    "turn":data["turn"],"replaceCurrentTurn":true,"nodes":plan["nodes"],"edges":plan["edges"],
+                    "mode":plan["mode"],"active_node_id":plan["active_node_id"],"active_path":plan["active_path"],
+                    "plan_revision":plan["plan_revision"],"rewind_records":plan["rewind_records"]}),None)?;
+            }
+            if let Some(tree)=data.get("task_tree").filter(|value|value["nodes"].as_object().is_some_and(|nodes|!nodes.is_empty())) {
+                agent_service::append_event_tx(&tx,&task,"flow/tree_state",&json!({"commit_id":data["commit_id"],
+                    "turn":data["turn"],"step":data["step"],"state":tree,
+                    "active_node_id":data["active_node_id"],"active_path":data["active_path"]}),None)?;
+            }
+            source_seq
+        };
         for mut input in observations {
             input["source_event_seq"]=json!(source_seq);
             let inserted=tx.execute("INSERT OR IGNORE INTO agent_observations(task_id,review_id,request_id,input,status) VALUES (?1,?2,?3,?4,'pending')",
@@ -272,6 +341,7 @@ pub struct ObserverSession {
     stop: CancellationToken,
     job: Option<tokio::task::JoinHandle<()>>,
     model_gate: std::sync::Arc<Semaphore>,
+    progress_revision: AtomicU64,
     seen: BTreeSet<String>,
     finished: bool,
     cleanup_on_drop: bool,
@@ -291,6 +361,7 @@ impl Drop for ObserverSession {
                     stop: self.stop.clone(),
                     job: self.job.take(),
                     model_gate: self.model_gate.clone(),
+                    progress_revision: AtomicU64::new(self.progress_revision.load(Ordering::Relaxed)),
                     seen: BTreeSet::new(),
                     finished: false,
                     cleanup_on_drop: false,
@@ -344,6 +415,7 @@ impl ObserverSession {
             stop,
             job,
             model_gate,
+            progress_revision: AtomicU64::new(0),
             seen: BTreeSet::new(),
             finished: false,
             cleanup_on_drop: true,
@@ -362,8 +434,13 @@ impl ObserverSession {
             let _ = self.wake.try_send(());
         }
     }
-    pub fn progress(&self, input: Value) {
+    pub fn progress(&self, mut input: Value) {
         if self.enabled {
+            let revision=self.progress_revision.fetch_add(1,Ordering::Relaxed).saturating_add(1);
+            let review_id=format!("{}:update-{revision}",input["review_id"].as_str().unwrap_or("progress"));
+            input["review_id"]=json!(review_id);
+            input["source_event_id"]=json!(format!("progress:{}",input["review_id"].as_str().unwrap_or("progress")));
+            input["progress_sequence"]=json!(revision);
             self.progress.send_replace(Some(input));
             self.notify();
         }
@@ -385,6 +462,7 @@ impl ObserverSession {
             for item in result["recommendations"].as_array().into_iter().flatten() {
                 reviews.push(json!({"request_id":input["identity"]["request_id"],"identity":input["identity"],"review_id":input["review_id"],
                     "source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],"turn":input["turn"],"stage":input["stage"],"step":input["step"],"node_id":input["identity"]["node_id"],
+                    "observed_at":input["observed_at"],"execution_revision":input["identity"]["revision"],
                     "category":"planning","issue_key":item["issue_key"],"summary":result["summary"],"suggestions":[item["adjustment"]],"target":item["target"],"findings":result["findings"],
                     "visual_artifacts":result["visual_artifacts"],"visual_check_result":result["visual_check_result"]}));
             }
@@ -474,7 +552,7 @@ async fn run(
     let root = state.workspace.root();
     let mut cached_request = Value::Null;
     let mut memories = Vec::new();
-    let mut last_progress: Option<(String, String, Instant)> = None;
+    let mut last_progress: Option<(String, String)> = None;
     let mut attempted = BTreeSet::new();
     let mut rescan = true;
     loop {
@@ -549,13 +627,10 @@ async fn run(
             }
             let fingerprint = compact(&value["activity_summary"], 300).to_string();
             let instance = value["identity"].to_string();
-            if last_progress.as_ref().is_some_and(|(previous, key, at)| {
-                previous == &instance
-                    && (key == &fingerprint || at.elapsed() < Duration::from_secs(5))
-            }) {
+            if last_progress.as_ref().is_some_and(|(previous, key)| previous == &instance && key == &fingerprint) {
                 return None;
             }
-            last_progress = Some((instance, fingerprint, Instant::now()));
+            last_progress = Some((instance, fingerprint));
             Some(value)
         });
         let Some(mut input) = input else {
@@ -782,6 +857,95 @@ mod tests {
                 .is_none_or(|a| a.len() <= 3)
         );
     }
+    fn started_service() -> crate::work_scheduler::WorkScheduler {
+        let url = "http://127.0.0.1:38191/api/fonts";
+        let check = crate::http_probe::check_key(&json!({"url":url}));
+        let mut scheduler = crate::work_scheduler::WorkScheduler::default();
+        scheduler.request_started_turn = 1;
+        scheduler.apply(&json!({"action":"work","reason":"start","orders":[{"id":"start","node_id":"start","goal":"Start the font service",
+            "done_when":"the font API answers","completion":"check","checks":[check]}]}),false,true).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        scheduler.frame_mut().unwrap().project_observation = json!({"sampled_at":now-1500,
+            "processes":[{"process_id":"proc-7","script":"dev","running":true,"ready":true,"ready_url":"http://127.0.0.1:38191/"}]});
+        scheduler.observe("http_probe",&json!({"url":url}),&json!({"url":url,
+            "sampled_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"elapsed_ms":2,"reachable":true,
+            "http_status":200,"error_kind":Value::Null,"error_message":Value::Null,"check_key":check,"check_passed":true,
+            "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
+        assert!(scheduler.close_if_satisfied());
+        scheduler
+    }
+
+    #[test]
+    fn observer_sees_the_actual_startup_result_instead_of_a_field_catalog() {
+        let scheduler = started_service();
+        let wide = (0..24).map(|index| (format!("key_{index:02}"), json!(index))).collect::<serde_json::Map<_, _>>();
+        let input = observation("task", &scheduler, "start", 1, 2, "handoff", "start the editor", &json!({"reason":"start"}),
+            Value::Null, json!({"summary":"started","status":"done","exported_data":{"wide":wide}}), Value::Null);
+        let packed = pack(input, &[], &[]);
+        let http = &packed["node_state"]["http_observations"][0];
+        assert_eq!(http["http_status"], 200);
+        assert!(http["sampled_at"].is_string());
+        assert_eq!(packed["node_state"]["processes"][0]["process_id"], "proc-7");
+        assert_eq!(packed["node_state"]["processes"][0]["running"], true);
+        assert_eq!(packed["node_state"]["checks"][0]["passed"], true);
+        assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"], 23, "no key is dropped by position");
+        assert!(packed["delivery"].get("exported_fields").is_none());
+        assert!(packed["current_facts"]["http"][0].as_str().unwrap().contains("HTTP 200 at"));
+        assert!(packed["observed_at"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn latest_progress_snapshot_replaces_failure_with_same_node_recovery_facts() {
+        let url="http://127.0.0.1:38194/api/fonts";
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+        scheduler.apply(&json!({"action":"work","reason":"inspect and start the font service","orders":[
+            {"id":"fonts","node_id":"fonts","goal":"Make the font service answer","done_when":"capture actual service and HTTP state","completion":"output"}]}),false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let failed_at=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
+        scheduler.observe("http_probe",&json!({"url":url}),&json!({"url":url,"sampled_at":failed_at,"elapsed_ms":5,"reachable":false,
+            "http_status":Value::Null,"error_kind":"connection_refused","error_message":"connection refused","check_passed":false,
+            "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
+        let before=observation("task",&scheduler,"fonts",1,2,"progress","bring up the font service",&json!({"reason":"check the service"}),
+            json!({"purpose":"Probe the endpoint","actions":[{"tool":"http_probe","failed":true,"sampled_at":failed_at}]}),Value::Null,Value::Null);
+
+        let success_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let process_observation=json!({"sampled_at":success_at,"processes":[{"process_id":"font-service-8080","running":true,"ready":true,
+            "ready_url":"http://127.0.0.1:38194/","ready_port":38194}]});
+        scheduler.observe("run_project_script",&json!({"script":"dev","background":true}),&json!({"process_id":"font-service-8080","running":true,
+            "ready":true,"ready_url":"http://127.0.0.1:38194/","process_observation":process_observation}),false);
+        let after=observation("task",&scheduler,"fonts",1,3,"progress","bring up the font service",&json!({"reason":"check the service"}),
+            json!({"purpose":"Start and verify the font service","next_action":"load the document","actions":[
+                {"tool":"http_probe","failed":true,"sampled_at":failed_at},
+                {"tool":"run_project_script","failed":false,"running":true,"sampled_at":success_at}]}),Value::Null,Value::Null);
+
+        let (wake,_wake_rx)=mpsc::channel(1);let (scope,_scope_rx)=watch::channel(Value::Null);let (progress,mut progress_rx)=watch::channel(None);
+        let session=ObserverSession{enabled:true,root:PathBuf::new(),task:"task".into(),wake,scope,progress,stop:CancellationToken::new(),job:None,
+            model_gate:std::sync::Arc::new(Semaphore::new(1)),progress_revision:AtomicU64::new(0),seen:BTreeSet::new(),finished:false,cleanup_on_drop:false};
+        session.progress(before);
+        let first=progress_rx.borrow_and_update().clone().unwrap();
+        session.progress(after);
+        let latest=progress_rx.borrow_and_update().clone().unwrap();
+        assert_ne!(first["review_id"],latest["review_id"],"each refreshed snapshot gets its own durable review identity");
+        assert_eq!(latest["progress_sequence"],2);
+        assert_eq!(latest["node_facts"]["processes"][0]["process_id"],"font-service-8080");
+        assert_eq!(latest["node_facts"]["processes"][0]["running"],true);
+        assert_eq!(latest["node_facts"]["process_observation_sampled_at"],success_at);
+        assert!(latest["activity_summary"].to_string().contains("Start and verify the font service"));
+        assert!(latest["activity_summary"].to_string().contains(&failed_at),"the action history retains the prior failure timestamp");
+    }
+
+    #[test]
+    fn advice_written_before_newer_node_facts_is_marked_as_older() {
+        let scheduler = started_service();
+        let latest = scheduler.latest_fact_at("start");
+        let advice = |observed_at: u64| json!({"id":"advice_1","identity":identity("task",&scheduler,"start"),
+            "observed_at":observed_at,"summary":"the startup result lacks a status code"});
+        let annotated = annotate_advice(vec![advice(latest - 5_000), advice(latest + 1)], &scheduler);
+        assert_eq!(annotated[0]["based_on_older_facts"], true);
+        assert_eq!(annotated[0]["newer_facts_at"], latest);
+        assert!(annotated[1].get("based_on_older_facts").is_none());
+    }
+
     #[test]
     fn oversized_primary_goal_is_explicit_instead_of_silently_truncated() {
         let goal = "目标".repeat(INPUT_BUDGET);

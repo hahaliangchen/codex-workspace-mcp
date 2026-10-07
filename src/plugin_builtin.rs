@@ -156,10 +156,10 @@ fn mcp_handler() -> ToolHandler {
     })
 }
 
-fn command_handler() -> ToolHandler {
+fn program_handler() -> ToolHandler {
     Arc::new(|workspace, _, args| {
         Box::pin(async move {
-            crate::agent_service::execute_run_command(&workspace, &args).await
+            crate::program_execution::execute(&workspace, &args).await
         })
     })
 }
@@ -193,7 +193,6 @@ const FILE_TOOLS: &[&str] = &[
     "replace_range",
     "edit_file",
 ];
-const COMMAND_TOOLS: &[&str] = &["run_command"];
 const MEMORY_TOOLS: &[&str] = &[
     "record_work_memory",
     "list_work_memory",
@@ -252,8 +251,8 @@ impl Plugin for FileToolsPlugin {
         register_tools(context, FILE_TOOLS, mcp_handler())?;
         register_tools(context, crate::project_process::TOOLS, mcp_handler())?;
         register_tools(context, crate::http_probe::TOOLS, mcp_handler())?;
+        register_tools(context, crate::program_execution::TOOLS, program_handler())?;
         register_tools(context, crate::browser_control::TOOLS, mcp_handler())?;
-        register_tools(context, COMMAND_TOOLS, command_handler())?;
         context.provide("file-tools", Arc::new(()))
     }
 }

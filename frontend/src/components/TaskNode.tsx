@@ -111,13 +111,14 @@ export const TaskNode = memo(function TaskNode({
       return <div className={styles.spinner} title="进行中" />
     }
     if (isCompleted) {
+      const unmet = data.workUnit?.expectationMet === false
       return (
         <span
           className={styles.statusIcon}
-          style={{ color: 'var(--dsw-alias-state-success-primary, #22c55e)' }}
-          title="已完成"
+          style={{ color: unmet ? 'var(--dsw-alias-state-warn-primary, #f59e0b)' : 'var(--dsw-alias-state-success-primary, #22c55e)' }}
+          title={unmet ? `执行已结束，预期条件未满足${data.workUnit?.outcome ? `：${data.workUnit.outcome}` : ''}` : '执行已结束'}
         >
-          ✓
+          {unmet ? '!' : '✓'}
         </span>
       )
     }

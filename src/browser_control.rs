@@ -30,6 +30,50 @@ pub async fn cleanup_after_finish(root:&Path,task:&str,status:&str) {
     let _=close_session(root,task).await;
 }
 
+/// Verify that a historical upload receipt still names the live controlled
+/// page and the exact upload attempt kept in that page's JavaScript state.
+/// A completed work frame remains historical evidence even when this returns
+/// unavailable; callers only revoke reuse of the receipt.
+pub async fn validate_upload_receipt(root:&Path,task:&str,receipt:&Value)->Value {
+    let receipt_page=&receipt["page"];
+    let session_id=receipt_page["browser_session_id"].as_str().unwrap_or("");
+    let page_id=receipt_page["page_id"].as_str().unwrap_or("");
+    let attempt_id=receipt["upload_attempt_id"].as_str().unwrap_or("");
+    let invalid=|reason:&str|json!({"available":false,"reason":reason,"browser_session_id":session_id,
+        "page_id":page_id,"upload_attempt_id":attempt_id});
+    if session_id.is_empty()||page_id.is_empty()||attempt_id.is_empty() {return invalid("receipt_identity_incomplete");}
+    let page=sessions().lock().await.get(&session_key(root,task)).cloned();
+    let Some(page)=page else {return invalid("browser_session_missing");};
+    let mut guard=page.lock().await;
+    let Some(session)=guard.as_mut() else {return invalid("browser_session_closed");};
+    if session.session_id!=session_id {return invalid("browser_session_changed");}
+    if session.page_id!=page_id {return invalid("browser_page_changed");}
+    if !receipt_page["request_id"].is_null()&&session.owner["request_id"]!=receipt_page["request_id"] {return invalid("browser_request_identity_changed");}
+    if receipt_page["page_epoch"].as_u64().is_some_and(|epoch|session.epoch<epoch) {return invalid("browser_page_epoch_changed");}
+    match session.child.try_wait() {
+        Ok(Some(_))=>return invalid("browser_process_exited"),
+        Err(_)=>return invalid("browser_process_status_unavailable"),
+        Ok(None)=>{}
+    }
+    let token=serde_json::to_string(attempt_id).unwrap_or_else(|_|"\"\"".to_owned());
+    let expression=format!(r#"(()=>{{
+      const attempt=window.__codexDocumentUploadAttempts?.[{token}];
+      return {{url:location.href,attempt_id:attempt?.id||null,change_event_received:attempt?.change_event_received===true,
+        latest_attempt_id:window.__codexLatestDocumentUploadAttempt||null,file_name:attempt?.file_name||null,status:attempt?.status||null}};
+    }})()"#);
+    let current=match eval(&session.ws,&expression).await {
+        Ok(value)=>value,
+        Err(_)=>return invalid("browser_page_unreachable"),
+    };
+    if current["url"]!=receipt_page["url"] {return invalid("browser_page_url_changed");}
+    if current["attempt_id"]!=attempt_id||current["change_event_received"]!=true {return invalid("upload_attempt_missing_or_changed");}
+    if current["latest_attempt_id"]!=attempt_id {return invalid("upload_attempt_superseded");}
+    if !receipt["file"]["name"].is_null()&&current["file_name"]!=receipt["file"]["name"] {return invalid("upload_file_identity_changed");}
+    json!({"available":true,"reason":"active_session_page_and_upload_attempt_match","browser_session_id":session_id,
+        "page_id":page_id,"page_epoch":session.epoch,"upload_attempt_id":attempt_id,
+        "file_name":current["file_name"],"load_status":current["status"]})
+}
+
 async fn close_session(root:&Path,task:&str)->Value {
     let page=sessions().lock().await.remove(&session_key(root,task));
     if let Some(page)=page {if let Some(mut session)=page.lock().await.take() {
@@ -50,8 +94,8 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"browser_open","description":"Open a URL in the task-owned browser and return its identity, display mode, location, title and visible text. Set visible=true to show the controlled Chrome/Edge window to the user. This does not by itself prove a document or slide loaded.","inputSchema":{"type":"object","required":["url"],"properties":{"url":url,"visible":{"type":"boolean","description":"Show the task-owned browser window. Choose this on the first browser call when the user should see the page; it cannot be changed after the session starts."}}}}),
         json!({"name":"browser_read","description":"Read the current page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
         json!({"name":"browser_wait","description":"Wait up to timeout_ms for a selector, visible text, font loading state or an application-confirmed presentation load after the latest file change. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"document_loaded":{"type":"boolean","description":"Set true to wait for a confirmed upload change, a completed application loading cycle, a valid current/total page indicator, slides, and no explicit load error. A generic DOM snapshot without a correlated load cycle stays unconfirmed."},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
-        json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, failed fetch/XHR responses and recent font/resource requests captured since navigation. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{}}}),
-        json!({"name":"browser_click","description":"Click a button or link by its visible text, or a CSS selector when selector is set.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"}}}}),
+        json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, and the page's recorded requests since navigation: every fetch/XHR call (method, URL, status, time, duration, failure) plus font/resource timing entries. Filter with url_contains (e.g. /api/fonts) and category. request_coverage states what the record cannot see; an empty result means nothing matched in that scope, not that no request happened. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{"url_contains":{"type":"string"},"category":{"type":"string","enum":["all","fetch","xhr","font","resource"]}}}}),
+        json!({"name":"browser_click","description":"Click a visible, enabled control. text matches the same label browser_read lists under controls (exact label preferred, then containing); selector is an exact CSS selector and takes precedence. times (1-5) repeats the same click, e.g. to step through slides, before you read the result.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"},"times":{"type":"integer","minimum":1,"maximum":5}}}}),
         json!({"name":"browser_press_key","description":"Press a supported key in this task's focused browser page, e.g. Delete after selecting a slide element. This is an interaction, not proof of its visible result.","inputSchema":{"type":"object","required":["key"],"properties":{"key":{"type":"string","enum":["Delete","Backspace","Enter","Escape","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown"]}}}}),
         json!({"name":"browser_upload","description":"Assign a workspace file to an input[type=file]. path is relative to the workspace.","inputSchema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"},"selector":{"type":"string"}}}}),
         json!({"name":"browser_screenshot","description":"Capture an immutable visual artifact of this task's page and select it for the next normal Worker image request. Capture is not a visual pass. Default viewport; full_page is explicit.","inputSchema":{"type":"object","properties":{"full_page":{"type":"boolean"}}}}),
@@ -82,8 +126,8 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
         "browser_open" => open(&session.ws,args["url"].as_str().context("url is required")?).await?,
         "browser_read" => read(&session.ws,args["expect_text"].as_str().unwrap_or("")).await?,
         "browser_wait" => wait_for(&session.ws,args).await?,
-        "browser_diagnostics" => diagnostics(&session.ws).await?,
-        "browser_click" => click(&session.ws,args["text"].as_str().unwrap_or(""),args["selector"].as_str().unwrap_or("")).await?,
+        "browser_diagnostics" => diagnostics(&session.ws,args).await?,
+        "browser_click" => click(&session.ws,args["text"].as_str().unwrap_or(""),args["selector"].as_str().unwrap_or(""),args["times"].as_u64().unwrap_or(1)).await?,
         "browser_press_key" => press_key(&session.ws,args["key"].as_str().context("key is required")?).await?,
         "browser_upload" => upload(&session.ws,workspace.root(),args).await?,
         "browser_screenshot" => return screenshot(workspace.root(),context,session,args["full_page"]==true).await,
@@ -144,7 +188,7 @@ fn page_url_matches(href: &str, url: &str) -> bool {
 async fn read(ws:&str,expect: &str) -> Result<Value> {
     let value = eval(ws, r#"(()=>{
       const visible=el=>{const s=getComputedStyle(el);return !!(el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0)};
-      const controls=[...document.querySelectorAll('button,a,[role=button],input,select,textarea')].slice(0,40).map(el=>({tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.innerText||el.value||el.getAttribute('aria-label')||'').trim().slice(0,120),id:el.id||'',name:el.name||'',selector:el.id?'#'+CSS.escape(el.id):'',disabled:!!el.disabled,visible:visible(el)}));
+      const controls=[...document.querySelectorAll('button,a,[role=button],input,select,textarea')].slice(0,40).map(el=>({tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.getAttribute('aria-label')||el.innerText||el.value||'').trim().slice(0,120),id:el.id||'',name:el.name||'',selector:el.id?'#'+CSS.escape(el.id):'',disabled:!!el.disabled,visible:visible(el)}));
       const file_inputs=[...document.querySelectorAll('input[type=file]')].slice(0,12).map(el=>({id:el.id||'',name:el.name||'',accept:el.accept||'',multiple:!!el.multiple,disabled:!!el.disabled,visible:visible(el),files_length:el.files?.length||0,selector:el.id?'#'+CSS.escape(el.id):'input[type=file]'}));
       const slide_count=document.querySelectorAll('#slide-list .slide-item,.slide-item,[data-slide-index]').length;
       const page_indicator=[...document.querySelectorAll('#page-indicator,.page-number,.slide-number,[aria-current="page"]')].filter(visible).map(el=>(el.innerText||el.textContent||'').trim().slice(0,80)).filter(Boolean).slice(0,4);
@@ -184,19 +228,52 @@ async fn wait_for(ws:&str,args:&Value)->Result<Value> {
     }
 }
 
-async fn diagnostics(ws:&str)->Result<Value> {
-    let value=eval(ws,r#"(()=>{const d=window.__codexBrowserDiagnostics||{events:[],startedAt:null};const clean=x=>{try{const u=new URL(x,location.href);u.search='';u.hash='';return u.href.slice(0,500)}catch{return String(x||'').slice(0,500)}};const resources=performance.getEntriesByType('resource').filter(r=>r.initiatorType==='font'||/\.(woff2?|ttf|otf)(\?|$)/i.test(r.name)||Number(r.responseStatus)>=400).slice(-40).map(r=>({url:clean(r.name),initiator:r.initiatorType||'',status:Number(r.responseStatus)||null,duration_ms:Math.round(r.duration||0),transfer_bytes:Number(r.transferSize)||0}));const fonts=document.fonts?[...document.fonts].slice(0,40).map(f=>({family:String(f.family||'').slice(0,120),status:f.status,weight:f.weight,style:f.style})):[];return{url:location.href,started_at:d.startedAt||null,events:(d.events||[]).slice(-40),resources,font_state:document.fonts?document.fonts.status:'unsupported',font_faces:fonts}})()"#).await?;
+const REQUEST_LIMIT: usize = 60;
+
+/// Coverage of `requests`; repeating the read never widens it.
+fn request_coverage(captured: bool) -> Value {
+    json!({"captured_since_navigation":captured,
+        "recorded":"in-page fetch and XMLHttpRequest calls (every status) since the last navigation, plus Resource Timing entries for fetch/xhr/font/css/link",
+        "not_visible":["requests made before the last browser_open or by an earlier document","Web Worker and Service Worker requests",
+            "status of cross-origin Resource Timing entries without Timing-Allow-Origin (reported as null)","responses served from memory cache without a timing entry"],
+        "fact_kind":"browser-observed requests; a server-side http_probe result is a separate fact"})
+}
+
+async fn diagnostics(ws:&str,args:&Value)->Result<Value> {
+    let value=eval(ws,r#"(()=>{const d=window.__codexBrowserDiagnostics||{events:[],requests:[],startedAt:null};const clean=x=>{try{const u=new URL(x,location.href);u.search='';u.hash='';return u.href.slice(0,500)}catch{return String(x||'').slice(0,500)}};const entries=performance.getEntriesByType('resource');const resources=entries.filter(r=>r.initiatorType==='font'||/\.(woff2?|ttf|otf)(\?|$)/i.test(r.name)||Number(r.responseStatus)>=400).slice(-40).map(r=>({url:clean(r.name),initiator:r.initiatorType||'',status:Number(r.responseStatus)||null,duration_ms:Math.round(r.duration||0),transfer_bytes:Number(r.transferSize)||0}));const timing=entries.filter(r=>['fetch','xmlhttprequest','font','css','link'].includes(r.initiatorType)||/\.(woff2?|ttf|otf)(\?|$)/i.test(r.name)).slice(-150).map(r=>({source:'resource_timing',url:clean(r.name),initiator:r.initiatorType||'',method:null,status:Number(r.responseStatus)||null,time:Math.round(performance.timeOrigin+r.startTime),duration_ms:Math.round(r.duration||0),transfer_bytes:Number(r.transferSize)||0,cache:r.transferSize===0&&r.decodedBodySize>0?'cache_or_unexposed':null}));const fonts=document.fonts?[...document.fonts].slice(0,40).map(f=>({family:String(f.family||'').slice(0,120),status:f.status,weight:f.weight,style:f.style})):[];return{url:location.href,started_at:d.startedAt||null,events:(d.events||[]).slice(-40),requests:d.requests||[],requests_dropped:d.requestsDropped||0,timing,resources,font_state:document.fonts?document.fonts.status:'unsupported',font_faces:fonts}})()"#).await?;
     let events=value["events"].as_array().cloned().unwrap_or_default();let failures=events.iter().filter(|event|matches!(event["type"].as_str(),Some("page_error"|"unhandled_rejection"|"console_error"|"network_error"|"http_error"|"resource_error"|"font_error"))).cloned().collect::<Vec<_>>();
-    Ok(json!({"url":value["url"],"captured_since_navigation":value["started_at"].is_number(),"error_count":failures.len(),"errors":failures,"font_and_failed_resources":value["resources"],"font_state":value["font_state"],"font_faces":value["font_faces"],"limits":{"errors":40,"resources":40,"font_faces":40,"message_chars":900}}))
+    let needle=args["url_contains"].as_str().unwrap_or("").trim().to_owned();
+    let category=args["category"].as_str().unwrap_or("all");
+    let matches=|item:&Value|{
+        let url=item["url"].as_str().unwrap_or("");
+        let kind=match (item["source"].as_str(),item["initiator"].as_str()) {
+            (Some("fetch"),_)|(_,Some("fetch"))=>"fetch",(Some("xhr"),_)|(_,Some("xmlhttprequest"))=>"xhr",
+            (_,Some("font"))=>"font",_ if url.contains(".woff")||url.ends_with(".ttf")||url.ends_with(".otf")=>"font",_=>"resource"};
+        (needle.is_empty()||url.contains(&needle))&&(category=="all"||category==kind)
+    };
+    let mut requests=value["requests"].as_array().into_iter().flatten().chain(value["timing"].as_array().into_iter().flatten())
+        .filter(|item|matches(item)).cloned().collect::<Vec<_>>();
+    requests.sort_by_key(|item|item["time"].as_u64().unwrap_or(0));
+    let matched=requests.len();
+    let requests=requests.split_off(matched.saturating_sub(REQUEST_LIMIT));
+    let captured=value["started_at"].is_number();
+    let empty_reason=requests.is_empty().then(||format!("No matching request was recorded in the observed scope{}. This does not prove that no request was made or that fonts loaded; see request_coverage.",
+        if needle.is_empty(){String::new()}else{format!(" for URLs containing {needle:?}")}));
+    Ok(json!({"url":value["url"],"captured_since_navigation":captured,"error_count":failures.len(),"errors":failures,
+        "requests":requests,"request_filter":{"url_contains":needle,"category":category},"matched_requests":matched,
+        "requests_dropped_before_read":value["requests_dropped"],"empty_reason":empty_reason,"request_coverage":request_coverage(captured),
+        "font_and_failed_resources":value["resources"],"font_state":value["font_state"],"font_faces":value["font_faces"],
+        "limits":{"errors":40,"requests":REQUEST_LIMIT,"recorded_requests":150,"resources":40,"font_faces":40,"message_chars":900}}))
 }
 
 async fn arm_diagnostics(cdp:&mut CdpConnection)->Result<()> {
     cdp.call("Page.enable",json!({})).await?;
     let source=r#"(()=>{
       if(window.__codexBrowserDiagnostics)return;
-      const d=window.__codexBrowserDiagnostics={events:[],startedAt:Date.now()};
+      const d=window.__codexBrowserDiagnostics={events:[],requests:[],requestsDropped:0,startedAt:Date.now()};
       const cleanUrl=x=>{try{const u=new URL(x,location.href);u.search='';u.hash='';return u.href.slice(0,500)}catch{return String(x||'').slice(0,500)}};
       const add=(type,data={})=>{d.events.push({type,time:Date.now(),...data});if(d.events.length>80)d.events.shift()};
+      const request=data=>{d.requests.push({time:Date.now(),...data});if(d.requests.length>150){d.requests.shift();d.requestsDropped++}};
       const msg=x=>{try{return (x&&x.stack)||String(x)}catch{return '[unprintable]'}};
       add('navigation',{url:cleanUrl(location.href)});
       window.addEventListener('error',e=>{
@@ -210,22 +287,44 @@ async fn arm_diagnostics(cdp:&mut CdpConnection)->Result<()> {
       const oldError=console.error;
       console.error=function(...args){add('console_error',{stage:'console',message:args.map(msg).join(' ').slice(0,900)});return oldError.apply(this,args)};
       const oldFetch=window.fetch;
-      if(oldFetch)window.fetch=function(input,init){const url=cleanUrl(typeof input==='string'?input:(input&&input.url)||'');const method=(init&&init.method)||(input&&input.method)||'GET';return oldFetch.apply(this,arguments).then(response=>{if(!response.ok)add('http_error',{stage:'fetch_response',method,url,status:response.status});return response},error=>{add('network_error',{stage:'fetch',method,url,message:msg(error).slice(0,500)});throw error})};
+      if(oldFetch)window.fetch=function(input,init){const url=cleanUrl(typeof input==='string'?input:(input&&input.url)||'');const method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase().slice(0,16);const started=performance.now();return oldFetch.apply(this,arguments).then(response=>{request({source:'fetch',method,url,status:response.status,ok:response.ok,response_type:response.type,duration_ms:Math.round(performance.now()-started),failure:null});if(!response.ok)add('http_error',{stage:'fetch_response',method,url,status:response.status});return response},error=>{request({source:'fetch',method,url,status:null,ok:false,duration_ms:Math.round(performance.now()-started),failure:msg(error).slice(0,300)});add('network_error',{stage:'fetch',method,url,message:msg(error).slice(0,500)});throw error})};
       const XHR=window.XMLHttpRequest;
-      if(XHR){const oldOpen=XHR.prototype.open;XHR.prototype.open=function(method,url){this.__codexRequest={method:String(method||'GET').slice(0,16),url:cleanUrl(url)};return oldOpen.apply(this,arguments)};const oldSend=XHR.prototype.send;XHR.prototype.send=function(){const x=this;const req=x.__codexRequest||{method:'GET',url:''};x.addEventListener('loadend',()=>{if(x.status>=400)add('http_error',{...req,stage:'xhr_response',status:x.status});else if(x.status===0)add('network_error',{...req,stage:'xhr',message:'request ended with status 0'})},{once:true});x.addEventListener('error',()=>add('network_error',{...req,stage:'xhr',message:'XMLHttpRequest error'}),{once:true});return oldSend.apply(this,arguments)}}
+      if(XHR){const oldOpen=XHR.prototype.open;XHR.prototype.open=function(method,url){this.__codexRequest={method:String(method||'GET').toUpperCase().slice(0,16),url:cleanUrl(url)};return oldOpen.apply(this,arguments)};const oldSend=XHR.prototype.send;XHR.prototype.send=function(){const x=this;const req=x.__codexRequest||{method:'GET',url:''};const started=performance.now();x.addEventListener('loadend',()=>{request({source:'xhr',...req,status:x.status||null,ok:x.status>=200&&x.status<400,duration_ms:Math.round(performance.now()-started),failure:x.status===0?'request ended with status 0':null});if(x.status>=400)add('http_error',{...req,stage:'xhr_response',status:x.status});else if(x.status===0)add('network_error',{...req,stage:'xhr',message:'request ended with status 0'})},{once:true});x.addEventListener('error',()=>add('network_error',{...req,stage:'xhr',message:'XMLHttpRequest error'}),{once:true});return oldSend.apply(this,arguments)}}
     })()"#;
     cdp.call("Page.addScriptToEvaluateOnNewDocument",json!({"source":source})).await?;
     Ok(())
 }
 
-async fn click(ws:&str,text: &str, selector: &str) -> Result<Value> {
+const MAX_REPEATED_CLICKS: u64 = 5;
+
+/// Candidates and labels match `browser_read` controls, so any label it lists
+/// can be clicked by that text. An exact selector takes precedence.
+async fn click(ws:&str,text: &str, selector: &str, times: u64) -> Result<Value> {
     ensure!(!text.is_empty() || !selector.is_empty(), "click needs text or selector");
-    let expression = format!(r#"(()=>{{const text={};const selector={};const nodes=[...document.querySelectorAll(selector||'button,a,[role=button],input[type=button],input[type=submit]')];const el=selector&&!text?document.querySelector(selector):nodes.find(n=>((n.innerText||n.value||'')+'').includes(text));if(!el)return{{ok:false}};el.scrollIntoView({{block:'center',inline:'center'}});const r=el.getBoundingClientRect();return{{ok:r.width>0&&r.height>0,x:r.x+r.width/2,y:r.y+r.height/2,label:(el.innerText||el.value||el.tagName||'').slice(0,160)}}}})()"#,
+    let expression = format!(r#"(()=>{{const text={};const selector={};
+      const label=n=>(n.getAttribute('aria-label')||n.innerText||n.value||'').trim();const norm=s=>String(s).replace(/\s+/g,' ').trim().toLowerCase();
+      const visible=el=>{{const s=getComputedStyle(el);return !!(el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0)}};
+      let nodes;try{{nodes=[...document.querySelectorAll(selector||'button,a,[role=button],input,select,textarea')]}}catch(e){{return{{ok:false,error:'invalid selector: '+String(e).slice(0,200)}}}}
+      const wanted=norm(text);const usable=nodes.filter(n=>visible(n)&&!n.disabled);
+      const exact=wanted?usable.filter(n=>norm(label(n))===wanted):usable;const partial=wanted?usable.filter(n=>norm(label(n)).includes(wanted)):[];
+      const pool=exact.length?exact:partial;const el=pool[0];
+      if(!el)return{{ok:false,available:usable.slice(0,12).map(n=>label(n).slice(0,80)).filter(Boolean),hidden_or_disabled:nodes.length-usable.length}};
+      el.scrollIntoView({{block:'center',inline:'center'}});const r=el.getBoundingClientRect();
+      return{{ok:r.width>0&&r.height>0,x:r.x+r.width/2,y:r.y+r.height/2,label:(label(el)||el.tagName).slice(0,160),match:selector&&!text?'selector':exact.length?'exact_label':'label_contains',candidates:pool.length}}}})()"#,
         serde_json::to_string(text)?, serde_json::to_string(selector)?);
     let value = eval(&ws, &expression).await?;
-    ensure!(value["ok"] == true, "no matching control on the page");
-    for kind in ["mousePressed","mouseReleased"] {call(ws,"Input.dispatchMouseEvent",json!({"type":kind,"x":value["x"],"y":value["y"],"button":"left","clickCount":1})).await?;}
-    Ok(json!({"clicked":value["label"],"matched":true}))
+    if let Some(error)=value["error"].as_str() {anyhow::bail!("{error}");}
+    if value["ok"] != true {
+        anyhow::bail!("no visible enabled control matches {}; visible control labels: {}",
+            if selector.is_empty(){format!("text {text:?}")}else{format!("selector {selector:?}")},
+            serde_json::to_string(&value["available"]).unwrap_or_default());
+    }
+    let times=times.clamp(1,MAX_REPEATED_CLICKS);
+    for index in 0..times {
+        if index>0 {tokio::time::sleep(Duration::from_millis(120)).await;}
+        for kind in ["mousePressed","mouseReleased"] {call(ws,"Input.dispatchMouseEvent",json!({"type":kind,"x":value["x"],"y":value["y"],"button":"left","clickCount":1})).await?;}
+    }
+    Ok(json!({"clicked":value["label"],"matched":true,"match":value["match"],"candidates":value["candidates"],"times":times}))
 }
 
 async fn press_key(ws:&str,key:&str)->Result<Value> {
@@ -736,7 +835,7 @@ mod tests {
                 tokio::spawn(async move {
                     let mut request=vec![0u8;8192];let n=stream.read(&mut request).await.unwrap_or(0);let request=String::from_utf8_lossy(&request[..n]);
                     let path=request.split_whitespace().nth(1).unwrap_or("/");
-                    let (status,content_type,body)=if path=="/" {("200 OK","text/html; charset=utf-8",r#"<html><head><style>@font-face{font-family:missing;src:url('/missing-font.woff2')}body{font-family:missing}</style></head><body><input id='a' type='file'><input id='b' type='file'><p id='event'></p><script>document.querySelectorAll('input[type=file]').forEach(x=>x.addEventListener('change',e=>document.querySelector('#event').textContent='changed:'+e.target.files[0].name));console.error('fixture-console-error');fetch('/api-failure')</script></body></html>"#)}else if path=="/api-failure" {("503 Service Unavailable","application/json","{}" )}else if path=="/missing-font.woff2" {("404 Not Found","text/plain","missing")}else {("404 Not Found","text/plain","missing")};
+                    let (status,content_type,body)=if path=="/" {("200 OK","text/html; charset=utf-8",r#"<html><head><style>@font-face{font-family:missing;src:url('/missing-font.woff2')}body{font-family:missing}</style></head><body><input id='a' type='file'><input id='b' type='file'><p id='event'></p><button aria-label='Next slide' onclick="document.querySelector('#count').textContent=Number(document.querySelector('#count').textContent)+1">&gt;</button><span id='count'>0</span><script>document.querySelectorAll('input[type=file]').forEach(x=>x.addEventListener('change',e=>document.querySelector('#event').textContent='changed:'+e.target.files[0].name));console.error('fixture-console-error');fetch('/api-failure');fetch('/api/fonts?family=demo')</script></body></html>"#)}else if path=="/api-failure" {("503 Service Unavailable","application/json","{}" )}else if path.starts_with("/api/fonts") {("200 OK","application/json",r#"{"fonts":["demo"]}"#)}else if path=="/missing-font.woff2" {("404 Not Found","text/plain","missing")}else {("404 Not Found","text/plain","missing")};
                     let response=format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",body.len());let _=stream.write_all(response.as_bytes()).await;
                 });
             }
@@ -753,6 +852,21 @@ mod tests {
         assert!(diagnostics["errors"].as_array().unwrap().iter().any(|item|item["type"]=="http_error"&&item["status"]==503),"{diagnostics}");
         assert!(diagnostics["font_and_failed_resources"].as_array().unwrap().iter().any(|item|item["url"].as_str().unwrap_or("").contains("missing-font.woff2")),"{diagnostics}");
         assert!(diagnostics["font_faces"].as_array().unwrap().iter().any(|face|face["family"]=="missing"&&face["status"]=="error"),"{diagnostics}");
+        let fonts_api=execute_scoped(&workspace,&context,"browser_diagnostics",&json!({"url_contains":"/api/fonts","category":"fetch"})).await.unwrap();
+        let request=fonts_api["requests"].as_array().unwrap().iter().find(|item|item["source"]=="fetch").unwrap_or_else(||panic!("{fonts_api}"));
+        assert_eq!(request["status"],200);assert_eq!(request["method"],"GET");assert!(request["time"].is_u64());
+        assert!(!request["url"].as_str().unwrap().contains("family="),"query strings stay out of the record");
+        assert!(fonts_api["empty_reason"].is_null());assert!(fonts_api["request_coverage"]["not_visible"].is_array());
+        let none=execute_scoped(&workspace,&context,"browser_diagnostics",&json!({"url_contains":"/never-requested"})).await.unwrap();
+        assert_eq!(none["requests"],json!([]));assert!(none["empty_reason"].as_str().unwrap().contains("does not prove"),"{none}");
+        let read=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();
+        let label=read["controls"].as_array().unwrap().iter().find(|control|control["tag"]=="button").unwrap()["text"].as_str().unwrap().to_owned();
+        assert_eq!(label,"Next slide","browser_read lists the accessible label");
+        let clicked=execute_scoped(&workspace,&context,"browser_click",&json!({"text":"next slide","times":3})).await.unwrap();
+        assert_eq!(clicked["match"],"exact_label");assert_eq!(clicked["times"],3);
+        let count=inspect_test_page(&root,&context,"({n:document.querySelector('#count').textContent})").await.unwrap();assert_eq!(count["n"],"3");
+        let missing=execute_scoped(&workspace,&context,"browser_click",&json!({"text":"Export"})).await.unwrap_err().to_string();
+        assert!(missing.contains("Next slide"),"the failure lists the visible labels: {missing}");
         cleanup(workspace.root(),context.task_id()).await;server.abort();let _=std::fs::remove_dir_all(&root);
     }
 
