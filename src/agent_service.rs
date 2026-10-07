@@ -368,7 +368,7 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
 pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow::Result<()> {
     let root = workspace_root.to_path_buf();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = open_db(&root)?;
+        let mut conn = open_db(&root)?;
         let ids = {
             let mut stmt = conn.prepare("SELECT id FROM agent_tasks WHERE status='running'")?;
             stmt.query_map([], |row| row.get::<_, String>(0))?
@@ -412,9 +412,85 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
                 params![task_id, now()],
             )?;
         }
+        cleanup_terminal_task_data(&mut conn, None, true)?;
         Ok(())
     })
     .await??;
+    Ok(())
+}
+
+/// Remove execution-only snapshots after a task has reached a terminal state.
+/// User-visible messages, task metadata, Observer conclusions, notebook data,
+/// memories, and code indexes are deliberately retained.
+fn cleanup_terminal_task_data(
+    conn: &mut rusqlite::Connection,
+    task_id: Option<&str>,
+    compact: bool,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let task_filter = "status IN ('completed','failed','cancelled','max_steps','interrupted') AND (?1 IS NULL OR id=?1)";
+    if let Some(task_id) = task_id {
+        let status: Option<String> = tx.query_row("SELECT status FROM agent_tasks WHERE id=?1", [task_id], |r| r.get(0)).optional()?;
+        if !status.as_deref().is_some_and(|s| matches!(s, "completed" | "failed" | "cancelled" | "max_steps" | "interrupted")) {
+            return Ok(());
+        }
+    }
+    let task_selector = format!("SELECT id FROM agent_tasks WHERE {task_filter}");
+    let sql = format!(
+        "DELETE FROM agent_task_events WHERE task_id IN ({task_selector}) AND (
+            kind IN ('tool/call','tool/result','scheduler/state','worker/work_state',
+                     'worker/source_working_set','worker/progress','worker/finding_revision',
+                     'observer/inbox_state','assistant/delta','execution/tick',
+                     'organizer/progress','organizer/request_metrics',
+                     'debug/context_request','debug/context_end')
+            OR kind LIKE 'execution/%' OR kind LIKE 'flow/%'
+            OR (kind='assistant/message' AND EXISTS (
+                SELECT 1 FROM json_each(agent_task_events.data,'$.message.content') AS block
+                WHERE json_extract(block.value,'$.type')='tool-call'
+            ))
+        )"
+    );
+    tx.execute(&sql, [task_id])?;
+
+    // These tables are created lazily by the request-context feature.
+    let has_request_contexts: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_request_contexts')",
+        [], |r| r.get(0),
+    )?;
+    if has_request_contexts {
+        let sql = format!("DELETE FROM agent_request_contexts WHERE task_id IN ({task_selector})");
+        tx.execute(&sql, [task_id])?;
+    }
+    let has_debug_settings: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_context_debug')",
+        [], |r| r.get(0),
+    )?;
+    if has_debug_settings {
+        let sql = format!("DELETE FROM agent_context_debug WHERE task_id IN ({task_selector})");
+        tx.execute(&sql, [task_id])?;
+    }
+    tx.commit()?;
+
+    if compact {
+        let active_tasks: i64 = conn.query_row("SELECT COUNT(*) FROM agent_tasks WHERE status='running'", [], |r| r.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let free_pages: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        // Avoid blocking concurrent work. A one-time compaction after startup or
+        // a large purge returns the reclaimed pages to the filesystem.
+        if active_tasks == 0 && free_pages.saturating_mul(page_size) >= 16 * 1024 * 1024 {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_finished_task_data(root: &std::path::Path, task_id: &str) -> anyhow::Result<()> {
+    let root = root.to_path_buf();
+    let task_id = task_id.to_owned();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut conn = open_db(&root)?;
+        cleanup_terminal_task_data(&mut conn, Some(&task_id), true)
+    }).await??;
     Ok(())
 }
 
@@ -1724,6 +1800,9 @@ fn spawn_supervised_task(
             if let Err(error) = finish(&state, &task_id, "failed").await {
                 tracing::error!(task_id = %task_id, error = %error, "could not finish failed task");
             }
+        }
+        if let Err(error) = cleanup_finished_task_data(state.workspace.root(), &task_id).await {
+            tracing::warn!(task_id = %task_id, error = %error, "could not clean terminal task execution data");
         }
         clear_active_task(&state, &task_id, &run_id).await;
     });
@@ -4315,6 +4394,9 @@ fn run_subagent<'a>(
         if let error @ (Err(_) | Ok(Err(_))) = handle.await {
             clear_active_task(state, &child_id, &child_run_id).await;
             finish(state, &child_id, "failed").await?;
+            if let Err(cleanup_error) = cleanup_finished_task_data(state.workspace.root(), &child_id).await {
+                tracing::warn!(task_id = %child_id, error = %cleanup_error, "could not clean failed subagent execution data");
+            }
             emit(
                 &root,
                 parent_id,
@@ -4324,6 +4406,8 @@ fn run_subagent<'a>(
             .await?;
             anyhow::bail!("subagent {child_id} stopped unexpectedly: {error:?}");
         }
+
+        cleanup_finished_task_data(state.workspace.root(), &child_id).await?;
 
         let read_id = child_id.clone();
         let root = state.workspace.root().to_path_buf();
