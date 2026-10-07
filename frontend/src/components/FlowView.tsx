@@ -324,7 +324,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <span className={styles.legendDotRunning}>⟳</span> 进行中
             </span>
             <span className={styles.legendItem}>
-              <span className={styles.legendDotCompleted}>✓</span> 已完成
+              <span className={styles.legendDotCompleted}>↩</span> 执行已结束
             </span>
             <span className={styles.legendItem}>
               <span className={styles.legendDotPending}>○</span> 待执行
@@ -363,7 +363,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               const d = node.data as unknown as FlowNodeData | undefined
               if (d?.status === 'deprecated') return '#9ca3af'
               if (d?.status === 'running') return '#3b82f6'
-              if (d?.status === 'completed') return '#22c55e'
+              if (d?.status === 'done' || d?.status === 'completed') return '#94a3b8'
               if (d?.status === 'failed') return '#ef4444'
               if (d?.status === 'interrupted') return '#f59e0b'
               return '#94a3b8'
@@ -402,8 +402,8 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <div className={styles.nodeMetaBar}>
                 <span className={`${styles.nodeStatusBadge} ${styles['status_' + selectedNode.status] ?? ''}`}>
                   {selectedNode.status === 'running' && '⟳ 进行中'}
-                  {selectedNode.status === 'completed' && (selectedNode.workUnit?.expectationMet === false ? '⚠ 执行已结束 · 预期未满足' : '✓ 执行已结束')}
-                  {selectedNode.status === 'pending' && '○ 待执行'}
+                  {(selectedNode.status === 'done' || selectedNode.status === 'completed') && '↩ 执行已结束'}
+                  {(selectedNode.status === 'ready' || selectedNode.status === 'pending') && '○ 待执行'}
                   {selectedNode.status === 'waiting_children' && '⏳ 等待子问题'}
                   {selectedNode.status === 'paused' && '⏸ 待继续'}
                   {selectedNode.status === 'blocked' && '⚠ 受阻'}
@@ -486,19 +486,19 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
                 {selectedNode.parentId && <button type="button" className={styles.topBarPillBtn} onClick={() => setSelectedNodeId(selectedNode.parentId ?? null)}>查看父任务</button>}
               </div>}
               {selectedNode.result && <div className={styles.section}>
-                <div className={styles.sectionTitle}>节点结果{selectedNode.result.expectationMet === false ? ' · 预期条件未满足' : selectedNode.result.expectationMet === true ? ' · 预期条件满足' : ''}</div>
+                <div className={styles.sectionTitle}>节点结果{typeof selectedNode.result.goalAchieved === 'boolean' ? ` · Organizer 判断整体目标${selectedNode.result.goalAchieved ? '已达成' : '未达成'}` : typeof selectedNode.result.expectationMet === 'boolean' ? ' · 旧版宿主条件记录（非整体验收结论）' : ''}</div>
                 {selectedNode.result.outcome && <p className={styles.flowSubtext}>返回类型：{selectedNode.result.outcome}</p>}
                 <p>{selectedNode.result.summary}</p>
                 {!!selectedNode.result.limitations?.length && <><div className={styles.fieldLabel}>限制与未完成项</div><ul>{selectedNode.result.limitations.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
                 {selectedNode.result.materialIds.length > 0 && <p className={styles.flowSubtext}>材料编号：{selectedNode.result.materialIds.join('、')}</p>}
               </div>}
               {selectedNode.workUnit && <div className={styles.section}>
-                <div className={styles.sectionTitle}>当前执行单元 · {selectedNode.workUnit.done ? '已完成' : selectedNode.workUnit.status === 'running' ? '执行中' : '待执行'}</div>
+                <div className={styles.sectionTitle}>当前执行单元 · {selectedNode.workUnit.done ? '执行已结束' : selectedNode.workUnit.status === 'running' ? '执行中' : '待执行'}</div>
                 <p>{selectedNode.workUnit.goal}</p><div className={styles.fieldLabel}>完成条件</div><p>{selectedNode.workUnit.doneWhen}</p>
                 {!!selectedNode.workUnit.upstreamIds.length && <p>上游结果：{selectedNode.workUnit.upstreamIds.join('、')}</p>}
                 {!!selectedNode.workUnit.checks.length && <ul>{selectedNode.workUnit.checks.map(check => <li key={check}>{selectedNode.workUnit?.completedChecks.includes(check) ? '✓ ' : selectedNode.workUnit?.failedChecks?.includes(check) ? '✕ ' : '○ '}{check}</li>)}</ul>}
                 {selectedNode.workUnit.outputSummary && <p>{selectedNode.workUnit.outputSummary}</p>}
-                {selectedNode.workUnit.done && selectedNode.workUnit.expectationMet === false && <p className={styles.flowSubtext}>执行已结束，但预期条件未满足 · {selectedNode.workUnit.outcome ?? '结果待判断'}</p>}
+                {selectedNode.workUnit.done && typeof selectedNode.workUnit.expectationMet === 'boolean' && <p className={styles.flowSubtext}>旧版宿主条件记录：{selectedNode.workUnit.expectationMet ? '满足' : '未满足'} · 不代表整体验收结论</p>}
               </div>}
 
               <VisualMaterials events={events} node={selectedNode} />

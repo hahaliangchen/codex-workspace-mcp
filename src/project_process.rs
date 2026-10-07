@@ -194,8 +194,7 @@ fn process_fact(value: &Value) -> Value {
     json!({"process_id":value["process_id"],"project_path":value["project_path"],"script":value["script"],
         "args":value["args"],"operation":value["operation"],"state":value["state"],"running":value["running"],"ready":value["ready"],
         "listener_owned":value["listener_owned"],"page_ready":value["page_ready"],"ready_url":value["ready_url"],
-        "ready_port":value["ready_port"],"exit_code":value["exit_code"],"failure_stage":value["failure_stage"],
-        "diagnosis":value["diagnosis"]})
+        "ready_port":value["ready_port"],"exit_code":value["exit_code"]})
 }
 
 pub fn is_tool(name: &str) -> bool {
@@ -296,10 +295,6 @@ struct Meta {
     node_executable: String,
     #[serde(default)]
     npm_cli: String,
-    #[serde(default)]
-    failure_stage: String,
-    #[serde(default)]
-    failure_diagnosis: String,
     ready_url: Option<String>,
     ready_port: Option<u16>,
     started_at: u64,
@@ -444,16 +439,11 @@ impl Record {
         let complete_stderr=logs.chunks.iter().filter(|chunk|chunk["stream"]=="stderr")
             .filter_map(|chunk|chunk["text"].as_str()).collect::<String>();
         let stderr=if !meta.running&&meta.exit_code.is_some_and(|code|code!=0){complete_stderr}else{recent_stderr.clone()};
-        let readiness_unverified=meta.background && !meta.ready && (meta.ready_url.is_none()&&meta.ready_port.is_none() || !meta.ready);
-        let failure_stage=if !meta.failure_stage.is_empty(){meta.failure_stage.clone()}else if readiness_unverified{"readiness".to_owned()}else{String::new()};
-        let failure_diagnosis=if !meta.failure_diagnosis.is_empty(){meta.failure_diagnosis.clone()}else if failure_stage=="readiness"{"readiness".to_owned()}else if failure_stage=="runtime_bootstrap"{"host_runtime".to_owned()}else if failure_stage=="project_script"{"project_script".to_owned()}else if failure_stage=="dependency_install"{"dependency_install".to_owned()}else{"unknown".to_owned()};
         json!({"process_id":meta.process_id,"pid":meta.pid,"project_path":meta.project_path,"script":meta.script,"args":meta.args,"operation":meta.operation,
             "state":if meta.running{"running"}else{"exited"},"running":meta.running,"process_running":meta.running,
             "ready":meta.running&&meta.ready,"listener_owned":meta.listener_owned,"page_ready":meta.page_ready,
-            "failure_stage":if failure_stage.is_empty(){Value::Null}else{json!(failure_stage)},"diagnosis":failure_diagnosis,
             "readiness_detail":meta.readiness_detail,"script_command":meta.script_command,
             "host_runtime":{"node_executable":meta.node_executable,"npm_cli":meta.npm_cli,"host_pid":std::process::id(),"host_instance_id":host_instance_id()},
-            "port_args":if meta.script_command.contains("concurrently"){"Extra args reach this npm script only. A concurrently parent does not forward --port to the child that listens; set the port on that child script."}else{""},
             "readiness":if !meta.running{"exited"}else if meta.ready{"ready"}else if meta.ready_url.is_none()&&meta.ready_port.is_none(){"not_configured"}else{"pending"},
             "ready_url":meta.ready_url,"ready_port":meta.ready_port,"status":meta.exit_code,"exit_code":meta.exit_code,
             "background":meta.background,"check_key":meta.check_key,"started_at":meta.started_at,"ended_at":meta.ended_at,"termination_reason":meta.termination_reason,
@@ -659,19 +649,6 @@ pub(crate) fn resolve_node_executable() -> Result<PathBuf> {
 
 pub(crate) fn native_runtime_path(path: &Path) -> Result<OsString> {
     external_runtime_path(path)
-}
-
-pub fn failure_result(name:&str,args:&Value,error:&anyhow::Error)->Value {
-    let message=format!("{error:#}");
-    let failure_stage=if message.contains("unsupported_script_shell:") {"unsupported_script_shell"}else if message.contains("runtime_bootstrap:") {"runtime_bootstrap"}else{"unknown"};
-    let diagnosis=match failure_stage {"unsupported_script_shell"=>"unsupported_script_shell","runtime_bootstrap"=>"host_runtime",_=>"unknown"};
-    json!({"error":message,"failure_stage":failure_stage,"diagnosis":diagnosis,
-        "project_path":args["project_path"],"script":args["script"],"check_key":check_key(name,args),
-        "exit_code":Value::Null,"stderr":"","host_fix_guidance":if diagnosis=="host_runtime" {
-            "npm CLI or the host Node/npm runtime failed before project script execution. Do not infer project dependency damage from this error; preserve the original diagnostic and check the runtime path/installation."
-        } else if diagnosis=="unsupported_script_shell" {
-            "The host refused to execute a PowerShell npm script or script-shell. Report the named script and the unsupported PowerShell requirement; do not route it through another runtime."
-        } else {"The failure stage is unknown. Use the structured result and original error before deciding what to repair."}})
 }
 
 fn runtime_bootstrap(error:impl std::fmt::Display)->anyhow::Error {anyhow::anyhow!("runtime_bootstrap: {error}")}
@@ -996,9 +973,6 @@ mod tests {
             &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
         assert!(error.to_string().contains("unsupported_script_shell"),"{error:#}");
         assert!(error.to_string().contains("bad"),"{error:#}");
-        let structured=super::failure_result("run_project_script",&args,&error);
-        assert_eq!(structured["failure_stage"],"unsupported_script_shell");
-        assert_eq!(structured["diagnosis"],"unsupported_script_shell");
         for hook in ["prebad","postbad"] {
             let mut scripts=serde_json::Map::new();
             scripts.insert("bad".into(),serde_json::json!("node -e \"console.log('safe')\""));
@@ -1032,13 +1006,36 @@ mod tests {
             script:"dev".into(),args:args.iter().map(|arg|(*arg).to_owned()).collect(),operation:"script".into(),
             check_key:format!("npm-start:{project_path}:dev"),running:true,ready:false,listener_owned:false,page_ready:false,
             readiness_detail:"pending".into(),script_command:"npm run dev".into(),node_executable:"node".into(),npm_cli:"npm-cli.js".into(),
-            failure_stage:String::new(),failure_diagnosis:String::new(),ready_url:None,ready_port:None,started_at:super::now(),
+            ready_url:None,ready_port:None,started_at:super::now(),
             ended_at:None,exit_code:None,termination_reason:None,background:true,
         };
         std::sync::Arc::new(super::Record {
             meta:tokio::sync::Mutex::new(meta),logs:tokio::sync::Mutex::new(super::Logs::default()),
             persist_guard:tokio::sync::Mutex::new(()),dir:root.to_path_buf(),stop,ended:tokio::sync::Notify::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn process_snapshot_preserves_error_output_without_diagnosis_or_repair_guidance() {
+        let root=std::env::current_dir().unwrap();
+        let record=fixture_record(&root,"raw-error",".",&[]);
+        let stderr="MODULE_NOT_FOUND: cannot find module npm-cli\n  at original.js:17\n";
+        {
+            let mut meta=record.meta.lock().await;
+            meta.running=false;
+            meta.exit_code=Some(1);
+            meta.termination_reason=Some("exited".into());
+            meta.script_command="concurrently npm run frontend npm run backend".into();
+            let mut logs=record.logs.lock().await;
+            logs.sequence=1;
+            logs.chunks.push_back(serde_json::json!({"seq":1,"stream":"stderr","text":stderr}));
+        }
+        let result=record.snapshot(&serde_json::json!({})).await;
+        assert_eq!(result["stderr"],stderr);
+        assert_eq!(result["exit_code"],1);
+        for field in ["diagnosis","failure_stage","host_fix_guidance","port_args"] {
+            assert!(result.get(field).is_none(),"host must not interpret process output into {field}");
+        }
     }
 
     #[test]
@@ -1401,17 +1398,6 @@ async fn supervise(
             (None, Some("wait_error".into()))
         }
     };
-    let stderr={record.logs.lock().await.chunks.iter().filter(|chunk|chunk["stream"]=="stderr")
-        .filter_map(|chunk|chunk["text"].as_str()).collect::<String>().to_lowercase()};
-    let npm_bootstrap_failure=exit_code.is_some_and(|code|code!=0)
-        && (stderr.contains("module_not_found")||stderr.contains("cannot find module"))
-        && ["npm-cli","node_modules/npm","npm\\lib\\cli","npm/lib/cli"].iter().any(|hint|stderr.contains(hint));
-    let (failure_stage,failure_diagnosis)=if npm_bootstrap_failure {("runtime_bootstrap","host_runtime")}
-        else if exit_code.is_some_and(|code|code!=0) && reason.as_deref()==Some("timeout") {
-            if record.meta.lock().await.operation=="install" {("dependency_install","dependency_install")}else{("project_script","project_script")}
-        } else if exit_code.is_some_and(|code|code!=0) {
-            if record.meta.lock().await.operation=="install" {("dependency_install","dependency_install")}else{("project_script","project_script")}
-        } else {("","")};
     {
         let mut meta = record.meta.lock().await;
         meta.running = false;
@@ -1419,7 +1405,6 @@ async fn supervise(
         meta.ended_at = Some(now());
         meta.exit_code = exit_code;
         meta.termination_reason = reason;
-        meta.failure_stage=failure_stage.to_owned();meta.failure_diagnosis=failure_diagnosis.to_owned();
     }
     record.persist().await;
     record.ended.notify_waiters();
@@ -1672,8 +1657,6 @@ async fn launch(
             script_command,
             node_executable: node.to_string_lossy().into_owned(),
             npm_cli: npm.to_string_lossy().into_owned(),
-            failure_stage:String::new(),
-            failure_diagnosis:String::new(),
             ready_url,
             ready_port,
             started_at: now(),

@@ -207,8 +207,7 @@ impl WorkExecutor {
         let done = scheduler.done();
         let output = scheduler.output().cloned();
         let handoff = scheduler.pending_handoff().cloned();
-        let outcome = output.as_ref().and_then(|o| o["outcome"].as_str()).map(str::to_owned)
-            .or_else(|| if done { Some("completed".to_string()) } else { None });
+        let outcome = output.as_ref().and_then(|o| o["outcome"].as_str()).map(str::to_owned);
         let summary = output.as_ref().and_then(|o| o["summary"].as_str()).map(str::to_owned);
         let should_yield = scheduler.needs_organizer();
 
@@ -244,14 +243,13 @@ impl WorkExecutor {
         ensure!(identity.work_id == scheduler.id() && identity.node_id == scheduler.node()
             && identity.revision == scheduler.revision() && identity.plan_revision == scheduler.plan_revision,
             "execution identity changed during tool round");
-        scheduler.close_if_satisfied();
         if scheduler.output().is_some() {
             scheduler.attach_return_data(&work_state.unit_context(scheduler.id(), &[]), source_working_set.materials());
         }
         if scheduler.done() && task_tree.enabled() && task_tree.active() == scheduler.node() {
             task_tree.remember_sources(source_working_set.snapshot(), work_state.edit_targets());
             if let Some(output) = scheduler.output() {
-                task_tree.complete_work(output)?;
+                task_tree.record_work_return(output)?;
             }
         }
         let tick = Self::make_tick(identity, operations_count, repeated_reads, scheduler);
@@ -279,6 +277,20 @@ mod response_validation_tests {
     use serde_json::json;
     use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn execution_tick_keeps_missing_worker_outcome_unknown() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![crate::work_scheduler::WorkOrder{id:"worker".into(),node_id:"worker".into(),
+            goal:"observe a page".into(),done_when:"report what is visible".into(),..Default::default()}],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        scheduler.return_work(&json!({"summary":"The invocation returned without a categorical assessment."})).unwrap();
+        let identity=WorkExecutor::capture_identity(&scheduler,1);
+        let tick=WorkExecutor::make_tick(&identity,1,0,&scheduler);
+        assert!(tick.done);
+        assert!(tick.outcome.is_none());
+        assert!(tick.output.as_ref().unwrap()["outcome"].is_null());
+    }
 
     #[derive(Clone)]
     struct ScriptResponse { body:String, content_type:&'static str }

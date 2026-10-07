@@ -34,7 +34,7 @@ pub struct TaskNode {
 fn text(value: &Value, key: &str, max: usize) -> String {
     value[key].as_str().unwrap_or("").trim().chars().take(max).collect()
 }
-fn terminal(status: &str) -> bool { matches!(status,"completed"|"skipped"|"deprecated") }
+fn terminal(status: &str) -> bool { matches!(status,"done"|"completed"|"skipped"|"deprecated") }
 
 impl TaskTree {
     pub fn enabled(&self) -> bool { !self.nodes.is_empty() }
@@ -44,10 +44,36 @@ impl TaskTree {
     }
     pub fn snapshot(&self) -> Value {
         let mut snapshot=serde_json::to_value(self).unwrap_or(json!({}));
-        snapshot["schema_version"]=json!(1);
+        snapshot["schema_version"]=json!(2);
         snapshot
     }
-    pub fn normalize_snapshot_version(&mut self) { self.schema_version=1; }
+    pub fn normalize_snapshot_version(&mut self) {
+        if self.schema_version < 2 {
+            for node in self.nodes.values_mut() {
+                if node.status == "pending" { node.status = "ready".into(); }
+                // Older worker-node statuses described a sealed return. Migrate
+                // only nodes with a saved delivery; never invent a result.
+                if node.kind == "worker" && node.parent_id.is_some() {
+                    if let Some(result)=node.result.as_mut() {
+                        if result["outcome"]=="completed" {
+                            result["outcome"]=Value::Null;
+                            result["outcome_unverified_legacy"]=json!(true);
+                        }
+                        for field in ["blocked","need_split"] {
+                            if result[field]==false {result[field]=Value::Null;}
+                        }
+                    }
+                    if node.result.is_some() && matches!(node.status.as_str(), "completed" | "blocked") {
+                        node.status = "done".into();
+                    }
+                }
+                if node.parent_id.is_none() && matches!(node.status.as_str(), "completed" | "blocked") {
+                    node.status = "done".into();
+                }
+            }
+        }
+        self.schema_version=2;
+    }
     pub fn remember_sources(&mut self, mut snapshot: Value, targets: &[String]) {
         snapshot["edit_targets"]=json!(targets);
         if !self.active.is_empty() {self.source_sets.insert(self.active.clone(),snapshot);}
@@ -174,7 +200,7 @@ impl TaskTree {
         json!({"mode":"tree","active_path":path,"current_node":current,"ancestor_goals":ancestors,
             "task":root.map(|node|json!({"id":node.id,"title":node.title,"objective":node.objective,"constraints":node.constraints,"status":node.status,"result":node.result})),
             "child_results_and_remaining_problems":children,"stored_node_count":self.nodes.len(),
-            "context_rule":"Organizer selects the current node and relevant upstream outputs. The host completes work from actual returns/write/check facts. Ancestors supply goals and constraints; other branches' source stays in the notebook. Entering a child never completes its parent."})
+            "context_rule":"The host records a Worker return as a done invocation, not as proof that its goal passed. The Organizer reads the returned facts and chooses the next task or assesses the overall goal. Ancestors supply goals and constraints; other branches' source stays in the notebook."})
     }
     pub fn recall_nodes(&self, args: &Value) -> Result<Value> {
         let ids=args["tree_node_ids"].as_array().ok_or_else(||anyhow::anyhow!("tree_node_ids must be an array"))?;
@@ -193,31 +219,65 @@ impl TaskTree {
     pub fn root_finished(&self) -> bool {
         self.enabled() && self.nodes.values().filter(|node|node.parent_id.is_none()).all(|node|terminal(&node.status))
     }
+    pub fn goal_assessment(&self) -> Option<bool> {
+        self.nodes.values().find(|node|node.parent_id.is_none())
+            .and_then(|node|node.result.as_ref())
+            .and_then(|result|result["goal_achieved"].as_bool())
+    }
+    pub fn resume_unachieved_request(&mut self) {
+        let Some(root_id)=self.nodes.values().find(|node|node.parent_id.is_none()).map(|node|node.id.clone()) else {return;};
+        let Some(root)=self.nodes.get_mut(&root_id) else {return;};
+        if root.status=="done" && root.result.as_ref().and_then(|result|result["goal_achieved"].as_bool())!=Some(true) {
+            if let Some(result)=root.result.take() {root.history_results.push(result);}
+            root.status="running".into();
+            self.active=root_id;
+        }
+    }
     /// Record the request-level delivery from the host's finish_request call.
     /// Work nodes already carry their own sealed outcomes; this only closes
     /// the grouping root and never rewrites child results.
     pub fn finish_request(&mut self,summary:&str,achieved:bool)->Result<()> {
         let root_id=self.nodes.values().find(|node|node.parent_id.is_none()).map(|node|node.id.clone());
         let Some(root_id)=root_id else {return Ok(());};
-        if achieved {
-            let unfinished=self.nodes.values().filter(|node|node.id!=root_id&&!terminal(&node.status))
-                .map(|node|node.id.clone()).collect::<Vec<_>>();
-            ensure!(unfinished.is_empty(),"cannot mark the request goal achieved while Flow nodes remain unfinished: {}",unfinished.join(", "));
-        }
         let root=self.nodes.get_mut(&root_id).unwrap();
-        root.status=if achieved{"completed"}else{"blocked"}.to_owned();
+        // Status records the end of the request delivery. The Organizer's
+        // explicit goal assessment remains separate from execution status.
+        root.status="done".to_owned();
         root.result=Some(json!({"summary":text(&json!({"summary":summary}),"summary",1800),
-            "outcome":if achieved{"completed"}else{"blocked"},"expectation_met":achieved,"material_ids":[],"finding_ids":[]}));
+            "goal_achieved":achieved,"assessment_source":"organizer",
+            "material_ids":[],"finding_ids":[]}));
         self.active=root_id;
         Ok(())
     }
-    pub fn complete_work(&mut self, output:&Value) -> Result<()> {
+    pub fn record_work_return(&mut self, output:&Value) -> Result<()> {
         let id=output["node_id"].as_str().unwrap_or("");
         ensure!(output["done"]==true && self.active==id,"host completion must concern the active work node");
-        self.apply(&json!({"current_node_id":id,"node_result":{"node_id":id,"status":"completed",
-            "summary":output["summary"],"material_ids":output["material_ids"],"finding_ids":output["finding_ids"],
-            "outcome":output["outcome"],"expectation_met":output["expectation_met"],
-            "limitations":output["limitations"],"exported_data":output["exported_data"]}}))
+        let parent = {
+            let node=self.nodes.get_mut(id).ok_or_else(||anyhow::anyhow!("unknown work node: {id}"))?;
+            ensure!(node.parent_id.is_some(),"a Worker return cannot seal the user request goal");
+            ensure!(!terminal(&node.status),"work node '{id}' already has a sealed return");
+            // Legacy leaf nodes may not have a worker kind. The dispatch
+            // identity already establishes which invocation returned.
+            node.kind="worker".into();
+            let mut delivery=json!({"summary":text(output,"summary",1800),
+                "material_ids":output["material_ids"],"finding_ids":output["finding_ids"]});
+            for field in ["outcome","limitations","exported_data","blocked","need_split","upstream_problem",
+                "suggested_children","findings","checks","visual_artifact_ids","visual_check_result"] {
+                if let Some(value)=output.get(field).filter(|value|!value.is_null()) {delivery[field]=value.clone();}
+            }
+            node.status="done".into();
+            node.result=Some(delivery);
+            node.parent_id.clone()
+        };
+        self.active=parent.unwrap_or_else(||id.to_owned());
+        for path_id in self.path() {
+            if let Some(node)=self.nodes.get_mut(&path_id) {
+                if !terminal(&node.status) {
+                    node.status=if path_id==self.active {"running"} else {"waiting_children"}.into();
+                }
+            }
+        }
+        Ok(())
     }
     pub fn work_node_ready(&self, id:&str) -> bool {
         self.nodes.get(id).is_some_and(|node|!terminal(&node.status)&&node.status!="blocked") &&
@@ -285,7 +345,7 @@ impl TaskTree {
             ensure!(result["node_id"].as_str().is_some()&&result["status"].as_str().is_some()&&result["summary"].as_str().is_some(),
                 "flow_update.node_result requires string node_id, status and summary fields");
             for key in result.as_object().into_iter().flatten().map(|(key, _)|key.as_str()) {
-                ensure!(matches!(key,"node_id"|"status"|"summary"|"material_ids"|"finding_ids"|"outcome"|"expectation_met"|"limitations"|"exported_data"),
+                ensure!(matches!(key,"node_id"|"status"|"summary"|"material_ids"|"finding_ids"|"outcome"|"expectation_met"|"goal_achieved"|"assessment_source"|"limitations"|"exported_data"),
                     "flow_update.node_result.{key} is unsupported");
             }
         }
@@ -329,17 +389,17 @@ impl TaskTree {
                 let done_when=field("done_when",prior.map_or("",|node|&node.done_when),800);
                 ensure!(!title.is_empty()&&!objective.is_empty()&&!done_when.is_empty(),"tree node {id} needs title, objective and done_when");
                 let kind=field("kind",prior.map_or("step",|node|&node.kind),48);
-                let mut status=prior.map_or("pending",|node|&node.status).to_owned();
+                let mut status=prior.map_or("ready",|node|&node.status).to_owned();
                 let mut result=prior.and_then(|node|node.result.clone());
                 if raw["resume"]==true {
-                    ensure!(matches!(status.as_str(),"blocked"|"paused"),"field_path={update_path}[{update_index}].resume: node_id='{id}' has status='{status}'; resume is allowed only for blocked/paused nodes. Pending nodes are dispatched directly; completed nodes are sealed and require action=revisit for repair.");
-                    status="pending".to_owned();result=None;
+                    ensure!(matches!(status.as_str(),"blocked"|"paused"),"field_path={update_path}[{update_index}].resume: node_id='{id}' has status='{status}'; resume is allowed only for legacy blocked/paused nodes. Ready nodes are dispatched directly; done nodes are sealed and require action=revisit for repair.");
+                    status="ready".to_owned();result=None;
                 }
                 let constraints=raw["constraints"].as_array().map(|items|items.iter().filter_map(Value::as_str).take(12).map(|item|item.chars().take(500).collect()).collect())
                     .unwrap_or_else(||prior.map(|node|node.constraints.clone()).unwrap_or_default());
                 if let Some(prior)=prior.filter(|node|terminal(&node.status)) {
                     ensure!(title==prior.title&&objective==prior.objective&&done_when==prior.done_when&&constraints==prior.constraints,
-                        "completed Flow node '{id}' is immutable; add a new node under an unfinished ancestor for next work, or use action=revisit with target_node_id='{id}' when its delivered result needs repair");
+                        "sealed Flow node '{id}' is immutable; add a new node under an unfinished ancestor for next work, or use action=revisit with target_node_id='{id}' when its delivered result needs repair");
                 }
                 let history_results = prior.map(|node| node.history_results.clone()).unwrap_or_default();
                 self.nodes.insert(id.clone(),TaskNode{id,parent_id,title,kind,objective,done_when,constraints,status,result,history_results});
@@ -364,9 +424,11 @@ impl TaskTree {
             let finding_ids=result["finding_ids"].as_array().into_iter().flatten().filter_map(Value::as_str).take(16)
                 .map(|id|id.chars().take(80).collect::<String>()).collect::<Vec<_>>();
             let mut delivery=json!({"summary":summary,"material_ids":material_ids,"finding_ids":finding_ids,
-                "outcome":result["outcome"],"expectation_met":result["expectation_met"],
+                "outcome":result["outcome"],"goal_achieved":result["goal_achieved"],"assessment_source":result["assessment_source"],
+                "expectation_met":result["expectation_met"],
                 "limitations":result["limitations"],"exported_data":result["exported_data"]});
             if result["expectation_met"].is_boolean() {delivery["expectation_met"]=result["expectation_met"].clone();}
+            if result["goal_achieved"].is_boolean() {delivery["goal_achieved"]=result["goal_achieved"].clone();}
             node.status=status;node.result=Some(delivery);
         }
         let mut target=text(args,"current_node_id",80);
@@ -413,6 +475,68 @@ mod tests {
     }
 
     #[test]
+    fn organizer_goal_assessment_is_not_stored_as_a_legacy_host_expectation() {
+        let mut tree=TaskTree::default();
+        tree.ensure_request_goal("Complete the request").unwrap();
+        tree.ensure_work_child("unused","Optional further investigation","Return findings",&[]).unwrap();
+        tree.finish_request("The acceptance conditions were met",true).unwrap();
+        assert_eq!(tree.status("goal"),Some("done"));
+        assert_ne!(tree.status("unused"),Some("done"),"Organizer's assessment must not invent a child return");
+        let result=tree.nodes.get("goal").unwrap().result.as_ref().unwrap();
+        assert_eq!(result["goal_achieved"],true);
+        assert_eq!(result["assessment_source"],"organizer");
+        assert!(result.get("outcome").is_none());
+        assert!(result.get("expectation_met").is_none());
+    }
+
+    #[test]
+    fn unachieved_final_delivery_is_neutral_and_remains_continuable() {
+        let mut tree=TaskTree::default();
+        tree.ensure_request_goal("Finish the requested work").unwrap();
+        tree.finish_request("The required visual check remains unconfirmed",false).unwrap();
+        assert_eq!(tree.status("goal"),Some("done"));
+        assert_eq!(tree.goal_assessment(),Some(false));
+        tree.resume_unachieved_request();
+        assert_eq!(tree.status("goal"),Some("running"));
+        assert_eq!(tree.goal_assessment(),None);
+        assert_eq!(tree.nodes["goal"].history_results.len(),1);
+    }
+
+    #[test]
+    fn legacy_worker_completion_migrates_to_done_without_changing_result() {
+        let mut legacy=TaskTree::default();
+        legacy.ensure_request_goal("A request").unwrap();
+        legacy.ensure_work_child("work_a","Inspect","Return facts",&[]).unwrap();
+        legacy.nodes.get_mut("work_a").unwrap().status="completed".into();
+        legacy.nodes.get_mut("work_a").unwrap().result=Some(serde_json::json!({"summary":"HTTP 404","outcome":"blocked"}));
+        legacy.nodes.get_mut("goal").unwrap().status="blocked".into();
+        legacy.nodes.get_mut("goal").unwrap().result=Some(serde_json::json!({"summary":"Request not achieved","goal_achieved":false}));
+        legacy.schema_version=1;
+        let mut restored:TaskTree=serde_json::from_value(serde_json::to_value(legacy).unwrap()).unwrap();
+        restored.normalize_snapshot_version();
+        assert_eq!(restored.status("work_a"),Some("done"));
+        assert_eq!(restored.status("goal"),Some("done"));
+        assert_eq!(restored.goal_assessment(),Some(false));
+        assert_eq!(restored.nodes["work_a"].result.as_ref().unwrap()["outcome"],"blocked");
+    }
+
+    #[test]
+    fn worker_return_is_recorded_as_done_and_keeps_its_explicit_negative_result() {
+        let mut tree=TaskTree::default();
+        tree.ensure_request_goal("Inspect the font endpoint").unwrap();
+        tree.ensure_work_child("font_check","Check the font endpoint","Record its actual response",&[]).unwrap();
+        let output=serde_json::json!({"node_id":"font_check","done":true,"execution_status":"done",
+            "outcome":"blocked","summary":"Connection refused","limitations":["No HTTP response arrived"],
+            "exported_data":{"http_status":null,"error_kind":"connection_refused"}});
+        tree.record_work_return(&output).unwrap();
+        assert_eq!(tree.status("font_check"),Some("done"));
+        let result=tree.nodes["font_check"].result.as_ref().unwrap();
+        assert_eq!(result["outcome"],"blocked");
+        assert_eq!(result["limitations"][0],"No HTTP response arrived");
+        assert_eq!(tree.status("goal"),Some("running"));
+    }
+
+    #[test]
     fn flow_update_rejects_misplaced_ids_and_protects_completed_node_contracts() {
         let mut tree=TaskTree::default();
         tree.ensure_request_goal("Complete the goal").unwrap();
@@ -426,7 +550,7 @@ mod tests {
 
         tree.apply(&serde_json::json!({"node_result":{"node_id":"work_a","status":"completed","summary":"Project facts returned"},"current_node_id":"goal"})).unwrap();
         let error=tree.apply(&serde_json::json!({"node_updates":[{"id":"work_a","title":"Start project"}],"current_node_id":"goal"})).unwrap_err().to_string();
-        assert!(error.contains("completed Flow node 'work_a' is immutable"));
+        assert!(error.contains("sealed Flow node 'work_a' is immutable"));
         assert!(error.contains("action=revisit")&&error.contains("new node"));
     }
 
@@ -437,9 +561,9 @@ mod tests {
             {"id":"goal","parent_id":null,"title":"Goal","kind":"goal","objective":"Goal","done_when":"Done"},
             {"id":"upload","parent_id":"goal","title":"Upload","kind":"worker","objective":"Upload a file","done_when":"File assigned"}
         ]},"current_node_id":"goal"})).unwrap();
-        assert_eq!(tree.status("upload"),Some("pending"));
+        assert_eq!(tree.status("upload"),Some("ready"));
         let pending=tree.apply(&serde_json::json!({"node_updates":[{"id":"upload","resume":true}],"current_node_id":"goal"})).unwrap_err().to_string();
-        assert!(pending.contains("field_path=flow_update.node_updates[0].resume")&&pending.contains("status='pending'"));
+        assert!(pending.contains("field_path=flow_update.node_updates[0].resume")&&pending.contains("status='ready'"));
         tree.apply(&serde_json::json!({"current_node_id":"upload"})).unwrap();
         tree.apply(&serde_json::json!({"current_node_id":"goal","node_result":{"node_id":"upload","status":"blocked","summary":"Upload control is unavailable"}})).unwrap();
         assert_eq!(tree.status("upload"),Some("blocked"));

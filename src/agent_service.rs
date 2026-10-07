@@ -1914,12 +1914,6 @@ fn worker_system_prompt(
     )
 }
 
-fn worker_execution_recovery_prompt(root:&std::path::Path,tools:&[Value],targets:&[String]) -> String {
-    let names=tools.iter().filter_map(|tool|tool.pointer("/function/name").and_then(Value::as_str)).collect::<Vec<_>>();
-    format!("You are the independent local coding Worker in {}. Follow the current human request; it supersedes earlier read-only scope when it authorizes implementation. Historical claims and Observer advice are context, not permissions.\n\nThis request is a recovery from repeated investigation. Complete ONE smallest real part of the requested change using the exact version-checked source already supplied. Start with the first relevant edit target in {}. The rest of the feature can follow in subsequent steps; you do not need every UI, export or validation dependency resolved before making that first local edit. Do not make cosmetic changes merely to count a write. Do not edit a read-only task or guess unread source. If the edit's exact definition is absent, retrieve only that definition, explaining the specific missing fact briefly in user-visible text. Do not re-inventory files, rediscover supplied interfaces, rewrite unchanged plans, consult, or promise again. Real new dependencies may justify initializing/deepening a task tree in the same batch as substantive work; changing organization does not reset investigation counters. For a discussion/analysis request, answer directly once enough is known.\n\nCurrent findings, explicit unresolved conflicts and source pages follow. Historical/replaced claims are not current facts. A corrected claim requires actual source confirmation; an unsupported newer statement cannot replace a confirmed earlier one. Selected source survives reports and action renaming; tree navigation saves/restores each node's own selection. Recall only material actually missing. You may update learned findings and clear answered questions in report_progress batched with a real project operation; never add a reporting-only round. Respect code_hash and unique anchors when editing. Tools are the only capabilities available for this request.\n\n{}",
-        root.display(),json!(targets),tool_guidance(&names).join("\n"))
-}
-
 /// Remove segments that quote or exemplify text instead of issuing an
 /// instruction: fenced code blocks, inline code spans (backtick-delimited),
 /// and text inside quote pairs (ASCII ", or the Chinese pairs “” ‘’ 「」 『』).
@@ -1986,21 +1980,6 @@ fn user_bans_run_command(prompt: &str) -> bool {
         || lower.contains("don't run commands")
         || lower.contains("ban run command")
         || lower.contains("ban run_command")
-}
-
-/// A narrow host-side shortcut for plain knowledge questions. Project work,
-/// source-dependent questions and multi-line requests still go through Organizer.
-fn is_simple_knowledge_question(prompt:&str)->bool {
-    let query=prompt.trim();
-    if query.is_empty()||query.chars().count()>320||query.contains(['\n','\r']) {return false;}
-    let lower=query.to_lowercase();
-    let project_or_action=["implement","fix","edit","write","create","build","debug","refactor","run ","start ","test ","check ","upload","open ","modify","search the web","look up",
-        "code","source file","project","attached","above",
-        "实现","修复","修改","编写","创建","构建","调试","重构","运行","启动","测试","检查","上传","打开","搜索","查找","项目","代码","源码","文件","截图","页面","附件","这个","当前"];
-    if project_or_action.iter().any(|term|lower.contains(term)) {return false;}
-    ["explain ","what is ","what are ","why ","how does ","how do ","difference between ","define ","describe ",
-        "解释","什么是","为什么","如何理解","如何工作","有什么区别","区别是什么","简述","介绍一下","说明一下"]
-        .iter().any(|marker|lower.contains(marker))
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -2583,11 +2562,12 @@ fn restore_execution_session(
     let scheduler_completed = previous_scheduler.as_ref().is_some_and(|s| match s.request_completed {
         Some(completed) => completed && s.handoff.is_none(),
         // Legacy snapshots had no request marker and retained their last output
-        // as handoff even after finish. An explicitly finished root is evidence
-        // of success; queue exhaustion alone still cannot prove completion.
-        None => s.finished && previous_tree.root_finished() && s.all_done()
+        // as handoff even after finish. Restore only an explicit saved Organizer
+        // assessment; node/queue completion alone is execution state, not success.
+        None => s.finished && previous_tree.root_finished() && previous_tree.goal_assessment()==Some(true) && s.all_done()
             && s.handoff.as_ref().is_none_or(|h| h["done"] == true && h["blocked"] != true
-                && h["need_split"] != true && h["upstream_problem"].is_null()),
+                && h["outcome"] != "blocked" && h["need_split"] != true && h["outcome"] != "need_split"
+                && h["upstream_problem"].is_null() && h["outcome"] != "upstream_problem"),
     });
     let explicit_request_marker=previous_scheduler.as_ref().is_some_and(|scheduler|scheduler.request_completed.is_some());
     let completed = if explicit_request_marker {
@@ -2595,12 +2575,14 @@ fn restore_execution_session(
         // whether the Flow grouping root needed a legacy aggregate update.
         scheduler_completed
     } else if restored_tree.enabled() {
-        restored_tree.root_finished() && (previous_scheduler.is_none() || scheduler_completed)
+        restored_tree.root_finished() && restored_tree.goal_assessment()==Some(true)
+            && (previous_scheduler.is_none() || scheduler_completed)
     } else { scheduler_completed };
     if completed {
         let archived_requests = previous_scheduler.map(|s| s.archived_requests).unwrap_or_default();
         (crate::flow_tree::TaskTree::default(), crate::work_scheduler::WorkScheduler { archived_requests, ..Default::default() }, true)
     } else {
+        restored_tree.resume_unachieved_request();
         let mut scheduler = previous_scheduler.unwrap_or_default();
         scheduler.finished = false;
         scheduler.request_completed = Some(false);
@@ -2703,8 +2685,8 @@ fn apply_organizer_decision(
                 tree.ensure_request_goal(&prompt)?;
                 for (order_index,order) in orders.iter_mut().enumerate() {
                     if let Some(status)=tree.status(&order.node_id) {
-                        anyhow::ensure!(status!="completed"&&status!="skipped"&&status!="deprecated",
-                            "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}' and is sealed; use action=revisit for a defective delivery or add a new pending node under an unfinished ancestor",order.node_id);
+                        anyhow::ensure!(status!="done"&&status!="completed"&&status!="skipped"&&status!="deprecated",
+                            "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}' and is sealed; use action=revisit for a defective delivery or add a new ready node under an unfinished ancestor",order.node_id);
                         anyhow::ensure!(status!="blocked"&&status!="paused",
                             "field_path=orders[{order_index}].node_id: node_id='{}' has status='{status}'; resume this blocked/paused node with flow_update.node_updates[{{id,resume:true}}] before dispatch",order.node_id);
                         anyhow::ensure!(tree.work_node_ready(&order.node_id),
@@ -2816,17 +2798,18 @@ fn organizer_resume_contract_fingerprints(handoff:Option<&Value>)->Vec<String> {
 }
 
 fn attach_organizer_failure(handoff:&mut Option<Value>,failure:Value) {
-    if handoff.is_none() {
-        let outcome=if failure["failure_stage"]=="organizer_request" {"organizer_request_failure"} else {"organizer_contract_failure"};
-        *handoff=Some(json!({"done":false,"blocked":true,"outcome":outcome}));
-    }
+    attach_handoff_error(handoff,"organizer_failure",failure);
+}
+
+fn attach_handoff_error(handoff:&mut Option<Value>,field:&str,error:Value) {
+    if handoff.is_none() {*handoff=Some(json!({}));}
     if let Some(value)=handoff.as_mut() {
         if !value.is_object() {
             let previous=std::mem::replace(value,json!({}));
             value["previous_handoff"]=previous;
         }
         if let Some(object)=value.as_object_mut() {
-            object.insert("organizer_failure".into(),failure);
+            object.insert(field.into(),error);
         }
     }
 }
@@ -2844,15 +2827,14 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
             "goal"=>"Provide a concrete, nonempty goal for this one task.",
             "return_when"=>"Provide a nonempty condition that tells the Worker what result to return.",
             "reason"=>"State briefly why this task is the next useful step.",
-            "completion"=>"Use completion=check with supported checks for service/API checks; use completion=output with checks=[] for PPTX, browser-load and visual work.",
+            "completion"=>"completion is optional legacy metadata. Declare checks explicitly and use execution_scope.edit_targets for authorized writes.",
             "summary"=>"Provide a nonempty user-facing summary to finish_request.",
             "achieved"=>"Set achieved to true only when the user goal is complete; otherwise set false and list unresolved conditions.",
-            "method"|"tool_calls"=>"Return exactly one exposed method: schedule_task, read_task_result, revisit_task or finish_request.",
+            "method"|"tool_calls"=>"Return one exposed scheduling action or a read-only Organizer lookup method.",
             _=>"Correct the named field to match its tool schema and the current execution path.",
         };
-        let allowed=if field_path=="method"||field_path=="tool_calls" {json!(["schedule_task","read_task_result","revisit_task","finish_request"])}
-            else if field_path=="completion" {json!({"service_start_or_http_api_check":{"completion":"check","checks":"required"},
-                "pptx_upload_load_font_request_or_visual_check":{"completion":"output","checks":[]}})}
+        let allowed=if field_path=="method"||field_path=="tool_calls" {json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"])}
+            else if field_path=="completion" {json!(["output","write","check","write_check",null])}
             else {Value::Null};
         return json!({"error_code":code,"rule_id":code,"field_path":field_path,"rejected_value":rejected,
             "submitted_value_present":submitted,"allowed_values":allowed,"expected_shape":expected,
@@ -2865,26 +2847,19 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
         let rejected=submitted.cloned().unwrap_or(Value::Null);
         let code=if field_path=="flow_update"||field_path.starts_with("flow_update.") {"REMOVED_FLOW_PROTOCOL"}
             else if field_path.contains(".dependency_inputs[")||field_path.contains(".upstream_ids[") {"INVALID_DEPENDENCY_INPUT"}
-            else if field_path.ends_with(".checks")&&(message.contains("PPTX")||message.contains("visual")||message.contains("completion=check/write_check")||message.contains("completion=output"))
-                ||field_path.ends_with(".completion")&&(message.contains("service startup")||message.contains("HTTP/API checks")||message.contains("visual verification")) {"INVALID_CHECK_COMPLETION_COMBINATION"}
-            else if field_path.ends_with(".browser_document_path")||field_path.ends_with(".completion")&&message.contains("requires_pptx") {"INVALID_PPTX_CONTRACT"}
+            else if field_path.ends_with(".browser_document_path") {"INVALID_PPTX_CONTRACT"}
             else if field_path.ends_with(".checks")&&message.contains("supported identifier") {"INVALID_CHECK_IDENTIFIER"}
             else if field_path.ends_with(".node_id")&&message.contains("sealed") {"COMPLETED_NODE_IMMUTABLE"}
             else {"INVALID_WORK_FIELD"};
         let fingerprint=organizer_error_fingerprint(code,field_path,submitted.is_some(),&rejected);
         let (expected_shape,allowed_values)=if code=="REMOVED_FLOW_PROTOCOL" {
-            ("Flow state and node results are host-managed. Use one exposed method: schedule_task, read_task_result, revisit_task or finish_request.",json!(["schedule_task","read_task_result","revisit_task","finish_request"]))
+            ("Flow state and node results are host-managed. Use an exposed scheduling method or a direct read-only Organizer lookup.",json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"]))
         } else if code=="INVALID_DEPENDENCY_INPUT" {
             ("Use schedule_task.inputs with an exact work_id or node_id of a returned task, optional matching revision, and only fields listed on the delivery. TASK_NOT_RETURNED means wait for that task's return; TASK_DEPRECATED means it is history only. A browser upload receipt is a dependency only while its session, page and attempt are active; check process.current_facts.browser for the current page before scheduling a fresh open/upload.",json!({"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"],"current_browser_state":process["current_facts"]["browser"]}))
-        } else if code=="INVALID_CHECK_COMPLETION_COMBINATION" {
-            ("Use separate schedule_task calls: service startup and HTTP/API checks use completion=check with supported checks; PPTX upload/load, in-browser font inspection and visual inspection use completion=output with checks=[]. Pass exact upstream results as inputs.",json!({"allowed_combinations":[
-                {"work_type":"service startup or HTTP/API endpoint check","completion":"check","checks":"required supported identifiers"},
-                {"work_type":"PPTX upload/load, in-browser font-request or visual check","completion":"output","checks":[]}
-            ],"execution_path":process["execution_path"]}))
         } else if code=="INVALID_PPTX_CONTRACT" {
-            ("Set execution_scope.browser_document_path to the exact workspace-relative .pptx path and use completion=output with checks=[]. Schedule service/API checks separately; consume upload evidence only while host availability is true.",json!({"required_fields":["execution_scope.browser_document_path","completion=output","checks=[]"],"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"]}))
+            ("Set execution_scope.browser_document_path to the exact workspace-relative .pptx path; this field cannot contain a page URL.",json!({"required_fields":["execution_scope.browser_document_path"],"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"]}))
         } else if code=="INVALID_CHECK_IDENTIFIER" {
-            ("Use an authorized check identifier: npm:, npm-start:, npm-install:, program:, or http-probe:. Keep service/API checks in completion=check tasks and browser inspection in completion=output tasks with checks=[].",json!(["npm:","npm-start:","npm-install:","program:","http-probe:"]))
+            ("Use a supported, authorized check identifier. Checks are optional and do not classify the task.",json!(["npm:","npm-start:","npm-install:","program:","http-probe:"]))
         } else if code=="COMPLETED_NODE_IMMUTABLE" {
             ("Completed work is sealed. Schedule a new task, or use revisit_task with a target from process.available_revisit_targets.",process["available_revisit_targets"].clone())
         } else {
@@ -2901,7 +2876,9 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
         ("INVALID_REQUEST_ACTION","request_action",if continuation {"At session_continuation use one supplied action; replace requires schedule_task."}else{"On a normal turn omit request_action or use continue."},
             if continuation {json!(["continue","subtask","replace"])}else{json!(["continue"])})
     } else if message.contains("flow_update")||message.contains("node_result") {
-        ("REMOVED_FLOW_PROTOCOL","method","Flow updates and node results are host-managed. Use one of the exposed scheduling methods.",json!(["schedule_task","read_task_result","revisit_task","finish_request"]))
+        ("REMOVED_FLOW_PROTOCOL","method","Flow updates and node results are host-managed. Use a scheduling method or a direct read-only Organizer lookup.",
+            json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context",
+                "search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"]))
     } else if message.contains("target_node_id")||message.contains("revisit target") {
         ("INVALID_REVISIT_TARGET","target_node_id","Use an ID from process.available_revisit_targets.",process["available_revisit_targets"].clone())
     } else if message.contains("duplicate process observation")||message.contains("project_observation") {
@@ -2928,6 +2905,87 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
 }
 fn organizer_field_path_pointer(path:&str)->String {
     format!("/{}",path.replace('[',"/").replace(']',"").replace('.',"/"))
+}
+
+fn organizer_read_action(action:&str)->bool {
+    matches!(action,"read_task_result"|"read_flow_page"|"search_work_memory"|"search_architecture_memory"
+        |"search_symbol_business_context"|"search_project_symbols"|"read_project_symbol"|"read_source_material")
+}
+
+async fn execute_organizer_read(
+    state:&AgentServiceState,
+    scheduler:&crate::work_scheduler::WorkScheduler,
+    notebook:&mut crate::task_notebook::Notebook,
+    decision:&Value,
+    turn:usize,
+    step:usize,
+    source_chars:&mut usize,
+)->anyhow::Result<Value> {
+    let action=decision["action"].as_str().unwrap_or("").to_owned();
+    match action.as_str() {
+        "read_task_result"=>scheduler.read_task_result(decision),
+        "read_flow_page"=>scheduler.read_flow_page(decision),
+        "search_work_memory"|"search_architecture_memory"|"search_symbol_business_context"=>{
+            let workspace=state.workspace.clone();
+            let query=decision["query"].as_str().unwrap_or("").trim().to_owned();
+            let limit=decision["limit"].as_u64().unwrap_or(3).clamp(1,4) as usize;
+            let search_action=action.clone();
+            tokio::task::spawn_blocking(move||->anyhow::Result<Value>{
+                let root=workspace.root().display().to_string();
+                let value=match search_action.as_str() {
+                    "search_work_memory"=>serde_json::to_value(workspace.search_work_memory(crate::memory::SearchWorkMemoryRequest{workspace_root:root,query,limit})?)?,
+                    "search_architecture_memory"=>serde_json::to_value(workspace.search_architecture_memory(crate::memory::SearchArchitectureMemoryRequest{workspace_root:root,query,limit})?)?,
+                    _=>serde_json::to_value(workspace.search_symbol_business_context(crate::memory::SearchSymbolBusinessContextRequest{workspace_root:root,query,limit})?)?,
+                };
+                Ok(value)
+            }).await?
+        },
+        "search_project_symbols"|"read_project_symbol"=>{
+            let language=decision["language"].as_str().ok_or_else(||anyhow::anyhow!("language is required"))?;
+            let tool=if action=="search_project_symbols" {format!("search_{language}_symbols")} else {format!("read_{language}_symbol")};
+            let mut args=if action=="search_project_symbols" {
+                json!({"query":decision["query"],"limit":decision["limit"],"detailed":false,"match_mode":"any","include_locals":false})
+            } else {
+                json!({"symbol_id":decision["symbol_id"],"file_path":decision["file_path"],"name":decision["name"],"include_context":decision["include_context"]})
+            };
+            if !decision["file_path"].is_null()&&action=="search_project_symbols" {args["file_path"]=decision["file_path"].clone();}
+            args["workspace_root"]=json!(state.workspace.root().display().to_string());
+            let response=crate::mcp::call_tool(&state.workspace,json!({"name":tool,"arguments":args})).await?;
+            let mut value=response.get("structuredContent").cloned().unwrap_or(response);
+            if action=="read_project_symbol" {
+                let material=notebook.save(turn,step,scheduler.node(),&tool,&value).await?;
+                if let Some(material)=material {value["notebook_material"]=material;}
+                let budget=2_000usize.min(6_000usize.saturating_sub(*source_chars));
+                let content=value["content"].as_str().unwrap_or("");
+                let full_chars=content.chars().count();
+                let excerpt=content.chars().take(budget).collect::<String>();
+                *source_chars=source_chars.saturating_add(excerpt.chars().count());
+                value["content"]=json!(excerpt);
+                value["source_omitted_chars"]=json!(full_chars.saturating_sub(budget));
+                value["source_context_budget"] = json!({"used_chars":*source_chars,"limit_chars":6000,"snippet_limit_chars":2000});
+                if let Some(object)=value.as_object_mut() {
+                    object.remove("callers");object.remove("callees");object.remove("suggested_reads");object.remove("resolved_imports");
+                    object.remove("related_types");object.remove("related_type_issues");object.remove("edit_context");
+                }
+            }
+            Ok(value)
+        },
+        "read_source_material"=>{
+            let budget=2_000usize.min(6_000usize.saturating_sub(*source_chars));
+            if budget==0 {return Ok(json!({"omitted":true,"reason":"Organizer source excerpt budget of 6,000 characters is exhausted for this decision.",
+                "next_action":"Use the material_id in execution_scope.material_ids so Worker can read the full notebook material."}));}
+            let mut args=decision.clone();args["include_material"]=json!(true);args["max_chars"]=json!(budget);
+            if !decision["start_line"].is_null(){args["start_line"]=decision["start_line"].clone();}
+            if !decision["end_line"].is_null(){args["end_line"]=decision["end_line"].clone();}
+            let mut result=notebook.recall(&args).await?;
+            let used=result["materials"].as_array().into_iter().flatten().map(|item|item["returned_chars"].as_u64().unwrap_or(0) as usize).sum::<usize>();
+            *source_chars=source_chars.saturating_add(used);
+            result["source_context_budget"]=json!({"used_chars":*source_chars,"limit_chars":6000,"snippet_limit_chars":2000});
+            result["scope"]=json!("Organizer lookup only; attach material_ids to a scheduled task if Worker needs the source. Full materials remain in the notebook.");
+            Ok(result)
+        },
+        _=>anyhow::bail!("unsupported Organizer read action '{action}'"),
+    }
 }
 
 pub(crate) async fn run_task(
@@ -3080,20 +3138,6 @@ pub(crate) async fn run_task(
             "reason": format!("User sent new input '{prompt}' before the current goal ended. Choose request_action=continue, subtask, or replace; preserve sealed deliveries when continuing.")
         }));
     }
-    let host_direct_answer=scheduler.frames.is_empty()&&!task_tree.enabled()&&scheduler.pending_handoff().is_none()
-        &&is_simple_knowledge_question(&prompt);
-    if host_direct_answer {
-        let task_slug=task_id.chars().filter(|ch|ch.is_ascii_alphanumeric()||matches!(ch,'_'|'-'|'.')).take(32).collect::<String>();
-        let id=format!("answer_{}_{}",if task_slug.is_empty(){"request"}else{&task_slug},turn);
-        let node_id=format!("answer_{turn}");
-        let order=crate::work_scheduler::WorkOrder{id:id.clone(),node_id:node_id.clone(),goal:prompt.clone(),
-            done_when:"Give the user a direct, accurate answer using general knowledge; report any important uncertainty.".into(),
-            completion:crate::work_scheduler::Completion::Output,final_answer:true,..Default::default()};
-        scheduler.enqueue(vec![order],false,false)?;
-        scheduler.activate_next()?;
-        organizer_decision=json!({"action":"host_direct_answer","reason":"Narrow knowledge question dispatched directly as one answer node."});
-        emit(&root,&task_id,"scheduler/direct_answer",json!({"turn":turn,"step":0,"work_id":id,"node_id":node_id})).await?;
-    }
     scheduler.prepare_legacy_check_migration();
     let mut organizer_error=organizer_resume_decision_error(scheduler.pending_handoff()).unwrap_or(Value::Null);
     let mut organizer_request_error=organizer_resume_request_error(scheduler.pending_handoff()).unwrap_or(Value::Null);
@@ -3102,6 +3146,7 @@ pub(crate) async fn run_task(
     if let Some(fingerprint)=organizer_error["fingerprint"].as_str() {organizer_contract_fingerprints.insert(fingerprint.to_owned());}
     let mut organizer_request_failures=0usize;
     let mut organizer_read_results=Vec::<Value>::new();
+    let mut organizer_source_chars=0usize;
     let mut active_scope=String::new();
     for step in 1..=max_steps {
         if cancel.is_cancelled() {
@@ -3134,9 +3179,9 @@ pub(crate) async fn run_task(
                         .filter_map(|tool|tool.pointer("/function/name").and_then(Value::as_str)).filter(|name|state.permission_mode.allows(name)).collect::<Vec<_>>(),
                     "allowed_request_actions":if scheduler.pending_handoff().is_some_and(|handoff|handoff["intent"]=="session_continuation") {vec!["continue","subtask","replace"]} else {vec!["continue"]},
                     "can_check":can_run_check(&state,ban_run_command),
-                    "completion_contract":{"service_start_or_http_api_check":{"completion":"check","checks":"required supported identifiers"},
-                        "pptx_upload_load_font_request_or_visual_check":{"completion":"output","checks":[]},
-                        "mixed_work":"schedule separate tasks and pass exact upstream references"},
+                    "execution_contract":{"completion":"optional legacy metadata; it does not classify work or prove success",
+                        "task_return":"only the Worker seals its invocation with yield_work; host observations are dated facts",
+                        "checks":"optional explicit host observations; may coexist with browser, visual, or write work"},
                     "visual_input":{"provider":state.provider_name,"model":model,
                         "capability":serde_json::to_value(state.visual.capability(&state.provider_name,&model)).unwrap_or(Value::Null),
                         "fallback_available":state.visual.fallback.is_some()}},
@@ -3154,36 +3199,26 @@ pub(crate) async fn run_task(
                     return Ok(());
                 }
                 match request {
-                    Ok(decision) if decision["action"]=="read_task_result"=>{
-                        let read=scheduler.read_task_result(&decision).map_err(|error| {
-                            let field=if decision["work_id"].as_str().is_some_and(|id|!id.is_empty()){"work_id"}else{"node_id"};
-                            anyhow::anyhow!("field_path={field}: {error}")
-                        });
+                    Ok(decision) if decision["action"].as_str().is_some_and(organizer_read_action)=>{
+                        let read=execute_organizer_read(&state,&scheduler,&mut notebook,&decision,turn,step,&mut organizer_source_chars).await;
                         match read {
                             Ok(result)=>{
-                                let duplicate=organizer_read_results.iter().any(|old|old["work_id"]==result["work_id"]
-                                    &&old["revision"]==result["revision"]&&old["selected_fields"]==result["selected_fields"]);
-                                if duplicate||organizer_read_results.len()>=8 {
-                                    let error=anyhow::anyhow!("field_path=fields: result was already read or the per-decision read limit was reached");
-                                    let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&task_tree);
-                                    let fingerprint=feedback["fingerprint"].as_str().unwrap_or("").to_owned();
-                                    let repeated=!fingerprint.is_empty()&&!organizer_contract_fingerprints.insert(fingerprint.clone());
-                                    organizer_error=feedback.clone();organizer_input["last_decision_error"]=feedback.clone();
-                                    emit(&root,&task_id,"organizer/error",json!({"turn":turn,"step":step,"feedback":feedback,"repeated_fingerprint":repeated})).await?;
-                                    if repeated {
-                                        let failure=json!({"failure_stage":"organizer_contract_validation","last_decision_error":organizer_error,
-                                            "contract_error_fingerprints":organizer_contract_fingerprints.iter().cloned().collect::<Vec<_>>(),
-                                            "current_work":scheduler.id(),"current_node":scheduler.node(),"revision":scheduler.revision(),"resumable":true});
-                                        persist_organizer_failure(&root,&task_id,turn,step,&mut scheduler,&task_tree,"organizer_contract_validation",failure).await?;
-                                        fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
-                                            "Organizer repeated an invalid task-result reference; saved work can be resumed.".to_owned(),
-                                            "ORGANIZER_CONTRACT_REPEATED","organizer_contract_validation").await?;
-                                        observer.finish("failed").await?;
-                                        return Ok(());
-                                    }
+                                let query_key=crate::source_read::query_fingerprint(&decision);
+                                if organizer_read_results.iter().any(|old|old["query_key"]==query_key) {
+                                    organizer_input["last_read_notice"]=json!("This exact read has already been returned in read_task_results. Use its prior result and choose a scheduling decision or a different cursor/query.");
                                     continue;
                                 }
-                                organizer_read_results.push(result);
+                                let mut entry=json!({"action":decision["action"],"query_key":query_key,"request":decision,"result":result});
+                                const ORGANIZER_CONTEXT_BUDGET_CHARS:usize=80_000;
+                                if organizer_input.to_string().chars().count()+entry.to_string().chars().count()>ORGANIZER_CONTEXT_BUDGET_CHARS {
+                                    let read_request=entry["request"].clone();
+                                    let result=&entry["result"];
+                                    entry["result"]=json!({"omitted":true,"reason":"Organizer context budget reached; retry the read with a narrower field selection or smaller flow-page limit.",
+                                        "scope":result["offset"],"returned":result["returned"],"total":result["total"],"next_cursor":result["next_cursor"],
+                                        "work_id":result["work_id"],"node_id":result["node_id"],"read_request":read_request,
+                                        "reference":"read_flow_page(cursor, limit) or read_task_result(work_id, fields)"});
+                                }
+                                organizer_read_results.push(entry);
                                 organizer_input["read_task_results"]=json!(organizer_read_results);
                                 emit(&root,&task_id,"organizer/result_read",json!({"turn":turn,"step":step,"result":organizer_read_results.last()})).await?;
                                 continue;
@@ -3200,7 +3235,7 @@ pub(crate) async fn run_task(
                                         "current_work":scheduler.id(),"current_node":scheduler.node(),"revision":scheduler.revision(),"resumable":true});
                                     persist_organizer_failure(&root,&task_id,turn,step,&mut scheduler,&task_tree,"organizer_contract_validation",failure).await?;
                                     fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
-                                        "Organizer repeated the same invalid result reference; saved work can be resumed.".to_owned(),
+                                        "Organizer repeated the same invalid read reference; saved work can be resumed.".to_owned(),
                                         "ORGANIZER_CONTRACT_REPEATED","organizer_contract_validation").await?;
                                     observer.finish("failed").await?;
                                     return Ok(());
@@ -3365,9 +3400,8 @@ pub(crate) async fn run_task(
                 "purpose":order.goal,
                 "knownConditions":scheduler.worker_input(&prompt)["upstream_outputs"].as_array().into_iter().flatten().filter_map(|out|out["summary"].as_str()).collect::<Vec<_>>(),
                 "nextAction":order.done_when,
-                "workOrganization":{"mode":if task_tree.enabled(){"tree"}else{"direct"},"reason":if organizer_decision["action"]=="host_direct_answer" {
-                    "Host created one direct answer node for a plain knowledge question."
-                }else{"Organizer assigns a focused work packet; host schedules actual results."}}
+                "workOrganization":{"mode":if task_tree.enabled(){"tree"}else{"direct"},
+                    "reason":"Organizer assigned a focused work packet; host records Worker returns and dated tool observations."}
             });
             emit(&root,&task_id,"organizer/assignment",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"workId":order.id,"order":order})).await?;
             emit(&root,&task_id,"worker/progress",latest_worker_progress.clone()).await?;
@@ -3384,7 +3418,7 @@ pub(crate) async fn run_task(
         let mut next_flow_plan=scheduler.unified_flow_plan(if task_tree.enabled(){Some(&task_tree)}else{None});
         if next_flow_plan["nodes"].as_array().is_some_and(Vec::is_empty) {
             next_flow_plan["nodes"]=json!([{"id":"request","title":truncate(&prompt,160),"kind":"worker","objective":prompt,
-                "status":if scheduler.finished{"blocked"}else{"running"}}]);
+                "status":if scheduler.finished{"done"}else{"running"}}]);
             next_flow_plan["active_node_id"]=json!(if scheduler.finished{""}else{"request"});
         }
         if latest_flow_plan!=next_flow_plan {latest_flow_plan=next_flow_plan;}
@@ -3606,16 +3640,21 @@ pub(crate) async fn run_task(
                 }
 
                 if calls.is_empty() {
-                    if !final_step {
-                        scheduler.return_work(&json!({"summary":if text.trim().is_empty(){"Worker returned no concrete output"}else{&text},
-                            "blocked":text.trim().is_empty()||scheduler.order().is_some_and(|o|o.completion!=crate::work_scheduler::Completion::Output)}))?;
-                        let direct_final = scheduler.order().is_some_and(|o|o.final_answer)
-                            && scheduler.all_done() && !task_tree.enabled();
-                        if !direct_final {
-                            emit(&root,&task_id,"worker/yield",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"output":scheduler.output()})).await?;
+                    if !final_step && !scheduler.finished {
+                        if text.trim().is_empty() {
+                            // An empty model response is a host-observed protocol
+                            // failure, not a Worker business conclusion or result.
+                            scheduler.request_handoff("Worker response contained neither text nor a yield_work return.");
+                            emit(&root,&task_id,"worker/yield",json!({"turn":turn,"step":step,"nodeId":active_flow_node,
+                                "output":Value::Null,"failure_stage":"worker_empty_response"})).await?;
                             return Ok(crate::work_executor::ToolRoundOutput::stop(crate::work_executor::RoundDisposition::Yield));
                         }
-                        scheduler.finish(&text,false)?;
+                        // Plain text is the Worker's actual return. Seal only that
+                        // invocation, then let Organizer decide the next step and
+                        // whether the request goal was achieved.
+                        scheduler.return_work(&json!({"summary":text}))?;
+                        emit(&root,&task_id,"worker/yield",json!({"turn":turn,"step":step,"nodeId":active_flow_node,"output":scheduler.output()})).await?;
+                        return Ok(crate::work_executor::ToolRoundOutput::stop(crate::work_executor::RoundDisposition::Yield));
                     }
                     if !visible_content.is_empty() {
                         emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,
@@ -3624,7 +3663,7 @@ pub(crate) async fn run_task(
                     }
                     if !task_tree.enabled() && !active_flow_node.is_empty() {
                         emit(&root,&task_id,"flow/node_state",json!({"turn":turn,"id":active_flow_node,
-                            "status":if final_step {"interrupted"} else {"completed"}})).await?;
+                            "status":if scheduler.done() {"done"} else {"running"}})).await?;
                     }
                     end_text = Some(text);
                     return Ok(crate::work_executor::ToolRoundOutput::stop(crate::work_executor::RoundDisposition::End));
@@ -3871,9 +3910,7 @@ pub(crate) async fn run_task(
                             let failed_child = call.name == "spawn_subagent" && value["status"] != "completed";
                             (value, failed_child)
                         }
-                        Err(error) => (if crate::project_process::is_tool(&call.name) {
-                            crate::project_process::failure_result(&call.name,&args,&error)
-                        } else {json!({"error":error.to_string()})}, true),
+                        Err(error) => (json!({"error":format!("{error:#}")}), true),
                     };
                     let is_error = execution_error || if call.name=="run_program" {
                         result["outcome"]!="exited" || result["process_success"]!=true
@@ -4002,7 +4039,6 @@ pub(crate) async fn run_task(
                     messages.push(crate::format_translate::openai_chat_tool_result_message(&call, &bounded));
 
                     scheduler.observe(&call.name,&args,&result,is_error);
-                    scheduler.close_if_satisfied();
                     // A failed check returns to this Worker's next implementation/check
                     // round in the same frame. Only explicit blockers/splits hand off.
                     work_state.observe(step, &call.name, &args, &result, is_error, repeated_query || overlap_read || http_probe_reused);
@@ -4048,7 +4084,18 @@ pub(crate) async fn run_task(
             }
             Err(error) => {
                 crate::request_context::finish(request_trace.take(),"execution_error",json!({})).await;
-                fail_turn(&state, &root, &task_id, turn, step, &observer_model, &prompt, error.to_string(),
+                let message=format!("{error:#}");
+                attach_handoff_error(&mut scheduler.handoff,"execution_error",
+                    json!({"stage":"worker_execution","error":message,"work_id":process_identity.work_id,
+                        "node_id":process_identity.node_id,"revision":process_identity.revision}));
+                let flow_plan=scheduler.unified_flow_plan(if task_tree.enabled(){Some(&task_tree)}else{None});
+                crate::observer_service::commit(&root,&task_id,json!({
+                    "commit_id":format!("{turn}:{step}:{}:execution-error",scheduler.plan_revision),
+                    "turn":turn,"step":step,"scheduler":scheduler.snapshot(),"task_tree":task_tree.snapshot(),
+                    "worker_state":work_state.snapshot(),"flow_plan":flow_plan.clone(),
+                    "active_node_id":flow_plan["active_node_id"],"active_path":flow_plan["active_path"]
+                }),Vec::new()).await?;
+                fail_turn(&state, &root, &task_id, turn, step, &observer_model, &prompt, message,
                     "WORKER_EXECUTION_FAILED","worker_execution").await?;
                 observer.finish("failed").await?;
                 return Ok(());
@@ -4061,7 +4108,7 @@ pub(crate) async fn run_task(
         let mut sealed_flow_plan=scheduler.unified_flow_plan(if task_tree.enabled(){Some(&task_tree)}else{None});
         if sealed_flow_plan["nodes"].as_array().is_some_and(Vec::is_empty) {
             sealed_flow_plan["nodes"]=json!([{"id":"request","title":truncate(&prompt,160),"kind":"worker","objective":prompt,
-                "status":if scheduler.finished{"blocked"}else{"running"}}]);
+                "status":if scheduler.finished{"done"}else{"running"}}]);
             sealed_flow_plan["active_node_id"]=json!(if scheduler.finished{""}else{"request"});
         }
         latest_flow_plan=sealed_flow_plan;
@@ -4419,16 +4466,6 @@ pub(crate) mod tests {
     use axum::{extract::State, routing::post};
 
     #[test]
-    fn simple_knowledge_classifier_skips_project_and_source_work() {
-        assert!(is_simple_knowledge_question("Explain closures directly"));
-        assert!(is_simple_knowledge_question("什么是闭包？"));
-        assert!(!is_simple_knowledge_question("Explain this code's closure"));
-        assert!(!is_simple_knowledge_question("How do I implement a closure parser?"));
-        assert!(!is_simple_knowledge_question("Please fix the font endpoint"));
-        assert!(!is_simple_knowledge_question("Explain closures\nthen edit src/main.rs"));
-    }
-
-    #[test]
     fn scoped_context_keeps_an_action_ledger_after_old_steps_are_dropped() {
         let mut messages = vec![
             json!({"role":"system","content":"worker"}),
@@ -4474,9 +4511,10 @@ pub(crate) mod tests {
         Json(body): Json<Value>,
     ) -> Json<Value> {
         let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))
         });
         if is_organizer {
+            if let Some(finished)=mock_finish_returned_work(&body) {return finished;}
             let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
             let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
             let turn_num = input_json.get("turn").and_then(Value::as_u64).unwrap_or(1);
@@ -4587,7 +4625,7 @@ pub(crate) mod tests {
         }
 
         run_task(state.clone(), task_id.clone(), "fake-model".into(), "不要运行命令".into(),
-            3, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
+            4, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
         let conn = open_db(&root).unwrap();
         let raw: String = conn.query_row(
             "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' ORDER BY seq LIMIT 1",
@@ -4744,9 +4782,10 @@ pub(crate) mod tests {
         Json(body): Json<Value>,
     ) -> Json<Value> {
         let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))
         });
         if is_organizer {
+            if let Some(finished)=mock_finish_returned_work(&body) {return finished;}
             let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
             let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
             let turn_num = input_json.get("turn").and_then(Value::as_u64).unwrap_or(1);
@@ -4871,7 +4910,7 @@ pub(crate) mod tests {
         }
 
         run_task(state.clone(), task_id.clone(), "fake-model".into(), "不要运行命令".into(),
-            3, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
+            4, CancellationToken::new(), false, 1, Vec::new(), false, false).await.unwrap();
         run_task(state, task_id.clone(), "fake-model".into(), "继续回答".into(),
             1, CancellationToken::new(), false, 2, Vec::new(), false, false).await.unwrap();
 
@@ -4906,9 +4945,10 @@ pub(crate) mod tests {
         Json(body): Json<Value>,
     ) -> Json<Value> {
         let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))
         });
         if is_organizer {
+            if let Some(finished)=mock_finish_returned_work(&body) {return finished;}
             let input_text = body.pointer("/messages/1/content").and_then(Value::as_str).unwrap_or("");
             let input_json: Value = serde_json::from_str(input_text).unwrap_or(Value::Null);
             let has_work = input_json.pointer("/process/current_work").is_some_and(|w| !w.is_null());
@@ -5097,16 +5137,19 @@ pub(crate) mod tests {
         assert_eq!(retrospective_count, 1);
         assert!(mock.saw_both_histories.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(mock.worker_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert!((1..=3).contains(&mock.observer_calls.load(std::sync::atomic::Ordering::Relaxed)));
+        // Assignment, Worker handoff, consultation and retrospective can each
+        // trigger one independent Observer request.
+        assert!((1..=4).contains(&mock.observer_calls.load(std::sync::atomic::Ordering::Relaxed)));
         server.abort();
         drop(conn);
         let _ = std::fs::remove_dir_all(root);
     }
     async fn fake_chat(State(calls): State<Arc<std::sync::atomic::AtomicUsize>>, Json(body): Json<Value>) -> Json<Value> {
         let is_organizer = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))
+            tools.iter().any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))
         });
         if is_organizer {
+            if let Some(finished)=mock_finish_returned_work(&body) {return finished;}
             return Json(json!({
                 "choices": [{
                     "message": {
@@ -5291,7 +5334,7 @@ pub(crate) mod tests {
 
     fn is_worker_request(body: &Value) -> bool {
         body["stream"] == true && !body["tools"].as_array().into_iter().flatten()
-            .any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))
+            .any(|tool| tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))
     }
 
     #[derive(Default)]
@@ -5302,7 +5345,7 @@ pub(crate) mod tests {
     }
 
     async fn scripted_flow_chat(State(script): State<Arc<FlowScript>>, Json(body): Json<Value>) -> axum::response::Response {
-        let organizer = body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool));
+        let organizer = body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"));
         script.requests.lock().unwrap().push(body.clone());
         if !organizer && script.observer_gate.is_some() && body["stream"] == false {
             let input: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
@@ -5318,7 +5361,7 @@ pub(crate) mod tests {
             return Json(json!({"choices":[{"message":{"role":"assistant","content":answer.to_string()}}]})).into_response();
         }
         let (expected_organizer, mut message) = script.replies.lock().unwrap().pop_front().expect("unexpected model round");
-        assert_eq!(organizer, expected_organizer, "model round reached the wrong actor");
+        assert_eq!(organizer, expected_organizer, "model round reached the wrong actor: {}", body["messages"][1]["content"]);
         if organizer&&message["request_error"]==true {
             return (StatusCode::SERVICE_UNAVAILABLE,Json(json!({"error":"transient organizer response failure"}))).into_response();
         }
@@ -5439,7 +5482,7 @@ pub(crate) mod tests {
             "limitations":["The presentation was not uploaded"]})).unwrap();
         assert_eq!(scheduler.frame().unwrap().status,crate::work_scheduler::WorkStatus::Done);
         assert_eq!(returned["outcome"],"blocked");
-        assert_eq!(returned["expectation_met"],false);
+        assert!(returned.get("expectation_met").is_none());
         assert_eq!(returned["operations"][2]["failed"],true);
     }
 
@@ -5455,42 +5498,45 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pptx_checks_conflict_points_to_checks_and_fingerprints_the_rule_and_submitted_value() {
+    fn pptx_work_accepts_explicit_checks_and_invalid_check_keys_point_to_the_submitted_field() {
         let order=crate::work_scheduler::WorkOrder{ id:"visual".into(),node_id:"visual".into(),goal:"Load PPTX and inspect picture".into(),
             done_when:"Presentation is loaded and checked".into(),completion:crate::work_scheduler::Completion::Output,
             checks:vec!["http-probe:http://127.0.0.1:3000/api/fonts".into()],constraints:vec!["requires_pptx".into()],
             browser_document_path:Some("samples/demo.pptx".into()),..Default::default()};
         let scheduler=crate::work_scheduler::WorkScheduler::default();let tree=crate::flow_tree::TaskTree::default();
-        let error=crate::work_scheduler::WorkScheduler::default().enqueue(vec![order.clone()],false,true).unwrap_err();
-        let decision=json!({"orders":[{"id":"visual","node_id":"visual","completion":"output","checks":order.checks,
+        let mut compatible=crate::work_scheduler::WorkScheduler::default();
+        compatible.enqueue(vec![order.clone()],false,true).unwrap();
+        compatible.activate_next().unwrap();
+        assert_eq!(compatible.order().unwrap().checks,order.checks,"visual and HTTP observation requirements may coexist");
+        let invalid_check="npm run build";
+        let mut invalid_order=order.clone();invalid_order.checks=vec![invalid_check.into()];
+        let error=crate::work_scheduler::WorkScheduler::default().enqueue(vec![invalid_order],false,true).unwrap_err();
+        let decision=json!({"orders":[{"id":"visual","node_id":"visual","completion":"output","checks":[invalid_check],
             "constraints":["requires_pptx"],"browser_document_path":"samples/demo.pptx"}]});
         let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
         assert_eq!(feedback["field_path"],"orders[0].checks");
-        assert_eq!(feedback["rejected_value"],json!(["http-probe:http://127.0.0.1:3000/api/fonts"]));
-        assert_eq!(feedback["error_code"],"INVALID_CHECK_COMPLETION_COMBINATION");
-        assert!(feedback["expected_shape"].as_str().unwrap().contains("separate schedule_task calls"));
+        assert_eq!(feedback["rejected_value"],json!([invalid_check]));
+        assert_eq!(feedback["error_code"],"INVALID_CHECK_IDENTIFIER");
+        assert!(feedback["expected_shape"].as_str().unwrap().contains("supported, authorized check identifier"));
         let repeated=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
         assert_eq!(feedback["fingerprint"],repeated["fingerprint"]);
-        let same_rule_different_message=anyhow::anyhow!("field_path=orders[0].checks: this PPTX task must leave checks empty");
+        let same_rule_different_message=anyhow::anyhow!("field_path=orders[0].checks: unsupported check identifier; supported identifier keys are required");
         let same_rule=organizer_contract_feedback(&same_rule_different_message,&decision,&scheduler,&tree);
         assert_eq!(feedback["fingerprint"],same_rule["fingerprint"]);
-        let different_rule=anyhow::anyhow!("field_path=orders[0].checks: unsupported identifier; use a host check key");
+        let different_rule=anyhow::anyhow!("field_path=orders[0].checks: permission denied for checking under current permissions");
         let different=organizer_contract_feedback(&different_rule,&decision,&scheduler,&tree);
         assert_ne!(feedback["fingerprint"],different["fingerprint"]);
         let changed_value=json!({"orders":[{"id":"visual","node_id":"visual","completion":"output",
-            "checks":["http-probe:http://127.0.0.1:3000/api/other"],"constraints":["requires_pptx"],"browser_document_path":"samples/demo.pptx"}]});
+            "checks":["npm run test"],"constraints":["requires_pptx"],"browser_document_path":"samples/demo.pptx"}]});
         let changed=organizer_contract_feedback(&error,&changed_value,&scheduler,&tree);
         assert_ne!(feedback["fingerprint"],changed["fingerprint"]);
 
         let visual=crate::work_scheduler::WorkOrder{id:"visual_only".into(),node_id:"visual_only".into(),goal:"Inspect rendered picture".into(),
             done_when:"Picture checked".into(),completion:crate::work_scheduler::Completion::Check,visual_goal:Some("Inspect the rendered picture".into()),..Default::default()};
-        let visual_decision=json!({"orders":[{"id":"visual_only","node_id":"visual_only","completion":"check","checks":[],
-            "visual_goal":"Inspect the rendered picture"}]});
-        let visual_error=crate::work_scheduler::WorkScheduler::default().enqueue(vec![visual],false,true).unwrap_err();
-        let visual_feedback=organizer_contract_feedback(&visual_error,&visual_decision,&scheduler,&tree);
-        assert_eq!(visual_feedback["field_path"],"orders[0].completion");
-        assert_eq!(visual_feedback["error_code"],"INVALID_CHECK_COMPLETION_COMBINATION");
-        assert!(visual_feedback["expected_shape"].as_str().unwrap().contains("separate schedule_task calls"));
+        let mut visual_scheduler=crate::work_scheduler::WorkScheduler::default();
+        visual_scheduler.enqueue(vec![visual],false,true).unwrap();
+        visual_scheduler.activate_next().unwrap();
+        assert!(visual_scheduler.order().unwrap().visual_goal.is_some());
 
         let saved=json!({"failure_stage":"organizer_request","failure":{"stage":"organizer_request","attempt":2},
             "last_decision_error":{"rule_id":"INVALID_CHECK_COMPLETION_COMBINATION","field_path":"orders[0].checks","fingerprint":"prior"},
@@ -5500,6 +5546,25 @@ pub(crate) mod tests {
         assert_eq!(organizer_resume_request_error(Some(&wrapped)).unwrap()["stage"],"organizer_request");
         let mut fingerprints=organizer_resume_contract_fingerprints(Some(&wrapped));fingerprints.sort();fingerprints.dedup();
         assert_eq!(fingerprints,vec!["older".to_owned(),"prior".to_owned()]);
+    }
+
+    #[test]
+    fn host_errors_preserve_the_original_handoff_and_full_error_chain_without_worker_outcomes() {
+        let original=json!({"intent":"session_continuation","need_split":true,
+            "upstream_problem":{"reason":"Worker reported an unavailable font endpoint"}});
+        let mut handoff=Some(original.clone());
+        let error=anyhow::anyhow!("original process error\n  at original.js:17").context("tool invocation failed");
+        let raw=json!({"stage":"worker_execution","error":format!("{error:#}")});
+        attach_handoff_error(&mut handoff,"execution_error",raw.clone());
+        assert_eq!(handoff.as_ref().unwrap()["need_split"],true);
+        assert_eq!(handoff.as_ref().unwrap()["upstream_problem"],original["upstream_problem"]);
+        assert_eq!(handoff.as_ref().unwrap()["execution_error"],raw);
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();
+        scheduler.handoff=Some(json!({"intent":"session_continuation","previous_handoff":handoff}));
+        assert_eq!(scheduler.organizer_input()["handoff"]["execution_error"],raw);
+        let mut no_return=None;
+        attach_organizer_failure(&mut no_return,json!({"failure_stage":"organizer_request","error":"timeout"}));
+        for field in ["done","blocked","outcome"] {assert!(no_return.as_ref().unwrap().get(field).is_none());}
     }
 
     #[test]
@@ -5547,6 +5612,18 @@ pub(crate) mod tests {
     fn finish_flow_reply() -> (bool, Value) {
         scheduling_reply(json!({"action":"finish","reason":"all requested work is delivered","summary":"Request complete",
             "flow_update":{"current_node_id":"goal","node_result":{"node_id":"goal","status":"completed","summary":"All requested parts complete"}}}))
+    }
+
+    fn finish_simple_reply(summary:&str) -> (bool,Value) {
+        scheduling_reply(json!({"action":"finish","reason":"the returned answer addresses the request","summary":summary,"achieved":true}))
+    }
+
+    fn mock_finish_returned_work(body:&Value) -> Option<Json<Value>> {
+        let input:Value=serde_json::from_str(body.pointer("/messages/1/content")?.as_str()?).ok()?;
+        let returned=input.pointer("/process/current_result")?.as_object()?;
+        let summary=returned.get("summary")?.as_str()?;
+        let (_,message)=finish_simple_reply(summary);
+        Some(Json(json!({"choices":[{"message":message}]})))
     }
 
     async fn run_flow_script(replies: Vec<(bool, Value)>, turns: &[(&str, usize)]) -> (Vec<(String, Value)>, Vec<Value>) {
@@ -5693,14 +5770,16 @@ pub(crate) mod tests {
         };
         let errors = events.iter().filter(|(kind,_)| kind == "organizer/error" || kind == "worker/error").collect::<Vec<_>>();
         assert!(allow_organizer_errors||errors.is_empty(), "Agent rejected decisions: {errors:?}");
-        assert!(script.replies.lock().unwrap().is_empty(), "Agent stopped before consuming the scenario");
+        assert!(script.replies.lock().unwrap().is_empty(), "Agent stopped before consuming the scenario: {:?}",
+            events.iter().filter(|(kind,_)|matches!(kind.as_str(),"turn/end"|"tool/result"|"worker/error"|"organizer/error"))
+                .map(|(kind,value)|json!({"kind":kind,"reason":value["reason"],"error":value.pointer("/meta/result/error")})).collect::<Vec<_>>());
         let requests = std::mem::take(&mut *script.requests.lock().unwrap());
         if observer_enabled {
             if let Ok(directory)=std::env::var("OBSERVER_REVIEW_RECORD_DIR") {
                 let directory=std::path::PathBuf::from(directory);std::fs::create_dir_all(&directory).unwrap();
                 let name=turns[0].0.chars().map(|c|if c.is_ascii_alphanumeric(){c.to_ascii_lowercase()}else{'_'}).take(70).collect::<String>();
                 let worker_calls=requests.iter().filter(|b|is_worker_request(b)).count();
-                let organizer_calls=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count();
+                let organizer_calls=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).count();
                 let observer_calls=requests.len()-worker_calls-organizer_calls;
                 let tools=events.iter().filter(|(k,_)|k=="tool/call").count();
                 let evaluated=events.iter().filter(|(k,v)|k=="observer/node_review" && v["status"]=="completed").count();
@@ -5903,7 +5982,7 @@ pub(crate) mod tests {
 
         assert_eq!(requests.iter().filter(|b|is_worker_request(b)).count(),3);
         assert!(requests.iter().filter(|b|is_worker_request(b)).all(|b|!b["messages"][0]["content"].as_str().unwrap_or("").contains("observer_responses")));
-        assert_eq!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count(),4);
+        assert_eq!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).count(),4);
         assert!(!events.iter().any(|(kind,_)|kind=="organizer/advice_error"));
         assert!(events.iter().any(|(kind,v)|kind=="observer/advice_response" && v["actor"]=="organizer" && v["advice"]["application"]["field"]=="constraints"));
         for work in ["a","b","c"] {assert!(events.iter().any(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff" && v["identity"]["work_id"]==work));}
@@ -5933,22 +6012,31 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn agent_flow_observer_simple_answer_has_one_handoff_and_no_extra_model_round() {
-        let (events,requests)=run_flow_script_with_observer(vec![text_reply("A closure captures its environment")],&[("Explain closures directly",3)],true).await;
+    async fn agent_flow_observer_simple_answer_is_assigned_and_assessed_by_organizer() {
+        let mut answer=flow_order("answer","direct");answer["goal"]=json!("Explain closures directly");answer["final_answer"]=json!(true);
+        let (events,requests)=run_flow_script_with_observer(vec![
+            scheduling_reply(json!({"action":"work","reason":"Delegate the answer as one focused task","orders":[answer]})),
+            text_reply("A closure captures its environment"),
+            scheduling_reply(json!({"action":"finish","reason":"The Worker returned the requested explanation",
+                "summary":"A closure captures its environment","achieved":true})),
+        ],&[("Explain closures directly",5)],true).await;
         assert_eq!(requests.iter().filter(|b|is_worker_request(b)).count(),1);
-        assert_eq!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten()
-            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count(),0,
-            "a plain knowledge question should not require an Organizer model round");
+        let organizer_requests=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten()
+            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).collect::<Vec<_>>();
+        assert_eq!(organizer_requests.len(),2,"Organizer assigns the Worker task and then assesses its return");
+        let returned:Value=serde_json::from_str(organizer_requests[1]["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(returned["process"]["current_result"]["summary"],"A closure captures its environment");
+        assert!(returned["process"]["current_result"]["outcome"].is_null());
+        assert!(returned["process"]["current_result"]["blocked"].is_null());
         assert!(requests.iter().filter(|b|b["stream"]==false && b.get("tools").is_none()).count()<=1);
         let ids:std::collections::HashSet<_>=events.iter().filter(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff").map(|(_,v)|v["review_id"].clone()).collect();
         assert_eq!(ids.len(),1);
-        assert!(events.iter().any(|(kind,v)|kind=="observer/retrospective" && v["extraWorkerRounds"]==0));
-        assert!(!events.iter().any(|(kind,_)|kind=="observer/retrospective_start"));
         let commit=committed_turn(&events,1);
         let frames=commit["scheduler"]["frames"].as_object().unwrap();
-        assert_eq!(frames.len(),1,"direct Q&A creates exactly one answer task");
+        assert_eq!(frames.len(),1,"Organizer creates exactly one answer task");
         assert_eq!(frames.values().next().unwrap()["order"]["final_answer"],true);
         assert_eq!(frames.values().next().unwrap()["status"],"done");
+        assert_eq!(commit["scheduler"]["request_completed"],true,"request completion follows the Organizer's explicit finish decision");
     }
 
     #[tokio::test]
@@ -5963,7 +6051,7 @@ pub(crate) mod tests {
             finish_flow_reply(),
         ],&[("Do task_a",6)]).await;
         let organizer=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten()
-            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count();
+            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).count();
         assert_eq!(organizer,2,"schedule once, then decide once after the actual return");
         assert_eq!(requests.iter().filter(|b|is_worker_request(b)).count(),2);
         let frame=&committed_turn(&events,1)["scheduler"]["frames"]["task_a"];
@@ -5981,9 +6069,9 @@ pub(crate) mod tests {
             yield_reply("done","New request delivered",json!({})),
             finish_flow_reply(),
         ],&[("CANCELLED_DRAG_GOAL",1),("Cancel drag and explain the export format",4)],true).await;
-        let inputs:Vec<Value> = requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool)))
+        let inputs:Vec<Value> = requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task")))
             .map(|body|serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap()).collect();
-        let lifecycle_schemas=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool)))
+        let lifecycle_schemas=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task")))
             .map(|body|body["tools"].as_array().into_iter().flatten().find(|tool|tool.pointer("/function/name").and_then(Value::as_str)==Some("schedule_task")).and_then(|tool|tool.pointer("/function/parameters/properties/request_action/enum")).cloned().unwrap_or(Value::Null)).collect::<Vec<_>>();
         assert!(lifecycle_schemas.iter().any(|schema|schema==&json!(["continue","subtask","replace"])));
         // The lifecycle decision sees the unresolved advice belonging to the
@@ -6016,10 +6104,12 @@ pub(crate) mod tests {
             cancelled_drag_reply(),
             scheduling_reply(json!({"action":"work","request_action":"replace","reason":"human cancelled the feature","orders":[answer]})),
             text_reply("Closures capture their environment"),
-            scheduling_reply(json!({"action":"work","reason":"another new question","orders":[another]})),text_reply("Another answer"),
+            finish_simple_reply("Closures capture their environment"),
+            scheduling_reply(json!({"action":"work","reason":"answer the next question","orders":[another]})),
+            text_reply("Another answer"),finish_simple_reply("Another answer"),
         ],&[("CANCELLED_DRAG_GOAL",1),("不用做拖拽了，先解释闭包",3),("Another new question",3)]).await;
         let first=committed_turn(&events,1);assert_eq!(first["scheduler"]["frames"]["task_a"]["status"],"done");
-        assert_eq!(first["scheduler"]["frames"]["task_a"]["expectation_met"],false);
+        assert!(first["scheduler"]["frames"]["task_a"].get("expectation_met").is_none());
         let second=committed_turn(&events,2);
         assert_eq!(second["scheduler"]["frames"].as_object().unwrap().len(),1);
         assert!(second["task_tree"]["nodes"].as_object().unwrap().is_empty());
@@ -6041,7 +6131,7 @@ pub(crate) mod tests {
         assert!(third["scheduler"]["frames"].get("task_a").is_none());
         let restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(second["scheduler"].clone()).unwrap();
         let plan=restored.unified_flow_plan(None);let nodes=plan["nodes"].as_array().unwrap();
-        assert!(nodes.iter().any(|n|n["id"]=="task_a"&&n["status"]=="completed"));
+        assert!(nodes.iter().any(|n|n["id"]=="task_a"&&n["status"]=="done"));
         assert!(nodes.iter().any(|n|n["id"]=="request_1:task_a"&&n["status"]=="deprecated"));
         assert!(nodes.iter().filter(|n|n["id"].as_str().unwrap().starts_with("request_1:")).all(|n|n["status"]=="deprecated"));
     }
@@ -6105,11 +6195,11 @@ pub(crate) mod tests {
             ]},"current_node_id":"upload"},"orders":[flow_order("upload","upload")]});
         let (mut scheduler,mut tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,"Load a deck",initial,false,false).unwrap();
         assert_eq!(scheduler.id(),"upload");assert_eq!(scheduler.node(),"upload");assert_eq!(tree.status("upload"),Some("running"));
-        let output=scheduler.return_work(&json!({"summary":"File assigned"})).unwrap();tree.complete_work(&output).unwrap();
-        assert_eq!(tree.status("upload"),Some("completed"));
+        let output=scheduler.return_work(&json!({"summary":"File assigned"})).unwrap();tree.record_work_return(&output).unwrap();
+        assert_eq!(tree.status("upload"),Some("done"));
         let decision=json!({"action":"work","reason":"try to reopen the completed node","orders":[flow_order("upload_again","upload")]});
         let error=apply_organizer_decision(&scheduler,&tree,&tree,&root,"Load a deck",decision.clone(),false,false).err().unwrap();
-        assert!(error.to_string().contains("field_path=orders[0].node_id")&&error.to_string().contains("status='completed'"));
+        assert!(error.to_string().contains("field_path=orders[0].node_id")&&error.to_string().contains("status='done'"));
         let feedback=organizer_contract_feedback(&error,&decision,&scheduler,&tree);
         assert_eq!(feedback["error_code"],"COMPLETED_NODE_IMMUTABLE");assert_eq!(feedback["field_path"],"orders[0].node_id");
     }
@@ -6172,7 +6262,9 @@ pub(crate) mod tests {
         let feedback=organizer_contract_feedback(&resume_error,&resume_decision,&scheduler,&tree);
         assert_eq!(feedback["error_code"],"REMOVED_FLOW_PROTOCOL");
         assert_eq!(feedback["field_path"],"flow_update.node_updates[0].resume");
-        assert_eq!(feedback["allowed_values"],json!(["schedule_task","read_task_result","revisit_task","finish_request"]));
+        assert_eq!(feedback["allowed_values"],json!(["schedule_task","read_task_result","read_flow_page","search_work_memory",
+            "search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material",
+            "revisit_task","finish_request"]));
         assert!(feedback["expected_shape"].as_str().unwrap().contains("host-managed"));
     }
 
@@ -6183,15 +6275,17 @@ pub(crate) mod tests {
             scheduling_reply(json!({"action":"work","request_action":"replace","reason":"initial decision","orders":[answer.clone()]})),
             scheduling_reply(json!({"action":"work","request_action":"continue","reason":"correct lifecycle field","orders":[answer]})),
             text_reply("The answer is ready"),
+            finish_simple_reply("The answer is ready"),
         ],&[("Answer this question",5)]).await;
         let errors=events.iter().filter(|(kind,_)|kind=="organizer/error").collect::<Vec<_>>();
         assert_eq!(errors.len(),1);
         assert_eq!(errors[0].1["feedback"]["field_path"],"request_action");
-        let organizer_inputs=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool)))
+        let organizer_inputs=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task")))
             .filter_map(|body|body["messages"][1]["content"].as_str()).map(|raw|serde_json::from_str::<Value>(raw).unwrap()).collect::<Vec<_>>();
-        assert_eq!(organizer_inputs.len(),2);
+        assert_eq!(organizer_inputs.len(),3);
         assert_eq!(organizer_inputs[1]["last_decision_error"]["error_code"],"INVALID_REQUEST_ACTION");
         assert!(organizer_inputs[1]["last_decision_error"]["correction_instruction"].as_str().unwrap().contains("one targeted correction"));
+        assert_eq!(organizer_inputs[2]["process"]["current_result"]["summary"],"The answer is ready");
 
         let (repeat_events,repeat_requests)=run_flow_script_with_organizer_errors(vec![
             scheduling_reply(json!({"action":"work","request_action":"replace","reason":"invalid first decision","orders":[flow_order("answer","direct")]})),
@@ -6200,7 +6294,7 @@ pub(crate) mod tests {
         let repeated=repeat_events.iter().filter(|(kind,_)|kind=="organizer/error").collect::<Vec<_>>();
         assert_eq!(repeated.len(),2);
         assert_eq!(repeated[1].1["repeated_fingerprint"],true);
-        assert_eq!(repeat_requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count(),2);
+        assert_eq!(repeat_requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).count(),2);
         assert!(!repeat_events.iter().any(|(kind,_)|kind=="tool/call"));
     }
 
@@ -6212,12 +6306,13 @@ pub(crate) mod tests {
             scheduling_reply(json!({"action":"work","request_action":"replace","reason":"invalid lifecycle field","orders":[answer.clone()]})),
             scheduling_reply(json!({"action":"work","request_action":"continue","reason":"correct the lifecycle field","orders":[answer]})),
             text_reply("The answer is ready"),
+            finish_simple_reply("The answer is ready"),
         ],&[("Answer this question",6)]).await;
         assert_eq!(events.iter().filter(|(kind,_)|kind=="organizer/request_error").count(),1);
         let contract_errors=events.iter().filter(|(kind,_)|kind=="organizer/error").collect::<Vec<_>>();
         assert_eq!(contract_errors.len(),1);
         assert_eq!(contract_errors[0].1["repeated_fingerprint"],false);
-        let organizer_inputs=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool)))
+        let organizer_inputs=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task")))
             .filter_map(|body|body["messages"][1]["content"].as_str()).map(|raw|serde_json::from_str::<Value>(raw).unwrap()).collect::<Vec<_>>();
         assert!(organizer_inputs[1]["last_request_error"]["stage"]=="organizer_request");
         assert!(organizer_inputs[1]["last_decision_error"].is_null());
@@ -6240,7 +6335,7 @@ pub(crate) mod tests {
         assert_eq!(failures[0].1["retrying"],true);
         assert_eq!(failures[1].1["retrying"],false);
         let saved=events.iter().filter(|(kind,_)|kind=="scheduler/state").last().unwrap();
-        assert_eq!(saved.1["state"]["handoff"]["outcome"],"completed");
+        assert_eq!(saved.1["state"]["handoff"]["outcome"],"completed","preserve the Worker's explicit outcome during request failure");
         assert_eq!(saved.1["state"]["handoff"]["done"],true);
         assert_eq!(saved.1["state"]["handoff"]["organizer_failure"]["failure_stage"],"organizer_request");
         assert_eq!(saved.1["state"]["handoff"]["organizer_failure"]["resumable"],true);
@@ -6249,7 +6344,7 @@ pub(crate) mod tests {
         let completed=saved.1["state"]["frames"].as_object().unwrap().values().find(|frame|frame["order"]["id"]=="started").unwrap();
         assert_eq!(completed["status"],"done");
         assert_eq!(completed["output"]["exported_data"]["ready_url"],"http://127.0.0.1:3000/");
-        let organizer_calls=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool))).count();
+        let organizer_calls=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task"))).count();
         assert_eq!(organizer_calls,4);
     }
 
@@ -6277,16 +6372,17 @@ pub(crate) mod tests {
         assert_eq!(failures[0].1["retrying"],true);
         assert_eq!(failures[1].1["retrying"],false);
         let organizer_inputs=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten()
-            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(crate::work_organizer::is_organizer_tool)))
+            .any(|tool|tool.pointer("/function/name").and_then(Value::as_str).is_some_and(|name|name=="schedule_task")))
             .filter_map(|body|body["messages"][1]["content"].as_str()).map(|raw|serde_json::from_str::<Value>(raw).unwrap()).collect::<Vec<_>>();
         let resumed_input=organizer_inputs.iter().find(|input|input["last_request_error"]["stage"]=="organizer_request").unwrap();
-        assert_eq!(resumed_input["process"]["current_result"]["need_split"],true);
+        assert_eq!(resumed_input["process"]["current_result"]["outcome"],"need_split");
+        assert!(resumed_input["process"]["current_result"]["need_split"].is_null(),"do not derive unsubmitted flags from the Worker outcome");
         assert_eq!(resumed_input["process"]["current_result"]["suggested_children"][0]["goal"],"Check the font endpoint");
         let child_packet=worker_packets(&requests).into_iter().find(|packet|packet["current_work"]["id"]=="font_check").unwrap();
         assert!(child_packet["upstream_outputs"].to_string().contains("ready_url"));
         let final_commit=committed_turn(&events,2);
         assert_eq!(final_commit["scheduler"]["frames"]["task_a"]["status"],"done");
-        assert_eq!(final_commit["scheduler"]["frames"]["task_a"]["output"]["need_split"],true);
+        assert_eq!(final_commit["scheduler"]["frames"]["task_a"]["output"]["outcome"],"need_split");
         assert_eq!(final_commit["scheduler"]["frames"]["font_check"]["status"],"done");
         assert_eq!(final_commit["scheduler"]["request_completed"],true);
         assert_eq!(final_commit["scheduler"]["frames"].as_object().unwrap().len(),2,"continuation must preserve the split delivery and dispatch one child");
@@ -6319,7 +6415,7 @@ pub(crate) mod tests {
         assert_eq!(organizer_resume_request_error(restored.pending_handoff()).unwrap()["stage"],"organizer_request");
         let resumed_input=restored.organizer_input();
         assert_eq!(resumed_input["handoff"]["intent"],"session_continuation");
-        assert_eq!(resumed_input["current_result"]["need_split"],true);
+        assert_eq!(resumed_input["current_result"]["outcome"],"need_split");
         assert_eq!(resumed_input["current_result"]["suggested_children"][0]["goal"],"Verify the font endpoint");
         assert_eq!(resumed_input["current_result"]["suggested_children"][0]["done_when"],"The endpoint returns HTTP 2xx");
 
@@ -6329,7 +6425,7 @@ pub(crate) mod tests {
         assert_eq!(continued.id(),"split_child");
         assert_eq!(continued.frames["task_a"].status,crate::work_scheduler::WorkStatus::Done);
         assert!(continued.frames["task_a"].invalidated_by_plan_revision.is_none());
-        assert_eq!(continued.frames["task_a"].output.as_ref().unwrap()["need_split"],true);
+        assert_eq!(continued.frames["task_a"].output.as_ref().unwrap()["outcome"],"need_split");
         continued.return_work(&json!({"summary":"Focused child is complete"})).unwrap();
         assert_eq!(continued.frames["task_a"].status,crate::work_scheduler::WorkStatus::Done);
         assert_eq!(continued.frames["split_child"].order.upstream_ids,vec!["task_a"]);
@@ -6347,9 +6443,11 @@ pub(crate) mod tests {
             scheduling_reply(json!({"action":"work","request_action":"continue","reason":"continue with B using A","orders":[b]})),
             text_reply("B delivered"), finish_flow_reply(),
             scheduling_reply(json!({"action":"work","reason":"new simple request","orders":[answer]})), text_reply("Simple answer"),
+            finish_simple_reply("Simple answer"),
             scheduling_reply(json!({"action":"work","reason":"another simple request","orders":[{
                 "id":"next_answer","node_id":"direct","goal":"Answer next question","done_when":"Answer delivered","completion":"output","final_answer":true}]})),
             text_reply("Next simple answer"),
+            finish_simple_reply("Next simple answer"),
         ], &[("Complete A and B",2),("继续",5),("A new simple question",3),("Another simple question",3)]).await;
         let first = committed_turn(&events,1);
         assert_eq!(first["scheduler"]["frames"]["task_a"]["status"], "done");
@@ -6381,12 +6479,12 @@ pub(crate) mod tests {
         ], &[("Achieve the goal",6)]).await;
         let commit = committed_turn(&events,1);
         let tree: crate::flow_tree::TaskTree = serde_json::from_value(commit["task_tree"].clone()).unwrap();
-        assert_eq!(tree.status("work_task_a"),Some("completed"));
-        assert_eq!(tree.status("work_task_b"),Some("completed"));
+        assert_eq!(tree.status("work_task_a"),Some("done"));
+        assert_eq!(tree.status("work_task_b"),Some("done"));
         assert!(tree.root_finished());
         assert_eq!(commit["scheduler"]["frames"]["task_a"]["status"],"done");
         assert_eq!(commit["scheduler"]["frames"]["task_a"]["output"]["outcome"],"blocked");
-        assert_eq!(commit["scheduler"]["frames"]["task_a"]["expectation_met"],false);
+        assert!(commit["scheduler"]["frames"]["task_a"].get("expectation_met").is_none());
         assert!(commit["scheduler"]["frames"]["task_a"]["invalidated_by_plan_revision"].is_null());
         assert!(events.iter().any(|(kind,data)| kind=="execution/tick" && data["tick"]["work_id"]=="task_b" && data["tick"]["done"]==true));
     }
@@ -6424,21 +6522,21 @@ pub(crate) mod tests {
             let (mut scheduler,mut tree,_) = apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
                 "Complete the original goal",json!({"action":"work","orders":[flow_order("task_a","direct")]}),false,false).unwrap();
             scheduler.return_work(&json!({"outcome":outcome,"summary":"Need focused repair"})).unwrap();
-            tree.complete_work(scheduler.output().unwrap()).unwrap();
+            tree.record_work_return(scheduler.output().unwrap()).unwrap();
             assert_eq!(scheduler.frames["task_a"].status,crate::work_scheduler::WorkStatus::Done);
-            assert_eq!(tree.status("work_task_a"),Some("completed"));
+            assert_eq!(tree.status("work_task_a"),Some("done"));
             let mut repair=flow_order("repair","direct");repair["upstream_ids"]=json!(["task_a"]);
             let (mut scheduler,mut tree,_) = apply_organizer_decision(&scheduler,&tree,&tree,&root,
                 "Complete the original goal",json!({"action":"work","orders":[repair]}),false,false).unwrap();
             assert!(scheduler.frames["task_a"].invalidated_by_plan_revision.is_none());
             assert_eq!(scheduler.frames["task_a"].status,crate::work_scheduler::WorkStatus::Done);
-            assert_eq!(tree.status("work_task_a"),Some("completed"));
+            assert_eq!(tree.status("work_task_a"),Some("done"));
             scheduler.return_work(&json!({"summary":"repair delivered"})).unwrap();
-            tree.complete_work(scheduler.output().unwrap()).unwrap();
+            tree.record_work_return(scheduler.output().unwrap()).unwrap();
             assert_eq!(scheduler.frames["task_a"].status,crate::work_scheduler::WorkStatus::Done);
             assert_eq!(scheduler.frames["repair"].status,crate::work_scheduler::WorkStatus::Done);
             assert_eq!(scheduler.frames["repair"].order.upstream_ids,vec!["task_a"]);
-            assert_eq!(tree.status("work_repair"),Some("completed"));
+            assert_eq!(tree.status("work_repair"),Some("done"));
             let scheduler_before=scheduler.snapshot(); let tree_before=tree.snapshot();
             assert!(apply_organizer_decision(&scheduler,&tree,&TaskTree::default(),&root,"Complete the original goal",
                 json!({"action":"work","orders":[{"id":"bad","node_id":"direct","goal":"missing completion contract"}]}),false,false).is_err());
@@ -6468,7 +6566,7 @@ pub(crate) mod tests {
         let (mut scheduler,mut tree,_)=apply_organizer_decision(&WorkScheduler::default(),&TaskTree::default(),&TaskTree::default(),&root,
             "Finish the whole goal",json!({"action":"work","orders":[flow_order("legacy","direct")]}),false,false).unwrap();
         scheduler.return_work(&json!({"summary":"legacy child delivered"})).unwrap();
-        tree.complete_work(scheduler.output().unwrap()).unwrap();
+        tree.record_work_return(scheduler.output().unwrap()).unwrap();
         let legacy_handoff=scheduler.handoff.clone();
         scheduler.finish("legacy request finished",false).unwrap();
         scheduler.handoff=legacy_handoff;
@@ -6477,7 +6575,7 @@ pub(crate) mod tests {
         let legacy:WorkScheduler=serde_json::from_value(snapshot).unwrap();
         assert_eq!(legacy.request_completed,None);
         assert!(!restore_execution_session(&tree,Some(legacy.clone())).2);
-        tree.apply(&json!({"current_node_id":"goal","node_result":{"node_id":"goal","status":"completed","summary":"legacy root complete"}})).unwrap();
+        tree.finish_request("legacy root explicitly assessed as achieved",true).unwrap();
         assert!(restore_execution_session(&tree,Some(legacy)).2);
         // A newly recorded blocked finish cannot use the legacy compatibility rule.
         scheduler.request_completed=Some(false);
@@ -6536,7 +6634,7 @@ pub(crate) mod tests {
         let mut previous_tree = TaskTree::default();
         previous_tree.ensure_request_goal("Turn 1 Goal").unwrap();
         previous_tree.ensure_work_child("work_t1", "child 1", "done", &[]).unwrap();
-        previous_tree.complete_work(&json!({
+        previous_tree.record_work_return(&json!({
             "id": "work_t1", "node_id": "work_t1", "revision": 1, "plan_revision": 1, "done": true, "summary": "done"
         })).unwrap();
         previous_tree.apply(&json!({

@@ -13,7 +13,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-pub const INPUT_BUDGET: usize = 12_000;
+// The Observer receives a compact, structured snapshot with a roughly 12k-token budget.
+pub const INPUT_BUDGET: usize = 48_000;
 
 pub fn identity(task: &str, scheduler: &crate::work_scheduler::WorkScheduler, work: &str) -> Value {
     let order = scheduler.frames.get(work).map(|frame| &frame.order);
@@ -23,6 +24,18 @@ pub fn identity(task: &str, scheduler: &crate::work_scheduler::WorkScheduler, wo
 
 pub fn applies(identity: &Value, scope: &Value) -> bool {
     valid_instance(identity, scope) && identity["plan_revision"] == scope["plan_revision"]
+}
+
+fn observation_version_key(input:&Value)->String {
+    let identity=&input["identity"];
+    let instance=format!("{}:{}:{}:{}:{}",identity["task_id"],identity["request_id"],identity["work_id"],identity["revision"],identity["plan_revision"]);
+    if let Some(sequence)=input["source_event_seq"].as_i64() {
+        return format!("event:{instance}:{sequence}");
+    }
+    if let Some(revision)=input["progress_sequence"].as_u64() {
+        return format!("progress:{instance}:{revision}");
+    }
+    format!("review:{}",input["review_id"].as_str().unwrap_or(""))
 }
 
 fn valid_instance(identity: &Value, scope: &Value) -> bool {
@@ -114,8 +127,7 @@ pub fn pack(mut input: Value, path: &[Value], memories: &[Value]) -> Value {
             "upstream_problem":compact(&input["delivery"]["handoff"]["upstream_problem"],800)},
         "current_node":{"goal":input["current_node"]["goal"],"done_when":input["current_node"]["done_when"]},
         "observed_at":input["observed_at"],"node_state":node_state(&input["node_facts"]),
-        "current_facts":{"http":fact_texts(&input["current_facts"]["http"]),"browser":compact(&input["current_facts"]["browser"],600),
-            "earlier_observations":fact_texts(&input["current_facts"]["historical_observations"])},
+        "current_facts":{"http_observations":fact_texts(&input["current_facts"]["http_observations"]),"browser":compact(&input["current_facts"]["browser"],600)},
         "visual_artifacts":input["visual_artifacts"],"visual_check_result":input["visual_check_result"],"visual_capture":input["visual_capture"],"allowed_visual_artifact_ids":input["allowed_visual_artifact_ids"]});
     let optional = [
         ("node_operations", compact(&input["node_facts"]["operations"], 1600)),
@@ -195,6 +207,8 @@ pub fn observation(
             if stage == "handoff" { "sealed" } else { stage }
         )
     };
+    let total=scheduler.flow_directory_page(0,1)["total"].as_u64().unwrap_or(0) as usize;
+    let plan_overview=scheduler.flow_directory_page(total.saturating_sub(6),6)["entries"].clone();
     json!({"identity":id,"review_id":review_id,"source_event_id":source_event_id,
         "organizer_decision_id":decision["decision_id"],"stage":stage,"turn":turn,"step":step,
         "request":{"goal":prompt,"boundary":compact(&scheduler.goal_boundary,900),"constraints":order.map(|o|&o.constraints)},
@@ -205,8 +219,7 @@ pub fn observation(
         "resolved_inputs":packet["upstream_outputs"],"http_observations":packet["http_observations"],"materials":materials,"activity_summary":activity,
         "node_facts":scheduler.observer_facts(work),"current_facts":scheduler.current_facts(),
         "observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-        "delivery":delivery,"plan_overview":scheduler.frames.values().filter(|f|f.invalidated_by_plan_revision.is_none()).take(16)
-            .map(|f|json!({"work_id":f.order.id,"node_id":f.order.node_id,"goal":short(&f.order.goal,180),"status":f.status})).collect::<Vec<_>>(),
+        "delivery":delivery,"plan_overview":plan_overview,
         "defer_until_handoff":stage=="assignment" && order.is_some_and(|o|o.final_answer && o.completion==crate::work_scheduler::Completion::Output)})
 }
 
@@ -552,7 +565,6 @@ async fn run(
     let root = state.workspace.root();
     let mut cached_request = Value::Null;
     let mut memories = Vec::new();
-    let mut last_progress: Option<(String, String)> = None;
     let mut attempted = BTreeSet::new();
     let mut rescan = true;
     loop {
@@ -583,7 +595,7 @@ async fn run(
                 path.push(json!({"identity":input["identity"],"summary":result["summary"],"delivery":input["delivery"]}));
             }
             if !matches!(status.as_str(), "pending" | "unassessed" | "reviewing")
-                || attempted.contains(input["review_id"].as_str().unwrap_or(""))
+                || attempted.contains(&observation_version_key(input))
             {
                 continue;
             }
@@ -625,18 +637,13 @@ async fn run(
             if !applies(&value["identity"], &current) {
                 return None;
             }
-            let fingerprint = compact(&value["activity_summary"], 300).to_string();
-            let instance = value["identity"].to_string();
-            if last_progress.as_ref().is_some_and(|(previous, key)| previous == &instance && key == &fingerprint) {
-                return None;
-            }
-            last_progress = Some((instance, fingerprint));
             Some(value)
         });
         let Some(mut input) = input else {
             continue;
         };
-        if !attempted.insert(input["review_id"].as_str().unwrap_or("").to_owned()) {
+        let attempt_key=observation_version_key(&input);
+        if !attempted.insert(attempt_key.clone()) {
             continue;
         }
         if stop.is_cancelled() {
@@ -670,6 +677,11 @@ async fn run(
             .await
             {
                 input["source_event_seq"] = json!(seq);
+                let persisted_key=observation_version_key(&input);
+                if persisted_key!=attempt_key {
+                    attempted.remove(&attempt_key);
+                    attempted.insert(persisted_key);
+                }
             }
         }
         if stop.is_cancelled() {
@@ -871,7 +883,7 @@ mod tests {
             "sampled_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"elapsed_ms":2,"reachable":true,
             "http_status":200,"error_kind":Value::Null,"error_message":Value::Null,"check_key":check,"check_passed":true,
             "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
-        assert!(scheduler.close_if_satisfied());
+        scheduler.return_work(&json!({"summary":"Worker explicitly returned after the HTTP 200 observation."})).unwrap();
         scheduler
     }
 
@@ -890,7 +902,7 @@ mod tests {
         assert_eq!(packed["node_state"]["checks"][0]["passed"], true);
         assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"], 23, "no key is dropped by position");
         assert!(packed["delivery"].get("exported_fields").is_none());
-        assert!(packed["current_facts"]["http"][0].as_str().unwrap().contains("HTTP 200 at"));
+        assert!(packed["current_facts"]["http_observations"][0].as_str().unwrap().contains("HTTP 200 at"));
         assert!(packed["observed_at"].is_u64());
     }
 
@@ -905,8 +917,9 @@ mod tests {
         scheduler.observe("http_probe",&json!({"url":url}),&json!({"url":url,"sampled_at":failed_at,"elapsed_ms":5,"reachable":false,
             "http_status":Value::Null,"error_kind":"connection_refused","error_message":"connection refused","check_passed":false,
             "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
+        let same_activity=json!({"purpose":"Probe and start the endpoint","actions":[{"tool":"http_probe","failed":true,"sampled_at":failed_at}]});
         let before=observation("task",&scheduler,"fonts",1,2,"progress","bring up the font service",&json!({"reason":"check the service"}),
-            json!({"purpose":"Probe the endpoint","actions":[{"tool":"http_probe","failed":true,"sampled_at":failed_at}]}),Value::Null,Value::Null);
+            same_activity.clone(),Value::Null,Value::Null);
 
         let success_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
         let process_observation=json!({"sampled_at":success_at,"processes":[{"process_id":"font-service-8080","running":true,"ready":true,
@@ -914,9 +927,7 @@ mod tests {
         scheduler.observe("run_project_script",&json!({"script":"dev","background":true}),&json!({"process_id":"font-service-8080","running":true,
             "ready":true,"ready_url":"http://127.0.0.1:38194/","process_observation":process_observation}),false);
         let after=observation("task",&scheduler,"fonts",1,3,"progress","bring up the font service",&json!({"reason":"check the service"}),
-            json!({"purpose":"Start and verify the font service","next_action":"load the document","actions":[
-                {"tool":"http_probe","failed":true,"sampled_at":failed_at},
-                {"tool":"run_project_script","failed":false,"running":true,"sampled_at":success_at}]}),Value::Null,Value::Null);
+            same_activity,Value::Null,Value::Null);
 
         let (wake,_wake_rx)=mpsc::channel(1);let (scope,_scope_rx)=watch::channel(Value::Null);let (progress,mut progress_rx)=watch::channel(None);
         let session=ObserverSession{enabled:true,root:PathBuf::new(),task:"task".into(),wake,scope,progress,stop:CancellationToken::new(),job:None,
@@ -930,8 +941,27 @@ mod tests {
         assert_eq!(latest["node_facts"]["processes"][0]["process_id"],"font-service-8080");
         assert_eq!(latest["node_facts"]["processes"][0]["running"],true);
         assert_eq!(latest["node_facts"]["process_observation_sampled_at"],success_at);
-        assert!(latest["activity_summary"].to_string().contains("Start and verify the font service"));
+        assert_eq!(latest["activity_summary"],first["activity_summary"],"identical compressed activity is still a distinct persisted snapshot version");
         assert!(latest["activity_summary"].to_string().contains(&failed_at),"the action history retains the prior failure timestamp");
+    }
+
+    #[test]
+    fn observer_snapshot_deduplication_uses_revision_or_persisted_event_sequence_not_activity_text() {
+        let identity=json!({"task_id":"task","request_id":7,"work_id":"fonts","revision":2,"plan_revision":4});
+        let mut first=json!({"identity":identity,"review_id":"progress:update-1","progress_sequence":1,
+            "activity_summary":{"same":"compressed text"}});
+        let first_key=observation_version_key(&first);
+        first["activity_summary"]=json!({"same":"compressed text","different_raw_history":"omitted"});
+        assert_eq!(observation_version_key(&first),first_key,"compression/content changes do not invent a new snapshot version");
+        let second=json!({"identity":identity,"review_id":"progress:update-2","progress_sequence":2,
+            "activity_summary":{"same":"compressed text"}});
+        assert_ne!(observation_version_key(&second),first_key,"a new progress revision is independently reviewed even with the same compressed activity");
+
+        first["source_event_seq"]=json!(991);
+        let persisted_key=observation_version_key(&first);
+        let replay=json!({"identity":identity,"review_id":"different transient review id","progress_sequence":9,"source_event_seq":991,
+            "activity_summary":{"changed":true}});
+        assert_eq!(observation_version_key(&replay),persisted_key,"the durable event version wins across replay and compaction");
     }
 
     #[test]

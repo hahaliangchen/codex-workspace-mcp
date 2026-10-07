@@ -86,7 +86,7 @@ export const TaskNode = memo(function TaskNode({
     icon: '⚪',
   }
   const isRunning = data.status === 'running'
-  const isCompleted = data.status === 'completed'
+  const isDone = data.status === 'done' || data.status === 'completed'
   const isSkipped = data.status === 'skipped'
   const isInterrupted = data.status === 'interrupted'
   const isFailed = data.status === 'failed'
@@ -110,15 +110,14 @@ export const TaskNode = memo(function TaskNode({
     if (isRunning) {
       return <div className={styles.spinner} title="进行中" />
     }
-    if (isCompleted) {
-      const unmet = data.workUnit?.expectationMet === false
+    if (isDone) {
       return (
         <span
           className={styles.statusIcon}
-          style={{ color: unmet ? 'var(--dsw-alias-state-warn-primary, #f59e0b)' : 'var(--dsw-alias-state-success-primary, #22c55e)' }}
-          title={unmet ? `执行已结束，预期条件未满足${data.workUnit?.outcome ? `：${data.workUnit.outcome}` : ''}` : '执行已结束'}
+          style={{ color: '#9ca3af' }}
+          title="执行已结束；整体目标由组织者根据验收证据判定"
         >
-          {unmet ? '!' : '✓'}
+          ↩
         </span>
       )
     }

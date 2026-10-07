@@ -200,7 +200,7 @@ async fn saved_visual_pass_does_not_satisfy_delivery_after_source_versions_chang
     let returned=scheduler.return_work(&json!({"summary":"A visual result exists, but it predates the current renderer source version",
         "limitations":["The current renderer version has not been visually verified"]})).unwrap();
     assert_eq!(scheduler.frame().unwrap().status,crate::work_scheduler::WorkStatus::Done);
-    assert_eq!(returned["expectation_met"],false,"a stale visual pass cannot satisfy current delivery conditions");
+    assert!(returned.get("expectation_met").is_none(),"host freshness facts do not become a user-goal conclusion");
     assert_eq!(returned["visual_check_result"]["assessment"],"pass","the previous result remains historical evidence");
 }
 

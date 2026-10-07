@@ -27,13 +27,15 @@ pub fn contract_details(error:&anyhow::Error)->Option<&Value> {
 
 pub fn yield_tool() -> Value {
     json!({"type":"function","function":{"name":"yield_work","description":"Return this work's actual output, concrete blocker, request to split, or upstream problem to Organizer. This seals the current invocation; do not promise future work.","parameters":{"type":"object","properties":{
-        "summary":{"type":"string","minLength":1},"outcome":{"type":"string","enum":["completed","blocked","need_split","upstream_problem"]},
+        "summary":{"type":"string","minLength":1},"outcome":{"type":"string","enum":["completed","blocked","need_split","upstream_problem"],
+            "description":"Optional Worker-reported assessment. Omit it when no categorical outcome is known; the host records invocation status as done and never supplies a default success outcome."},
         "blocked":{"type":"boolean"},"need_split":{"type":"boolean"},
         "upstream_problem":{"type":"object","properties":{
             "node_id":{"type":"string"},"revision":{"type":"integer"},"field":{"type":"string"},"reason":{"type":"string"},"material_ids":{"type":"array","items":{"type":"integer"}}
         },"required":["node_id","reason"]},
         "findings":{"type":"array","items":{"type":"object"}},"material_ids":{"type":"array","items":{"type":"integer"}},
-        "finding_ids":{"type":"array","items":{"type":"string"}},"limitations":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":1200}},
+        "finding_ids":{"type":"array","items":{"type":"string"}},"limitations":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":1200},
+            "description":"Worker-reported remaining limits. Use [] only when you have confirmed there are none; omit when unknown."},
         "suggested_children":{"type":"array","maxItems":16,
             "description":"For need_split, return concise child goals, dependencies and completion conditions for Organizer.",
             "items":{"type":"object","properties":{"id":{"type":"string"},"node_id":{"type":"string"},"title":{"type":"string"},
@@ -58,12 +60,12 @@ fn request_action_schema(input:&Value)->Value {
 
 fn organizer_tools(input:&Value)->Vec<Value> {
     let schedule=json!({"type":"function","function":{"name":"schedule_task",
-        "description":"Create exactly one new work node now. The host generates IDs, Flow events and dependency links. A service-start or HTTP/API check requires completion=check and declared checks. PPTX upload/load, in-browser font request inspection and screenshot review require completion=output with checks=[]. Split mixed task types into successive tasks.",
+        "description":"Create exactly one focused work node. The host generates IDs, Flow events and dependency links. completion is legacy metadata and does not classify the task or decide success. Declare checks only when useful; checks and browser/visual work may coexist. The Worker explicitly returns each invocation with yield_work, including negative or incomplete findings.",
         "parameters":{"type":"object","properties":{
             "goal":{"type":"string","minLength":1,"maxLength":2400},"return_when":{"type":"string","minLength":1,"maxLength":1200},
             "reason":{"type":"string","minLength":1,"maxLength":1200},
-            "completion":{"type":"string","enum":["output","write","check","write_check"]},
-            "checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000},"description":"Required for check/write_check. Supported identifiers: npm:, npm-start:, npm-install:, program:, http-probe:."},
+            "completion":{"type":"string","enum":["output","write","check","write_check"],"description":"Optional legacy metadata; does not constrain task contents or imply success."},
+            "checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000},"description":"Optional host-observed check identifiers. Supported identifiers: npm:, npm-start:, npm-install:, program:, http-probe:."},
             "inputs":{"type":"array","maxItems":16,"description":"Exact upstream work/node references and fields from available_dependency_deliveries.","items":{"type":"object","properties":{
                 "work_id":{"type":"string"},"node_id":{"type":"string"},"revision":{"type":"integer"},"fields":{"type":"array","items":{"type":"string"}},
                 "http_urls":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":4096}}},"anyOf":[{"required":["work_id"]},{"required":["node_id"]}]}},
@@ -76,12 +78,32 @@ fn organizer_tools(input:&Value)->Vec<Value> {
                 "finding_ids":{"type":"array","maxItems":16,"items":{"type":"string"}},
                 "project_observation":{"type":"object"}}},
             "request_action":request_action_schema(input)
-        },"required":["goal","return_when","reason","completion"]}}});
+        },"required":["goal","return_when","reason"]}}});
     let read=json!({"type":"function","function":{"name":"read_task_result",
-        "description":"Read selected fields from a previously completed task result. Use only when the concise execution path or delivery catalog does not already answer the question. Raw materials remain in the notebook.",
+        "description":"Read exact selected fields from any completed task instance by work_id, including historical/deprecated revisions. The response labels whether it is historical and dependency-eligible. Raw source and operation materials remain in the notebook.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"node_id":{"type":"string"},
             "fields":{"type":"array","maxItems":16,"items":{"type":"string"}}},
             "anyOf":[{"required":["work_id"]},{"required":["node_id"]}]}}});
+    let flow=json!({"type":"function","function":{"name":"read_flow_page",
+        "description":"Read a compact chronological page of flow nodes, up to 50. The initial input already contains page 1. Follow next_cursor until the flow total has been covered when older history can affect the decision.",
+        "parameters":{"type":"object","properties":{"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":[]}}});
+    let memory_search=|name:&str,description:&str|json!({"type":"function","function":{"name":name,"description":description,
+        "parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":4}},"required":["query"]}}});
+    let work_memory=memory_search("search_work_memory","Search existing work memory directly without starting a Worker task. Returns a small set of relevant records.");
+    let architecture_memory=memory_search("search_architecture_memory","Search existing architecture memory directly without starting a Worker task. Returns a small set of relevant records.");
+    let symbol_memory=memory_search("search_symbol_business_context","Search saved symbol responsibility descriptions directly without starting a Worker task.");
+    let symbols=json!({"type":"function","function":{"name":"search_project_symbols",
+        "description":"Search the existing project symbol index directly. This is a read-only Organizer lookup and does not create a Worker node.",
+        "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"query":{"type":"string","minLength":1,"maxLength":1000},
+            "file_path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":5}},"required":["language","query"]}}});
+    let read_symbol=json!({"type":"function","function":{"name":"read_project_symbol",
+        "description":"Read one known symbol definition and its responsibility description from the existing project index. Source is saved in the task notebook; the Organizer receives a short excerpt and a material reference.",
+        "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"symbol_id":{"type":"string"},"file_path":{"type":"string"},"name":{"type":"string"},
+            "include_context":{"type":"boolean"}},"required":["language"],"anyOf":[{"required":["symbol_id"]},{"required":["file_path","name"]}]}}});
+    let read_material=json!({"type":"function","function":{"name":"read_source_material",
+        "description":"Read a focused version-checked notebook source page by material ID or query. Returns at most 2,000 source characters per call and states any omitted range; full materials remain available to Worker.",
+        "parameters":{"type":"object","properties":{"query":{"type":"string","maxLength":1000},"material_ids":{"type":"array","maxItems":4,"items":{"type":"integer"}},
+            "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"anyOf":[{"required":["query"]},{"required":["material_ids"]}]}}});
     let finish=json!({"type":"function","function":{"name":"finish_request",
         "description":"Deliver the user-facing result. The task invocation may have ended without meeting the overall goal; report that honestly.",
         "parameters":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":6000},
@@ -94,7 +116,7 @@ fn organizer_tools(input:&Value)->Vec<Value> {
             "reason":{"type":"string","minLength":1},"repair_goal":{"type":"string","maxLength":2400},
             "replacement_checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000}},
             "request_action":request_action_schema(input)},"required":["target_node_id","reason"]}}});
-    vec![schedule,read,finish,revisit]
+    vec![schedule,read,flow,work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit]
 }
 
 fn host_work_id(task_id:&str,turn:usize,step:usize)->String {
@@ -116,7 +138,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             let goal=args["goal"].as_str().unwrap().trim();
             let return_when=args["return_when"].as_str().unwrap().trim();
             let reason=args["reason"].as_str().unwrap().trim();
-            if !matches!(args["completion"].as_str(),Some("output"|"write"|"check"|"write_check")) {
+            if args.get("completion").is_some_and(|value|!matches!(value.as_str(),Some("output"|"write"|"check"|"write_check"))) {
                 return Err(contract_error("INVALID_COMPLETION","completion",args.get("completion"),"completion must be output, write, check, or write_check"));
             }
             if args.get("execution_scope").is_some_and(|scope|!scope.is_object()) {
@@ -125,7 +147,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             let scope=args.get("execution_scope").cloned().unwrap_or_else(||json!({}));
             let id=host_work_id(task_id,turn,step);
             let order=json!({"id":id,"node_id":format!("work_{id}"),"goal":goal,"done_when":return_when,
-                "completion":args["completion"],"checks":args.get("checks").cloned().unwrap_or_else(||json!([])),
+                "completion":args.get("completion").cloned().unwrap_or(json!("output")),"checks":args.get("checks").cloned().unwrap_or_else(||json!([])),
                 "constraints":args.get("constraints").cloned().unwrap_or_else(||json!([])),
                 "dependency_inputs":args.get("inputs").cloned().unwrap_or_else(||json!([])),
                 "edit_targets":scope.get("edit_targets").cloned().unwrap_or_else(||json!([])),
@@ -146,6 +168,33 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             }
             Ok(json!({"action":"read_task_result","work_id":args["work_id"],"node_id":args["node_id"],
                 "fields":args.get("fields").cloned().unwrap_or_else(||json!([]))}))
+        },
+        "read_flow_page"=>Ok(json!({"action":"read_flow_page","cursor":args["cursor"],"limit":args.get("limit").cloned().unwrap_or(json!(50))})),
+        "search_work_memory"|"search_architecture_memory"|"search_symbol_business_context"=>{
+            let query=args["query"].as_str().unwrap_or("").trim();
+            if query.is_empty(){return Err(contract_error("SEARCH_QUERY_REQUIRED","query",args.get("query"),"provide a focused query"));}
+            Ok(json!({"action":name,"query":query,"limit":args.get("limit").cloned().unwrap_or(json!(3))}))
+        },
+        "search_project_symbols"=>{
+            let language=args["language"].as_str().unwrap_or("");let query=args["query"].as_str().unwrap_or("").trim();
+            if !matches!(language,"go"|"rust"|"ts"|"python") {return Err(contract_error("SYMBOL_LANGUAGE_REQUIRED","language",args.get("language"),"language must be go, rust, ts, or python"));}
+            if query.is_empty(){return Err(contract_error("SEARCH_QUERY_REQUIRED","query",args.get("query"),"provide a focused symbol query"));}
+            Ok(json!({"action":"search_project_symbols","language":language,"query":query,"file_path":args["file_path"],"limit":args.get("limit").cloned().unwrap_or(json!(5))}))
+        },
+        "read_project_symbol"=>{
+            let language=args["language"].as_str().unwrap_or("");
+            if !matches!(language,"go"|"rust"|"ts"|"python") {return Err(contract_error("SYMBOL_LANGUAGE_REQUIRED","language",args.get("language"),"language must be go, rust, ts, or python"));}
+            if args["symbol_id"].as_str().is_none_or(str::is_empty)&&!(args["file_path"].as_str().is_some_and(|s|!s.trim().is_empty())&&args["name"].as_str().is_some_and(|s|!s.trim().is_empty())) {
+                return Err(contract_error("SYMBOL_REFERENCE_REQUIRED","symbol_id",args.get("symbol_id"),"provide symbol_id or file_path and name"));
+            }
+            Ok(json!({"action":"read_project_symbol","language":language,"symbol_id":args["symbol_id"],"file_path":args["file_path"],"name":args["name"],"include_context":args.get("include_context").cloned().unwrap_or(json!(false))}))
+        },
+        "read_source_material"=>{
+            if args["query"].as_str().is_none_or(str::is_empty)&&args["material_ids"].as_array().is_none_or(Vec::is_empty) {
+                return Err(contract_error("MATERIAL_REFERENCE_REQUIRED","query",args.get("query"),"provide a focused query or material_ids"));
+            }
+            Ok(json!({"action":"read_source_material","query":args["query"],"material_ids":args["material_ids"],
+                "start_line":args["start_line"],"end_line":args["end_line"],"max_chars":2000}))
         },
         "finish_request"=>{
             let summary=args["summary"].as_str().unwrap_or("").trim();
@@ -173,7 +222,8 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
 }
 
 pub fn is_organizer_tool(name:&str)->bool {
-    matches!(name,"schedule_task"|"read_task_result"|"finish_request"|"revisit_task")
+    matches!(name,"schedule_task"|"read_task_result"|"read_flow_page"|"search_work_memory"|"search_architecture_memory"
+        |"search_symbol_business_context"|"search_project_symbols"|"read_project_symbol"|"read_source_material"|"finish_request"|"revisit_task")
 }
 
 const MAX_METHOD_ARGUMENT_BYTES:usize=24_000;

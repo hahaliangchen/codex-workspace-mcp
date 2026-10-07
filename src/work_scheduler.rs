@@ -62,9 +62,9 @@ pub struct WorkFrame {
     pub idle_rounds: usize,
     pub continues_without_progress: usize,
     pub output: Option<Value>,
-    /// Whether declared objective conditions were actually met. A negative
-    /// TaskReturn can still make the execution status `done`.
-    #[serde(default)]
+    /// Legacy host-derived value. Kept for deserialization; new snapshots and
+    /// Organizer inputs never serialize it as if it were a Worker conclusion.
+    #[serde(default, skip_serializing)]
     pub expectation_met: Option<bool>,
     pub source_selection: Value,
     pub organizer_guidance: Value,
@@ -151,7 +151,7 @@ pub struct ArchivedRequest {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorkScheduler {
-    /// Missing from legacy snapshots (version 0); new snapshots use version 1.
+    /// Missing from legacy snapshots (version 0); current snapshots use version 2.
     #[serde(default)]
     pub schema_version: u32,
     pub request_started_turn: usize,
@@ -196,15 +196,12 @@ pub struct WorkScheduler {
     /// Stall handoffs per normalized goal; bounds re-dispatch of the same task.
     #[serde(default)]
     pub stalled_goals: BTreeMap<String, usize>,
-    /// Visual goals whose return reported image input unavailable, with the returning task.
-    #[serde(default)]
-    pub visual_unavailable_goals: BTreeMap<String, String>,
 }
 
 impl Default for WorkScheduler {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: WORK_SCHEDULER_SCHEMA_VERSION,
             request_started_turn: 0,
             archived_requests: Vec::new(),
             frames: BTreeMap::new(),
@@ -229,7 +226,6 @@ impl Default for WorkScheduler {
             next_http_observation_id: 0,
             applied_decisions: BTreeMap::new(),
             stalled_goals: BTreeMap::new(),
-            visual_unavailable_goals: BTreeMap::new(),
         }
     }
 }
@@ -238,12 +234,13 @@ impl Default for WorkScheduler {
 pub const REPORT_ONLY_ROUND_LIMIT: usize = 3;
 /// Stall handoffs one goal may cause before re-dispatching it is rejected.
 const STALLED_GOAL_LIMIT: usize = 2;
+const WORK_SCHEDULER_SCHEMA_VERSION: u32 = 2;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-const EXECUTION_PATH_STEPS: usize = 24;
+const EXECUTION_PATH_STEPS: usize = 12;
 
 fn rfc3339_ms(value: &Value) -> Option<u64> {
     value.as_str().and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok()).map(|time| time.timestamp_millis().max(0) as u64)
@@ -265,20 +262,11 @@ fn stall_key(goal: &str) -> String {
     goal.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-fn visual_key(order: &WorkOrder) -> Option<String> {
-    let visual = order.visual_goal.is_some() || order.constraints.iter().any(|item| item == "requires_visual");
-    visual.then(|| stall_key(order.visual_goal.as_deref().unwrap_or(&order.goal)))
-}
-
-/// Request/diagnostic inspection is read from tool records, never from pixels.
-fn network_or_diagnostic_work(order: &WorkOrder) -> bool {
-    let text = format!("{} {}", order.goal, order.done_when).to_lowercase();
-    let network = ["font request", "network request", "request log", "browser_diagnostics", "diagnostic", "console error", "http status",
-        "/api/", "字体请求", "网络请求", "请求记录", "诊断"].iter().any(|word| text.contains(word));
-    let visual = ["screenshot", "visible", "render", "look", "appear", "截图", "显示", "外观", "渲染", "看图"].iter().any(|word| text.contains(word));
-    network && !visual
-}
 fn limited(s: &str, count: usize) -> String { s.chars().take(count).collect() }
+fn push_organizer_omission(item:Value,items:&mut Vec<Value>,total:&mut usize) {
+    *total=total.saturating_add(1);
+    if items.len()<24 {items.push(item);}
+}
 fn organizer_compact(value:&Value,depth:usize)->Value {
     if depth>8 {return Value::Null;}
     match value {
@@ -293,6 +281,43 @@ fn organizer_compact(value:&Value,depth:usize)->Value {
         Value::Array(items)=>Value::Array(items.iter().take(16).map(|item|organizer_compact(item,depth+1)).collect()),
         Value::String(text)=>Value::String(limited(text,1200)),
         _=>value.clone(),
+    }
+}
+fn neutralize_legacy_worker_outcome(output:&mut Value) {
+    if output["done"]==true {
+        if output["outcome"]=="completed" {
+            output["outcome"]=Value::Null;
+            output["outcome_unverified_legacy"]=json!(true);
+        }
+        for field in ["blocked","need_split"] {
+            if output[field]==false {output[field]=Value::Null;}
+        }
+    }
+    if let Some(previous)=output.get_mut("previous_handoff") {neutralize_legacy_worker_outcome(previous);}
+}
+fn organizer_omissions(value:&Value,path:&str,depth:usize,items:&mut Vec<Value>,total:&mut usize) {
+    if depth>8 {
+        push_organizer_omission(json!({"path":path,"reason":"nesting limit","reference":"read_task_result with this work_id and field path"}),items,total);
+        return;
+    }
+    match value {
+        Value::Object(object)=>for (key,child) in object {
+            let child_path=if path.is_empty(){key.clone()}else{format!("{path}.{key}")};
+            if matches!(key.as_str(),"operations"|"logs"|"stdout"|"stderr"|"stderr_recent"|"log_file"|"raw_output"|"source_text") {
+                push_organizer_omission(json!({"path":child_path,"reason":"raw execution/source material is kept in the event log or notebook","reference":"material_ids or the task notebook"}),items,total);
+            } else {organizer_omissions(child,&child_path,depth+1,items,total);}
+        },
+        Value::Array(array)=>{
+            if array.len()>16 {push_organizer_omission(json!({"path":path,"reason":"array compacted","omitted_items":array.len()-16,
+                "reference":"read_task_result with this work_id and field path"}),items,total);}
+            for (index,child) in array.iter().take(16).enumerate() {organizer_omissions(child,&format!("{path}[{index}]"),depth+1,items,total);}
+        },
+        Value::String(text)=>{
+            let count=text.chars().count();
+            if count>1200 {push_organizer_omission(json!({"path":path,"reason":"string compacted","omitted_chars":count-1200,
+                "reference":"read_task_result with this work_id and field path"}),items,total);}
+        },
+        _=>{}
     }
 }
 fn compact_suggested_children(value:&Value)->Value {
@@ -320,6 +345,10 @@ fn organizer_handoff(handoff:&Value)->Value {
     }
     if let Some(children)=handoff.get("suggested_children") {compact["suggested_children"]=compact_suggested_children(children);}
     if let Some(failure)=handoff.get("organizer_failure") {compact["organizer_failure"]=organizer_compact(failure,0);}
+    fn execution_error(handoff:&Value)->Option<&Value> {
+        handoff.get("execution_error").or_else(||handoff.get("previous_handoff").and_then(execution_error))
+    }
+    if let Some(error)=execution_error(handoff) {compact["execution_error"]=error.clone();}
     if let Some(reason)=handoff["reason"].as_str() {compact["reason"]=json!(limited(reason,500));}
     if let Some(failure)=handoff.get("failure") {
         compact["failure"]=json!({"error_code":failure["error_code"],"stage":failure["stage"],
@@ -487,9 +516,13 @@ impl WorkScheduler {
     pub fn snapshot(&self) -> Value { serde_json::to_value(self).unwrap_or(json!({})) }
 
     pub fn normalize_snapshot_version(&mut self) {
-        // Migration only stamps the current format; it never upgrades legacy
-        // execution or business outcomes to success.
-        self.schema_version = 1;
+        if self.schema_version < WORK_SCHEDULER_SCHEMA_VERSION {
+            for frame in self.frames.values_mut() {
+                if let Some(output)=frame.output.as_mut() {neutralize_legacy_worker_outcome(output);}
+            }
+            if let Some(handoff)=self.handoff.as_mut() {neutralize_legacy_worker_outcome(handoff);}
+        }
+        self.schema_version = WORK_SCHEDULER_SCHEMA_VERSION;
     }
 
     /// A replacement creates a fresh request; cancelled frames cannot be selected,
@@ -595,13 +628,11 @@ impl WorkScheduler {
                 "status": if f.invalidated_by_plan_revision.is_some() {
                     "deprecated"
                 } else if f.status == WorkStatus::Done {
-                    "completed"
-                } else if self.finished || f.output.as_ref().is_some_and(|out| out["blocked"] == true) {
-                    "blocked"
+                    "done"
                 } else if f.status == WorkStatus::Running {
                     "running"
                 } else {
-                    "pending"
+                    "ready"
                 },
                 "result": f.output
             })).collect::<Vec<_>>(),
@@ -742,8 +773,6 @@ impl WorkScheduler {
             }
             let requires_pptx=o.constraints.iter().any(|constraint|constraint=="requires_pptx");
             if requires_pptx {
-                ensure!(o.completion==Completion::Output,"field_path=orders[{index}].completion: requires_pptx needs completion=output");
-                ensure!(o.checks.is_empty(),"field_path=orders[{index}].checks: PPTX upload, load and visual verification use completion=output with checks=[]; move startup and HTTP checks into a separate check work order");
                 let expected=o.browser_document_path.as_deref().filter(|path|!path.trim().is_empty()).ok_or_else(||anyhow::anyhow!("field_path=orders[{index}].browser_document_path: requires_pptx needs the exact workspace-relative target file path"))?;
                 let normalized=path(expected.trim());
                 ensure!(normalized.chars().count()<=2000&&!normalized.starts_with('/')&&!normalized.contains(':')&&!normalized.split('/').any(|part|part==".."||part==".")&&normalized.to_ascii_lowercase().ends_with(".pptx"),"field_path=orders[{index}].browser_document_path: target must be a workspace-relative .pptx file path without traversal segments");
@@ -751,15 +780,7 @@ impl WorkScheduler {
             } else if let Some(expected)=o.browser_document_path.as_deref() {
                 o.browser_document_path=Some(path(expected.trim()));
             }
-            let visual = o.visual_goal.is_some() || o.constraints.iter().any(|s| s == "requires_visual");
-            ensure!(!visual || o.completion == Completion::Output, "field_path=orders[{index}].completion: visual verification needs completion=output; keep code write/check work in a separate order");
-            ensure!(!visual || o.checks.is_empty(), "field_path=orders[{index}].checks: visual verification uses completion=output with checks=[]; move startup and HTTP checks into a separate check work order");
             ensure!(o.visual_goal.as_ref().is_none_or(|s| !s.trim().is_empty() && s.chars().count() <= 2400), "visual_goal must be a focused nonempty goal");
-            ensure!(o.visual_goal.is_none() || !network_or_diagnostic_work(&o),
-                "field_path=orders[{index}].visual_goal: network, font-request and diagnostic work does not take visual_goal; read requests with browser_diagnostics and schedule any screenshot inspection as a separate task");
-            if let Some(previous)=visual_key(&o).and_then(|key|self.visual_unavailable_goals.get(&key)) {
-                anyhow::bail!("field_path=orders[{index}].visual_goal: VISUAL_INPUT_UNAVAILABLE: task {previous} already returned this visual goal with image input unavailable; the screenshot can be delivered as is. Finish with the limitation or use another available capability instead of dispatching it again");
-            }
             ensure!(o.upstream_ids.len() <= 16 && o.finding_ids.len() <= 16 && o.material_ids.len() <= 16 && o.material_ranges.len() <= 16 && o.edit_targets.len() <= 16 && o.checks.len() <= 4, "keep work inputs and checks focused");
             for range in &mut o.material_ranges {
                 let id = range["id"].as_i64().filter(|id| *id > 0).ok_or_else(|| anyhow::anyhow!("material range needs a material id"))?;
@@ -770,18 +791,13 @@ impl WorkScheduler {
             ensure!(o.upstream_ids.iter().all(|id| id != &o.id), "work cannot depend on itself");
             o.edit_targets = o.edit_targets.iter().map(|s| path(s)).collect();
             o.checks = o.checks.iter().map(|s| command(s)).collect();
-            let writing = matches!(o.completion, Completion::Write | Completion::WriteCheck);
-            let checking = matches!(o.completion, Completion::Check | Completion::WriteCheck);
-            let service_or_http_check=o.checks.iter().any(|check|check.starts_with("npm-start:")||check.starts_with("http-probe:"));
-            ensure!(!service_or_http_check||o.completion==Completion::Check,
-                "field_path=orders[{index}].completion: service startup and HTTP/API checks use completion=check; keep file-writing work in a separate order");
-            ensure!(!(writing || !o.edit_targets.is_empty()) || can_write, "write work is unavailable under current permissions");
+            let checking = !o.checks.is_empty();
+            ensure!(o.edit_targets.is_empty() || can_write, "write work is unavailable under current permissions");
             ensure!(!checking || can_check, "checks are unavailable under current tool permissions");
-            ensure!(!writing || !o.edit_targets.is_empty(), "write work needs explicit target files");
-            ensure!(!checking || (!o.checks.is_empty() && o.checks.iter().all(|s| !s.is_empty() && s.chars().count() <= 2000)), "field_path=orders[{index}].checks: completion=check/write_check needs specific authorized check identifiers");
-            ensure!(!checking || o.checks.iter().all(|check|supported_check_key(check)),
+            ensure!(!matches!(o.completion,Completion::Write|Completion::WriteCheck) || !o.edit_targets.is_empty(), "write work needs explicit target files");
+            ensure!(o.checks.iter().all(|s| !s.is_empty() && s.chars().count() <= 2000), "field_path=orders[{index}].checks: each declared observation/check must be a specific nonempty identifier");
+            ensure!(o.checks.iter().all(|check|supported_check_key(check)),
                 "field_path=orders[{index}].checks: use a supported identifier: npm:, npm-start:, npm-install:, program:, or http-probe:; shell command strings are no longer accepted");
-            ensure!(checking || o.checks.is_empty(), "field_path=orders[{index}].checks: nonempty checks require completion=check/write_check; for PPTX or visual work use completion=output with checks=[] and split service/API checks into a separate check node");
 
             if o.revision == 0 {
                 let rev = self.node_revisions.entry(o.node_id.clone()).or_insert(1);
@@ -864,7 +880,7 @@ impl WorkScheduler {
         let modified_files=output["modified_files"].as_object().map(|files|files.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
         let compact=json!({"work_id":output["id"],"node_id":output["node_id"],"revision":output["revision"],
             "status":if self.effectively_done(frame){"done".to_owned()}else{format!("{:?}",frame.status).to_ascii_lowercase()},
-            "done":output["done"],"execution_status":output["execution_status"],"expectation_met":output["expectation_met"],
+            "done":output["done"],"execution_status":output["execution_status"],
             "outcome":output["outcome"],"summary":output["summary"],
             "checks":output["checks"],"modified_files":modified_files,"finding_ids":output["finding_ids"],
             "material_ids":output["material_ids"],"exported_data":self.filtered_export_data(frame,&output["exported_data"]),
@@ -874,7 +890,14 @@ impl WorkScheduler {
             "suggested_children":compact_suggested_children(&output["suggested_children"])});
         // Keep only the result Organizer needs to route next. Full exports,
         // source and execution history remain available to Worker/notebook.
-        organizer_compact(&compact,0)
+        let mut compacted=organizer_compact(&compact,0);
+        let mut omissions=Vec::new();let mut omitted_total=0;
+        organizer_omissions(&compact,"current_result",0,&mut omissions,&mut omitted_total);
+        if omitted_total>0 {
+            compacted["context_omissions"]=json!({"items":omissions,"omitted_item_count":omitted_total.saturating_sub(24),
+                "reference":{"method":"read_task_result","work_id":frame.order.id,"fields":"request the listed field paths"}});
+        }
+        compacted
     }
 
     pub fn resolve_dependency_deliveries(&self, order: &WorkOrder) -> Result<Vec<Value>, String> {
@@ -1060,7 +1083,6 @@ impl WorkScheduler {
         cur_frame.started_at.get_or_insert_with(now_ms);
         self.handoff = None;
         self.consume_bound_http_checks();
-        self.close_if_satisfied();
         Ok(true)
     }
 
@@ -1069,7 +1091,6 @@ impl WorkScheduler {
     pub fn prepare_legacy_check_migration(&mut self)->Vec<Value> {
         let mut migrations=Vec::new();
         for frame in self.frames.values_mut().filter(|frame|frame.invalidated_by_plan_revision.is_none()&&frame.status!=WorkStatus::Done) {
-            if !matches!(frame.order.completion,Completion::Check|Completion::WriteCheck) {continue;}
             let legacy=frame.order.checks.iter().filter(|check|!supported_check_key(check)).cloned().collect::<Vec<_>>();
             if legacy.is_empty(){continue;}
             for check in &legacy {frame.checked.remove(check);frame.http_check_samples.remove(check);frame.check_errors.remove(check);}
@@ -1229,28 +1250,13 @@ impl WorkScheduler {
 
     pub fn finish(&mut self, summary: &str, blocked: bool) -> Result<()> {
         ensure!(!summary.trim().is_empty(), "finish requires an actual result or blocker summary");
-        ensure!(blocked || self.all_done(), "unfinished work must be completed, resumed or reported blocked");
+        // This is Organizer's explicit assessment. Queue state is a host
+        // execution fact, not a veto or substitute for the goal judgment.
         self.finished = true;
         self.request_completed = Some(!blocked);
         if !blocked { self.handoff = None; }
         self.final_result = limited(summary, 6000);
         Ok(())
-    }
-
-    fn gate(&self, f: &WorkFrame) -> bool {
-        let written = !f.writes.is_empty() && f.order.edit_targets.iter().all(|p| f.writes.contains_key(&path(p)));
-        let checked = f.check_errors.is_empty() && !f.order.checks.is_empty() && f.order.checks.iter().all(|c| {
-            f.checked.get(c) == Some(&f.epoch)
-                && (!c.starts_with("http-probe:") || self.http_check_sample_is_current(f, c))
-        });
-        let visual_required=f.order.visual_goal.is_some() || f.order.constraints.iter().any(|item|item=="requires_visual");
-        if visual_required && !Self::visual_check_is_current(f) {return false;}
-        match f.order.completion {
-            Completion::Output => false,
-            Completion::Write => written,
-            Completion::Check => checked,
-            Completion::WriteCheck => written && checked,
-        }
     }
 
     fn http_check_sample_is_current(&self, frame: &WorkFrame, check: &str) -> bool {
@@ -1392,12 +1398,13 @@ impl WorkScheduler {
     }
 
     fn attach_http_observations(observations:Vec<Value>,exported_data:&mut Value) {
+        if let Some(fields)=exported_data.as_object_mut() {fields.remove("http_observations");}
+        if observations.is_empty() {return;}
         if !exported_data.is_object() {
             let prior=std::mem::replace(exported_data,Value::Null);
             *exported_data=json!({"worker_data":prior});
         }
-        if let Some(fields)=exported_data.as_object_mut() {fields.remove("http_observations");}
-        if !observations.is_empty() {exported_data["http_observations"]=json!(observations);}
+        exported_data["http_observations"]=json!(observations);
     }
 
     fn visual_check_is_current(f:&WorkFrame)->bool {
@@ -1410,7 +1417,8 @@ impl WorkScheduler {
     }
 
     pub fn verification_due(&self) -> bool {
-        self.frame().is_some_and(|f| f.check_errors.is_empty() && (f.order.completion == Completion::Check || (f.order.completion == Completion::WriteCheck && !f.writes.is_empty() && f.order.edit_targets.iter().all(|p| f.writes.contains_key(&path(p))))))
+        self.frame().is_some_and(|f| !f.order.checks.is_empty() && f.check_errors.is_empty()
+            && (f.order.edit_targets.is_empty() || f.order.edit_targets.iter().all(|target|f.writes.contains_key(&path(target)))))
     }
 
     pub fn reusable_http_probe(&self,args:&Value)->Option<Value> {
@@ -1426,8 +1434,7 @@ impl WorkScheduler {
         let age_ms=self.http_sample_freshness(sample).1;
         result["reused"]=json!(true);
         result["reuse_age_ms"]=json!(age_ms);
-        result["fresh"]=json!(true);
-        result["relation_to_service_start"]=self.http_relation_to_service_start(sample);
+        result["fresh_for_cache_reuse"]=json!(true);
         result["guidance"]=json!("A fresh result for this exact local URL was reused; use its sampled_at and response details instead of probing again.");
         Some(result)
     }
@@ -1439,12 +1446,6 @@ impl WorkScheduler {
             .and_then(|id|self.http_observation_samples.get(id)).is_some_and(|sample|!self.http_sample_freshness(sample).0)
     }
 
-    fn http_relation_to_service_start(&self,sample:&Value)->Value {
-        let url=sample["url"].as_str().unwrap_or("");
-        let (Some(start),Some(at))=(self.service_observed_running_at(url),rfc3339_ms(&sample["sampled_at"])) else {return Value::Null;};
-        json!(if at<start {"before the matching service instance was observed ready"} else {"after the matching service instance was observed ready"})
-    }
-
     /// Previous sample for the same URL, reported with a new observation so the
     /// Worker sees why it was not reused.
     pub fn http_previous_sample(&self,args:&Value)->Value {
@@ -1452,7 +1453,7 @@ impl WorkScheduler {
             .and_then(|id|self.http_observation_samples.get(id)) else {return Value::Null;};
         let (fresh,age_ms,reason)=self.http_sample_freshness(sample);
         json!({"sample_id":sample["sample_id"],"sampled_at":sample["sampled_at"],"http_status":sample["http_status"],"error_kind":sample["error_kind"],
-            "age_ms":age_ms,"reusable":fresh,"invalidation_reason":reason,"relation_to_service_start":self.http_relation_to_service_start(sample)})
+            "age_ms":age_ms,"fresh_for_cache_reuse":fresh,"cache_invalidation_reason":reason})
     }
 
     fn http_sample_freshness(&self, sample:&Value)->(bool,u64,Option<&'static str>) {
@@ -1489,8 +1490,8 @@ impl WorkScheduler {
             object.remove("process_event_generation");
         }
         delivered["age_ms"]=json!(age_ms);
-        delivered["fresh"]=json!(fresh);
-        delivered["invalidation_reason"]=invalidation_reason.map_or(Value::Null,|reason|json!(reason));
+        delivered["fresh_for_cache_reuse"]=json!(fresh);
+        delivered["cache_invalidation_reason"]=invalidation_reason.map_or(Value::Null,|reason|json!(reason));
         Some(delivered)
     }
 
@@ -1527,8 +1528,7 @@ impl WorkScheduler {
             let previous=self.http_previous_sample(args);
             self.http_observation_samples.insert(id.clone(),result.clone());
             if !previous.is_null() {result["previous_sample"]=previous;}
-            result["fresh"]=json!(true);
-            result["relation_to_service_start"]=self.http_relation_to_service_start(result);
+            result["fresh_for_cache_reuse"]=json!(true);
             self.http_probe_results.insert(crate::http_probe::check_key(args),json!({"sample_id":id}));
             id
         });
@@ -1607,9 +1607,7 @@ impl WorkScheduler {
     }
 
     fn may_edit(f: &WorkFrame) -> bool {
-        matches!(f.order.completion, Completion::Write | Completion::WriteCheck) ||
-            (f.order.completion==Completion::Output && f.order.visual_goal.is_some() && !f.order.edit_targets.is_empty()) ||
-            (f.order.completion == Completion::Check && !f.order.edit_targets.is_empty() && !f.check_errors.is_empty())
+        !f.order.edit_targets.is_empty()
     }
 
     pub fn permits(&self, name: &str, args: &Value) -> Result<()> {
@@ -1839,8 +1837,6 @@ impl WorkScheduler {
             "project_path": result["project_path"],
             "script": result["script"],
             "process_observation":result["process_observation"],
-            "failure_stage":result["failure_stage"],
-            "diagnosis":result["diagnosis"],
             "host_runtime":result["host_runtime"],
             "ready": result["ready"],
             "check_key": result["check_key"],
@@ -1901,83 +1897,6 @@ impl WorkScheduler {
         self.update_versions(&versions);
     }
 
-    /// What the host actually observed when it closed a check/write task.
-    fn host_check_summary(&self, frame: &WorkFrame, http_observations: &[Value]) -> String {
-        let mut facts = Vec::new();
-        let mut latest = BTreeMap::<String, &Value>::new();
-        for sample in http_observations {
-            let url = sample["url"].as_str().unwrap_or("").to_owned();
-            if latest.get(&url).is_none_or(|old| old["sampled_at"].as_str() <= sample["sampled_at"].as_str()) { latest.insert(url, sample); }
-        }
-        for (url, sample) in latest {
-            facts.push(match sample["http_status"].as_u64() {
-                Some(status) => format!("{url} returned HTTP {status}"),
-                None => format!("{url} received no HTTP response ({})", sample["error_kind"].as_str().unwrap_or("unreachable")),
-            });
-        }
-        for process in frame.project_observation["processes"].as_array().into_iter().flatten().take(4) {
-            let id = process["process_id"].as_str().unwrap_or("?");
-            let mut state = vec![if process["running"] == true { "running".to_owned() } else { process["state"].as_str().unwrap_or("not running").to_owned() }];
-            if process["ready"] == true { state.push(format!("ready at {}", process["ready_url"].as_str().unwrap_or("its URL"))); }
-            facts.push(format!("managed process {id} ({}) is {}", process["script"].as_str().unwrap_or("script"), state.join(", ")));
-        }
-        let other_checks = frame.checked.keys().filter(|check| !check.starts_with("http-probe:")).cloned().collect::<Vec<_>>();
-        if !other_checks.is_empty() { facts.push(format!("checks passed: {}", other_checks.join(", "))); }
-        if !frame.writes.is_empty() { facts.push(format!("modified {}", frame.writes.keys().cloned().collect::<Vec<_>>().join(", "))); }
-        if facts.is_empty() { return format!("Host confirmed the declared {:?} conditions for: {}", frame.order.completion, limited(&frame.order.goal, 300)); }
-        limited(&facts.join("; "), 2400)
-    }
-
-    pub fn close_if_satisfied(&mut self) -> bool {
-        self.refresh_http_check_validity();
-        let work_id=self.current.clone();
-        let Some(snapshot)=self.frames.get(&work_id).cloned() else {return false;};
-        if snapshot.status==WorkStatus::Done||!self.gate(&snapshot) {return false;}
-        let http_observations=self.frame_http_observations(&snapshot);
-        let requires_pptx=snapshot.order.constraints.iter().any(|item|item=="requires_pptx");
-        let requires_browser=requires_pptx||snapshot.order.constraints.iter().any(|item|item=="requires_browser");
-        if requires_browser&&Self::latest_current_browser_read(&snapshot).is_none() {return false;}
-        if requires_pptx&&!self.browser_presentation_loaded(&snapshot) {return false;}
-        let host_summary=self.host_check_summary(&snapshot,&http_observations);
-        let Some(f)=self.frames.get_mut(&work_id) else {return false;};
-        f.status = WorkStatus::Done;
-        f.returned_at = Some(now_ms());
-        f.expectation_met = Some(true);
-        let mut exported_data=json!({});
-        if !f.project_observation.is_null() {
-            let observation=f.project_observation.clone();
-            exported_data=json!({"project_observation":observation,
-                "project_path":observation.pointer("/scope/project_path").cloned().unwrap_or(Value::Null),
-                "script":observation.pointer("/scope/script").cloned().unwrap_or(Value::Null),
-                "ready_url":observation.pointer("/scope/ready_url").cloned().unwrap_or(Value::Null),
-                "ready_port":observation.pointer("/scope/ready_port").cloned().unwrap_or(Value::Null),
-                "process_id":observation.pointer("/processes/0/process_id").cloned().unwrap_or(Value::Null)});
-        }
-        Self::attach_http_observations(http_observations,&mut exported_data);
-        Self::attach_active_browser_upload(&self.active_browser_uploads,f,&mut exported_data);
-        let output = json!({
-            "id": f.order.id,
-            "node_id": f.order.node_id,
-            "revision": f.order.revision,
-            "plan_revision": f.order.plan_revision,
-            "goal": f.order.goal,
-            "done": true,
-            "execution_status": "done",
-            "expectation_met": true,
-            "outcome": "completed",
-            "summary": host_summary,
-            "modified_files": f.writes,
-            "checks": f.checked.keys().collect::<Vec<_>>(),
-            "exported_data":exported_data,
-            "project_observation":f.project_observation,
-            "versions": f.versions,
-            "operations": f.operations
-        });
-        f.output = Some(output.clone());
-        self.handoff = Some(output);
-        true
-    }
-
     pub fn return_work(&mut self, args: &Value) -> Result<Value> {
         self.refresh_http_check_validity();
         ensure!(args.to_string().len() <= 32_000, "work return is too large; return conclusions and material IDs");
@@ -1988,46 +1907,17 @@ impl WorkScheduler {
         let frame_id=self.current.clone();
         let f = self.frames.get(&frame_id).cloned().ok_or_else(|| anyhow::anyhow!("no active work"))?;
         ensure!(f.status!=WorkStatus::Done,"this task return is already sealed; schedule a new task or revisit its node");
-        let is_upstream_prob = args["outcome"].as_str() == Some("upstream_problem") || args.get("upstream_problem").is_some();
-        let is_blocked = args["blocked"] == true || args["outcome"].as_str() == Some("blocked");
-        let is_need_split = args["need_split"] == true || args["outcome"].as_str() == Some("need_split");
         // A valid TaskReturn seals this invocation even when its finding is
         // negative, blocked, upstream-dependent, or asks the Organizer to split.
         let done = true;
-        let requires_visual=f.order.visual_goal.is_some()||f.order.constraints.iter().any(|item|item=="requires_visual");
-        let visual_met=!requires_visual||Self::visual_check_is_current(&f);
-        let requires_pptx=f.order.constraints.iter().any(|item|item=="requires_pptx");
-        let requires_browser=requires_pptx||f.order.constraints.iter().any(|item|item=="requires_browser");
-        let browser_met=!requires_browser||Self::latest_current_browser_read(&f).is_some();
-        let pptx_met=!requires_pptx||self.browser_presentation_loaded(&f);
-        let explicit_negative=is_blocked||is_need_split||is_upstream_prob;
-        let has_host_gate=requires_visual||requires_browser||requires_pptx;
-        let declared_conditions_met=if explicit_negative {
-            Some(false)
-        } else if f.order.completion==Completion::Output {
-            has_host_gate.then_some(visual_met&&browser_met&&pptx_met)
-        } else {
-            Some(self.gate(&f)&&visual_met&&browser_met&&pptx_met)
-        };
         if let Some(frame)=self.frames.get_mut(&frame_id) {
             frame.status=WorkStatus::Done;
             frame.returned_at=Some(now_ms());
-            frame.expectation_met=declared_conditions_met;
+            // The Worker reports its conclusion. Host observations are kept
+            // alongside it; the host does not infer whether the goal passed.
+            frame.expectation_met=None;
         }
-        let image_unavailable=f.visual_check_result["assessment"]=="unavailable"||args["visual_check_result"]["assessment"]=="unavailable";
-        if let Some(key)=visual_key(&f.order).filter(|_|image_unavailable&&!visual_met) {
-            self.visual_unavailable_goals.insert(key,frame_id.clone());
-        }
-        let outcome = if is_upstream_prob {
-            "upstream_problem"
-        } else if is_blocked {
-            "blocked"
-        } else if is_need_split {
-            "need_split"
-        } else {
-            "completed"
-        };
-        let mut exported_data=args.get("exported_data").cloned().unwrap_or_else(||json!({}));
+        let mut exported_data=args.get("exported_data").cloned().unwrap_or(Value::Null);
         Self::attach_http_observations(self.frame_http_observations(&f),&mut exported_data);
         if !f.project_observation.is_null() {
             if !exported_data.is_object(){exported_data=json!({"worker_data":exported_data});}
@@ -2048,14 +1938,19 @@ impl WorkScheduler {
             "goal": f.order.goal,
             "done": done,
             "execution_status": "done",
-            "expectation_met": declared_conditions_met,
-            "outcome": outcome,
-            "summary": limited(summary, 2400),
-            "blocked": is_blocked,
-            "need_split": is_need_split,
-            "upstream_problem": args.get("upstream_problem"),
+            // These are Worker-reported business conclusions. Preserve an
+            // omitted value as unknown; invocation completion is represented
+            // only by done/execution_status above.
+            "outcome": args.get("outcome").cloned().unwrap_or(Value::Null),
+            "summary": args["summary"],
+            // Keep the submitted return intact. Context projections and host
+            // observations must never replace what the Worker actually said.
+            "worker_return": args,
+            "blocked": args.get("blocked").cloned().unwrap_or(Value::Null),
+            "need_split": args.get("need_split").cloned().unwrap_or(Value::Null),
+            "upstream_problem": args.get("upstream_problem").cloned().unwrap_or(Value::Null),
             "suggested_children": args["suggested_children"],
-            "limitations": args.get("limitations").cloned().unwrap_or_else(||json!([])),
+            "limitations": args.get("limitations").cloned().unwrap_or(Value::Null),
             "findings": args["findings"],
             "material_ids": args["material_ids"],
             "finding_ids": args["finding_ids"],
@@ -2097,7 +1992,7 @@ impl WorkScheduler {
     }
 
     /// Keep the latest reports on the node. They describe intent and known
-    /// conditions; only a TaskReturn or host check records a result.
+    /// conditions; only a Worker return seals the invocation.
     pub fn record_progress(&mut self, args: &Value, turn: usize, step: usize) {
         let Some(frame) = self.frames.get_mut(&self.current) else { return; };
         if frame.status == WorkStatus::Done { return; }
@@ -2162,7 +2057,7 @@ impl WorkScheduler {
             "outstanding_checks": self.frame().map(|frame| frame.order.checks.iter().filter(|check| frame.status != WorkStatus::Done
                 && (frame.checked.get(*check) != Some(&frame.epoch)
                     || check.starts_with("http-probe:") && !self.http_check_sample_is_current(frame, check))).collect::<Vec<_>>()),
-            "return_contract": "Do the current work using its smallest necessary materials. Use yield_work to return collected findings, a specific blocker, NeedSplit, or upstream_problem. Write/check completion is decided by the host's actual results. Do not replan, switch nodes, reopen completed work or announce readiness in separate rounds."
+            "return_contract": "Do the current work using its smallest necessary materials. Use yield_work to explicitly end this invocation with findings, a specific blocker, NeedSplit, or upstream_problem. The host records actual writes, checks, and observations but does not decide whether the user goal passed. Do not replan, switch nodes, reopen completed work or announce readiness in separate rounds."
         })
     }
 
@@ -2187,100 +2082,19 @@ impl WorkScheduler {
         else { "ready" }
     }
 
-    fn same_local_host(left:&str,right:&str)->bool {
-        let left=left.trim_matches(['[',']']).to_ascii_lowercase();
-        let right=right.trim_matches(['[',']']).to_ascii_lowercase();
-        left==right || ["localhost","127.0.0.1","::1"].contains(&left.as_str())
-            && ["localhost","127.0.0.1","::1"].contains(&right.as_str())
-    }
-
-    fn process_matches_http_url(process:&Value,url:&str)->bool {
-        let Ok(target)=reqwest::Url::parse(url) else {return false;};
-        let (Some(target_host),Some(target_port))=(target.host_str(),target.port_or_known_default()) else {return false;};
-        if let Some(ready_url)=process["ready_url"].as_str() {
-            let Ok(ready)=reqwest::Url::parse(ready_url) else {return false;};
-            let (Some(ready_host),Some(ready_port))=(ready.host_str(),ready.port_or_known_default()) else {return false;};
-            ready_port==target_port && Self::same_local_host(ready_host,target_host)
-                && process["ready_port"].as_u64().is_none_or(|port|port==u64::from(target_port))
-        } else {
-            process["ready_port"].as_u64()==Some(u64::from(target_port))
-        }
-    }
-
-    /// The earliest host observation that this exact HTTP target's managed
-    /// listener was ready. Unrelated running processes provide no timing proof.
-    fn service_observed_running_at(&self,url:&str)->Option<u64> {
-        self.frames.values().filter_map(|frame| {
-            let observed_at=frame.project_observation["sampled_at"].as_u64()?;
-            let matching=frame.project_observation["processes"].as_array()?.iter().any(|process|
-                process["running"]==true && process["ready"]==true && Self::process_matches_http_url(process,url));
-            matching.then_some(observed_at)
-        }).min()
-    }
-
-    fn later_http_recovery<'a>(&'a self,frame:&WorkFrame,limitation:Option<&str>)->Option<&'a Value> {
-        let mut recoveries=Vec::new();
-        for old in frame.http_observation_ids.iter().filter_map(|id|self.http_observation_samples.get(id)) {
-            if old["check_passed"]==true {continue;}
-            let Some(url)=old["url"].as_str() else {continue;};
-            let linked=if let Some(text)=limitation {
-                text.to_ascii_lowercase().contains(&url.to_ascii_lowercase())
-            } else {
-                frame.order.checks.iter().any(|check|check==&crate::http_probe::check_key(&json!({"url":url})))
-            };
-            if !linked {continue;}
-            let old_at=rfc3339_ms(&old["sampled_at"]).unwrap_or(0);
-            if let Some(newer)=self.http_observation_samples.values().filter(|sample|
-                crate::http_probe::check_key(&json!({"url":sample["url"]}))==crate::http_probe::check_key(&json!({"url":url}))
-                    &&sample["check_passed"]==true&&self.http_sample_freshness(sample).0
-                    &&rfc3339_ms(&sample["sampled_at"]).is_some_and(|at|at>old_at))
-                .max_by_key(|sample|rfc3339_ms(&sample["sampled_at"]).unwrap_or(0)) {
-                recoveries.push(newer);
-            }
-        }
-        recoveries.into_iter().max_by_key(|sample|rfc3339_ms(&sample["sampled_at"]).unwrap_or(0))
-    }
-
-    /// Latest HTTP sample per URL is the current fact; earlier samples with a
-    /// different outcome stay as dated history and never stand in for now.
-    fn http_fact_lines(&self) -> (Vec<Value>, Vec<Value>) {
-        let mut by_url = BTreeMap::<String, Vec<&Value>>::new();
-        for sample in self.http_observation_samples.values() {
-            by_url.entry(crate::http_probe::check_key(&json!({"url":sample["url"]}))).or_default().push(sample);
-        }
-        let relation = |sample: &Value| -> Value {
-            let url=sample["url"].as_str().unwrap_or("");
-            let service_running_at=self.service_observed_running_at(url);
-            let (Some(start), Some(at)) = (service_running_at, rfc3339_ms(&sample["sampled_at"])) else { return Value::Null; };
-            json!(if at < start { "before the matching service instance was observed ready" } else { "after the matching service instance was observed ready" })
-        };
-        let (mut current, mut history) = (Vec::new(), Vec::new());
-        for samples in by_url.values_mut() {
-            samples.sort_by(|left, right| left["sampled_at"].as_str().cmp(&right["sampled_at"].as_str()));
-            let latest = *samples.last().unwrap();
-            let (fresh, age_ms, reason) = self.http_sample_freshness(latest);
-            let url = latest["url"].as_str().unwrap_or("");
-            let when = time_label(&latest["sampled_at"]);
-            let text = if fresh {
-                format!("{url}: {} at {when} (current sample)", http_outcome(latest))
-            } else if latest["check_passed"] == true {
-                format!("{url}: current state unknown (sample {}); last success {} at {when}", reason.unwrap_or("stale"), http_outcome(latest))
-            } else {
-                format!("{url}: current state unknown (sample {}); last sample {} at {when}", reason.unwrap_or("stale"), http_outcome(latest))
-            };
-            current.push(json!({"url":url,"http_status":latest["http_status"],"error_kind":latest["error_kind"],"sampled_at":latest["sampled_at"],
-                "sample_id":latest["sample_id"],"producer_work_id":latest["producer_work_id"],"fresh":fresh,"age_ms":age_ms,
-                "invalidation_reason":reason,"relation_to_service_start":relation(latest),"text":text}));
-            for earlier in samples.iter().rev().skip(1).filter(|sample| sample["check_passed"] != latest["check_passed"]
-                || sample["http_status"] != latest["http_status"]).take(3) {
-                let context = relation(earlier).as_str().map(|text| format!(", {text}")).unwrap_or_default();
-                history.push(json!({"url":url,"http_status":earlier["http_status"],"error_kind":earlier["error_kind"],
-                    "sampled_at":earlier["sampled_at"],"sample_id":earlier["sample_id"],"superseded_by":latest["sample_id"],
-                    "text":format!("{url}: {} at {}{context}; superseded by the later sample at {when} ({})",
-                        http_outcome(earlier), time_label(&earlier["sampled_at"]), http_outcome(latest))}));
-            }
-        }
-        (current, history)
+    /// Chronological HTTP records. Freshness is cache metadata only; every
+    /// sample remains a dated observation and no sample supersedes another.
+    fn http_observations(&self) -> Vec<Value> {
+        let mut samples=self.http_observation_samples.values().collect::<Vec<_>>();
+        samples.sort_by_key(|sample|(rfc3339_ms(&sample["sampled_at"]).unwrap_or(0),sample["sample_id"].as_str().unwrap_or("").to_owned()));
+        samples.into_iter().map(|sample| {
+            let (fresh,age_ms,invalidation_reason)=self.http_sample_freshness(sample);
+            json!({"url":sample["url"],"http_status":sample["http_status"],"reachable":sample["reachable"],
+                "error_kind":sample["error_kind"],"error_message":sample["error_message"],"sampled_at":sample["sampled_at"],
+                "sample_id":sample["sample_id"],"producer_work_id":sample["producer_work_id"],"fresh_for_cache_reuse":fresh,
+                "age_ms":age_ms,"cache_invalidation_reason":invalidation_reason,
+                "text":format!("{}: {} at {}",sample["url"].as_str().unwrap_or("unknown URL"),http_outcome(sample),time_label(&sample["sampled_at"]))})
+        }).collect()
     }
 
     /// Host-owned browser resource state, independent of which task produced it.
@@ -2315,10 +2129,9 @@ impl WorkScheduler {
         states
     }
 
-    /// Shared view of current host facts and superseded history for Organizer and Observer.
+    /// Shared raw host observations and current resource availability.
     pub fn current_facts(&self) -> Value {
-        let (http, history) = self.http_fact_lines();
-        json!({"http":http,"browser":self.current_browser_state(),"historical_observations":history})
+        json!({"http_observations":self.http_observations(),"browser":self.current_browser_state()})
     }
 
     /// Time of the newest host-recorded fact on a node. Observer advice written
@@ -2340,7 +2153,7 @@ impl WorkScheduler {
         let output = frame.output.as_ref();
         let http = self.frame_http_observations(frame).into_iter().map(|sample| json!({"url":sample["url"],"http_status":sample["http_status"],
             "reachable":sample["reachable"],"error_kind":sample["error_kind"],"error_message":sample["error_message"],"sampled_at":sample["sampled_at"],
-            "fresh":sample["fresh"],"age_ms":sample["age_ms"],"invalidation_reason":sample["invalidation_reason"],"producer_work_id":sample["producer_work_id"]}))
+            "fresh_for_cache_reuse":sample["fresh_for_cache_reuse"],"age_ms":sample["age_ms"],"cache_invalidation_reason":sample["cache_invalidation_reason"],"producer_work_id":sample["producer_work_id"]}))
             .collect::<Vec<_>>();
         let processes = frame.project_observation["processes"].as_array().into_iter().flatten().map(|process| json!({
             "process_id":process["process_id"],"script":process["script"],"running":process["running"],"ready":process["ready"],
@@ -2358,7 +2171,7 @@ impl WorkScheduler {
             "passed":frame.checked.get(check) == Some(&frame.epoch),"failure":frame.check_errors.get(check)})).collect::<Vec<_>>();
         let exported = output.map(|output| organizer_compact(&output["exported_data"], 0)).unwrap_or(Value::Null);
         json!({"work_id":work_id,"node_id":frame.order.node_id,"revision":frame.order.revision,"status":self.path_status(frame),
-            "started_at":frame.started_at,"returned_at":frame.returned_at,"expectation_met":frame.expectation_met,
+            "started_at":frame.started_at,"returned_at":frame.returned_at,
             "process_observation_sampled_at":frame.project_observation["sampled_at"],
             "result":output.map(|output| json!({"summary":output["summary"],"outcome":output["outcome"],"limitations":output["limitations"]})),
             "exported_data":exported,"reports":frame.progress,"checks":checks,"http_observations":http,"processes":processes,
@@ -2367,90 +2180,64 @@ impl WorkScheduler {
             "superseded":frame.superseded,"latest_fact_at":self.latest_fact_at(work_id)})
     }
 
-    fn execution_narrative(&self, ordered: &[&WorkFrame], omitted: usize, http: &[Value], history: &[Value], browser: &[Value]) -> String {
-        let mut lines = vec!["Execution path in actual order (step N is the Nth task invocation; only a returned task has a result):".to_owned()];
-        if omitted > 0 { lines.push(format!("Steps 1-{omitted} omitted; use read_task_result for their details.")); }
+    fn execution_narrative(&self, ordered: &[&WorkFrame], omitted: usize, http: &[Value], browser: &[Value]) -> (String,usize) {
+        let mut lines = vec!["Execution path in actual invocation order. A done node records a Worker return; it does not assert that the user goal passed.".to_owned()];
+        if omitted > 0 { lines.push(format!("Earlier range 1-{omitted} omitted; use the flow directory page or read a sealed result by work_id.")); }
         for (index, frame) in ordered.iter().enumerate().skip(omitted) {
             let status = self.path_status(frame);
             let output = frame.output.as_ref();
-            let summary = output.and_then(|output| output["summary"].as_str()).map(|text| limited(text, 280));
-            lines.push(format!("Step {} - {} r{} [{status}]: {}", index + 1, frame.order.node_id, frame.order.revision, limited(&frame.order.goal, 160)));
-            let detail = match status {
-                "done" => {
-                    let met = match frame.expectation_met { Some(true) => " Declared conditions met.", Some(false) => " Declared conditions were NOT met at this step.", None => "" };
-                    let limits = output.and_then(|output| output["limitations"].as_array()).map(|items| items.iter().filter_map(Value::as_str)
-                        .take(2).map(|text| limited(text, 160)).collect::<Vec<_>>().join("; ")).filter(|text| !text.is_empty())
-                        .map(|text| format!(" Limitations reported at that step: {text}.")).unwrap_or_default();
-                    let recovery=output.and_then(|result|result["limitations"].as_array().into_iter().flatten()
-                        .filter_map(Value::as_str).find_map(|item|self.later_http_recovery(frame,Some(item))))
-                        .or_else(||(frame.expectation_met==Some(false)).then(||self.later_http_recovery(frame,None)).flatten())
-                        .map(|sample|format!(" Later host evidence resolved the matching HTTP condition: {} at {}.",
-                            http_outcome(sample),time_label(&sample["sampled_at"]))).unwrap_or_default();
-                    format!("  Returned{}: {}.{met}{limits}{recovery}", frame.returned_at.map(|at| format!(" at {}", ms_label(at))).unwrap_or_default(),
-                        summary.unwrap_or_else(|| "no summary".to_owned()))
-                },
-                "deprecated" => {
-                    let reason = frame.superseded.as_ref().and_then(|record| record["reason"].as_str()).map(|text| limited(text, 160))
-                        .unwrap_or_else(|| "superseded by a later plan revision".to_owned());
-                    match summary {
-                        Some(summary) => format!("  History only, not a valid input (deprecated: {reason}). Result at that time: {summary}."),
-                        None => format!("  History only (deprecated: {reason}); it did not return a result."),
+            let summary = output.and_then(|output| output["summary"].as_str());
+            lines.push(format!("Step {} - {} r{} [{status}]: {}", index + 1, frame.order.node_id, frame.order.revision, limited(&frame.order.goal, 180)));
+            if let Some(output)=output {
+                if frame.order.id==self.current {
+                    lines.push("  Current Worker return is provided once in current_result; use read_task_result for omitted fields.".to_owned());
+                } else {
+                    lines.push(format!("  Worker return{} ({}): {}",frame.returned_at.map(|at|format!(" at {}",ms_label(at))).unwrap_or_default(),
+                        output["outcome"].as_str().unwrap_or("reported"),limited(summary.unwrap_or("no summary"),420)));
+                    for limitation in output["limitations"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                        lines.push(format!("  Worker-reported limitation: {}",limited(limitation,240)));
                     }
-                },
-                "running" => {
-                    let report = frame.progress.last().and_then(|report| report["next_action"].as_str().or_else(|| report["purpose"].as_str()))
-                        .map(|text| format!(" Latest report (intent, not a result): {}.", limited(text, 200))).unwrap_or_default();
-                    format!("  Not returned yet.{report}")
-                },
-                _ => "  Not started.".to_owned(),
-            };
-            lines.push(detail);
+                }
+                for operation in frame.operations.iter().rev().take(6).rev() {
+                    let tool=operation["tool"].as_str().unwrap_or("host_tool");
+                    let at=time_label(&operation["sampled_at"]);
+                    let fact=operation["http_status"].as_u64().map(|status|format!("HTTP {status}"))
+                        .or_else(||operation["process_id"].as_str().map(|id|format!("process_id {id}, running={}, ready={}",
+                            operation["process_observation"]["processes"][0]["running"],operation["ready"])))
+                        .or_else(||operation["browser_stage"].as_str().map(str::to_owned))
+                        .or_else(||operation["outcome"].as_str().map(|text|limited(text,180)));
+                    if let Some(fact)=fact {lines.push(format!("  Host action {tool} at {at}: {fact}."));}
+                }
+            } else if status=="running" {
+                let report=frame.progress.last().and_then(|item|item["next_action"].as_str().or_else(||item["purpose"].as_str()))
+                    .map(|text|format!(" Latest Worker report (intent): {}.",limited(text,220))).unwrap_or_default();
+                lines.push(format!("  No Worker return recorded.{report}"));
+            } else if status=="deprecated" {
+                let reason=frame.superseded.as_ref().and_then(|record|record["reason"].as_str()).unwrap_or("superseded by a later plan revision");
+                lines.push(format!("  Historical record, not a valid dependency input: {}.",limited(reason,180)));
+            } else { lines.push("  Not started.".to_owned()); }
         }
-        let mut facts = http.iter().filter_map(|fact| fact["text"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        lines.push("HTTP observations, in recorded time order:".to_owned());
+        if http.is_empty() { lines.push("- none recorded".to_owned()); }
+        lines.extend(http.iter().filter_map(|fact|fact["text"].as_str()).map(|text|format!("- {text}")));
+        for frame in ordered.iter().skip(omitted) {
+            let observation=&frame.project_observation;
+            for process in observation["processes"].as_array().into_iter().flatten() {
+                lines.push(format!("Host process observation at {}: process_id={}, running={}, ready={}, ready_url={}",
+                    observation["sampled_at"].as_u64().map(ms_label).unwrap_or_else(||"unknown time".to_owned()),
+                    process["process_id"].as_str().unwrap_or("unknown"),process["running"],process["ready"],process["ready_url"].as_str().unwrap_or("unknown")));
+            }
+        }
         for state in browser {
             let loaded = &state["document_loaded"];
-            let document = if loaded["status"] == "loaded" {
-                format!("has {} loaded ({} slides{})", state["document_path"].as_str().unwrap_or("the document"), loaded["slides_detected"],
-                    loaded["page_indicator"].as_array().and_then(|items| items.first()).and_then(Value::as_str).map(|text| format!(", indicator {text}")).unwrap_or_default())
-            } else {
-                format!("received upload of {}; no later read confirmed it loaded", state["document_path"].as_str().unwrap_or("the document"))
-            };
-            let producer = &state["uploaded_by"];
-            facts.push(format!("Browser page {} {document}; uploaded by {}{}{}", state["page"]["url"].as_str().unwrap_or(""),
-                producer["work_id"].as_str().unwrap_or("?"),
-                if producer["producer_deprecated"] == true { " (that task is deprecated; the page state is still current)" } else { "" },
-                state["read_by_work_id"].as_str().map(|work| format!("; confirmed by {work}")).unwrap_or_default()));
+            lines.push(format!("Host browser observation at {}: page={}, document={}, load_status={}, slides={}, upload_attempt={}, session_available={}",
+                state["read_at"].as_u64().map(ms_label).unwrap_or_else(||"unknown time".to_owned()),
+                state["page"]["url"].as_str().unwrap_or("unknown"),state["document_path"].as_str().unwrap_or("unknown"),
+                loaded["status"].as_str().unwrap_or("not confirmed"),loaded["slides_detected"],state["upload_attempt_id"],state["availability"]["available"]));
         }
-        lines.push("Latest known facts:".to_owned());
-        if facts.is_empty() { lines.push("- none recorded by host tools".to_owned()); }
-        lines.extend(facts.into_iter().map(|fact| format!("- {fact}")));
-        if !history.is_empty() {
-            lines.push("Earlier observations (history, not current state):".to_owned());
-            lines.extend(history.iter().filter_map(|fact| fact["text"].as_str()).map(|text| format!("- {text}")));
-        }
-        let mut remaining = Vec::new();
-        for frame in ordered.iter().rev().filter(|frame| self.path_status(frame) == "done") {
-            let Some(output) = frame.output.as_ref() else { continue; };
-            let explicit_blocker=output["blocked"]==true || matches!(output["outcome"].as_str(),Some("blocked"|"upstream_problem"|"need_split"));
-            let visual_unavailable=frame.order.visual_goal.is_some() && (output["visual_check_result"]["assessment"]=="unavailable"
-                || output["limitations"].as_array().into_iter().flatten().filter_map(Value::as_str)
-                    .any(|item|item.to_ascii_lowercase().contains("image input unavailable")||item.to_ascii_lowercase().contains("visual inspection not performed")));
-            for item in output["limitations"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                if self.later_http_recovery(frame,Some(item)).is_some() {continue;}
-                if (explicit_blocker||visual_unavailable) && remaining.len() < 8 {
-                    remaining.push(format!("- {}: {}", frame.order.node_id, limited(item, 200)));
-                }
-            }
-            if frame.expectation_met == Some(false) && remaining.len() < 8 && output["limitations"].as_array().is_none_or(Vec::is_empty)
-                && self.later_http_recovery(frame,None).is_none() && (explicit_blocker||visual_unavailable) {
-                remaining.push(format!("- {}: {}",frame.order.node_id,if visual_unavailable {"visual inspection remains unavailable"} else {"the step returned an explicit blocker"}));
-            }
-        }
-        if !remaining.is_empty() {
-            lines.push("Remaining limitations:".to_owned());
-            lines.extend(remaining);
-        }
-        limited(&lines.join("\n"), 12_000)
+        let full=lines.join("\n");
+        let omitted_chars=full.chars().count().saturating_sub(16_000);
+        (limited(&full, 16_000),omitted_chars)
     }
 
     pub fn organizer_input(&self) -> Value {
@@ -2463,30 +2250,39 @@ impl WorkScheduler {
         let execution_path=ordered.iter().enumerate().skip(omitted_steps).map(|(index,frame)| {
             let output=frame.output.as_ref();
             let status=self.path_status(frame);
+            let is_current_work=frame.order.id==self.current;
+            let current=is_current_work&&output.is_some();
+            let goal=limited(&frame.order.goal,420);
+            let mut omissions=Vec::new();let mut omitted_total=0;
+            if let Some(output)=output.filter(|_|!current) {organizer_omissions(output,"result",0,&mut omissions,&mut omitted_total);}
             json!({"step":index+1,"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
-                "status":status,"goal":limited(&frame.order.goal,420),
-                "outcome":output.map(|value|value["outcome"].clone()),
-                "expectation_met":frame.expectation_met,
-                "summary":if frame.order.id==self.current {Value::Null}else{output.map(|value|json!(limited(value["summary"].as_str().unwrap_or(""),420))).unwrap_or(Value::Null)},
-                "limitations":output.map(|value|organizer_compact(&value["limitations"],0)),
+                "status":status,"goal":goal,"goal_omitted_chars":frame.order.goal.chars().count().saturating_sub(420),
+                "outcome":if current {Value::Null}else{output.map(|value|value["outcome"].clone()).unwrap_or(Value::Null)},
+                "summary":if current {Value::Null}else{output.map(|value|json!(limited(value["summary"].as_str().unwrap_or(""),420))).unwrap_or(Value::Null)},
+                "summary_omitted_chars":if current {Value::Null}else{output.and_then(|value|value["summary"].as_str()).map(|value|json!(value.chars().count().saturating_sub(420))).unwrap_or(Value::Null)},
+                "limitations":if current {Value::Null}else{output.map(|value|organizer_compact(&value["limitations"],0)).unwrap_or(Value::Null)},
                 "returned_at":frame.returned_at,
+                "result_reference":if current {json!({"method":"current_result"})}else if is_current_work {json!({"method":"current_work","detail":"Worker has not returned"})}
+                    else {json!({"method":"read_task_result","work_id":frame.order.id})},
+                "context_omissions":if omitted_total>0 {json!({"items":omissions,"omitted_item_count":omitted_total.saturating_sub(24),
+                    "reference":{"method":"read_task_result","work_id":frame.order.id,"fields":"request an omitted field explicitly"}})}else{Value::Null},
                 "valid_input":status=="done",
                 "deprecation":frame.invalidated_by_plan_revision.map(|plan_revision|json!({"plan_revision":plan_revision,
                     "reason":frame.superseded.as_ref().map(|record|record["reason"].clone())
                         .or_else(||self.rewind_records.iter().find(|rewind|rewind.invalidated_tasks.contains(&frame.order.id)||rewind.source_work_id==frame.order.id).map(|rewind|json!(limited(&rewind.reason,240))))})),
-                "material_ids":output.map(|value|value["material_ids"].clone()),
-                "finding_ids":output.map(|value|value["finding_ids"].clone())})
+                "material_ids":if current {Value::Null}else{output.map(|value|value["material_ids"].clone()).unwrap_or(Value::Null)},
+                "finding_ids":if current {Value::Null}else{output.map(|value|value["finding_ids"].clone()).unwrap_or(Value::Null)}})
         }).collect::<Vec<_>>();
         let current_browser_state=self.current_browser_state();
-        let (current_http_facts,historical_http_facts)=self.http_fact_lines();
-        let execution_narrative=self.execution_narrative(&ordered,omitted_steps,&current_http_facts,&historical_http_facts,&current_browser_state);
+        let http_observations=self.http_observations();
+        let (execution_narrative,execution_narrative_omitted_chars)=self.execution_narrative(&ordered,omitted_steps,&http_observations,&current_browser_state);
         let mut delivery_catalog=self.frames.values().filter(|frame|self.effectively_done(frame)&&frame.invalidated_by_plan_revision.is_none())
             .filter_map(|frame|frame.output.as_ref().map(|output|{
                 let exported=self.filtered_export_data(frame,&output["exported_data"]);
                 let exported_fields=exported.as_object().map(|fields|fields.keys().filter(|key|key.as_str()!="browser_upload_availability").cloned().collect::<Vec<_>>()).unwrap_or_default();
                 let output_fields=output.as_object().map(|fields|fields.keys().filter(|key|!matches!(key.as_str(),"operations"|"versions"|"modified_files"|"exported_data")).cloned().collect::<Vec<_>>()).unwrap_or_default();
                 json!({"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
-                    "status":"done","expectation_met":output["expectation_met"],"exported_fields":exported_fields,"output_fields":output_fields})
+                    "status":"done","exported_fields":exported_fields,"output_fields":output_fields})
             })).collect::<Vec<_>>();
         delivery_catalog.sort_by(|a,b|a["work_id"].as_str().cmp(&b["work_id"].as_str()));
         let mut upload_frames=self.frames.values().filter(|frame|frame.browser_upload_receipt.is_some()).collect::<Vec<_>>();
@@ -2513,7 +2309,7 @@ impl WorkScheduler {
         let current_work=self.order().map(|order|json!({"id":order.id,"node_id":order.node_id,"revision":order.revision,
             "goal":order.goal,"return_when":order.done_when,"completion":order.completion,"constraints":order.constraints}));
         json!({
-            "schema_version":1,
+            "schema_version":WORK_SCHEDULER_SCHEMA_VERSION,
             "current_work": current_work,
             "request_id":self.request_started_turn,
             "current_node": self.node(),
@@ -2522,10 +2318,11 @@ impl WorkScheduler {
             "handoff": handoff,
             "current_result": current_result,
             "execution_narrative": execution_narrative,
+            "execution_narrative_omitted_chars":execution_narrative_omitted_chars,
+            "execution_narrative_reference":{"method":"read_flow_page","then":"read_task_result(work_id, fields) for full node details"},
             "execution_path": execution_path,
-            "current_facts":{"http":current_http_facts,"browser":current_browser_state},
-            "historical_observations":historical_http_facts,
-            "visual_goals_returned_without_image_input":self.visual_unavailable_goals.iter().map(|(goal,work)|json!({"visual_goal":goal,"work_id":work})).collect::<Vec<_>>(),
+            "flow_directory":self.flow_directory_page(0,50),
+            "current_facts":{"http_observations":http_observations,"browser":current_browser_state},
             "available_dependency_deliveries":delivery_catalog,
             "available_revisit_targets":available_revisit_targets,
             "browser_upload_availability":upload_availability,
@@ -2548,46 +2345,91 @@ impl WorkScheduler {
         ids
     }
 
+    /// Compact, chronological flow listing for Organizer pagination. Full
+    /// return payloads remain available through read_task_result.
+    pub fn flow_directory_page(&self, offset:usize, limit:usize) -> Value {
+        let ordered=self.execution_order();
+        let total=ordered.len();
+        let start=offset.min(total);
+        let page_size=limit.clamp(1,50);
+        let end=start.saturating_add(page_size).min(total);
+        let entries=ordered.iter().enumerate().skip(start).take(end-start).map(|(index,frame)| {
+            let output=frame.output.as_ref();
+            let is_current_work=frame.order.id==self.current;
+            let current=is_current_work&&output.is_some();
+            let goal=limited(&frame.order.goal,360);
+            let summary=output.and_then(|value|value["summary"].as_str());
+            json!({"step":index+1,"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
+                "status":self.path_status(frame),"goal":goal,"goal_omitted_chars":frame.order.goal.chars().count().saturating_sub(360),
+                "outcome":if current {Value::Null}else{output.map(|value|value["outcome"].clone()).unwrap_or(Value::Null)},
+                "summary":if current {Value::Null}else{summary.map(|value|json!(limited(value,240))).unwrap_or(Value::Null)},
+                "summary_omitted_chars":if current {Value::Null}else{summary.map(|value|json!(value.chars().count().saturating_sub(240))).unwrap_or(Value::Null)},
+                "limitation_count":if current {Value::Null}else{output.and_then(|value|value["limitations"].as_array().map(|items|json!(items.len()))).unwrap_or(Value::Null)},
+                "material_ids":if current {Value::Null}else{output.map(|value|value["material_ids"].clone()).unwrap_or(Value::Null)},
+                "finding_ids":if current {Value::Null}else{output.map(|value|value["finding_ids"].clone()).unwrap_or(Value::Null)},
+                "detail_reference":if current {json!({"method":"current_result"})}else if is_current_work {json!({"method":"current_work","detail":"Worker has not returned"})}
+                    else {json!({"method":"read_task_result","work_id":frame.order.id})},
+                "returned_at":frame.returned_at,"prior_actions":if current&&frame.status==WorkStatus::Running {
+                    json!(frame.operations.iter().rev().take(8).rev().map(|operation|organizer_compact(operation,0)).collect::<Vec<_>>())
+                } else {Value::Null}})
+        }).collect::<Vec<_>>();
+        json!({"entries":entries,"offset":start,"returned":end-start,"total":total,
+            "next_cursor":(end<total).then_some(end),"omitted_range":(start>0).then(||json!({"from_step":1,"through_step":start})),
+            "reference":"read_flow_page(cursor=next_cursor) to continue; read_task_result(work_id, fields) for an exact sealed return"})
+    }
+
+    pub fn read_flow_page(&self,args:&Value)->Result<Value> {
+        let cursor=args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let limit=args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+        ensure!(limit<=50,"field_path=limit: read_flow_page allows at most 50 nodes per page");
+        Ok(self.flow_directory_page(cursor,limit.max(1)))
+    }
+
     pub fn organizer_input_with_freshness(&self, root:&std::path::Path) -> Value {
         let mut input=self.organizer_input();
         if let Some(items)=input["project_process_observations"].as_array_mut() {
             for item in items {
                 let observation=item["observation"].clone();
-                item["fresh"]=json!(crate::project_process::observation_sample_is_current(root,&observation));
+                item["fresh_for_cache_reuse"]=json!(crate::project_process::observation_sample_is_current(root,&observation));
             }
         }
         input
     }
 
-    /// Read an exact sealed result by work instance or the latest valid node
-    /// revision. Only selected structured fields and notebook references leave
-    /// the host; operation traces stay in the event log/notebook.
+    /// Read an exact sealed result by work instance, including deprecated
+    /// historical revisions, or the latest valid node revision. A historical
+    /// read is never eligible to serve as a new task's dependency input.
     pub fn read_task_result(&self,args:&Value)->Result<Value> {
         let requested_work=args["work_id"].as_str().filter(|id|!id.trim().is_empty());
         let requested_node=args["node_id"].as_str().filter(|id|!id.trim().is_empty());
         ensure!(requested_work.is_some()||requested_node.is_some(),"read_task_result needs work_id or node_id");
         let frame=if let Some(work_id)=requested_work {
-            self.frames.get(work_id).filter(|frame|frame.invalidated_by_plan_revision.is_none()&&self.effectively_done(frame))
+            self.frames.get(work_id).filter(|frame|self.effectively_done(frame))
         } else {
             self.frames.values().filter(|frame|frame.invalidated_by_plan_revision.is_none()&&self.effectively_done(frame)
                 &&Some(frame.order.node_id.as_str())==requested_node)
                 .max_by_key(|frame|(frame.order.revision,frame.sequence))
         }.ok_or_else(||anyhow::anyhow!("requested task result is not an active sealed delivery"))?;
         let output=frame.output.as_ref().ok_or_else(||anyhow::anyhow!("sealed task has no saved output"))?;
-        let fields=args["fields"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
-        let exported=self.filtered_export_data(frame,&output["exported_data"]);
+        let requested_fields=args["fields"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+        let default_fields=["summary","outcome","limitations","findings","material_ids","finding_ids","exported_data","checks",
+            "visual_artifact_ids","visual_check_result","upstream_problem","suggested_children"];
+        let fields=if requested_fields.is_empty(){default_fields.as_slice()}else{requested_fields.as_slice()};
+        let exported=&output["exported_data"];
         let mut selected=json!({});
         for field in fields {
-            ensure!(!matches!(field,"operations"|"versions"|"modified_files"|"raw_output"),"field '{field}' is stored as a material; retrieve it from the notebook by ID");
+            ensure!(!matches!(*field,"operations"|"versions"|"modified_files"|"raw_output"),"field_path=fields: '{field}' is stored as a material; retrieve it from the notebook by ID");
             let value=output.get(field).or_else(||exported.get(field))
-                .ok_or_else(||anyhow::anyhow!("field '{field}' is not present in this delivery"))?;
-            selected[field]=organizer_compact(value,0);
+                .ok_or_else(||anyhow::anyhow!("field_path=fields: '{field}' is not present in this delivery"))?;
+            selected[field]=value.clone();
         }
-        let resource_availability=exported.get("browser_upload_availability").cloned().unwrap_or(Value::Null);
+        let resource_availability=exported.get("browser_upload_receipt").map(|receipt|{
+            browser_upload_status_key(receipt).and_then(|key|self.browser_upload_availability.get(&key)).cloned()
+                .unwrap_or(json!({"available":false,"reason":"host_validation_not_run"}))
+        }).unwrap_or(Value::Null);
+        let historical=frame.invalidated_by_plan_revision.is_some();
         Ok(json!({"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
-            "status":"done","summary":limited(output["summary"].as_str().unwrap_or(""),2400),
-            "outcome":output["outcome"],"expectation_met":output["expectation_met"],
-            "material_ids":output["material_ids"],"finding_ids":output["finding_ids"],
+            "status":"done","historical":historical,"dependency_eligible":!historical,
             "selected_fields":selected,"resource_availability":resource_availability}))
     }
 
@@ -2717,17 +2559,14 @@ impl WorkScheduler {
         }
 
         if let Some(checks)=replacement_checks {
-            ensure!(matches!(new_order.completion,Completion::Check|Completion::WriteCheck),
-                "field_path=replacement_checks: only check-bearing work can replace check identifiers");
             ensure!(!checks.is_empty()&&checks.len()<=4,"field_path=replacement_checks: provide one to four supported check identifiers");
             new_order.checks=checks.iter().map(|check|command(check)).collect();
             ensure!(new_order.checks.iter().all(|check|!check.is_empty()&&check.chars().count()<=2000&&supported_check_key(check)),
                 "field_path=replacement_checks: provide npm:, npm-start:, npm-install:, program:, or http-probe: identifiers");
         }
 
-        let writing = matches!(new_order.completion, Completion::Write | Completion::WriteCheck);
-        let checking = matches!(new_order.completion, Completion::Check | Completion::WriteCheck);
-        ensure!(!(writing || !new_order.edit_targets.is_empty()) || can_write, "write work is unavailable under current permissions");
+        let checking = !new_order.checks.is_empty();
+        ensure!(new_order.edit_targets.is_empty() || can_write, "write work is unavailable under current permissions");
         ensure!(!checking || can_check, "checks are unavailable under current tool permissions");
 
         let sequence = self.frames.len() + 1;
@@ -2881,7 +2720,6 @@ impl WorkScheduler {
                 f.output = Some(out.clone());
             }
         }
-        self.close_if_satisfied();
         self.finish_round(tick.operations_count, tick.repeated_reads);
         if let Some(h) = &tick.handoff {
             self.handoff = Some(h.clone());
@@ -2894,7 +2732,6 @@ impl WorkScheduler {
                 f.output = Some(out);
             }
         }
-        self.close_if_satisfied();
         self.finish_round(project_operations, repeated_reads);
         if let Some(h) = handoff {
             self.handoff = Some(h);
@@ -2917,6 +2754,79 @@ mod tests {
             completion: Completion::Output,
             ..WorkOrder::default()
         }
+    }
+
+    #[test]
+    fn return_records_done_without_inventing_an_outcome_or_false_flags() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![output_order()],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let output=scheduler.return_work(&json!({"summary":"The Worker returned an observation, but made no categorical assessment."})).unwrap();
+        assert_eq!(output["done"],true);
+        assert_eq!(output["execution_status"],"done");
+        assert!(output["outcome"].is_null());
+        assert!(output["blocked"].is_null());
+        assert!(output["need_split"].is_null());
+        assert!(output["limitations"].is_null());
+        assert!(output["exported_data"].is_null());
+
+        let mut explicit=WorkScheduler::default();
+        explicit.enqueue(vec![output_order()],false,false).unwrap();
+        explicit.activate_next().unwrap();
+        let output=explicit.return_work(&json!({"summary":"The Worker explicitly assessed this work.","outcome":"blocked"})).unwrap();
+        assert_eq!(output["done"],true);
+        assert_eq!(output["outcome"],"blocked");
+        assert!(output["blocked"].is_null(),"the host must preserve the submitted fields without deriving an alias");
+    }
+
+    #[test]
+    fn organizer_goal_assessment_is_recorded_without_deriving_it_from_queue_state() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![output_order()],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        assert!(!scheduler.all_done());
+        scheduler.finish("Organizer explicitly assessed the user goal",false).unwrap();
+        assert_eq!(scheduler.request_completed,Some(true));
+        assert_eq!(scheduler.frame().unwrap().status,WorkStatus::Running);
+        assert!(scheduler.output().is_none(),"finishing the request cannot fabricate a Worker return");
+    }
+
+    #[test]
+    fn worker_return_is_saved_intact_and_readable_after_context_compaction() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![output_order()],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let submitted=json!({"summary":format!("  {}  ","Worker failure description\n".repeat(150)),
+            "outcome":"failed","limitations":["Font rendering has not been checked"],
+            "exported_data":{"original_error":"MODULE_NOT_FOUND\n  at original.js:17"},
+            "suggested_children":[{"goal":"Inspect the recorded error","done_when":"Report the cause"}]});
+        let output=scheduler.return_work(&submitted).unwrap();
+        assert_eq!(output["worker_return"],submitted);
+        assert_eq!(output["summary"],submitted["summary"]);
+        let exact=scheduler.read_task_result(&json!({"work_id":scheduler.id(),"fields":["worker_return"]})).unwrap();
+        assert_eq!(exact["selected_fields"]["worker_return"],submitted);
+        let frame=scheduler.frame().unwrap();
+        let compact=scheduler.compact_current_result(frame,&output);
+        assert!(compact["summary"].as_str().unwrap().len()<submitted["summary"].as_str().unwrap().len());
+        assert_eq!(scheduler.output().unwrap()["worker_return"],submitted);
+    }
+
+    #[test]
+    fn legacy_default_success_is_migrated_to_unknown_on_the_result_and_handoff() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.schema_version=1;
+        let old=json!({"id":"start","node_id":"work_start","done":true,"execution_status":"done",
+            "outcome":"completed","blocked":false,"need_split":false,"summary":"Old saved result"});
+        scheduler.frames.insert("start".into(),WorkFrame{order:output_order(),status:WorkStatus::Done,output:Some(old.clone()),..Default::default()});
+        scheduler.handoff=Some(json!({"previous_handoff":old,"done":true,"outcome":"completed","blocked":false,"need_split":false}));
+        scheduler.normalize_snapshot_version();
+        assert_eq!(scheduler.schema_version,WORK_SCHEDULER_SCHEMA_VERSION);
+        let saved=scheduler.frames["start"].output.as_ref().unwrap();
+        assert!(saved["outcome"].is_null());
+        assert_eq!(saved["outcome_unverified_legacy"],true);
+        assert!(saved["blocked"].is_null()&&saved["need_split"].is_null());
+        assert!(scheduler.handoff.as_ref().unwrap()["outcome"].is_null());
+        assert!(scheduler.handoff.as_ref().unwrap()["previous_handoff"]["outcome"].is_null());
     }
 
     #[test]
@@ -2968,7 +2878,7 @@ mod tests {
             checks:vec![check.clone()],dependency_inputs:vec![json!({"work_id":"http_source","fields":["http_observations"],"http_urls":[first_url]})],..WorkOrder::default()};
         scheduler.enqueue(vec![consumer],false,true).unwrap();
         assert!(scheduler.activate_next().unwrap());
-        assert!(scheduler.done());
+        assert!(!scheduler.done(),"host-consumed checks do not seal the Worker invocation");
         assert_eq!(scheduler.frame().unwrap().checked.get(&check),Some(&scheduler.frame().unwrap().epoch));
         assert!(scheduler.frame().unwrap().operations.iter().any(|operation|operation["auto_consumed_http_sample_id"].is_string()));
         assert_eq!(scheduler.http_observation_samples.len(),2);
@@ -2977,13 +2887,15 @@ mod tests {
         assert_eq!(bound.len(),1);
         assert_eq!(bound[0]["url"],first_url);
         assert_eq!(bound[0]["http_status"],200);
-        assert_eq!(bound[0]["fresh"],true);
+        assert_eq!(bound[0]["fresh_for_cache_reuse"],true);
         assert_eq!(bound[0]["producer_work_id"],"http_source");
         assert_eq!(bound[0]["sampled_at"],exported[0]["sampled_at"]);
         assert_eq!(scheduler.http_probe_results[&check]["sample_id"],bound[0]["sample_id"]);
         assert!(scheduler.organizer_input()["available_dependency_deliveries"].as_array().unwrap().iter()
             .any(|item|item["work_id"]=="http_source"&&item["exported_fields"].as_array().unwrap().iter().any(|field|field=="http_observations")));
 
+        scheduler.return_work(&json!({"summary":"Worker returns the endpoint result after receiving its bound HTTP sample."})).unwrap();
+        assert!(scheduler.done());
         let sample_id=bound[0]["sample_id"].as_str().unwrap().to_owned();
         let completed_output=scheduler.frame().unwrap().output.clone();
         scheduler.http_observation_samples.get_mut(&sample_id).unwrap()["sampled_at"]=
@@ -2994,7 +2906,7 @@ mod tests {
         let organizer=scheduler.organizer_input();
         let work=organizer["execution_path"].as_array().unwrap().iter().find(|item|item["work_id"]=="font_check").unwrap();
         assert_eq!(work["status"],"done");
-        assert_eq!(work["expectation_met"],true);
+        assert!(work.get("expectation_met").is_none());
         assert_eq!(organizer["current_result"]["summary"],completed_output.as_ref().unwrap()["summary"]);
         assert!(organizer["handoff"].is_null());
         assert!(organizer.get("current_output").is_none());
@@ -3007,8 +2919,8 @@ mod tests {
         assert_eq!(frame.http_check_samples.get(&check),Some(&sample_id));
         assert!(frame.check_errors.is_empty());
         let delivery=&scheduler.worker_input("read the historical result")["http_observations"]["bound_upstream"][0];
-        assert_eq!(delivery["fresh"],false);
-        assert_eq!(delivery["invalidation_reason"],"expired");
+        assert_eq!(delivery["fresh_for_cache_reuse"],false);
+        assert_eq!(delivery["cache_invalidation_reason"],"expired");
     }
 
     #[test]
@@ -3049,7 +2961,7 @@ mod tests {
             scheduler.observe("http_probe",&json!({"url":url}),&result,false);
             let returned=scheduler.return_work(&json!({"summary":if reachable{"The endpoint returned HTTP 404"}else{"Connection refused; no HTTP response arrived"}})).unwrap();
             assert_eq!(returned["done"],true);assert_eq!(returned["execution_status"],"done");
-            assert_eq!(returned["expectation_met"],false);assert_eq!(scheduler.frame().unwrap().status,WorkStatus::Done);
+            assert!(returned.get("expectation_met").is_none());assert_eq!(scheduler.frame().unwrap().status,WorkStatus::Done);
             assert!(scheduler.return_work(&json!({"summary":"a second return must not rewrite the sealed result"})).is_err());
         }
     }
@@ -3084,7 +2996,6 @@ mod tests {
         let migrations=scheduler.prepare_legacy_check_migration();
         assert_eq!(migrations.len(),1);
         assert_eq!(scheduler.frames["legacy"].checked.contains_key("npm run build"),false);
-        scheduler.close_if_satisfied();
         assert_eq!(scheduler.frames["legacy"].status,WorkStatus::Running,"a persisted shell-check pass cannot complete old work");
         assert_eq!(scheduler.organizer_input()["legacy_check_contracts"][0]["work_id"],"legacy");
         assert_eq!(scheduler.pending_handoff().unwrap()["legacy_check_contract_migration_required"],true);
@@ -3124,18 +3035,17 @@ mod tests {
     }
 
     #[test]
-    fn visual_contracts_require_output_and_expire_after_page_interaction() {
+    fn visual_work_can_include_checks_and_expire_after_page_interaction() {
         let mut scheduler=WorkScheduler::default();let mut order=output_order();order.visual_goal=Some("confirm rendered slide".into());
         order.completion=Completion::WriteCheck;order.edit_targets=vec!["slide.ts".into()];order.checks=vec!["npm:.:test".into()];
-        assert!(scheduler.enqueue(vec![order.clone()],true,true).unwrap_err().to_string().contains("output"));
-        order.completion=Completion::Output;order.checks.clear();scheduler.enqueue(vec![order],true,true).unwrap();scheduler.activate_next().unwrap();
+        scheduler.enqueue(vec![order],true,true).unwrap();scheduler.activate_next().unwrap();
         scheduler.observe("browser_open",&json!({}),&json!({"page":{"page_id":"p","page_epoch":1}}),false);
         scheduler.frames.get_mut(&scheduler.current).unwrap().visual_check_result=json!({"assessment":"pass"});
         let epoch=scheduler.frame().unwrap().epoch;
         scheduler.observe("browser_press_key",&json!({"key":"Delete"}),&json!({"page":{"page_id":"p","page_epoch":2}}),false);
         assert_eq!(scheduler.frame().unwrap().epoch,epoch+1);assert!(scheduler.frame().unwrap().visual_check_result.is_null());
         let returned=scheduler.return_work(&json!({"summary":"captured","status":"done","limitations":["当前页面截图已捕获，但没有绑定到此版本的视觉判断"]})).unwrap();
-        assert_eq!(returned["done"],true);assert_eq!(returned["expectation_met"],false);
+        assert_eq!(returned["done"],true);assert!(returned.get("expectation_met").is_none());
     }
 
     #[test]
@@ -3169,7 +3079,7 @@ mod tests {
         scheduler.enqueue(vec![order.clone()], false, false).unwrap();
         scheduler.activate_next().unwrap();
         let missing=scheduler.return_work(&json!({"summary":"页面已打开，但目标内容未能匹配","outcome":"blocked"})).unwrap();
-        assert_eq!(missing["done"],true);assert_eq!(missing["expectation_met"],false);assert!(scheduler.done());
+        assert_eq!(missing["done"],true);assert!(missing.get("expectation_met").is_none());assert!(scheduler.done());
 
         let mut scheduler=WorkScheduler::default();scheduler.enqueue(vec![order.clone()],false,false).unwrap();scheduler.activate_next().unwrap();
         let old_page=json!({"browser_session_id":"s","page_id":"p","page_epoch":1,"url":"http://localhost:3000/"});
@@ -3178,12 +3088,12 @@ mod tests {
         scheduler.observe("browser_read", &json!({"expect_text":"Slide 1"}), &json!({"matched":false,"expect_text":"Slide 1","page":old_page}), false);
         scheduler.observe("browser_open",&json!({"url":"http://localhost:3000/other"}),&json!({"page":current_page.clone()}),false);
         let stale=scheduler.return_work(&json!({"summary":"旧页面的匹配结果已失效"})).unwrap();
-        assert_eq!(stale["expectation_met"],false);
+        assert!(stale.get("expectation_met").is_none());
 
         let mut scheduler=WorkScheduler::default();scheduler.enqueue(vec![order],false,false).unwrap();scheduler.activate_next().unwrap();
         scheduler.observe("browser_read", &json!({"expect_text":"Slide 1"}), &json!({"matched":true,"expect_text":"Slide 1","page":current_page}), false);
         let current=scheduler.return_work(&json!({"summary":"slide is visible"})).unwrap();
-        assert_eq!(current["expectation_met"],true);
+        assert!(current.get("expectation_met").is_none());
     }
 
     #[test]
@@ -3205,7 +3115,7 @@ mod tests {
             "document_loaded":{"status":"loaded","slides_detected":2,"page_indicator":["1 / 2"],"loading_indicators":[]},"page":page(epoch)});
         scheduler.observe("browser_read",&json!({"expect_text":"Slide 1"}),&loaded_read(2),false);
         let loaded=scheduler.return_work(&json!({"summary":"the real file is loaded"})).unwrap();
-        assert_eq!(loaded["done"],true);assert_eq!(loaded["expectation_met"],true);
+        assert_eq!(loaded["done"],true);assert!(loaded.get("expectation_met").is_none());
 
         let mut scheduler=WorkScheduler::default();let mut order=output_order();order.constraints=vec!["requires_pptx".into()];order.browser_document_path=Some("samples/deck.pptx".into());
         scheduler.enqueue(vec![order],false,false).unwrap();scheduler.activate_next().unwrap();
@@ -3215,7 +3125,7 @@ mod tests {
         scheduler.observe("browser_open",&json!({"url":"http://localhost:3000/"}),&json!({"page":page(3)}),false);
         scheduler.observe("browser_read",&json!({"expect_text":"Slide 1"}),&loaded_read(3),false);
         let stale=scheduler.return_work(&json!({"summary":"旧上传页面已切换，无法确认当前文稿"})).unwrap();
-        assert_eq!(stale["done"],true);assert_eq!(stale["expectation_met"],false);
+        assert_eq!(stale["done"],true);assert!(stale.get("expectation_met").is_none());
     }
 
     #[test]
@@ -3241,7 +3151,7 @@ mod tests {
         assert_eq!(read["page"]["page_epoch"],2);
         assert!(scheduler.browser_presentation_loaded(scheduler.frame().unwrap()));
         let returned=scheduler.return_work(&json!({"summary":"deck loaded and controls inspected"})).unwrap();
-        assert_eq!(returned["expectation_met"],true);
+        assert!(returned.get("expectation_met").is_none());
     }
 
     #[test]
@@ -3311,7 +3221,7 @@ mod tests {
         assert_eq!(ret["outcome"], "upstream_problem");
         assert!(scheduler.done());
         assert_eq!(ret["done"],true);
-        assert_eq!(ret["expectation_met"],false);
+        assert!(ret.get("expectation_met").is_none());
 
         // Organizer decides revisit to node_A
         let rev_result = scheduler.revisit("node_A", None, "backend API crashed, restart on 8080", Some("start backend on 8080"), None, false, false).unwrap();
@@ -3415,7 +3325,7 @@ mod tests {
         tree.ensure_work_child("work_b", "start frontend", "frontend is running", &[]).unwrap();
         // Complete work_a in tree
         tree.apply(&json!({"current_node_id": "work_a"})).unwrap();
-        tree.complete_work(&json!({"node_id": "work_a", "done": true, "summary": "backend on 8080"})).unwrap();
+        tree.record_work_return(&json!({"node_id": "work_a", "done": true, "summary": "backend on 8080"})).unwrap();
         // Switch to work_b
         tree.apply(&json!({"current_node_id": "work_b"})).unwrap();
 
@@ -3424,7 +3334,7 @@ mod tests {
         assert_eq!(tree.active(), "work_b");
         assert_eq!(tree.status("work_b"), Some("running"));
         // work_a was not invalidated, so it remains completed in tree
-        assert_eq!(tree.status("work_a"), Some("completed"));
+        assert_eq!(tree.status("work_a"), Some("done"));
     }
 
     #[test]
@@ -3723,7 +3633,7 @@ mod tests {
     }
 
     #[test]
-    fn service_checks_and_pptx_visual_work_use_distinct_completion_contracts() {
+    fn service_checks_and_pptx_visual_work_share_flexible_completion_metadata() {
         let mut startup=output_order();startup.completion=Completion::Check;startup.checks=vec!["npm-start:frontend:dev".into()];
         let mut scheduler=WorkScheduler::default();scheduler.enqueue(vec![startup],false,true).unwrap();
 
@@ -3735,15 +3645,18 @@ mod tests {
         let mut scheduler=WorkScheduler::default();
         scheduler.enqueue(vec![pptx.clone()],false,true).unwrap();
         pptx.checks=vec!["http-probe:http://127.0.0.1:3000/api/fonts".into()];
-        let error=WorkScheduler::default().enqueue(vec![pptx.clone()],false,true).unwrap_err().to_string();
-        assert!(error.contains("field_path=orders[0].checks"),"{error}");
-        pptx.checks.clear();pptx.completion=Completion::Check;pptx.visual_goal=None;
-        let error=WorkScheduler::default().enqueue(vec![pptx],false,true).unwrap_err().to_string();
-        assert!(error.contains("field_path=orders[0].completion"),"{error}");
+        let mut combined=WorkScheduler::default();
+        combined.enqueue(vec![pptx.clone()],false,true).unwrap();
+        combined.activate_next().unwrap();
+        assert_eq!(combined.order().unwrap().checks.len(),1,"visual inspection can carry an independently declared font HTTP observation");
+        pptx.completion=Completion::Check;
+        let mut check_visual=WorkScheduler::default();
+        check_visual.enqueue(vec![pptx],false,true).unwrap();
+        check_visual.activate_next().unwrap();
+        assert!(check_visual.order().unwrap().visual_goal.is_some());
 
         let mut invalid_start=output_order();invalid_start.checks=vec!["npm-start:frontend:dev".into()];
-        let error=WorkScheduler::default().enqueue(vec![invalid_start],false,true).unwrap_err().to_string();
-        assert!(error.contains("field_path=orders[0].completion"),"{error}");
+        WorkScheduler::default().enqueue(vec![invalid_start],false,true).unwrap();
     }
 
     #[test]
@@ -3781,17 +3694,48 @@ mod tests {
         assert_eq!(input["current_result"]["modified_files"],json!(["src/main.rs"]));
         assert_eq!(input["current_result"]["exported_data"]["font_check"]["url"],"http://127.0.0.1:3000/api/fonts");
         assert_eq!(input["current_result"]["exported_data"]["font_check"]["detail"].as_str().unwrap().chars().count(),1200);
+        assert!(input["current_result"]["context_omissions"]["items"].as_array().unwrap().iter()
+            .any(|item|item["path"]=="current_result.exported_data.font_check.detail"&&item["omitted_chars"]==json!(long_export.chars().count()-1200)),
+            "compacted current-result fields must identify the omitted range and read reference");
         assert!(input["current_result"]["exported_data"]["debug"].get("stdout").is_none());
         assert!(input["current_result"]["exported_data"].get("source_text").is_none());
         assert!(input.get("node_summaries").is_none());
         let work=input["execution_path"].as_array().unwrap().iter().find(|entry|entry["work_id"]=="start").unwrap();
         assert!(work["summary"].is_null());
+        assert!(work["outcome"].is_null());
+        assert!(work["limitations"].is_null());
+        assert_eq!(work["result_reference"]["method"],"current_result");
+        assert!(!input["execution_narrative"].as_str().unwrap().contains("Worker return (completed): Current result"),
+            "the current Worker return must only appear once");
+        assert!(input["execution_narrative"].as_str().unwrap().contains("Current Worker return is provided once in current_result"));
         assert!(input.get("work_index").is_none());
         assert_eq!(scheduler.frames["start"].output.as_ref().unwrap()["exported_data"]["font_check"]["detail"].as_str().unwrap(),long_export.as_str());
         let consumer=WorkOrder{id:"font_result_consumer".into(),node_id:"font_result_consumer".into(),goal:"Use font result".into(),done_when:"Font result used".into(),
             dependency_inputs:vec![json!({"work_id":"start","fields":["font_check"]})],..Default::default()};
         let worker_upstream=scheduler.resolve_dependency_deliveries(&consumer).unwrap();
         assert_eq!(worker_upstream[0]["exported_data"]["font_check"]["detail"].as_str().unwrap(),long_export.as_str());
+    }
+
+    #[test]
+    fn exact_result_read_can_retrieve_deprecated_history_without_making_it_a_dependency() {
+        let old_output=json!({"id":"font_check_r1","node_id":"font_check","revision":1,"done":true,"execution_status":"done",
+            "outcome":"blocked","summary":"The old font endpoint was unavailable","limitations":["HTTP sample at the time had no response"],
+            "findings":[{"id":"old-finding","summary":"Historical finding"}],"material_ids":[19],"finding_ids":["old-finding"],
+            "exported_data":{"font_url":"http://127.0.0.1:3000/api/fonts"},"checks":[],"visual_artifact_ids":[],"visual_check_result":Value::Null,
+            "upstream_problem":Value::Null,"suggested_children":[]});
+        let old_frame=WorkFrame {order:WorkOrder{id:"font_check_r1".into(),node_id:"font_check".into(),revision:1,plan_revision:1,
+            goal:"Check the font service".into(),done_when:"Record the response".into(),..WorkOrder::default()},status:WorkStatus::Done,
+            invalidated_by_plan_revision:Some(3),sequence:2,output:Some(old_output),..WorkFrame::default()};
+        let mut scheduler=WorkScheduler::default();scheduler.frames.insert("font_check_r1".into(),old_frame);
+        let read=scheduler.read_task_result(&json!({"work_id":"font_check_r1","fields":["summary","limitations","findings","font_url"]})).unwrap();
+        assert_eq!(read["historical"],true);
+        assert_eq!(read["dependency_eligible"],false);
+        assert_eq!(read["selected_fields"]["summary"],"The old font endpoint was unavailable");
+        assert_eq!(read["selected_fields"]["limitations"][0],"HTTP sample at the time had no response");
+        assert_eq!(read["selected_fields"]["font_url"],"http://127.0.0.1:3000/api/fonts");
+        let consumer=WorkOrder{id:"new_consumer".into(),node_id:"new_consumer".into(),goal:"Use the old result".into(),done_when:"Use only a current delivery".into(),
+            dependency_inputs:vec![json!({"work_id":"font_check_r1"})],..WorkOrder::default()};
+        assert!(scheduler.resolve_dependency_deliveries(&consumer).unwrap_err().contains("TASK_DEPRECATED"));
     }
 
     #[test]
@@ -3832,6 +3776,49 @@ mod tests {
         assert_eq!(valid_delivery[0]["exported_data"]["browser_upload_receipt"]["upload_attempt_id"],"upload-1");
         assert_eq!(valid_delivery[0]["browser_upload_availability"]["available"],true);
         assert_eq!(scheduler.frames["upload_work"].status,WorkStatus::Done);
+    }
+
+    #[test]
+    fn organizer_flow_directory_paginates_beyond_fifty_while_context_keeps_only_last_twelve() {
+        let mut scheduler=WorkScheduler::default();
+        for index in 0..60 {
+            let id=format!("work_{index:02}");
+            let mut order=task(&id,&format!("Goal {index}"));
+            order.node_id=format!("node_{index:02}");
+            order.revision=1;
+            scheduler.activated_history.push(id.clone());
+            scheduler.frames.insert(id.clone(),WorkFrame{order,status:WorkStatus::Done,sequence:index+1,
+                returned_at:Some(index as u64+1),output:Some(json!({"id":id,"node_id":format!("node_{index:02}"),"revision":1,
+                    "done":true,"execution_status":"done","outcome":"completed","summary":format!("Result {index}"),
+                    "limitations":[],"material_ids":[index as i64+1],"finding_ids":[format!("finding_{index}")],"exported_data":{}})),
+                ..Default::default()});
+        }
+        scheduler.current="work_59".into();
+
+        let input=scheduler.organizer_input();
+        let recent=input["execution_path"].as_array().unwrap();
+        assert_eq!(recent.len(),12);
+        assert_eq!(recent[0]["step"],49);
+        assert_eq!(recent[0]["work_id"],"work_48");
+        assert_eq!(recent[11]["step"],60);
+        assert!(recent[11]["summary"].is_null(),"the current Worker return appears once in current_result");
+        assert_eq!(input["current_result"]["summary"],"Result 59");
+        assert!(input.get("current_output").is_none());
+
+        let first=&input["flow_directory"];
+        assert_eq!(first["total"],60);
+        assert_eq!(first["returned"],50);
+        assert_eq!(first["next_cursor"],50);
+        assert_eq!(first["entries"][0]["work_id"],"work_00");
+        assert_eq!(first["entries"][49]["material_ids"],json!([50]));
+        let second=scheduler.read_flow_page(&json!({"cursor":first["next_cursor"],"limit":50})).unwrap();
+        assert_eq!(second["offset"],50);
+        assert_eq!(second["returned"],10);
+        assert_eq!(second["entries"][0]["work_id"],"work_50");
+        assert!(second["next_cursor"].is_null());
+        assert!(second["entries"][9]["summary"].is_null(),"the current return is not duplicated in the paged directory");
+        assert_eq!(second["omitted_range"]["through_step"],50);
+        assert!(scheduler.read_flow_page(&json!({"cursor":0,"limit":51})).unwrap_err().to_string().contains("at most 50"));
     }
 
     #[test]
@@ -3931,7 +3918,7 @@ mod tests {
         let input=scheduler.organizer_input();
         let narrative=input["execution_narrative"].as_str().unwrap();
         assert!(narrative.contains("Step 1 - work_upload r1 [deprecated]"),"{narrative}");
-        assert!(narrative.contains("it did not return a result"),"{narrative}");
+        assert!(narrative.contains("No Worker return recorded."),"{narrative}");
         assert!(narrative.contains("Step 2 - work_reopen r1 [running]"),"{narrative}");
         let path=input["execution_path"].as_array().unwrap();
         assert_eq!(path[0]["valid_input"],false);
@@ -3949,7 +3936,7 @@ mod tests {
     }
 
     #[test]
-    fn narrative_keeps_failure_then_recovery_in_order_with_dated_current_facts() {
+    fn narrative_preserves_worker_returns_and_dated_http_facts_without_inferred_recovery() {
         let url="http://127.0.0.1:38190/api/fonts";
         let mut scheduler=WorkScheduler::default();
         let mut probe=task("probe","Probe the font service");probe.completion=Completion::Check;
@@ -3966,9 +3953,11 @@ mod tests {
         let processes=json!([{"process_id":"proc-1","script":"dev","running":true,"ready":true,"ready_url":"http://127.0.0.1:38190/"}]);
         scheduler.frame_mut().unwrap().project_observation=json!({"sampled_at":now_ms()-2000,"processes":processes});
         scheduler.observe("http_probe",&json!({"url":url}),&http_sample(url,Some(200),1),false);
-        assert!(scheduler.close_if_satisfied());
-        let summary=scheduler.output().unwrap()["summary"].as_str().unwrap().to_owned();
-        assert!(summary.contains("returned HTTP 200")&&summary.contains("proc-1"),"host summary states the observed facts: {summary}");
+        assert_eq!(scheduler.frame().unwrap().status,WorkStatus::Running,"a successful host observation does not end the Worker invocation");
+        assert!(scheduler.output().is_none());
+        let worker_summary="Worker reports that the font endpoint returned HTTP 200";
+        scheduler.return_work(&json!({"summary":worker_summary})).unwrap();
+        assert_eq!(scheduler.output().unwrap()["summary"],worker_summary,"host observations do not rewrite the Worker return");
 
         let input=scheduler.organizer_input();
         let narrative=input["execution_narrative"].as_str().unwrap();
@@ -3976,21 +3965,19 @@ mod tests {
         let second=narrative.find("Step 2 - work_start").unwrap();
         assert!(first<second,"{narrative}");
         assert!(narrative.contains("Connection refused"),"{narrative}");
-        let facts=narrative.split("Latest known facts:").nth(1).unwrap();
-        let (current,history)=facts.split_once("Earlier observations (history, not current state):").unwrap();
-        assert!(current.contains("HTTP 200 at")&&current.contains("(current sample)"),"{narrative}");
-        assert!(!current.contains("no HTTP response"),"the old failure is not a current conclusion: {narrative}");
-        assert!(history.contains("no HTTP response (connection_refused)")&&history.contains("before the matching service instance was observed ready")
-            &&history.contains("superseded by the later sample"),"{narrative}");
-        assert!(narrative.contains("Limitations reported at that step")&&narrative.contains("Later host evidence resolved the matching HTTP condition"),"{narrative}");
-        assert!(!narrative.contains("Remaining limitations:")||!narrative.split("Remaining limitations:").nth(1).unwrap().contains("connection refused"),
-            "a recovered HTTP failure stays historical: {narrative}");
-        assert_eq!(input["current_facts"]["http"][0]["http_status"],200);
-        assert_eq!(input["historical_observations"][0]["http_status"],Value::Null);
+        assert!(!narrative.contains("resolved")&&!narrative.contains("superseded by the later sample")
+            &&!narrative.contains("Latest known facts:")&&!narrative.contains("Remaining limitations:"),"no inferred recovery or limitations synthesis: {narrative}");
+        let facts=input["current_facts"]["http_observations"].as_array().unwrap();
+        assert_eq!(facts.len(),2);
+        assert_eq!(facts[0]["http_status"],Value::Null);
+        assert_eq!(facts[1]["http_status"],200);
+        assert!(facts[0]["text"].as_str().unwrap().contains("no HTTP response"));
+        assert!(facts[1]["text"].as_str().unwrap().contains("HTTP 200 at"));
+        assert!(facts.iter().all(|fact|fact.get("relation_to_service_start").is_none()));
     }
 
     #[test]
-    fn http_timing_uses_the_matching_ready_port_not_an_unrelated_managed_process() {
+    fn http_history_keeps_timestamps_without_inferencing_a_service_start_relation() {
         let url="http://127.0.0.1:8080/api/fonts";
         let mut scheduler=WorkScheduler::default();
         scheduler.enqueue(vec![task("probe","Probe the font endpoint")],false,false).unwrap();scheduler.activate_next().unwrap();
@@ -4010,10 +3997,11 @@ mod tests {
         scheduler.observe("http_probe",&json!({"url":url}),&http_sample(url,Some(200),0),false);
 
         let input=scheduler.organizer_input();
-        let current=input["current_facts"]["http"].as_array().unwrap().iter().find(|fact|fact["http_status"]==200).unwrap();
-        assert!(current["relation_to_service_start"].as_str().unwrap().contains("after the matching service instance"));
-        let history=input["historical_observations"].as_array().unwrap();
-        assert!(history[0]["text"].as_str().unwrap().contains("before the matching service instance"),"{history:?}");
+        let history=input["current_facts"]["http_observations"].as_array().unwrap();
+        assert_eq!(history.len(),2);
+        assert_eq!(history[1]["http_status"],200);
+        assert!(history[1]["text"].as_str().unwrap().contains("HTTP 200 at"));
+        assert!(history.iter().all(|sample|sample.get("relation_to_service_start").is_none()));
         let failed=scheduler.http_observation_samples.values().find(|sample|sample["http_status"].is_null()).unwrap();
         assert_eq!(history[0]["sampled_at"],failed["sampled_at"],"the original probe time stays attached to the failure");
     }
@@ -4050,8 +4038,8 @@ mod tests {
         assert_eq!(stale["historical"],true,"the old session's receipt describes only itself");
         assert!(receipts.iter().any(|item|item["upload_attempt_id"]=="a2"&&item["historical"]==false));
         let narrative=input["execution_narrative"].as_str().unwrap();
-        assert!(narrative.contains("has decks/demo.pptx loaded (8 slides, indicator 1 / 8)"),"{narrative}");
-        assert!(narrative.contains("the page state is still current"),"{narrative}");
+        assert!(narrative.contains("document=decks/demo.pptx, load_status=loaded, slides=8"),"{narrative}");
+        assert!(narrative.contains("session_available=true"),"{narrative}");
 
         let mut wrong=task("bad","Inspect fonts");wrong.browser_document_path=Some("http://127.0.0.1:5173/editor".into());
         let error=scheduler.enqueue(vec![wrong],false,false).unwrap_err().to_string();
@@ -4059,23 +4047,22 @@ mod tests {
     }
 
     #[test]
-    fn network_work_rejects_visual_goal_and_unavailable_image_input_is_not_redispatched() {
-        let mut scheduler=WorkScheduler::default();
+    fn work_can_combine_network_and_visual_goals_and_unavailable_image_does_not_permanently_block_retry() {
         let mut fonts=task("fonts","Read the browser font requests to /api/fonts");fonts.visual_goal=Some("see fonts".into());
-        let error=scheduler.enqueue(vec![fonts],false,false).unwrap_err().to_string();
-        assert!(error.contains("does not take visual_goal"),"{error}");
+        let mut compatible=WorkScheduler::default();
+        compatible.enqueue(vec![fonts],false,false).unwrap();
 
+        let mut scheduler=WorkScheduler::default();
         let mut look=task("look","Capture the editor and check the rendered slide");look.visual_goal=Some("The first slide is rendered".into());
         scheduler.enqueue(vec![look.clone()],false,false).unwrap();scheduler.activate_next().unwrap();
         let returned=scheduler.return_work(&json!({"summary":"Screenshot captured; image input unavailable","limitations":["visual inspection not performed: image input unavailable"],
             "visual_check_result":{"assessment":"unavailable"}})).unwrap();
-        assert_eq!(returned["expectation_met"],false);
-        assert_eq!(scheduler.organizer_input()["visual_goals_returned_without_image_input"][0]["work_id"],"look");
+        assert!(returned.get("expectation_met").is_none());
         let mut again=look;again.id="look_again".into();
-        let error=scheduler.apply(&json!({"action":"work","reason":"retry","orders":[again]}),false,false).unwrap_err().to_string();
-        assert!(error.contains("VISUAL_INPUT_UNAVAILABLE"),"{error}");
-        let narrative=scheduler.organizer_input()["execution_narrative"].as_str().unwrap().to_owned();
-        assert!(narrative.contains("Remaining limitations:")&&narrative.contains("image input unavailable"),"{narrative}");
+        scheduler.enqueue(vec![again],false,false).unwrap();
+        assert!(scheduler.activate_next().unwrap());
+        assert_eq!(scheduler.current,"look_again");
+        assert_eq!(scheduler.frames["look"].status,WorkStatus::Done,"the unavailable visual return remains a sealed historical invocation");
     }
 
     #[test]
@@ -4091,10 +4078,10 @@ mod tests {
         scheduler.permits("http_probe",&json!({"url":url})).unwrap();
         let mut fresh=http_sample(url,Some(200),0);
         scheduler.record_http_probe(&json!({"url":url}),&mut fresh,"call-2");
-        assert_eq!(fresh["previous_sample"]["invalidation_reason"],"expired");
+        assert_eq!(fresh["previous_sample"]["cache_invalidation_reason"],"expired");
         assert_eq!(fresh["previous_sample"]["http_status"],Value::Null);
-        assert_eq!(fresh["previous_sample"]["reusable"],false);
-        assert_eq!(fresh["fresh"],true);
+        assert_eq!(fresh["previous_sample"]["fresh_for_cache_reuse"],false);
+        assert_eq!(fresh["fresh_for_cache_reuse"],true);
         let reused=scheduler.reusable_http_probe(&json!({"url":url})).unwrap();
         assert_eq!(reused["reused"],true);assert!(reused["reuse_age_ms"].is_u64());
     }

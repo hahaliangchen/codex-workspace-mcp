@@ -4,9 +4,9 @@
 
 Work nodes retain the three execution states `ready`, `running`, and `done`. `done` means the current task invocation returned and the host sealed its TaskReturn. It does not mean the declared expectation passed or the user's overall goal was achieved.
 
-The host records `expectation_met` separately from execution state. A connection refusal, HTTP 404, unavailable image input, blocker, split request, or upstream problem can be a valid `done` result with a negative outcome. The Organizer uses that result to schedule follow-up work or deliver an honest unresolved answer. Flow completion records the actual outcome and expectation fact so a completed node is not displayed as proof of business success.
+New scheduler results do not emit `expectation_met`. Older persisted values remain compatibility history and are not a conclusion about the user's goal. A connection refusal, HTTP 404, unavailable image input, blocker, split request, or upstream problem can be a valid `done` result. The Organizer uses the Worker return and dated host evidence to schedule follow-up work or report unresolved acceptance conditions.
 
-Write and check facts remain host-owned. A write is recorded only after a real file change; a check is successful only for the current input version and according to that tool's result. `check` work can return a non-2xx observation as a finished result, while `expectation_met=false` preserves that the declared condition did not pass.
+Write and check facts remain host-owned. A write is recorded only after a real file change; a check is successful only for the current input version and according to that tool's result. These facts do not synthesize a Worker return or decide whether a business/user goal passed.
 
 ## Organizer scheduling methods
 
@@ -17,27 +17,25 @@ Each scheduling decision uses one method:
 - `schedule_task` creates one concrete next task. The host generates work/node IDs, appends Flow state and resolves dependencies. Pass upstream data as exact `inputs` referencing an available `work_id` or `node_id` and listed fields.
 - `read_task_result` reads selected fields from an active sealed delivery when those fields are absent from the concise context. `current_result` is already present and should not be fetched again.
 - `revisit_task` creates a new execution revision for a defective upstream node, preserves its old result and deprecates the old downstream branch.
-- `finish_request` returns the user-facing summary, whether the overall goal was achieved, and unresolved conditions. Completed nodes or an empty queue alone do not establish goal completion.
+- `finish_request` returns the user-facing summary, whether the overall goal was achieved, and unresolved conditions. Done nodes or an empty queue alone do not establish goal completion.
 
 The Organizer request streams (`stream=true`). The host assembles the SSE frames, including tool arguments split across frames and UTF-8 characters split across network chunks. It applies exactly one scheduling method, and only after `[DONE]` or a `finish_reason` arrives. A truncated stream, an upstream error frame, multiple methods or invalid arguments produce a contract or request error and no scheduler or Flow change. A complete JSON response is accepted as `response_format=json`. Timings are milliseconds after request start, and `null` means not received: `response_headers_ms`, `first_chunk_ms`, `first_delta_ms`, `first_tool_delta_ms`, `response_complete_ms`. They are stored with the request record. `organizer/progress` events (at most one per second plus phase changes) drive the frontend's "等待响应 / 正在接收决策 / 决策已完成" display. Cancellation and the overall deadline end the request while reading; keepalives do not extend the deadline.
 
-`process.execution_narrative` is a short text in the order tasks actually ran. It shows which tasks returned and what they returned, which are history only (deprecated), the latest report of the running task (intent, not a result), and the latest known facts with sample times. Earlier observations that a later sample superseded are listed separately as history. A last section lists the remaining limitations. `process.current_facts` carries the same current HTTP and browser facts as structured data.
+`process.execution_narrative` is a short text in actual invocation order. It shows which tasks returned and what they returned, which are history only (deprecated), the latest report of the running task (intent, not a result), and host actions with sample times. HTTP observations are supplied as a separate chronological list; later samples do not rewrite or interpret earlier ones. Worker-reported limitations remain attached to their task. `process.current_facts` carries dated HTTP observations and current browser availability as structured data.
 
 A Worker `report_progress` records intent on the current node and continues the same task; it never creates a TaskReturn or an Organizer call. Only rounds with no actual project operation count toward a stall. After `REPORT_ONLY_ROUND_LIMIT` such rounds, the host hands off with `handoff.stall` and `task_returned=false`. A goal that stalled twice is not accepted again (`STALLED_GOAL_REPEATED`).
 
 A successor that references an unreturned task is rejected with `TASK_NOT_RETURNED`, and the running task, the queue and other results are left unchanged. Scheduling unrelated new work while a task is unreturned deprecates that task explicitly, recording the reason, the replacement and its last report. Other dependency errors are `TASK_DEPRECATED`, `REVISION_MISMATCH`, `FIELD_NOT_EXPORTED`, `INVALID_REFERENCE_TYPE` and `UNKNOWN_TASK`.
 
-Simple knowledge questions use one answer task. Composite requests grow Flow one task at a time. A task that needs splitting returns its concrete child suggestions, dependencies and completion conditions; the Organizer schedules the next suitable child rather than receiving a model-authored task tree.
+Simple knowledge questions use one Organizer-assigned answer task. A plain-text Worker response seals that invocation and goes back to Organizer, just like `yield_work`. `final_answer` never bypasses that handoff or completes the overall request. Only Organizer's explicit `finish_request` assesses the goal. Composite requests grow Flow one task at a time. A task that needs splitting returns its concrete child suggestions, dependencies and completion conditions; the Organizer schedules the next suitable child rather than receiving a model-authored task tree.
 
-## Task contract combinations
+The host only dispatches, records and loads information in order. Program errors retain their complete original diagnostic chain; the host adds no diagnosis, recovery judgment or repair guidance. Process exit codes, output streams, probe replies and resource identities remain recorded facts. Worker return submissions are stored intact as `worker_return`, readable through `read_task_result`; context compaction changes only the projection, not the saved return.
 
-| Work type | `completion` | `checks` |
-| --- | --- | --- |
-| Service startup, HTTP/API endpoint check | `check` | Required supported identifiers |
-| PPTX upload/load, in-browser font-request inspection, screenshot/image inspection | `output` | Must be empty |
-| Source writing | `write` or `write_check` | `write_check` also needs supported checks |
+The host records Organizer's explicit goal assessment as submitted. It neither derives that assessment from queue state nor changes unfinished child nodes into successful returns when Organizer finishes the request.
 
-Keep mixed tasks separate and pass the startup/check result to the later browser task as an explicit input. The host validates these combinations before scheduling and returns the exact rejected field path with a correction instruction.
+## Work scope and checks
+
+`completion` is optional legacy metadata; it does not classify task contents or imply success. `checks` are optional supported host-observation identifiers and can coexist with browser, visual, HTTP, or writing work when that makes the task clearer. `edit_targets` and tool permissions still govern writes. Split work when distinct steps or dependencies call for it, then pass required upstream fields as explicit inputs. The host validates field types, permissions, paths, dependencies, and supported check identifiers, and reports the exact rejected field with correction guidance.
 
 Supported check keys are `npm:<project>:<script>`, `npm-start:<project>:<script>`, `npm-install:<project>`, `program:<cargo|git|node|python>:<project>:<args-json>`, and `http-probe:<exact-local-url>`. Shell command strings are not check identifiers. Permissions and task scope must authorize each operation; do not add unrelated tests, builds or installs.
 
@@ -47,9 +45,9 @@ Task completion and live resource availability are independent. Upload evidence 
 
 `browser_diagnostics` returns the page's recorded requests: every fetch/XHR call with method, URL, status, time, duration and failure, plus font and resource timing entries, filterable by `url_contains` and `category`. `request_coverage` states what the record cannot see. An empty result explains that nothing matched in the observed scope, not that no request happened. A browser-observed `/api/fonts` 200 and a server-side `http_probe` 200 are separate facts.
 
-Network, font-request and diagnostic tasks may not set `visual_goal`. When image input is unavailable, the Worker is told it did not see the screenshot and returns an `unavailable` visual result that cites the screenshot. The task is sealed with `expectation_met=false`, and the same visual goal is not accepted again (`VISUAL_INPUT_UNAVAILABLE`).
+Network, font-request, diagnostic, and visual requirements may coexist when the requested work benefits from them. If image input is unavailable, the Worker reports that limitation and explicitly returns the invocation; the Organizer can arrange another route or retry when capability changes. The completed invocation remains history, and no permanent host block is applied to that goal.
 
-HTTP samples and project process observations also retain source identity, time and validity. Expiry or process changes affect whether a new task may reuse a sample, not whether a completed observation happened. New sampling is tied to a real state change or current-state question; it does not rewrite the old fact. A fresh sample is reused with its age. Once the host has marked the latest sample invalid (expired, process change, superseded), a new probe needs no extra reason. Its result includes `previous_sample` with that sample's time, status, age, invalidation reason and whether it was taken before or after the managed service was observed running.
+HTTP samples and project process observations retain source identity and time. Expiry or process changes affect whether a sample can be reused from cache or satisfy an unfinished host check, not whether that observation happened or whether a completed node stays done. New sampling does not rewrite the old fact. A sample reused from cache includes its age and the cache-reuse decision; no service-start timing relation is inferred.
 
 ## Recovery and persistence
 
@@ -57,6 +55,6 @@ Organizer network/timeout failures have their own bounded retry counter and do n
 
 When retries are exhausted, the host persists the failure stage alongside the existing handoff. It retains split suggestions, upstream-problem details, session continuation and other prior handoff data. The saved scheduler is resumable without rerunning completed nodes. Scheduling decisions carry a host-generated call ID and are idempotent across request replay.
 
-New scheduler and Flow snapshots include `schema_version`. Legacy snapshots deserialize with version 0, preserve their saved statuses/results, and are stamped with the current version when restored. Migration never changes an old unfinished node into a successful result.
+New scheduler and Flow snapshots include `schema_version`. Legacy snapshots deserialize with version 0 and are stamped with the current version when restored. A legacy worker node is normalized to `done` only when it has a saved delivery; an unfinished or resultless node is never promoted. Legacy `outcome=completed` and synthesized false flags are treated as unknown because old host versions supplied them by default. Overall goal completion is restored only from an explicit saved Organizer assessment (`goal_achieved=true`), never from done nodes or an empty queue.
 
 The Observer reviews the same host input and outputs in parallel. Its suggestions are advisory, never approval gates, and are considered during a normal Organizer decision. There is no additional acknowledgement round. Its input is the node's actual state (`node_state`): reports, returned result, exported values, check outcomes, HTTP samples with URL/status/error/time, process IDs and running state, and browser page/upload/load facts. It also receives the shared current facts. Long lists are shortened, but no object key is dropped by position. Each piece of advice carries the node identity, revision and `observed_at`. Advice written before the node's newer facts reaches the Organizer marked `based_on_older_facts` and cannot override them.

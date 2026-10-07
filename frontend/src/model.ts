@@ -545,7 +545,7 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
 }
 
 export type FlowNodeKind = string
-export type FlowNodeStatus = 'pending' | 'running' | 'waiting_children' | 'paused' | 'blocked' | 'completed' | 'skipped' | 'interrupted' | 'failed' | 'deprecated'
+export type FlowNodeStatus = 'ready' | 'running' | 'done' | 'waiting_children' | 'pending' | 'paused' | 'blocked' | 'completed' | 'skipped' | 'interrupted' | 'failed' | 'deprecated'
 
 export interface FlowToolExecution {
   readonly id: string
@@ -670,7 +670,7 @@ export interface FlowNodeData {
   readonly doneWhen?: string | undefined
   readonly workUnit?: FlowWorkUnit | undefined
   readonly constraints?: readonly string[] | undefined
-  readonly result?: { readonly summary: string; readonly materialIds: readonly number[]; readonly outcome?: string | undefined; readonly expectationMet?: boolean | undefined; readonly limitations?: readonly string[] | undefined } | undefined
+  readonly result?: { readonly summary: string; readonly materialIds: readonly number[]; readonly outcome?: string | undefined; readonly goalAchieved?: boolean | undefined; readonly expectationMet?: boolean | undefined; readonly limitations?: readonly string[] | undefined } | undefined
   readonly progress: readonly FlowProgressReport[]
   readonly tools: readonly FlowToolExecution[]
   readonly consults: readonly FlowObserverConsult[]
@@ -782,6 +782,8 @@ function extractFilesFromArgs(argsStr: string): string[] {
 
 function flowStatus(value: unknown): FlowNodeStatus {
   switch (value) {
+    case 'ready':
+    case 'done':
     case 'running':
     case 'waiting_children':
     case 'paused':
@@ -793,7 +795,7 @@ function flowStatus(value: unknown): FlowNodeStatus {
     case 'deprecated':
       return value
     default:
-      return 'pending'
+      return 'ready'
   }
 }
 
@@ -803,7 +805,7 @@ function createFlowNode(
   title = '工作者任务',
   kind = 'step',
   description?: string,
-  status: FlowNodeStatus = 'pending',
+  status: FlowNodeStatus = 'ready',
 ): {
   id: string
   title: string
@@ -815,7 +817,7 @@ function createFlowNode(
   doneWhen?: string | undefined
   workUnit?: FlowWorkUnit | undefined
   constraints?: string[] | undefined
-  result?: { summary: string; materialIds: number[]; outcome?: string | undefined; expectationMet?: boolean | undefined; limitations?: readonly string[] | undefined } | undefined
+  result?: { summary: string; materialIds: number[]; outcome?: string | undefined; goalAchieved?: boolean | undefined; expectationMet?: boolean | undefined; limitations?: readonly string[] | undefined } | undefined
   progress: FlowProgressReport[]
   tools: FlowToolExecution[]
   consults: FlowObserverConsult[]
@@ -876,6 +878,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     node.result = result && typeof result.summary === 'string' ? { summary: result.summary,
       materialIds: Array.isArray(result.material_ids) ? result.material_ids.filter((id): id is number => typeof id === 'number') : [],
       outcome: stringOf(result.outcome),
+      goalAchieved: typeof result.goal_achieved === 'boolean' ? result.goal_achieved : undefined,
       expectationMet: typeof result.expectation_met === 'boolean' ? result.expectation_met : undefined,
       limitations: observerStringList(result.limitations) } : undefined
   }
@@ -1221,7 +1224,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           const isInvalidated = frame.invalidated_by_plan_revision !== null && frame.invalidated_by_plan_revision !== undefined
           if (!treeTurns.has(turn)) {
             node.title = (numberOf(order.revision) ?? 1) > 1 ? `${work.goal} (r${order.revision})` : (work.goal || node.title)
-            node.status = isInvalidated ? 'deprecated' : work.done ? 'completed' : state?.finished === true || output?.blocked === true ? 'blocked' : work.status === 'running' ? 'running' : 'pending'
+            node.status = isInvalidated ? 'deprecated' : work.done ? 'done' : work.status === 'running' ? 'running' : 'ready'
             if (work.outputSummary) node.result = { summary: work.outputSummary, materialIds: [], outcome: work.outcome,
               expectationMet: work.expectationMet }
           } else if (isInvalidated) {
@@ -1419,8 +1422,8 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         for (const node of nodeMap.values()) {
           if (node.turn !== turn || node.status === 'deprecated') continue
           if (reason.kind === 'completed' && !treeTurns.has(turn) && !node.workUnit) {
-            if (node.status === 'running') node.status = 'completed'
-            else if (node.status === 'pending') node.status = 'skipped'
+            if (node.status === 'running') node.status = 'done'
+            else if (node.status === 'ready' || node.status === 'pending') node.status = 'skipped'
           } else if (reason.kind === 'error' && node.id === activeNodeId) {
             node.status = 'failed'
           } else if (reason.kind === 'aborted' && node.id === activeNodeId) {
@@ -1429,7 +1432,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         }
         if (treeTurns.has(turn)) {
           const root = Array.from(nodeMap.values()).find(node => node.turn === turn && !node.parentId)
-          unfinishedTree = !!root && root.status !== 'completed' && root.status !== 'skipped'
+          unfinishedTree = !!root && !['done', 'completed', 'skipped'].includes(root.status)
           // Preserve explicit node statuses when a run ends; final text is not completion.
         }
         activeNodeId = undefined
@@ -1442,10 +1445,10 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     const ended = [...events].reverse().find(event => event.type === 'turn/end')
     const reason = ended ? reasonOf(ended.data.reason) : undefined
     const status: FlowNodeStatus = reason?.kind === 'completed'
-      ? 'completed'
+      ? 'done'
       : reason?.kind === 'error' ? 'failed'
         : reason?.kind === 'aborted' ? 'interrupted'
-          : events.some(event => event.type === 'turn/start') ? 'running' : 'pending'
+          : events.some(event => event.type === 'turn/start') ? 'running' : 'ready'
     const id = nodeKey('worker', currentTurn)
     const node = createFlowNode(
       id,
