@@ -89,7 +89,17 @@ AI Proxy 日志统一走 `proxy_log`，外部模块不再自己实现文件日�
 
 ## 多模态策略
 
-DeepSeek、Mimo 这类文本模型不直接吃图片。代理会：
+### Agent 任务的图片输入
+
+在设置页的模型能力中点击「验证图片输入」，会先保存当前设置，再向选定模型发送随机颜色与圆点测试图。只有实际请求包含 PNG 内容且模型回答正确时，才记录为 `supported`。HTTP 成功但回答错误、网络失败或认证失败仍为 `unknown`；接口明确拒绝图片时记录为 `unsupported`。验证原始响应、错误与耗时保存在本地 `agent-generation.yml`，证据绑定端点和模型，修改路由后需重新验证。也可运行 `codex-workspace-mcp --probe-image-input` 验证当前主模型。
+
+`browser_screenshot`、`view_image` 和图片材料使用任务所属的不可变图片记录。支持图片的 Worker/Observer 收到真实 `image_url` 内容块；后续回合保留请求标识、图片来源、页面版本与判断，方便正确引用。能力未知时保留截图并报告未确认范围；只有当前模型明确不支持且已配置经过验证的视觉路线时，才调用视觉服务。模型请求失败的原始原因进入角色上下文、最终交付和历史视图，图片不会被静默重试。
+
+实际验收与复现方法见 [视觉输入实施记录](docs/agent_visual_input_implementation_2026-10-08.md)。业务截图和完整本机配置保存在忽略的验收目录中。
+
+### 兼容代理的图片转述
+
+面向文本模型的兼容代理会：
 
 1. 只检查最新 user 消息中的真实图片
 2. 尝试用默认主模型解析图片；该模型需要支持图像输入
@@ -390,9 +400,18 @@ Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息
 
 ### 按功能定位代码（单个定义、文件、相关功能组）
 
+任务的信息入口为**项目内会话历史 + 代码索引**。默认请求提供当前任务、前一步结果和精简 Flow；缺少具体历史信息时再查询，缺少代码位置时按职责描述定位。记忆系统保留为独立能力，不作为例行任务记录或启动时必查的入口。
+
+Worker、Organizer、Observer 共用 `read_session_history`，直接读取当前工作区已有的会话事件，不新增历史数据库：
+
+- 默认读当前会话，可按 `query`、`role`、`node_id`、`turn` 筛选；记录保留原文、角色和采样时间，按事件顺序返回。
+- `scope=project` 查找同项目的相关会话，每个会话返回一条最近匹配记录、简短需求和 `read_reference`。只查当前工作区数据库，不跨项目。
+- 使用返回的 `task_id` 读取选定会话；`event_seq` 定位原始记录，`char_offset` 分页读取长内容。事件序号只在所属会话内有效。
+- 会话内向前翻页用 `next_before_seq`；项目检索翻页用 `next_search`。每次正文最多 12000 字符，不将项目全部历史注入模型。历史观察不代表当前服务状态。
+
 `search_code_map` 用任务描述（例如“节点拖拽”“图片渲染”）查询 Rust、TypeScript/JavaScript、Python、Go，返回功能组的职责说明和可直接读取的定义入口。分组来自保存的 `belongs_to_area`、架构记忆里的 `key_files`，或源文件边界；不根据调用链推断功能，也不根据函数名伪造说明。一个文件属于多个已匹配功能区时，不猜测它唯一属于哪一组。每组返回少量入口，候选和分组各自带分页信息，候选窗口最多每语言 100 个。
 
-理解一个函数后，可用 `record_symbol_business_context` 保存职责、关键词和 `read_when`；`scope=file` 保存文件级说明。理解一组相关代码后，可用 `record_architecture_memory` 保存 `area`、`summary`、`key_files`、`key_symbols`。这些知识由 Worker 或 Observer 基于已读代码积累，不要求额外遍历项目。源码注释会自动成为初始描述。没有描述时明确返回 `missing`；架构组说明是历史知识，返回 `saved_requires_confirmation`，并不声称当前实现已验证。
+理解一个函数后，可用 `record_symbol_business_context` 保存职责、关键词和 `read_when`；`scope=file` 保存文件级说明，`belongs_to_area` 标识相关功能组。这些描述由 Worker 或 Observer 基于已读代码积累，不要求额外遍历项目。源码注释会自动成为初始描述。已有架构记忆的分组信息仍兼容读取；`record_architecture_memory` 保留供单独的记忆工作使用，不要求普通任务写入。没有描述时明确返回 `missing`；旧架构组说明返回 `saved_requires_confirmation`，并不声称当前实现已验证。
 
 函数职责保存独立 `definition_hash`，未改动的函数可在同文件其他位置变化或行号移动后继续复用；文件级说明仍按整文件版本失效。`code_hash` 继续表示整文件版本，兼容写入前置条件。旧描述没有函数版本时，只有文件版本仍匹配才能建立函数版本，否则保留过期状态。
 

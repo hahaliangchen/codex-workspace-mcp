@@ -1,5 +1,11 @@
 export type PermissionMode = 'read_only' | 'workspace_write' | 'full_access'
 
+export interface ResumeTarget {
+  readonly work_id: string
+  readonly revision: number
+  readonly request_id: number
+}
+
 export interface RequestContextMeta {
   readonly id: number
   readonly actor: string
@@ -131,6 +137,14 @@ export const REASONING_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'
 
 export interface ModelCapabilities {
   readonly image_input?: 'supported' | 'unsupported' | 'unknown'
+  readonly image_probe?: {
+    readonly status: string
+    readonly capability: string
+    readonly elapsed_ms: number
+    readonly checked_at: number
+    readonly response_body: string | null
+    readonly error: string | null
+  }
   readonly reasoning_efforts: readonly string[]
   readonly default_effort: string | null
   readonly fast_mode: boolean
@@ -288,13 +302,14 @@ export const api = {
   changeDiff: (id: string, turn: number, index: number, path?: string) => request<FileDiff>(`${task(id)}/changes/${turn}/files/${index}${path === undefined ? '' : `?path=${encodeURIComponent(path)}`}`, { cache: 'no-store' }),
   undoChanges: (id: string, turn: number) => post<ChangesSummary>(`${task(id)}/changes/${turn}/undo`, {}),
   createSession: async () => (await post<{ task_id: string }>('/agent/sessions')).task_id,
-  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined }) =>
+  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; resume_target?: ResumeTarget | undefined }) =>
     post<{ task_id: string }>(`${task(id)}/messages`, { prompt, ...options }),
   cancel: (id: string) => request<unknown>(task(id), { method: 'DELETE' }),
   interruptNode: (id: string, nodeId: string) =>
     post<unknown>(`${task(id)}/flow/nodes/${encodeURIComponent(nodeId)}/interrupt`),
   getSettings: () => request<SettingsData>('/agent/settings/data'),
   saveSettings: (payload: SaveSettingsInput) => put<SettingsData>('/agent/settings/data', payload),
+  probeImage: (payload: { revision: string; provider: string; model: string }) => post<{ probe: Record<string, unknown>; settings: SettingsData }>('/agent/settings/probe-image', payload),
   discoverModels: (input: { id: string; url: string; api_key?: string }) =>
     post<{ models: string[] }>('/agent/settings/discover', input),
   getPlugins: () => request<PluginsSnapshot>('/agent/plugins'),

@@ -141,6 +141,7 @@ export function SettingsModal({
   const [draft, setDraft] = useState<DraftSettings | null>(null)
   const [openProviderId, setOpenProviderId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [probingImage, setProbingImage] = useState<string | null>(null)
   const [statusMsg, setStatusMsg] = useState<{ text: string; error: boolean } | null>(null)
   const [discoveringId, setDiscoveringId] = useState<string | null>(null)
   const [discoveredModels, setDiscoveredModels] = useState<Record<string, string[]>>({})
@@ -262,11 +263,36 @@ export function SettingsModal({
       setDraft(toDraft(saved))
       setStatusMsg({ text: '设置已保存并立即对新任务生效。', error: false })
       onSaved()
+      return saved
     } catch (err) {
       setStatusMsg({ text: err instanceof Error ? err.message : String(err), error: true })
     } finally {
       setSaving(false)
     }
+  }
+
+  const handleProbeImage = async (provider: DraftProvider, model: string) => {
+    if (probingImage || saving) return
+    setProbingImage(`${provider._draftId}:${model}`)
+    try {
+      const saved = await handleSave()
+      if (!saved) return
+      setStatusMsg({ text: '正在验证图片输入…', error: false })
+      const result = await api.probeImage({ revision: saved.revision, provider: provider.id.trim(), model })
+      const verified = result.settings.providers.find(p => p.id === provider.id.trim())?.model_capabilities[model]
+      if (!verified) throw new Error('验证返回缺少模型能力记录')
+      setDraft(current => current && ({ ...current, revision: result.settings.revision,
+        providers: current.providers.map(item => item.id.trim() === provider.id.trim()
+          ? { ...item, model_capabilities: { ...item.model_capabilities, [model]: verified } }
+          : item) }))
+      const capability = result.probe.capability
+      setStatusMsg({ text: capability === 'supported' ? '模型正确识别了测试图片，已接通真实图片输入。'
+        : capability === 'unsupported' ? '接口明确拒绝图片，已保存原始原因。'
+        : `图片能力仍未确认：${String(result.probe.error ?? '模型未正确识别测试图片')}`, error: capability !== 'supported' })
+      onSaved()
+    } catch (err) {
+      setStatusMsg({ text: err instanceof Error ? err.message : String(err), error: true })
+    } finally { setProbingImage(null) }
   }
 
   const handleAddProvider = () => {
@@ -401,7 +427,7 @@ export function SettingsModal({
                 <button
                   type="button"
                   className={modelsCss.primaryButton}
-                  disabled={saving || draft === null}
+                  disabled={saving || probingImage !== null || draft === null}
                   onClick={() => { void handleSave() }}
                 >
                   {saving ? '保存中…' : '保存更改'}
@@ -714,7 +740,7 @@ export function SettingsModal({
                                 onChange={(e) => { updateProvider(provider._draftId, { models_text: e.target.value }) }}
                               />
 
-                              <div className={modelsCss.modelCatalogMeta}>按提供方声明模型能力；模型 ID 不代表支持图片，未声明时为未知。</div>
+                              <div className={modelsCss.modelCatalogMeta}>图片支持需通过实际图片验证。验证会保存当前设置，并向此模型发送一张随机测试图。</div>
                               {parseModels(provider.models_text).map(model => {
                                 const capability = provider.model_capabilities[model] ?? { reasoning_efforts: [], default_effort: null, fast_mode: false }
                                 return (
@@ -724,9 +750,18 @@ export function SettingsModal({
                                       <label className={modelsCss.field}>
                                         <span className={modelsCss.fieldLabel}>图片输入能力</span>
                                         <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={capability.image_input ?? 'unknown'} onChange={event => { updateModelCapability(provider, model, { image_input: event.target.value as 'supported' | 'unsupported' | 'unknown' }) }}>
-                                          <option value="unknown">未知：保留材料，报告限制</option><option value="supported">支持：发送真实图片</option><option value="unsupported">不支持</option>
+                                          <option value="unknown">未知：保留材料，报告限制</option><option value="supported" disabled>已验证支持：发送真实图片</option><option value="unsupported">不支持</option>
                                         </select>
                                       </label>
+                                      <button type="button" className={modelsCss.secondaryButton} disabled={saving || probingImage !== null || provider.api_type !== 'openai-completions'} onClick={() => { void handleProbeImage(provider, model) }}>
+                                        {probingImage === `${provider._draftId}:${model}` ? '正在验证图片…' : '验证图片输入'}
+                                      </button>
+                                      {capability.image_probe && <details>
+                                        <summary>上次图片验证：{capability.image_probe.status} · {capability.image_probe.elapsed_ms} ms</summary>
+                                        <p>{new Date(capability.image_probe.checked_at).toLocaleString()}</p>
+                                        {capability.image_probe.error && <p>{capability.image_probe.error}</p>}
+                                        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{capability.image_probe.response_body}</pre>
+                                      </details>}
                                       <div className={modelsCss.field}>
                                         <span className={modelsCss.fieldLabel}>支持的等级</span>
                                         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>

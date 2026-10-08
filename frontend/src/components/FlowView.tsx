@@ -9,7 +9,8 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 
-import type { AgentEvent, Task } from '../api.ts'
+import type { AgentEvent, Task, ResumeTarget } from '../api.ts'
+import { resumeTargetForWork } from '../taskProgress.ts'
 import {
   flowState,
   formatDuration,
@@ -38,6 +39,8 @@ interface FlowViewProps {
   task?: Task | undefined
   running?: boolean | undefined
   onInterruptNode?: ((nodeId: string) => void) | undefined
+  onResumeNode?: ((target: ResumeTarget, title: string) => Promise<boolean>) | undefined
+  resumeDisabled?: boolean | undefined
 }
 
 function isNoteMatchingNode(note: FlowObserverNote, node: FlowNodeData): boolean {
@@ -56,7 +59,7 @@ function isNoteMatchingNode(note: FlowObserverNote, node: FlowNodeData): boolean
   return false
 }
 
-export function FlowView({ events, task, running, onInterruptNode }: FlowViewProps) {
+export function FlowView({ events, task, running, onInterruptNode, onResumeNode, resumeDisabled }: FlowViewProps) {
   const api = useAgentApi()
   const [debug, setDebug] = useState(false)
   const [debugBusy, setDebugBusy] = useState(true)
@@ -830,17 +833,22 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               </div>
 
               {/* 8. 中断当前节点 */}
-              {running && selectedNode.status === 'running' && selectedNode.id.startsWith('turn_') && onInterruptNode && (
+              {running && !selectedNode.isMainTask && selectedNode.status === 'running' && selectedNode.id.startsWith('turn_') && onInterruptNode && (
                 <div className={styles.actionSection}>
                   <button
                     type="button"
                     className={styles.interruptBtn}
-                    onClick={() => onInterruptNode(selectedNode.id)}
+                    onClick={() => onInterruptNode(`turn_${selectedNode.turn}:${selectedNode.workUnit?.nodeId ?? selectedNode.id.split(':').slice(1).join(':')}`)}
                   >
                     ⏸ 中断当前节点
                   </button>
                 </div>
               )}
+              {!running && onResumeNode && resumeTargetForWork(events, selectedNode.workUnit?.id) && <div className={styles.actionSection}>
+                <button type="button" className={styles.interruptBtn} disabled={resumeDisabled}
+                  onClick={() => { const target = resumeTargetForWork(events, selectedNode.workUnit?.id)
+                    if (target) void onResumeNode(target, selectedNode.title) }}>▶ 继续此任务</button>
+              </div>}
             </div>
           </div>
         )}

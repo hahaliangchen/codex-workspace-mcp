@@ -139,7 +139,10 @@ impl WorkExecutor {
         ) -> Result<ToolRoundOutput>,
     ) -> Result<ExecutionRound> {
         let started = std::time::Instant::now();
-        let mut model = Self::model_round(scheduler, identity, runtime, body).await?;
+        let mut model = Self::model_round(scheduler, identity, runtime, body).await.map_err(|error|
+            if runtime.visual_dispatch["status"] != "no_images" {
+                crate::visual_probe::VisualModelFailure {manifest:runtime.visual_dispatch.clone(),error}.into()
+            }else{error})?;
         model.response_stats["model_round_ms"] = serde_json::json!(started.elapsed().as_millis() as u64);
         if let Some(reason)=worker_response_rejection(&model.response_stats) {
             model.response_stats["worker_execution_rejected"]=serde_json::json!(reason);
@@ -178,7 +181,7 @@ impl WorkExecutor {
             res = request_fut => res?,
         };
         let headers_ms = model_request_started.elapsed().as_millis() as u64;
-        let response = response.error_for_status()?;
+        let response = crate::visual_probe::successful_response(response).await?;
         let (message, mut response_stats) = crate::agent_service::consume_model_stream(
             response, runtime.root, runtime.task_id, runtime.turn, runtime.step, runtime.cancel
         ).await?;

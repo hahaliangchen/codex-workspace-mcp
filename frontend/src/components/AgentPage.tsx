@@ -3,6 +3,7 @@ import clsx from 'clsx'
 import logoImg from '../assets/logo.png'
 import { taskTitle, workspaceName } from './Sidebar.tsx'
 import { FlowView } from './FlowView.tsx'
+import { TaskProgressCard } from './TaskProgressCard.tsx'
 import type { AgentSlotProps } from '../cordis/slot-contract.ts'
 import root from '../dsh/conversation/ConversationRoot.module.css'
 import welcomeCss from './Welcome.module.css'
@@ -204,9 +205,13 @@ export function ConversationPage({
               {tab === 'chat'
                 ? renderSlot('agent.chat', { events: session.events, task, running, onOpenTask: openTask, onChangesUpdated: session.reload })
                 : tab === 'flow'
-                ? <FlowView key={workspace.taskId} events={session.events} task={task} running={running} onInterruptNode={interruptNode} />
+                ? <FlowView key={workspace.taskId} events={session.events} task={task} running={running} onInterruptNode={interruptNode}
+                    onResumeNode={workspace.resumeNode} resumeDisabled={!ready || !canContinue || workspace.resumeBusy || isChild} />
                 : renderSlot('agent.trajectory', { events: session.events, onOpenTask: openTask })}
             </div>
+            {tab === 'chat' && !isChild && <TaskProgressCard events={session.events} running={running}
+              disabled={!ready || !canContinue || workspace.resumeBusy} onResume={workspace.resumeNode}
+              onContinue={() => workspace.resumeNode(undefined)} onViewFlow={() => setTab('flow')} />}
           </div>
           <div className={root.composerSeat}>
             {isChild

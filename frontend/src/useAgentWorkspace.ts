@@ -1,4 +1,4 @@
-import type { PermissionMode } from './api'
+import type { PermissionMode, ResumeTarget } from './api'
 import { useCallback, useEffect, useState } from 'react'
 import { acceptsPrompt, type AgentInfo, type SettingsData, type Task } from './api.ts'
 import { useAgentApi } from './cordis/react.tsx'
@@ -332,6 +332,21 @@ export function useAgentWorkspace() {
     }
   }, [api, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
 
+  const [resumeBusy, setResumeBusy] = useState(false)
+  const resumeNode = useCallback(async (target: ResumeTarget | undefined, title = ''): Promise<boolean> => {
+    if (!taskId || running || resumeBusy) return false
+    setResumeBusy(true); setNotice(undefined)
+    try {
+      await api.prompt(taskId, target ? `继续任务：${title}` : '继续', {
+        resume_target: target, model: modelName ?? undefined,
+        reasoning_effort: reasoningEffort || undefined, fast_mode: fastMode,
+      })
+      refreshTasks(); session.reload()
+      return true
+    } catch (cause) { setNotice(messageOf(cause)); return false }
+    finally { setResumeBusy(false) }
+  }, [api, taskId, running, resumeBusy, modelName, reasoningEffort, fastMode, refreshTasks, session.reload])
+
   const stop = useCallback(() => {
     if (taskId === undefined) return
     api.cancel(taskId).then(
@@ -362,7 +377,7 @@ export function useAgentWorkspace() {
     canContinue: ready && task !== undefined && acceptsPrompt(task),
     settingsOpen, settingsTab, setSettingsTab,
     openSettings, closeSettings, saveSettings, refreshInfoAndSettings, selectModel, toggleSubagent, setGenerationOptions,
-    openTask, submit, stop, interruptNode,
+    openTask, submit, stop, interruptNode, resumeNode, resumeBusy,
   }
 }
 

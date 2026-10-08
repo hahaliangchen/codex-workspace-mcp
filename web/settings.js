@@ -4,7 +4,7 @@ import { BrowserRuntime, httpPlugin } from '/agent/browser-runtime.js';
 let runtime;
 let http;
 const byId = (id) => document.getElementById(id);
-const view = { draft: null, revision: '', openProvider: null, tab: 'models', busy: false };
+const view = { draft: null, revision: '', openProvider: null, tab: 'models', busy: false, probing: false };
 
 function el(tag, className, label) {
   const node = document.createElement(tag);
@@ -186,6 +186,24 @@ function renderProviders() {
         finally { discover.disabled = false; }
       });
       editor.append(discover, discovered);
+      editor.append(el('p', 'field-note', '图片支持需实际验证。验证会先保存设置，再向选定模型发送一张随机测试图。'));
+      for (const model of provider.models_text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)) {
+        const capability = provider.model_capabilities?.[model];
+        const details = el('details');
+        const label = { supported: '已验证支持', unsupported: '不支持', unknown: '未知' }[capability?.image_input || 'unknown'];
+        details.append(el('summary', '', `${model} · 图片能力：${label}`));
+        const probe = el('button', 'small-button', '验证图片输入'); probe.type = 'button';
+        probe.disabled = view.probing || view.busy || provider.api_type !== 'openai-completions';
+        probe.addEventListener('click', () => probeImage(provider.id.trim(), model));
+        details.append(probe);
+        if (capability?.image_probe) {
+          const evidence = capability.image_probe;
+          details.append(el('p', 'field-note', `${new Date(evidence.checked_at).toLocaleString()} · ${evidence.status} · ${evidence.elapsed_ms} ms`));
+          const raw = el('pre', '', evidence.error || evidence.response_body || '');
+          raw.style.whiteSpace = 'pre-wrap'; raw.style.overflowWrap = 'anywhere'; details.append(raw);
+        }
+        editor.append(details);
+      }
       editor.append(el('p', 'field-note', `密钥引用：${provider.api_key_env || '保存密钥时自动创建'}。Provider ID 保存后固定。`));
       const actions = el('div', 'provider-actions');
       const remove = el('button', 'danger-button', '删除提供商'); remove.type = 'button';
@@ -278,8 +296,31 @@ async function save() {
     const body = await response.json();
     if (!response.ok) throw new Error(body.error || `保存失败 (${response.status})`);
     adopt(body); status('已保存。新任务将使用当前模型路由。');
+    return body;
   } catch (error) { status(error.message, true); }
   finally { view.busy = false; byId('save-settings').disabled = false; }
+}
+
+async function probeImage(provider, model) {
+  if (view.probing || view.busy) return;
+  view.probing = true;
+  try {
+    const saved = await save();
+    if (!saved) return;
+    byId('save-settings').disabled = true;
+    status('正在验证图片输入…');
+    const response = await http.request('/agent/settings/probe-image', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ revision: saved.revision, provider, model }) });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || `验证失败 (${response.status})`);
+    view.revision = body.settings.revision;
+    const current = view.draft.providers.find(item => item.id.trim() === provider);
+    if (current) current.model_capabilities = { ...current.model_capabilities,
+      [model]: body.settings.providers.find(item => item.id === provider).model_capabilities[model] };
+    status(body.probe.capability === 'supported' ? '模型正确识别了测试图片，已接通真实图片输入。'
+      : body.probe.error || '图片能力仍未确认。', body.probe.capability !== 'supported');
+  } catch (error) { status(error.message, true); }
+  finally { view.probing = false; renderProviders(); byId('save-settings').disabled = false; }
 }
 
 function initialize(ctx) {

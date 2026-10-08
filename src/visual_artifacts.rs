@@ -38,9 +38,8 @@ pub struct VisualContext {
     pub related_source_versions:Value,
     /// The page snapshot most recently recorded by the host for this work item.
     pub current_page:Value,
-    /// Artifacts explicitly accepted by the host as captures of the current page.
-    /// This permits a freshly captured image to survive the scheduler epoch bump
-    /// caused by that same capture discovering an asynchronous page update.
+    /// Legacy latest-capture references, retained for saved-session compatibility.
+    /// They do not determine whether a model may use a screenshot.
     pub host_current_artifact_ids:Vec<String>,
     pub original_artifact_ids:Vec<String>,
 }
@@ -84,7 +83,9 @@ pub fn save(root:&Path,context:&VisualContext,mut metadata:Value,bytes:&[u8])->R
     metadata["source_tool_call_id"]=json!(context.source_tool_call_id);metadata["source_event_id"]=json!(context.source_event_id);
     metadata["execution_epoch"]=json!(context.execution_epoch);metadata["related_source_versions"]=context.related_source_versions.clone();
     metadata["content_hash"]=json!(hash(bytes));metadata["mime_type"]=json!("image/png");metadata["width"]=json!(width);metadata["height"]=json!(height);
-    metadata["byte_size"]=json!(bytes.len());metadata["captured_at"]=json!(now());metadata["workspace_relative_path"]=json!(relative);
+    metadata["byte_size"]=json!(bytes.len());
+    if metadata["captured_at"].as_u64().is_none() {metadata["captured_at"]=json!(now());}
+    metadata["workspace_relative_path"]=json!(relative);
     metadata["image_url"]=json!(format!("/agent/tasks/{}/visual-artifacts/{id}/image",context.task_id()));
     connection(root)?.execute("INSERT INTO agent_visual_artifacts(artifact_id,task_id,metadata) VALUES (?1,?2,?3)",params![id,context.task_id(),metadata.to_string()])?;
     Ok(metadata)
@@ -100,23 +101,13 @@ pub fn read(root:&Path,task:&str,id:&str)->Result<(Value,Vec<u8>)> {
     ensure!(item["workspace_relative_path"]==expected,"visual path does not match its immutable identity");
     let path=crate::file_edit::workspace_path(root,&expected)?;
     ensure!(std::fs::metadata(&path)?.len()<=MAX_ORIGINAL_BYTES as u64,"visual file exceeds original budget");
-    let bytes=std::fs::read(path)?;ensure!(item["content_hash"]==hash(&bytes),"visual material hash changed; recapture instead of trusting overwritten pixels");
+    let bytes=std::fs::read(path)?;ensure!(item["content_hash"]==hash(&bytes),"stored visual bytes do not match the recorded content_hash");
     let img=decode(&bytes)?;ensure!(item["width"]==img.width() && item["height"]==img.height(),"visual dimensions changed");
     Ok((item,bytes))
 }
 pub fn authorize(item:&Value,context:&VisualContext)->Result<()> {
     ensure!(item["task_id"]==context.task_id() && item["request_id"]==context.identity["request_id"],"visual artifact belongs to a different task/request");
     ensure!(item["identity"]==context.identity || context.allowed_artifact_ids.iter().any(|id|item["artifact_id"]==id.as_str()),"visual artifact is from another work instance; require an explicit valid upstream export");Ok(())
-}
-pub(crate) fn is_current_result(item:&Value,context:&VisualContext)->bool {
-    if item["related_source_versions"]!=context.related_source_versions {return false;}
-    let page_matches=!context.current_page.is_null() && ["browser_session_id","page_id","page_epoch"].iter().all(|field| {
-        !context.current_page[field].is_null() && item[field]==context.current_page[field]
-    });
-    if !context.current_page.is_null() && !page_matches {return false;}
-    let same_epoch=item["execution_epoch"]==json!(context.execution_epoch);
-    let host_accepted=page_matches && item["artifact_id"].as_str().is_some_and(|id|context.host_current_artifact_ids.iter().any(|current|current==id));
-    same_epoch || host_accepted
 }
 fn seal_visual_service_result(mut result:Value,manifest:&Value,context:&VisualContext,goal:&str)->Result<Value> {
     ensure!(result.is_object(),"visual service response must be a JSON object");
@@ -192,12 +183,11 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
     let mut images=Vec::new();let mut unavailable=Vec::new();
     for id in ids.iter().take(MAX_IMAGES) {
         match image_block(state.workspace.root(),context,id,context.original_artifact_ids.contains(id)) {
-            Ok((block,mut sent))=>{sent["current_result"]=json!(is_current_result(&sent,context));blocks.push(json!({"type":"text","text":format!("artifact_id={id}; capture identity {}; page_epoch={}; input_mode={}; current_result={}",sent["identity"],sent["page_epoch"],sent["mode"],sent["current_result"])}));blocks.push(block);images.push(sent);},
+            Ok((block,sent))=>{blocks.push(json!({"type":"text","text":format!("artifact_id={id}; captured_at={}; url={}; capture identity {}; page_epoch={}; related_source_versions={}; input_mode={}",sent["captured_at"],sent["url"],sent["identity"],sent["page_epoch"],sent["related_source_versions"],sent["mode"])}));blocks.push(block);images.push(sent);},
             Err(error)=>unavailable.push(json!({"artifact_id":id,"reason":error.to_string()})),
         }
     }
     manifest["images"]=json!(images);manifest["unavailable"]=json!(unavailable);
-    manifest["current_result_artifact_ids"]=json!(images.iter().filter(|image|image["current_result"]==true).map(|image|image["artifact_id"].clone()).collect::<Vec<_>>());
     manifest["omitted_by_image_budget"]=json!(ids.len().saturating_sub(MAX_IMAGES));
     let messages=body["messages"].as_array_mut().context("image request requires messages")?;
     if images.is_empty() {manifest["status"]=json!("unavailable");}
@@ -208,42 +198,47 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
         let service_trace=manifest["request_trace_id"].as_str().unwrap_or("");
         let service_artifact_ids=manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>();
         let vision_body=json!({"model":route.model,"stream":false,"max_tokens":1600,"messages":[
-            {"role":"system","content":format!("You are a visual tool service. Inspect the supplied images for this goal: {goal}. Return JSON with request_trace_id, checked_goal (copy verbatim), artifact_ids (exact supplied IDs in order), expected_visible_result, assessment pass|issue|uncertain, observed_facts [{{artifact_id,region,fact}}], issues, and limitations. Cite only supplied artifact IDs. A pass or issue needs at least one visible fact from a current_result=true image. An uncertain result may have no observations. Do not infer source code or interaction correctness from pixels alone. Host request_trace_id={service_trace} and artifact_ids={service_artifact_ids:?}")},
+            {"role":"system","content":format!("You are a visual tool service. Inspect the supplied images for this goal: {goal}. Return JSON with request_trace_id, checked_goal (copy verbatim), artifact_ids (exact supplied IDs in order), expected_visible_result, assessment pass|issue|uncertain, observed_facts [{{artifact_id,region,fact}}], issues, and limitations. Cite supplied artifact IDs. Use their capture times, page information and source versions to judge whether the images answer the goal; describe relevant limitations. Do not infer source code or interaction correctness from pixels alone. Host request_trace_id={service_trace} and artifact_ids={service_artifact_ids:?}")},
             {"role":"user","content":blocks}]});
         let mut fallback_metadata=manifest.clone();fallback_metadata["actor"]=json!("visual_service");fallback_metadata["model_route"]=json!({"provider":route.provider,"model":route.model});fallback_metadata["model"]=json!(route.model);
         let trace=crate::request_context::record(state.workspace.root(),context.task_id(),fallback_metadata.clone(),&vision_body).await;
         let started=std::time::Instant::now();
-        let result=tokio::time::timeout(std::time::Duration::from_secs(10),async {
-            let response=state.client.post(format!("{}/chat/completions",route.url.trim_end_matches('/'))).bearer_auth(&route.api_key).header("x-codex-visual-dispatch","task-owned").json(&vision_body).send().await?.error_for_status()?;
-            let response:Value=response.json().await?;let raw=response.pointer("/choices/0/message/content").and_then(Value::as_str).context("visual service returned no text")?;
+        let mut raw_service_response=Value::Null;
+        let result=tokio::time::timeout(std::time::Duration::from_secs(60),async {
+            let response=state.client.post(format!("{}/chat/completions",route.url.trim_end_matches('/'))).bearer_auth(&route.api_key).header("x-codex-visual-dispatch","task-owned").json(&vision_body).send().await?;
+            let response=crate::visual_probe::successful_response(response).await?;
+            let raw=response.text().await?;raw_service_response=json!(raw);
+            let response:Value=serde_json::from_str(&raw)?;let raw=response.pointer("/choices/0/message/content").and_then(Value::as_str).context("visual service returned no text")?;
             let result:Value=serde_json::from_str(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim())?;Ok::<_,anyhow::Error>(result)
         }).await.map_err(|_|anyhow::anyhow!("visual service timed out")).and_then(|r|r);
-        crate::request_context::finish(trace,if result.is_ok(){"completed"}else{"failed"},json!({"duration_ms":started.elapsed().as_millis()})).await;
+        let result=result.and_then(|result|seal_visual_service_result(result,&manifest,context,goal));
+        crate::request_context::finish(trace,if result.is_ok(){"completed"}else{"failed"},json!({"duration_ms":started.elapsed().as_millis(),
+            "error":result.as_ref().err().map(|error|format!("{error:#}")),"response":raw_service_response})).await;
         let result=match result {
-            Ok(result)=>match seal_visual_service_result(result,&manifest,context,goal) {
-                Ok(result)=>result,
-                Err(error)=>json!({"assessment":"unavailable","limitations":[error.to_string()],"host_validation":{"validated":false}}),
-            },
-            Err(error)=>json!({"assessment":"unavailable","limitations":[error.to_string()],"host_validation":{"validated":false}}),
+            Ok(result)=>result,
+            Err(error)=>json!({"assessment":"unavailable","limitations":[format!("{error:#}")],"host_validation":{"validated":false}}),
         };
         let validated=result["host_validation"]["validated"]==true;
         manifest["status"]=json!(if validated {"fallback"}else{"unavailable"});
         manifest["visual_service_result_id"]=if validated {result["visual_service_result_id"].clone()}else{Value::Null};
         manifest["visual_service_result_validated"]=json!(validated);
+        manifest["visual_service_response"]=raw_service_response;
         manifest["visual_service_result"]=result.clone();manifest["visual_service_route"]=fallback_metadata["model_route"].clone();
         messages.push(json!({"role":"system","content":format!("Host visual service result (the current role did not receive images): {}. Source images: {}. Preserve this provenance; do not claim your own direct image inspection.",result,manifest["images"])}));
         crate::agent_service::emit(state.workspace.root(),context.task_id(),"visual/service_result",json!({"manifest":manifest,"result":result,"elapsed_ms":started.elapsed().as_millis()})).await?;
     } else {
         manifest["status"]=json!(if capability==ImageCapability::Unknown {"unknown_capability"}else{"unavailable"});manifest["selected_images"]=manifest["images"].take();manifest["images"]=json!([]);
         let captured=manifest["selected_images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>();
-        manifest["image_input_unavailable"]=json!({"reason":if capability==ImageCapability::Unknown {"image capability of this model is unknown and no fallback visual service is configured"}else{"this model does not accept images and no fallback visual service is configured"},
+        manifest["image_input_unavailable"]=json!({"reason":if capability==ImageCapability::Unknown {
+            if state.visual.fallback.is_some() {"image capability of this model is unknown; the configured fallback is used only after explicit image rejection"}else{"image capability of this model is unknown and no fallback visual service is configured"}
+        }else{"this model does not accept images and no fallback visual service is configured"},
             "captured_artifact_ids":captured});
         messages.push(json!({"role":"system","content":format!("Image input is unavailable for this request: {}. The screenshots {captured:?} exist and can be delivered to the user, but this request did not receive their image content.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or(""))}));
     }
     let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
         "checked_goal":goal,"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
         "observed_facts":[{"artifact_id":manifest["images"][0]["artifact_id"],"region":"describe the inspected region","fact":"replace this with actual visible evidence"}],"issues":[],"limitations":[]});
-    messages.push(json!({"role":"system","content":format!("Host visual dispatch: {}. For visual_check_result use this JSON structure: {}. COPY checked_goal VERBATIM and request_trace_id; do not summarize or shorten checked_goal. Preserve artifact_ids. A pass/issue must cite at least one observed_fact from a current_result=true artifact; older images may support comparison but cannot establish the current result by themselves. In fallback mode, cite visual_service_result_id and copy only the service's expected_visible_result and observed facts; do not add facts. The service assessment must support your assessment. Only direct means this role receives real image content blocks; fallback is explicitly attributed service evidence; unavailable/unknown requires an uncertain or unavailable visual result. Capture/DOM matched is never pass.",manifest,contract)}));
+    messages.push(json!({"role":"system","content":format!("Host visual dispatch: {}. For visual_check_result use this JSON structure: {}. Preserve checked_goal, request_trace_id and artifact references so the observation can be associated with its inputs. Capture metadata and this request's page/source observations are recorded facts; you decide whether the supplied screenshots are sufficient for the goal and whether another capture is needed. Describe visible facts and any relevant limitations. Only direct means this role received real image content blocks; fallback evidence comes from the named visual service and should retain that attribution. unavailable/unknown means image content was not delivered. Screenshot or DOM status alone is not a visual assessment.",manifest,contract)}));
     Ok(manifest)
 }
 
@@ -263,10 +258,6 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
     }
     if let Some(request)=request {
         ensure!(request["checked_goal"]==goal,"checked_goal must match the actual visual request goal");
-        ensure!(request["execution_epoch"]==json!(context.execution_epoch)
-            && request["related_source_versions"]==context.related_source_versions
-            && request["current_page"]==context.current_page,
-            "project files or the current page changed after the image request; perform current visual verification");
         // An unavailable/uncertain result may cite the screenshots that were
         // selected but could not be delivered to the model.
         let undelivered_allowed=!matches!(assessment,"pass"|"issue");
@@ -284,12 +275,6 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
         for fact in check["observed_facts"].as_array().unwrap() {
             ensure!(fact["fact"].as_str().is_some_and(|s|!s.trim().is_empty()) && ids.iter().any(|id|id==&fact["artifact_id"]),"each observed fact must cite a selected artifact_id and describe visible evidence");
         }
-        let current_ids=artifacts.iter().filter(|artifact|is_current_result(artifact,context)
-            && request["images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==artifact["artifact_id"] && image["current_result"]==true))
-            .map(|artifact|artifact["artifact_id"].clone()).collect::<Vec<_>>();
-        ensure!(!current_ids.is_empty(),"visual pass/issue needs an image captured for the host's current page and source versions; recapture the current result");
-        ensure!(check["observed_facts"].as_array().unwrap().iter().any(|fact|current_ids.iter().any(|id|id==&fact["artifact_id"])),
-            "visual pass/issue must cite an observed fact from a current result image");
         if request["status"]=="fallback" {
             let service=&request["visual_service_result"];
             ensure!(request["visual_service_result_validated"]==true && service["host_validation"]["validated"]==true
@@ -309,8 +294,11 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
     }
     let mut result=check.clone();result["identity"]=context.identity.clone();result["actor"]=json!(actor);result["checked_at"]=json!(now());result["artifacts"]=json!(artifacts);
     result["model_route"]=request.map(|r|r["model_route"].clone()).unwrap_or(Value::Null);result["input_mode"]=request.map(|r|r["status"].clone()).unwrap_or(json!("not_received"));
-    result["source_binding"]=json!({"execution_epoch":context.execution_epoch,"related_source_versions":context.related_source_versions,"current_page":context.current_page});
-    result["current_result_artifact_ids"]=json!(artifacts.iter().filter(|artifact|is_current_result(artifact,context)).map(|artifact|artifact["artifact_id"].clone()).collect::<Vec<_>>());
+    // Keep the observations supplied with the image request. Later page/source
+    // observations must not rewrite what the model actually received.
+    result["source_binding"]=request.map(|request|json!({"execution_epoch":request["execution_epoch"],
+        "related_source_versions":request["related_source_versions"],"current_page":request["current_page"]}))
+        .unwrap_or_else(||json!({"execution_epoch":context.execution_epoch,"related_source_versions":context.related_source_versions,"current_page":context.current_page}));
     if let Some(request)=request {
         // Preserve the same dispatch record for successes and failures. A
         // missing model input must not erase why the host did not send it.

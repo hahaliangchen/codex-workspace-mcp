@@ -631,6 +631,7 @@ export interface FlowProgressReport {
 
 export interface FlowWorkUnit {
   readonly id: string
+  readonly nodeId?: string | undefined
   readonly status: 'ready' | 'running' | 'done'
   readonly done: boolean
   readonly goal: string
@@ -666,6 +667,7 @@ export interface FlowNodeData {
   readonly status: FlowNodeStatus
   readonly description?: string | undefined
   readonly parentId?: string | undefined
+  readonly isMainTask?: boolean | undefined
   readonly objective?: string | undefined
   readonly doneWhen?: string | undefined
   readonly workUnit?: FlowWorkUnit | undefined
@@ -813,6 +815,7 @@ function createFlowNode(
   status: FlowNodeStatus
   description?: string | undefined
   parentId?: string | undefined
+  isMainTask?: boolean | undefined
   objective?: string | undefined
   doneWhen?: string | undefined
   workUnit?: FlowWorkUnit | undefined
@@ -865,6 +868,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
   let unfinishedTree = false
   const treeTurns = new Set<number>()
   const treeFields = (node: ReturnType<typeof createFlowNode>, raw: Record<string, unknown>, turn: number) => {
+    node.isMainTask = raw.is_main_task === true || node.isMainTask
     node.requestId = numberOf(raw.request_id) ?? node.requestId
     const parent = stringOf(raw.parent_id)
     if (parent) {
@@ -883,7 +887,20 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
       limitations: observerStringList(result.limitations) } : undefined
   }
 
-  for (const event of events) {
+  const flowEvents: readonly AgentEvent[] = events.flatMap(event => {
+    if (event.type !== 'flow/session') return [event]
+    const data = event.data
+    const state = data.scheduler as Record<string, unknown> | undefined
+    const plan = data.flow_plan as Record<string, unknown> | undefined
+    const planNodes = (Array.isArray(plan?.nodes) ? plan.nodes : []).map((raw: Record<string, unknown>) => ({ ...raw,
+      status: raw.status === 'running' && (raw.work_id === state?.current || raw.is_main_task === true) ? 'paused' : raw.status,
+    }))
+    return [
+      { ...event, type: 'scheduler/state', data: { turn: data.turn, state } },
+      { ...event, type: 'flow/plan', data: { ...plan, nodes: planNodes, turn: data.turn, active_node_id: '', replaceCurrentTurn: true } },
+    ]
+  })
+  for (const event of flowEvents) {
     const data = event.data || {}
     const turn = numberOf(data.turn) ?? currentTurn
     switch (event.type) {
@@ -1202,6 +1219,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           const output = frame.output as Record<string, unknown> | undefined
           const work: FlowWorkUnit = {
             id: stringOf(order.id) ?? '',
+            nodeId: stringOf(order.node_id),
             status: frame.status === 'done' ? 'done' : frame.status === 'running' ? 'running' : 'ready',
             done: frame.status === 'done', goal: stringOf(order.goal) ?? '', doneWhen: stringOf(order.done_when) ?? '',
             upstreamIds: observerStringList(order.upstream_ids), checks: observerStringList(order.checks),
@@ -1421,7 +1439,9 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const reason = reasonOf(data.reason)
         for (const node of nodeMap.values()) {
           if (node.turn !== turn || node.status === 'deprecated') continue
-          if (reason.kind === 'completed' && !treeTurns.has(turn) && !node.workUnit) {
+          if (node.isMainTask) {
+            if (node.result?.goalAchieved !== true) node.status = 'paused'
+          } else if (reason.kind === 'completed' && !treeTurns.has(turn) && !node.workUnit) {
             if (node.status === 'running') node.status = 'done'
             else if (node.status === 'ready' || node.status === 'pending') node.status = 'skipped'
           } else if (reason.kind === 'error' && node.id === activeNodeId) {
@@ -1469,6 +1489,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     status: node.status,
     description: node.description,
     parentId: node.parentId,
+    isMainTask: node.isMainTask,
     objective: node.objective,
     doneWhen: node.doneWhen,
     workUnit: node.workUnit,

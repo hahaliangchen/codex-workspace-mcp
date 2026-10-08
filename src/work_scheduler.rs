@@ -69,7 +69,7 @@ pub struct WorkFrame {
     pub source_selection: Value,
     pub organizer_guidance: Value,
     pub visual_artifact_ids:Vec<String>,
-    /// Latest screenshot IDs explicitly accepted for the current host page state.
+    /// Latest captured screenshot IDs. These references do not expire prior images.
     pub current_visual_artifact_ids:Vec<String>,
     pub visual_original_artifact_ids:Vec<String>,
     pub seen_visual_artifact_ids:Vec<String>,
@@ -155,6 +155,9 @@ pub struct WorkScheduler {
     #[serde(default)]
     pub schema_version: u32,
     pub request_started_turn: usize,
+    /// Original human goal, preserved across follow-up messages and node resumes.
+    pub request_goal: String,
+    pub request_unresolved: Vec<String>,
     pub archived_requests: Vec<ArchivedRequest>,
     pub frames: BTreeMap<String, WorkFrame>,
     pub queue: VecDeque<String>,
@@ -203,6 +206,8 @@ impl Default for WorkScheduler {
         Self {
             schema_version: WORK_SCHEDULER_SCHEMA_VERSION,
             request_started_turn: 0,
+            request_goal: String::new(),
+            request_unresolved: Vec::new(),
             archived_requests: Vec::new(),
             frames: BTreeMap::new(),
             queue: VecDeque::new(),
@@ -337,6 +342,30 @@ fn handoff_matches_current_output(handoff:&Value,output:&Value)->bool {
     if let Some(object)=semantic.as_object_mut() {object.remove("organizer_failure");}
     semantic==*output
 }
+// Every context view uses the same Worker-reported result fields. Keep the
+// original return as well: unrecognised fields must remain readable, rather
+// than disappearing when one role's projection differs from another's.
+const WORKER_RESULT_FIELDS: &[&str] = &[
+    "summary", "outcome", "reason", "blocked", "need_split", "limitations",
+    "upstream_problem", "suggested_children", "worker_return",
+];
+
+fn worker_result_field<'a>(output:&'a Value, field:&str)->Option<&'a Value> {
+    output.get(field).filter(|value|!value.is_null())
+        .or_else(||output.get("worker_return").and_then(|original|original.get(field)).filter(|value|!value.is_null()))
+        .or_else(||if field=="reason" {
+            output.pointer("/exported_data/reason").filter(|value|!value.is_null())
+                .or_else(||output.pointer("/upstream_problem/reason").filter(|value|!value.is_null()))
+        } else {None})
+        .or_else(||output.get(field))
+}
+
+fn copy_worker_result(output:&Value, target:&mut Value) {
+    for field in WORKER_RESULT_FIELDS {
+        target[*field]=worker_result_field(output,field).cloned().unwrap_or(Value::Null);
+    }
+}
+
 fn organizer_handoff(handoff:&Value)->Value {
     let mut compact=json!({});
     for field in ["done","blocked","need_split","outcome","failure_stage","resumable","intent",
@@ -349,7 +378,8 @@ fn organizer_handoff(handoff:&Value)->Value {
         handoff.get("execution_error").or_else(||handoff.get("previous_handoff").and_then(execution_error))
     }
     if let Some(error)=execution_error(handoff) {compact["execution_error"]=error.clone();}
-    if let Some(reason)=handoff["reason"].as_str() {compact["reason"]=json!(limited(reason,500));}
+    if handoff.get("worker_return").is_some() {copy_worker_result(handoff,&mut compact);}
+    if let Some(reason)=worker_result_field(handoff,"reason") {compact["reason"]=reason.clone();}
     if let Some(failure)=handoff.get("failure") {
         compact["failure"]=json!({"error_code":failure["error_code"],"stage":failure["stage"],
             "attempt":failure["attempt"],"retry_limit":failure["retry_limit"],
@@ -358,7 +388,12 @@ fn organizer_handoff(handoff:&Value)->Value {
     compact
 }
 fn path(s: &str) -> String { s.replace('\\',"/") }
-fn command(s: &str) -> String { s.trim().replace("\r\n","\n") }
+fn command(s: &str) -> String {
+    let check=s.trim().replace("\r\n","\n");
+    if let Some(url)=check.strip_prefix("http-probe:") {
+        crate::http_probe::check_key(&json!({"url":url.trim()}))
+    }else{check}
+}
 fn supported_check_key(check:&str)->bool {
     ["npm:","npm-start:","npm-install:","program:","http-probe:"]
         .iter().any(|prefix|check.starts_with(prefix))
@@ -573,6 +608,56 @@ impl WorkScheduler {
     }
 
     /// A bounded work packet is already a Flow node; drawing it needs no extra planning call.
+    pub fn main_task_summary(&self)->Value {
+        let steps=self.execution_order().iter().map(|frame|json!({
+            "work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
+            "goal":limited(&frame.order.goal,240),"status":self.path_status(frame),"returned":frame.output.is_some(),
+            "summary":frame.output.as_ref().map(|output|limited(output["summary"].as_str().unwrap_or(""),420)),
+            "outcome":frame.output.as_ref().and_then(|output|worker_result_field(output,"outcome")),
+            "reason":frame.output.as_ref().and_then(|output|worker_result_field(output,"reason")).map(|reason|organizer_compact(reason,0)),
+            "material_ids":frame.output.as_ref().map(|output|output["material_ids"].clone()),
+            "result_reference":{"method":"read_task_result","work_id":frame.order.id}
+        })).collect::<Vec<_>>();
+        let total=steps.len();
+        let recent=steps.into_iter().skip(total.saturating_sub(4)).collect::<Vec<_>>();
+        json!({"request_id":self.request_started_turn,"goal":self.request_goal,
+            "completed":self.request_completed,"last_run_returned":self.finished,
+            "summary":self.final_result,"unresolved":self.request_unresolved,
+            "current_work_id":self.current,"steps":recent,"total_steps":total,"omitted_steps":total.saturating_sub(4),
+            "history_reference":{"method":"read_flow_page"}})
+    }
+
+    /// Keep a completed goal's compact overview and Flow as history. Its
+    /// execution sources are not imported into the next goal.
+    pub fn after_completed_request(&self,tree:&crate::flow_tree::TaskTree)->Self {
+        let id=format!("request_{}",self.archived_requests.len()+1);
+        let mut plan=self.active_flow_plan(tree.enabled().then_some(tree));
+        for node in plan["nodes"].as_array_mut().into_iter().flatten() {
+            node["request_id"]=json!(self.request_started_turn);
+            node["original_id"]=node["id"].clone();
+            for key in ["id","node_id","work_id","parent_id"] {
+                if let Some(value)=node[key].as_str().filter(|value|!value.is_empty()) {
+                    node[key]=json!(format!("{id}:{value}"));
+                }
+            }
+            if let Some(result)=node.get("result").cloned() {
+                node["result"]=json!({"summary":result["summary"],"outcome":result["outcome"],"material_ids":result["material_ids"],
+                    "reason":worker_result_field(&result,"reason"),"limitations":result["limitations"],"goal_achieved":result["goal_achieved"]});
+            }
+        }
+        for edge in plan["edges"].as_array_mut().into_iter().flatten() {
+            for key in ["id","source","target","source_node","target_node"] {
+                if let Some(value)=edge[key].as_str().filter(|value|!value.is_empty()) {edge[key]=json!(format!("{id}:{value}"));}
+            }
+        }
+        plan["active_node_id"]=json!("");
+        let mut archives=self.archived_requests.clone();
+        archives.push(ArchivedRequest{id,started_turn:self.request_started_turn,plan_revision:self.plan_revision,
+            reason:"Completed human goal; retained as history".into(),scheduler:json!({"main_task":self.main_task_summary()}),
+            task_tree:Value::Null,flow_plan:plan,worker_state:None});
+        Self{archived_requests:archives,..Default::default()}
+    }
+
     pub fn flow_plan(&self) -> Value {
         let mut frames = self.frames.values().collect::<Vec<_>>();
         frames.sort_by_key(|f| f.sequence);
@@ -605,37 +690,27 @@ impl WorkScheduler {
             }));
         }
 
+        let main_id=format!("main_{}",self.request_started_turn);
+        let mut nodes=frames.iter().map(|f| json!({
+            "id":f.order.id,"node_id":f.order.node_id,"work_id":f.order.id,"parent_id":main_id,
+            "revision":f.order.revision,"plan_revision":f.order.plan_revision,"invalidated_by_plan_revision":f.invalidated_by_plan_revision,
+            "title":if f.order.revision>1 {format!("{} (r{})",f.order.goal,f.order.revision)}else{f.order.goal.clone()},
+            "kind":"worker","objective":f.order.goal,"description":f.order.goal,"done_when":f.order.done_when,
+            "constraints":f.order.constraints,"status":if f.invalidated_by_plan_revision.is_some(){"deprecated"}
+                else if f.status==WorkStatus::Done{"done"}else if f.status==WorkStatus::Running{"running"}else{"ready"},"result":f.output
+        })).collect::<Vec<_>>();
+        if !self.request_goal.is_empty() {
+            nodes.insert(0,json!({"id":main_id,"kind":"plan","is_main_task":true,"request_id":self.request_started_turn,
+                "title":self.request_goal,"objective":self.request_goal,"description":"用户主任务",
+                "status":if self.request_completed==Some(true){"completed"}else if self.finished{"paused"}else{"running"},
+                "result":{"summary":self.final_result,"goal_achieved":self.request_completed,"limitations":self.request_unresolved}}));
+            for frame in &frames {edges.push(json!({"id":format!("contains_{}",frame.order.id),"source":main_id,
+                "target":frame.order.id,"label":"子任务","deprecated":frame.invalidated_by_plan_revision.is_some()}));}
+        } else {for node in &mut nodes {node.as_object_mut().unwrap().remove("parent_id");}}
         json!({
             "mode": if frames.len() > 1 { "dag" } else { "direct" },
             "plan_revision": self.plan_revision,
-            "nodes": frames.iter().map(|f| json!({
-                "id": f.order.id,
-                "node_id": f.order.node_id,
-                "work_id": f.order.id,
-                "revision": f.order.revision,
-                "plan_revision": f.order.plan_revision,
-                "invalidated_by_plan_revision": f.invalidated_by_plan_revision,
-                "title": if f.order.revision > 1 {
-                    format!("{} (r{})", f.order.goal, f.order.revision)
-                } else {
-                    f.order.goal.clone()
-                },
-                "kind": "worker",
-                "objective": f.order.goal,
-                "description": f.order.goal,
-                "done_when": f.order.done_when,
-                "constraints": f.order.constraints,
-                "status": if f.invalidated_by_plan_revision.is_some() {
-                    "deprecated"
-                } else if f.status == WorkStatus::Done {
-                    "done"
-                } else if f.status == WorkStatus::Running {
-                    "running"
-                } else {
-                    "ready"
-                },
-                "result": f.output
-            })).collect::<Vec<_>>(),
+            "nodes": nodes,
             "edges": edges,
             "rewind_records": self.rewind_records,
             "active_node_id": if self.done() || self.finished { "" } else { self.id() },
@@ -656,6 +731,10 @@ impl WorkScheduler {
     fn active_flow_plan(&self, tree: Option<&crate::flow_tree::TaskTree>) -> Value {
         let mut base = self.flow_plan();
         if let Some(t) = tree.filter(|t| t.enabled()) {
+            // A legacy tree already supplies its grouping root and hierarchy.
+            if let Some(nodes)=base["nodes"].as_array_mut() {nodes.retain(|node|node["is_main_task"]!=true);
+                for node in nodes {node.as_object_mut().unwrap().remove("parent_id");}}
+            if let Some(edges)=base["edges"].as_array_mut() {edges.retain(|edge|edge["label"]!="子任务");}
             let tree_plan = t.plan();
             let mut nodes = base["nodes"].as_array().cloned().unwrap_or_default();
             let mut edges = base["edges"].as_array().cloned().unwrap_or_default();
@@ -881,12 +960,13 @@ impl WorkScheduler {
         let compact=json!({"work_id":output["id"],"node_id":output["node_id"],"revision":output["revision"],
             "status":if self.effectively_done(frame){"done".to_owned()}else{format!("{:?}",frame.status).to_ascii_lowercase()},
             "done":output["done"],"execution_status":output["execution_status"],
-            "outcome":output["outcome"],"summary":output["summary"],
+            "outcome":worker_result_field(output,"outcome"),"summary":worker_result_field(output,"summary"),
             "checks":output["checks"],"modified_files":modified_files,"finding_ids":output["finding_ids"],
             "material_ids":output["material_ids"],"exported_data":self.filtered_export_data(frame,&output["exported_data"]),
-            "limitations":output["limitations"],
+            "limitations":worker_result_field(output,"limitations"),
             "visual_artifact_ids":output["visual_artifact_ids"],"visual_check_result":output["visual_check_result"],
-            "blocked":output["blocked"],"need_split":output["need_split"],"upstream_problem":output["upstream_problem"],
+            "blocked":worker_result_field(output,"blocked"),"need_split":worker_result_field(output,"need_split"),
+            "upstream_problem":worker_result_field(output,"upstream_problem"),
             "suggested_children":compact_suggested_children(&output["suggested_children"])});
         // Keep only the result Organizer needs to route next. Full exports,
         // source and execution history remain available to Worker/notebook.
@@ -894,6 +974,9 @@ impl WorkScheduler {
         // The routing projection is not the message. Deliver the original
         // Worker return without truncating text, arrays, or diagnostic fields.
         compacted["worker_return"]=output["worker_return"].clone();
+        // A blocker decides the next task. Never truncate or drop it through
+        // the generic source/log compactor, including legacy nested reasons.
+        compacted["reason"]=worker_result_field(output,"reason").cloned().unwrap_or(Value::Null);
         compacted["visual_check_result"]=output["visual_check_result"].clone();
         compacted["visual_requests"]=output["visual_requests"].clone();
         let mut omissions=Vec::new();let mut omitted_total=0;
@@ -946,6 +1029,7 @@ impl WorkScheduler {
                 "done": output["done"],
                 "summary": output["summary"],
             });
+            copy_worker_result(output,&mut filtered);
 
             if let Some(fields) = dep.get("fields").and_then(Value::as_array) {
                 let mut missing = Vec::new();
@@ -967,7 +1051,8 @@ impl WorkScheduler {
                         } else if field_name=="browser_upload_receipt" {
                             output.pointer("/exported_data/browser_upload_receipt").filter(|receipt|self.browser_receipt_is_active(receipt))
                         } else {
-                            output.pointer(&format!("/exported_data/{field_name}")).or_else(||output.get(field_name))
+                            if WORKER_RESULT_FIELDS.contains(&field_name) {worker_result_field(output,field_name)}
+                            else {output.pointer(&format!("/exported_data/{field_name}")).or_else(||worker_result_field(output,field_name))}
                         };
                         if let Some(val) = delivered_value {
                             filtered[field_name] = val.clone();
@@ -1043,6 +1128,7 @@ impl WorkScheduler {
                     "modified_files": output["modified_files"],
                     "checks": output["checks"],
                 });
+                copy_worker_result(output,&mut deliverable);
                 if let Some(exp) = output.get("exported_data") {
                     deliverable["exported_data"] = self.filtered_export_data(frame,exp);
                     if let Ok(observations)=self.http_observations_for_dependency(frame,None) {
@@ -1414,15 +1500,6 @@ impl WorkScheduler {
         exported_data["http_observations"]=json!(observations);
     }
 
-    fn visual_check_is_current(f:&WorkFrame)->bool {
-        let result=&f.visual_check_result;let binding=&result["source_binding"];
-        !result.is_null() && matches!(result["assessment"].as_str(),Some("pass"|"issue"))
-            && binding["execution_epoch"]==json!(f.epoch)
-            && binding["related_source_versions"]==json!(f.versions)
-            && binding["current_page"]==f.browser_page
-            && result["current_result_artifact_ids"].as_array().is_some_and(|ids|!ids.is_empty())
-    }
-
     pub fn verification_due(&self) -> bool {
         self.frame().is_some_and(|f| !f.order.checks.is_empty() && f.check_errors.is_empty()
             && (f.order.edit_targets.is_empty() || f.order.edit_targets.iter().all(|target|f.writes.contains_key(&path(target)))))
@@ -1645,7 +1722,7 @@ impl WorkScheduler {
             ensure!(f.checked.get(&c) != Some(&f.epoch)||http_refresh||http_reuse, "this command already succeeded for the current versions; reuse its recorded result");
         }
         if self.verification_due() {
-            ensure!(crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "stop_project_process"), "the current work awaits its declared checks; broader investigation belongs in another work order");
+            ensure!(crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "read_session_history" | "stop_project_process"), "the current work awaits its declared checks; broader investigation belongs in another work order");
         }
         Ok(())
     }
@@ -1654,7 +1731,7 @@ impl WorkScheduler {
         tools.retain(|tool| {
             let name = tool.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
             if self.verification_due() {
-                return crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "stop_project_process");
+                return crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "read_session_history" | "stop_project_process");
             }
             if matches!(name, "edit_file" | "replace_range" | "write_file") {
                 return self.frame().is_some_and(Self::may_edit);
@@ -1715,19 +1792,14 @@ impl WorkScheduler {
                 f.project_observation=observation.clone();
             }
         }
-        // A failed capture can mean the page changed while pixels were being read.
-        // Revoke prior current-image claims until a stable screenshot succeeds.
-        if failed && name=="browser_screenshot" {
-            f.epoch+=1;f.current_visual_artifact_ids.clear();f.visual_check_result=Value::Null;
-        }
         let browser_mutation=matches!(name,"browser_open"|"browser_click"|"browser_press_key"|"browser_upload"|"browser_close");
         let identity_changed=!f.browser_page.is_null()&&!page.is_null()&&!Self::page_matches(&page,&f.browser_page);
         if identity_changed||browser_mutation||name=="browser_read"||failed&&(matches!(name,"browser_screenshot")||name=="browser_wait"&&args["document_loaded"]==true) {f.browser_current_read=None;}
-        if name=="browser_close" || (failed&&(browser_mutation||matches!(name,"browser_read"|"browser_screenshot"))) {
-            f.browser_page=Value::Null;f.epoch+=1;f.current_visual_artifact_ids.clear();f.visual_check_result=Value::Null;
+        if name=="browser_close" && !failed {
+            f.browser_page=Value::Null;f.epoch+=1;
         } else if !failed && !page.is_null() {
             if !f.browser_page.is_null() && (page["browser_session_id"]!=f.browser_page["browser_session_id"] || page["page_id"]!=f.browser_page["page_id"] || page["page_epoch"]!=f.browser_page["page_epoch"]) {
-                f.epoch+=1;f.current_visual_artifact_ids.clear();f.visual_check_result=Value::Null;
+                f.epoch+=1;
             }
             f.browser_page=page.clone();
         }
@@ -1747,7 +1819,9 @@ impl WorkScheduler {
                 if result["view_original"]==true {f.visual_original_artifact_ids.push(id.to_owned());}
                 if name=="browser_screenshot" {
                     let artifact=&result["visual_artifact"];
-                    f.browser_page=json!({"browser_session_id":artifact["browser_session_id"],"page_id":artifact["page_id"],"page_epoch":artifact["page_epoch"],"url":artifact["url"],"viewport":artifact["viewport"]});
+                    if page.is_null() {
+                        f.browser_page=json!({"browser_session_id":artifact["browser_session_id"],"page_id":artifact["page_id"],"page_epoch":artifact["page_epoch"],"url":artifact["url"],"viewport":artifact["viewport"]});
+                    }
                     if artifact["artifact_id"]==id {
                         f.current_visual_artifact_ids.clear();f.current_visual_artifact_ids.push(id.to_owned());
                     }
@@ -1761,8 +1835,6 @@ impl WorkScheduler {
                     f.epoch += 1;
                     f.checked.clear();
                     f.http_check_samples.clear();
-                    f.current_visual_artifact_ids.clear();
-                    f.visual_check_result=Value::Null;
                 }
                 f.versions.insert(file.clone(), hash.to_owned());
                 if matches!(name, "edit_file" | "replace_range" | "write_file") && result["changed"] == true {
@@ -1772,8 +1844,6 @@ impl WorkScheduler {
                     f.rounds_without_change = 0;
                     f.reviewed_without_change = 0;
                     f.writes.insert(file, json!({"code_hash": hash, "changes": result["changes"], "material": result["notebook_material"]}));
-                    f.current_visual_artifact_ids.clear();
-                    f.visual_check_result=Value::Null;
                 }
             }
         }
@@ -1827,7 +1897,11 @@ impl WorkScheduler {
             .or_else(|| result.get("stdout")).map(|value| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())).unwrap_or_default();
         f.operations.push(json!({
             "tool": name,
+            "at":now_ms(),
             "page":page,
+            "closed_page":result["closed_page"],
+            "closed":result["closed"],
+            "title":result["title"],
             "path": file,
             "program":if name=="run_program" {result.get("program")} else {None},
             "args":if name=="run_program" {result.get("args")} else {None},
@@ -1888,8 +1962,6 @@ impl WorkScheduler {
             f.epoch += 1;
             f.checked.clear();
             f.http_check_samples.clear();
-            f.current_visual_artifact_ids.clear();
-            f.visual_check_result=Value::Null;
             f.versions = versions.clone();
         }
     }
@@ -1950,6 +2022,7 @@ impl WorkScheduler {
             // only by done/execution_status above.
             "outcome": args.get("outcome").cloned().unwrap_or(Value::Null),
             "summary": args["summary"],
+            "reason": worker_result_field(args,"reason").cloned().unwrap_or(Value::Null),
             // Keep the submitted return intact. Context projections and host
             // observations must never replace what the Worker actually said.
             "worker_return": args,
@@ -1982,6 +2055,44 @@ impl WorkScheduler {
             for id in manifest["selected_artifact_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 if !frame.seen_visual_artifact_ids.iter().any(|old|old==id) {frame.seen_visual_artifact_ids.push(id.to_owned());}
             }
+        }
+    }
+
+    pub fn visual_input_ids(&self) -> Vec<String> {
+        let Some(frame)=self.frame() else {return vec![];};
+        let mut selected=frame.visual_artifact_ids.iter().rev().filter(|id|!frame.seen_visual_artifact_ids.contains(id))
+            .take(crate::visual_artifacts::MAX_IMAGES).cloned().collect::<Vec<_>>();
+        if selected.is_empty() {return selected;}
+        // A new selected image may need the previous successful image as its
+        // comparison context. Failed/unavailable requests are never retried here.
+        for id in frame.visual_artifact_ids.iter().rev() {
+            if selected.len()>=crate::visual_artifacts::MAX_IMAGES {break;}
+            if !selected.contains(id) && frame.visual_requests.iter().rev().find(|request|
+                request["selected_artifact_ids"].as_array().is_some_and(|ids|ids.iter().any(|item|item.as_str()==Some(id.as_str()))))
+                    .is_some_and(|request|matches!(request["status"].as_str(),Some("direct"|"fallback"))) {
+                selected.push(id.clone());
+            }
+        }
+        selected.sort_by_key(|id|frame.visual_artifact_ids.iter().position(|item|item==id));
+        selected
+    }
+
+    pub fn visual_response_failed(&mut self, manifest:&Value, error:&str) {
+        if manifest["status"] == "no_images" { return; }
+        let mut failed = manifest.clone();
+        failed["dispatch_status"] = manifest["status"].clone();
+        failed["status"] = json!("request_failed");
+        failed["error"] = json!(error);
+        if let Some(frame) = self.frames.get_mut(&self.current) {
+            frame.visual_requests.push(failed.clone());
+            // Record the attempt so a failed image is not silently retried.
+            // Worker may explicitly select it again with view_image.
+            for id in manifest["selected_artifact_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if !frame.seen_visual_artifact_ids.iter().any(|old|old==id) {frame.seen_visual_artifact_ids.push(id.to_owned());}
+            }
+            frame.visual_check_result = json!({"assessment":"unavailable","actor":"worker","identity":manifest["identity"],
+                "artifact_ids":manifest["selected_artifact_ids"],"checked_goal":manifest["checked_goal"],
+                "model_route":manifest["model_route"],"input_mode":"request_failed","visual_request":failed,"limitations":[error]});
         }
     }
 
@@ -2043,6 +2154,26 @@ impl WorkScheduler {
         if !self.finished { self.handoff = Some(output.clone()); }
     }
 
+    /// Carry the immediately preceding invocation's result and material index,
+    /// even when the Organizer didn't declare a dependency. This is context,
+    /// not a success receipt or an implicit import of another node's source.
+    fn previous_step(&self)->Option<Value> {
+        let ordered=self.execution_order();
+        let position=ordered.iter().position(|frame|frame.order.id==self.current)?;
+        let previous=ordered[..position].iter().rev().find(|frame|frame.status!=WorkStatus::Ready)?;
+        let result=previous.output.as_ref().map(|output| {
+            let mut result=self.compact_current_result(previous,output);
+            result.as_object_mut().unwrap().remove("worker_return");
+            result
+        });
+        Some(json!({"work_id":previous.order.id,"node_id":previous.order.node_id,"revision":previous.order.revision,
+            "goal":previous.order.goal,"status":self.path_status(previous),"returned":previous.output.is_some(),
+            "historical":previous.invalidated_by_plan_revision.is_some(),"result":result,
+            "latest_report":previous.progress.last(),"material_directory":previous.source_selection["materials"],
+            "result_reference":{"method":"read_task_result","work_id":previous.order.id},
+            "note":"A report is intent, not a returned result. Material references require version-checked notebook recall; historical results do not establish current resource availability."}))
+    }
+
     pub fn worker_input(&self, human_request: &str) -> Value {
         let upstream = self.order()
             .and_then(|o| self.resolve_dependency_deliveries(o).ok())
@@ -2051,13 +2182,20 @@ impl WorkScheduler {
             "human_request": human_request,
             "request_id":self.request_started_turn,
             "goal_boundary": self.goal_boundary,
+            "main_task_goal":self.request_goal,
             "current_work": self.order(),
             "upstream_outputs": upstream,
+            "previous_step": self.previous_step(),
             "http_observations":self.worker_http_observations(),
             "done": self.done(),
             "organizer_handoff": self.frame().map(|f| &f.organizer_guidance),
             "verification_due": self.verification_due(),
             "actual_operations": self.frame().map(|f| &f.operations),
+            // Image blocks are transient, but their dispatch bindings and
+            // failures remain available for later tool/return decisions.
+            "visual_artifact_ids":self.frame().map(|f|&f.visual_artifact_ids),
+            "visual_requests":self.frame().map(|f|&f.visual_requests),
+            "visual_check_result":self.frame().map(|f|&f.visual_check_result),
             "check_failures": self.frame().map(|f| &f.check_errors),
             "source_epoch": self.frame().map(|f| f.epoch),
             "outstanding_checks": self.frame().map(|frame| frame.order.checks.iter().filter(|check| frame.status != WorkStatus::Done
@@ -2103,8 +2241,53 @@ impl WorkScheduler {
         }).collect()
     }
 
-    /// Host-owned browser resource state, independent of which task produced it.
+    /// Latest recorded observations for each task-owned page, whether or not a
+    /// file was uploaded. These are tool facts, not a live browser inventory.
     fn current_browser_state(&self) -> Vec<Value> {
+        let mut pages=BTreeMap::<String,Value>::new();
+        for frame in self.execution_order() {
+            // Saved frames retain the page even after bounded operations expire.
+            let page=if browser_page_key(&frame.browser_page).is_some() {&frame.browser_page}
+                else if let Some(read)=frame.browser_current_read.as_ref().filter(|read|browser_page_key(&read["page"]).is_some()) {&read["page"]}
+                else if let Some(receipt)=frame.browser_upload_receipt.as_ref() {&receipt.page}
+                else {&Value::Null};
+            if let Some(key)=browser_page_key(page) {
+                let operation=frame.operations.iter().rev().find(|operation|operation["failed"]!=true
+                    && browser_page_key(&operation["page"]).as_ref()==Some(&key));
+                let read=frame.browser_current_read.as_ref().filter(|read|Self::page_matches(&read["page"],page));
+                let observed_at=operation.and_then(|operation|operation.get("at")).filter(|at|at.is_u64()).cloned()
+                    .or_else(||read.map(|read|read["observed_at"].clone())).unwrap_or(Value::Null);
+                let previous=pages.get(&key).filter(|previous|previous["page"]["url"]==page["url"]);
+                let title=frame.operations.iter().rev().find(|operation|operation["failed"]!=true
+                    &&browser_page_key(&operation["page"]).as_ref()==Some(&key)&&operation["page"]["url"]==page["url"]&&operation["title"].is_string())
+                    .map(|operation|operation["title"].clone())
+                    .or_else(||previous.map(|previous|previous["title"].clone())).unwrap_or(Value::Null);
+                pages.insert(key,json!({"page":page,"title":title,"observed_at":observed_at,
+                    "observation":"page_returned","live_availability":{"available":null,"reason":"not_checked"},
+                    "observed_by":{"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision},
+                    "last_tool":operation.map(|operation|operation["tool"].clone()),
+                    "source":"recorded browser tool page; no upload is required to retain this observation"}));
+            }
+            for (index,operation) in frame.operations.iter().enumerate().filter(|(_,operation)|operation["tool"]=="browser_close"
+                &&operation["failed"]!=true&&operation["closed"]==true) {
+                if let Some(key)=browser_page_key(&operation["closed_page"]) {
+                    if frame.operations[index+1..].iter().any(|later|later["failed"]!=true
+                        &&browser_page_key(&later["page"]).as_ref()==Some(&key)) {continue;}
+                    let state=pages.entry(key).or_insert_with(||json!({"page":operation["closed_page"]}));
+                    state["observation"]=json!("closed");
+                    state["observed_at"]=operation["at"].clone();
+                    state["last_tool"]=json!("browser_close");
+                    state["observed_by"]=json!({"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision});
+                    state["live_availability"]=json!({"available":false,"reason":"explicit_browser_close"});
+                }
+            }
+        }
+        pages.into_values().collect()
+    }
+
+    /// Upload observations are separate from page observations. An empty list
+    /// only means no active upload record is retained, not that no page exists.
+    fn current_browser_uploads(&self) -> Vec<Value> {
         let mut states = Vec::new();
         for (page_key, attempt_id) in &self.active_browser_uploads {
             let Some(producer) = self.frames.values().find(|frame| frame.browser_upload_receipt.as_ref().is_some_and(|receipt|
@@ -2137,7 +2320,9 @@ impl WorkScheduler {
 
     /// Shared raw host observations and current resource availability.
     pub fn current_facts(&self) -> Value {
-        json!({"http_observations":self.http_observations(),"browser":self.current_browser_state()})
+        json!({"http_observations":self.http_observations(),"browser":self.current_browser_state(),
+            "browser_uploads":self.current_browser_uploads(),
+            "browser_scope":"Recorded task-owned page observations, not a fresh browser inventory. An empty browser list means no page observation was retained; an empty browser_uploads list means no active upload record was retained. Neither proves there is no open page. live_availability.available=null means not checked."})
     }
 
     /// Time of the newest host-recorded fact on a node. Observer advice written
@@ -2179,14 +2364,15 @@ impl WorkScheduler {
         json!({"work_id":work_id,"node_id":frame.order.node_id,"revision":frame.order.revision,"status":self.path_status(frame),
             "started_at":frame.started_at,"returned_at":frame.returned_at,
             "process_observation_sampled_at":frame.project_observation["sampled_at"],
-            "result":output.map(|output| json!({"summary":output["summary"],"outcome":output["outcome"],"limitations":output["limitations"]})),
+            "result":output.map(|output| json!({"summary":output["summary"],"outcome":output["outcome"],"limitations":output["limitations"],
+                "reason":worker_result_field(output,"reason"),"blocked":worker_result_field(output,"blocked"),"need_split":worker_result_field(output,"need_split")})),
             "exported_data":exported,"reports":frame.progress,"checks":checks,"http_observations":http,"processes":processes,
             "browser":{"page":frame.browser_page,"upload":upload,"current_read":read},
             "operations":frame.operations.iter().rev().take(8).rev().map(|operation| organizer_compact(operation, 0)).collect::<Vec<_>>(),
             "superseded":frame.superseded,"latest_fact_at":self.latest_fact_at(work_id)})
     }
 
-    fn execution_narrative(&self, ordered: &[&WorkFrame], omitted: usize, http: &[Value], browser: &[Value]) -> (String,usize) {
+    fn execution_narrative(&self, ordered: &[&WorkFrame], omitted: usize, http: &[Value], browser: &[Value], uploads: &[Value]) -> (String,usize) {
         let mut lines = vec!["Execution path in actual invocation order. A done node records a Worker return; it does not assert that the user goal passed.".to_owned()];
         if omitted > 0 { lines.push(format!("Earlier range 1-{omitted} omitted; use the flow directory page or read a sealed result by work_id.")); }
         for (index, frame) in ordered.iter().enumerate().skip(omitted) {
@@ -2202,6 +2388,10 @@ impl WorkScheduler {
                         output["outcome"].as_str().unwrap_or("reported"),limited(summary.unwrap_or("no summary"),420)));
                     for limitation in output["limitations"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                         lines.push(format!("  Worker-reported limitation: {}",limited(limitation,240)));
+                    }
+                    if let Some(reason)=worker_result_field(output,"reason").filter(|value|!value.is_null()) {
+                        let text=reason.as_str().map(str::to_owned).unwrap_or_else(||reason.to_string());
+                        lines.push(format!("  Worker-reported reason: {} (full value: read_task_result).",limited(&text,420)));
                     }
                 }
                 for operation in frame.operations.iter().rev().take(6).rev() {
@@ -2235,6 +2425,11 @@ impl WorkScheduler {
             }
         }
         for state in browser {
+            lines.push(format!("Recorded browser page observation at {}: page={}, observation={}, live_availability={} (null means not checked). This page record is independent of uploads.",
+                state["observed_at"].as_u64().map(ms_label).unwrap_or_else(||"unknown time".to_owned()),
+                state["page"]["url"].as_str().unwrap_or("unknown"),state["observation"],state["live_availability"]["available"]));
+        }
+        for state in uploads {
             let loaded = &state["document_loaded"];
             lines.push(format!("Host browser observation at {}: page={}, document={}, load_status={}, slides={}, upload_attempt={}, session_available={}",
                 state["read_at"].as_u64().map(ms_label).unwrap_or_else(||"unknown time".to_owned()),
@@ -2267,6 +2462,8 @@ impl WorkScheduler {
                 "summary":if current {Value::Null}else{output.map(|value|json!(limited(value["summary"].as_str().unwrap_or(""),420))).unwrap_or(Value::Null)},
                 "summary_omitted_chars":if current {Value::Null}else{output.and_then(|value|value["summary"].as_str()).map(|value|json!(value.chars().count().saturating_sub(420))).unwrap_or(Value::Null)},
                 "limitations":if current {Value::Null}else{output.map(|value|organizer_compact(&value["limitations"],0)).unwrap_or(Value::Null)},
+                "reason":if current {Value::Null}else{output.and_then(|value|worker_result_field(value,"reason")).map(|value|organizer_compact(value,0)).unwrap_or(Value::Null)},
+                "blocked":if current {Value::Null}else{output.and_then(|value|worker_result_field(value,"blocked")).cloned().unwrap_or(Value::Null)},
                 "returned_at":frame.returned_at,
                 "result_reference":if current {json!({"method":"current_result"})}else if is_current_work {json!({"method":"current_work","detail":"Worker has not returned"})}
                     else {json!({"method":"read_task_result","work_id":frame.order.id})},
@@ -2280,8 +2477,9 @@ impl WorkScheduler {
                 "finding_ids":if current {Value::Null}else{output.map(|value|value["finding_ids"].clone()).unwrap_or(Value::Null)}})
         }).collect::<Vec<_>>();
         let current_browser_state=self.current_browser_state();
+        let current_browser_uploads=self.current_browser_uploads();
         let http_observations=self.http_observations();
-        let (execution_narrative,execution_narrative_omitted_chars)=self.execution_narrative(&ordered,omitted_steps,&http_observations,&current_browser_state);
+        let (execution_narrative,execution_narrative_omitted_chars)=self.execution_narrative(&ordered,omitted_steps,&http_observations,&current_browser_state,&current_browser_uploads);
         let mut delivery_catalog=self.frames.values().filter(|frame|self.effectively_done(frame)&&frame.invalidated_by_plan_revision.is_none())
             .filter_map(|frame|frame.output.as_ref().map(|output|{
                 let exported=self.filtered_export_data(frame,&output["exported_data"]);
@@ -2313,9 +2511,22 @@ impl WorkScheduler {
         let handoff=self.handoff.as_ref().filter(|handoff|current_output.is_none_or(|output|!handoff_matches_current_output(handoff,output)))
             .map(organizer_handoff);
         let current_work=self.order().map(|order|json!({"id":order.id,"node_id":order.node_id,"revision":order.revision,
-            "goal":order.goal,"return_when":order.done_when,"completion":order.completion,"constraints":order.constraints}));
+            "goal":order.goal,"return_when":order.done_when,"completion":order.completion,"constraints":order.constraints,
+            "material_directory":self.frame().map(|frame|&frame.source_selection["materials"])}));
         json!({
             "schema_version":WORK_SCHEDULER_SCHEMA_VERSION,
+            "main_task":self.main_task_summary(),
+            "previous_main_tasks":self.archived_requests.iter().rev().take(1).map(|archive|{
+                let mut summary=archive.scheduler.get("main_task").cloned().unwrap_or_else(||
+                    serde_json::from_value::<WorkScheduler>(archive.scheduler.clone()).map(|scheduler|scheduler.main_task_summary()).unwrap_or(Value::Null));
+                if summary.is_object() {
+                    summary["historical"]=json!(true);
+                    summary["history_reference"]=json!({"source":"historical Flow summaries and version-checked task notebook",
+                        "note":"read_task_result addresses the current human goal, not archived human goals"});
+                    for step in summary["steps"].as_array_mut().into_iter().flatten() {step.as_object_mut().unwrap().remove("result_reference");}
+                }
+                summary
+            }).collect::<Vec<_>>(),
             "current_work": current_work,
             "request_id":self.request_started_turn,
             "current_node": self.node(),
@@ -2328,8 +2539,11 @@ impl WorkScheduler {
             "execution_narrative_reference":{"method":"read_flow_page","then":"read_task_result(work_id, fields) for full node details"},
             "execution_path": execution_path,
             "flow_directory":self.flow_directory_page(0,50),
-            "current_facts":{"http_observations":http_observations,"browser":current_browser_state},
+            "current_facts":self.current_facts(),
             "available_dependency_deliveries":delivery_catalog,
+            "resumable_tasks":self.frames.values().filter(|frame|frame.invalidated_by_plan_revision.is_none()&&frame.status!=WorkStatus::Done)
+                .map(|frame|json!({"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision,
+                    "goal":frame.order.goal,"current":frame.order.id==self.current})).collect::<Vec<_>>(),
             "available_revisit_targets":available_revisit_targets,
             "browser_upload_availability":upload_availability,
             "recent_rewinds":self.rewind_records.iter().rev().take(4).map(|rewind|json!({"source_node":rewind.source_node,
@@ -2371,6 +2585,8 @@ impl WorkScheduler {
                 "summary":if current {Value::Null}else{summary.map(|value|json!(limited(value,240))).unwrap_or(Value::Null)},
                 "summary_omitted_chars":if current {Value::Null}else{summary.map(|value|json!(value.chars().count().saturating_sub(240))).unwrap_or(Value::Null)},
                 "limitation_count":if current {Value::Null}else{output.and_then(|value|value["limitations"].as_array().map(|items|json!(items.len()))).unwrap_or(Value::Null)},
+                "reason":if current {Value::Null}else{output.and_then(|value|worker_result_field(value,"reason")).map(|value|organizer_compact(value,0)).unwrap_or(Value::Null)},
+                "blocked":if current {Value::Null}else{output.and_then(|value|worker_result_field(value,"blocked")).cloned().unwrap_or(Value::Null)},
                 "material_ids":if current {Value::Null}else{output.map(|value|value["material_ids"].clone()).unwrap_or(Value::Null)},
                 "finding_ids":if current {Value::Null}else{output.map(|value|value["finding_ids"].clone()).unwrap_or(Value::Null)},
                 "detail_reference":if current {json!({"method":"current_result"})}else if is_current_work {json!({"method":"current_work","detail":"Worker has not returned"})}
@@ -2418,16 +2634,19 @@ impl WorkScheduler {
         }.ok_or_else(||anyhow::anyhow!("requested task result is not an active sealed delivery"))?;
         let output=frame.output.as_ref().ok_or_else(||anyhow::anyhow!("sealed task has no saved output"))?;
         let requested_fields=args["fields"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
-        let default_fields=["summary","outcome","limitations","findings","material_ids","finding_ids","exported_data","checks",
+        let default_fields=["summary","outcome","reason","blocked","need_split","limitations","findings","material_ids","finding_ids","exported_data","checks",
             "visual_artifact_ids","visual_check_result","upstream_problem","suggested_children"];
         let fields=if requested_fields.is_empty(){default_fields.as_slice()}else{requested_fields.as_slice()};
         let exported=&output["exported_data"];
         let mut selected=json!({});
         for field in fields {
             ensure!(!matches!(*field,"operations"|"versions"|"modified_files"|"raw_output"),"field_path=fields: '{field}' is stored as a material; retrieve it from the notebook by ID");
-            let value=output.get(field).or_else(||exported.get(field))
-                .ok_or_else(||anyhow::anyhow!("field_path=fields: '{field}' is not present in this delivery"))?;
-            selected[field]=value.clone();
+            let value=worker_result_field(output,field).or_else(||exported.get(field));
+            if let Some(value)=value {selected[field]=value.clone();}
+            else if matches!(*field,"reason"|"blocked"|"need_split") {
+                // Older persisted returns may omit these optional fields.
+                selected[field]=Value::Null;
+            } else {anyhow::bail!("field_path=fields: '{field}' is not present in this delivery");}
         }
         let resource_availability=exported.get("browser_upload_receipt").map(|receipt|{
             browser_upload_status_key(receipt).and_then(|key|self.browser_upload_availability.get(&key)).cloned()
@@ -2698,6 +2917,7 @@ impl WorkScheduler {
             },
             "finish" | "blocked" => {
                 let blocked = decision["action"] == "blocked";
+                self.request_unresolved=decision["unresolved"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
                 self.finish(decision["summary"].as_str().unwrap_or(""), blocked)
             },
             other => anyhow::bail!("unrecognized Organizer action: {other}"),
@@ -3042,7 +3262,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_work_can_include_checks_and_expire_after_page_interaction() {
+    fn visual_work_preserves_observations_after_page_interaction() {
         let mut scheduler=WorkScheduler::default();let mut order=output_order();order.visual_goal=Some("confirm rendered slide".into());
         order.completion=Completion::WriteCheck;order.edit_targets=vec!["slide.ts".into()];order.checks=vec!["npm:.:test".into()];
         scheduler.enqueue(vec![order],true,true).unwrap();scheduler.activate_next().unwrap();
@@ -3050,7 +3270,7 @@ mod tests {
         scheduler.frames.get_mut(&scheduler.current).unwrap().visual_check_result=json!({"assessment":"pass"});
         let epoch=scheduler.frame().unwrap().epoch;
         scheduler.observe("browser_press_key",&json!({"key":"Delete"}),&json!({"page":{"page_id":"p","page_epoch":2}}),false);
-        assert_eq!(scheduler.frame().unwrap().epoch,epoch+1);assert!(scheduler.frame().unwrap().visual_check_result.is_null());
+        assert_eq!(scheduler.frame().unwrap().epoch,epoch+1);assert_eq!(scheduler.frame().unwrap().visual_check_result["assessment"],"pass");
         let returned=scheduler.return_work(&json!({"summary":"captured","status":"done","limitations":["当前页面截图已捕获，但没有绑定到此版本的视觉判断"]})).unwrap();
         assert_eq!(returned["done"],true);assert!(returned.get("expectation_met").is_none());
     }
@@ -4036,7 +4256,7 @@ mod tests {
         scheduler.browser_upload_availability.insert(key("a2","s-new"),json!({"available":true,"reason":"active_session_page_and_upload_attempt_match","page_epoch":1}));
 
         let input=scheduler.organizer_input();
-        let state=&input["current_facts"]["browser"][0];
+        let state=&input["current_facts"]["browser_uploads"][0];
         assert_eq!(state["document_loaded"]["slides_detected"],8);
         assert_eq!(state["uploaded_by"]["producer_deprecated"],true);
         assert_eq!(state["read_by_work_id"],"inspect");

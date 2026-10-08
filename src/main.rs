@@ -23,6 +23,7 @@ mod plugin_builtin;
 mod plugin_runtime;
 mod proxy_log;
 mod request_context;
+mod session_history;
 mod task_notebook;
 mod flow_tree;
 mod python_index;
@@ -50,6 +51,7 @@ mod ts_index;
 mod upstream;
 mod vision_preprocess;
 mod visual_artifacts;
+mod visual_probe;
 #[cfg(test)]
 mod visual_tests;
 
@@ -105,6 +107,12 @@ async fn run_server(listener: TcpListener, workspace: Arc<Workspace>) -> anyhow:
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_timer(ChinaTime).init();
+
+    if env::args().any(|arg| arg == "--probe-image-input") {
+        let result = ai_proxy::probe_default_image_input(&ai_proxy::dsh_config_path()).await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
 
     let workspace_root = env::var("WORKSPACE_ROOT")
         .map(PathBuf::from)

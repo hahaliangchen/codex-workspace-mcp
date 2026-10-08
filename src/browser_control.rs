@@ -546,30 +546,48 @@ async fn describe_file_inputs(cdp:&mut CdpConnection,node_ids:Vec<Value>)->Resul
     Ok(candidates)
 }
 
-fn ensure_capture_stable(before:&Value,after:&Value)->Result<()> {
-    ensure!(before==after,"page changed during capture; visual ownership/state is uncertain, retry a focused capture");
-    Ok(())
+fn capture_observation(before:&Value,after:&Value)->Value {
+    let snapshot=|state:&Value| if state.is_null() {Value::Null} else {
+        json!({"url":state["url"],"viewport":state["viewport"],"document_epoch":state["document_epoch"],
+            "ready":state["ready"],"dom_hash":state["dom"].as_str().map(|dom|crate::visual_artifacts::hash(dom.as_bytes()))})
+    };
+    json!({"before":snapshot(before),"after":snapshot(after)})
 }
 
 async fn screenshot(root:&Path,context:&crate::visual_artifacts::VisualContext,session:&mut Session,full_page:bool)->Result<Value> {
-    let before=page_state(&session.ws).await?;
-    if !session.signature.is_null() && session.signature!=before {session.epoch+=1;}
-    session.signature=before.clone();
+    let before_result=page_state(&session.ws).await;
+    let before=before_result.as_ref().ok().cloned().unwrap_or(Value::Null);
+    if !before.is_null() {
+        if !session.signature.is_null() && session.signature!=before {session.epoch+=1;}
+        session.signature=before.clone();
+    }
+    let captured_page_epoch=session.epoch;
     let mut options=json!({"format":"png","captureBeyondViewport":full_page});
     if full_page {
         let layout=call(&session.ws,"Page.getLayoutMetrics",json!({})).await?;let size=&layout["result"]["cssContentSize"];
         options["clip"]=json!({"x":0,"y":0,"width":size["width"],"height":size["height"],"scale":1});
     }
+    let capture_started_at=crate::visual_artifacts::now();
     let shot = call(&session.ws, "Page.captureScreenshot", options).await?;
+    let capture_finished_at=crate::visual_artifacts::now();
     let data = shot.pointer("/result/data").and_then(Value::as_str).context("screenshot missing")?;
     let bytes = base64_decode(data)?;
-    let after=page_state(&session.ws).await?;
-    ensure_capture_stable(&before,&after)?;
+    let after_result=page_state(&session.ws).await;
+    let after=after_result.as_ref().ok().cloned().unwrap_or(Value::Null);
+    let mut observation=capture_observation(&before,&after);
+    observation["before_error"]=before_result.err().map(|error|json!(error.to_string())).unwrap_or(Value::Null);
+    observation["after_error"]=after_result.err().map(|error|json!(error.to_string())).unwrap_or(Value::Null);
+    if !after.is_null() {
+        if !session.signature.is_null() && session.signature!=after {session.epoch+=1;}
+        session.signature=after.clone();
+    }
     session.capture_seq+=1;
     let display_mode=if session.visible{"visible_window"}else{"headless"};
-    let artifact=crate::visual_artifacts::save(root,context,json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,
-        "capture_seq":session.capture_seq,"url":before["url"],"viewport":before["viewport"],"full_page":full_page,"display_mode":display_mode}),&bytes)?;
-    Ok(json!({"artifact_id":artifact["artifact_id"],"visual_artifact":artifact,"captured":true,"display_mode":display_mode,"page":{"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":before["url"]},"visual_assessment":"not_evaluated","guidance":"Capture succeeded; this does not prove the rendered result passed a visual check."}))
+    let artifact=crate::visual_artifacts::save(root,context,json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":captured_page_epoch,
+        "capture_seq":session.capture_seq,"captured_at":capture_finished_at,"capture_started_at":capture_started_at,"capture_finished_at":capture_finished_at,
+        "url":before["url"],"viewport":before["viewport"],"page_observations":observation,"full_page":full_page,"display_mode":display_mode}),&bytes)?;
+    Ok(json!({"artifact_id":artifact["artifact_id"],"visual_artifact":artifact,"captured":true,"display_mode":display_mode,
+        "page":{"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":after["url"],"viewport":after["viewport"]}}))
 }
 
 async fn launch(visible:bool) -> Result<Session> {
@@ -803,11 +821,15 @@ mod tests {
     }
 
     #[test]
-    fn page_change_during_capture_is_uncertain() {
+    fn page_change_during_capture_is_recorded() {
         let before=json!({"url":"http://localhost/","dom":"old"});
         let after=json!({"url":"http://localhost/","dom":"new"});
-        assert!(ensure_capture_stable(&before,&after).unwrap_err().to_string().contains("uncertain"));
-        assert!(ensure_capture_stable(&before,&before).is_ok());
+        let observation=capture_observation(&before,&after);
+        assert_eq!(observation["before"]["url"],before["url"]);
+        assert_eq!(observation["after"]["url"],after["url"]);
+        assert_ne!(observation["before"]["dom_hash"],observation["after"]["dom_hash"]);
+        let unchanged=capture_observation(&before,&before);
+        assert_eq!(unchanged["before"],unchanged["after"]);
     }
 
     #[test]

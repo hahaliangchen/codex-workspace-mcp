@@ -511,6 +511,14 @@ impl ObserverInbox {
         messages.sort_by_key(|item|item["id"].as_str().and_then(|id|id.strip_prefix("advice_")).and_then(|id|id.parse::<usize>().ok()).unwrap_or(0));
         messages
     }
+    pub fn message_cursor(&self)->usize {self.counter}
+    pub fn messages_since(&self,cursor:usize)->Vec<Value> {
+        let number=|item:&Value|item["id"].as_str().and_then(|id|id.strip_prefix("advice_"))
+            .and_then(|id|id.parse::<usize>().ok()).unwrap_or(0);
+        let mut messages=self.items.values().filter(|item|item["request_id"]==self.request_id&&number(item)>cursor)
+            .cloned().collect::<Vec<_>>();
+        messages.sort_by_key(number);messages
+    }
     pub fn historical(&self)->Vec<Value> {
         self.items.values().filter(|item|item["request_id"]==self.request_id && item["archived"]==true).rev().take(4).cloned().collect()
     }

@@ -21,7 +21,7 @@ fn images(body:&Value)->Vec<Vec<u8>> {body["messages"].as_array().into_iter().fl
 fn manifest(body:&Value)->Value {body["messages"].as_array().into_iter().flatten().filter_map(|message|message["content"].as_str()).find_map(|text|text.strip_prefix("Host visual dispatch: ")).map(|text|serde_json::Deserializer::from_str(text).into_iter::<Value>().next().unwrap().unwrap()).unwrap_or(Value::Null)}
 fn check(dispatch:&Value)->Value {
     let selected=dispatch["images"].as_array().into_iter().flatten().collect::<Vec<_>>();
-    let current=selected.iter().rev().find(|image|image["current_result"]==true).or_else(||selected.last());
+    let current=selected.last();
     let observed=current.map(|image|vec![json!({"artifact_id":image["artifact_id"],"region":"viewport","fact":"fixture image was supplied"})]).unwrap_or_default();
     json!({"artifact_ids":selected.iter().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
     "checked_goal":dispatch["checked_goal"],"expected_visible_result":"a visible slide fixture","request_trace_id":dispatch["request_trace_id"],"assessment":"pass",
@@ -111,6 +111,7 @@ async fn unavailable_visual_message_survives_worker_restore_and_observer_http() 
     assert!(!body.to_string().contains("Return now with yield_work"),"a capability diagnostic does not decide when Worker must stop unrelated work");
     scheduler.visual_response_received(&dispatch);
     let mut restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+    assert_eq!(restored.worker_input("check slide")["visual_requests"][0],dispatch,"later Worker requests retain the actual image dispatch without resending pixels");
     let worker_check=json!({"assessment":"unavailable","request_trace_id":dispatch["request_trace_id"],"checked_goal":"check slide","artifact_ids":[id],"limitations":["No image input was sent"]});
     let checked=visual::validate_check(&root.0,&ctx,&worker_check,&restored.frame().unwrap().visual_requests,"worker").unwrap();
     assert_eq!(checked["visual_request"],dispatch);assert_eq!(checked["input_mode"],"unknown_capability");assert_eq!(checked["model_route"],dispatch["model_route"]);
@@ -132,7 +133,7 @@ async fn unavailable_visual_message_survives_worker_restore_and_observer_http() 
 }
 
 #[tokio::test]
-async fn visual_pass_requires_a_current_image_and_a_fact_from_it() {
+async fn visual_reports_keep_capture_facts_when_page_or_source_changes() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut before=context("task");before.execution_epoch=0;before.related_source_versions=json!({"src/app.ts":"v1"});
     let old=visual::save(&root.0,&before,json!({"browser_session_id":"session","page_id":"page","page_epoch":1}),&png(80,60)).unwrap()["artifact_id"].as_str().unwrap().to_owned();
@@ -140,25 +141,27 @@ async fn visual_pass_requires_a_current_image_and_a_fact_from_it() {
     let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
 
     let mut body=json!({"messages":[]});let old_only=visual::prepare_request(&state,"worker","fake-model",&current,&[old.clone()],"check slide",&mut body).await.unwrap();
-    assert_eq!(old_only["images"][0]["current_result"],false,"restoring the pre-navigation screenshot does not refresh its host binding: {old_only}");
-    assert!(visual::validate_check(&root.0,&current,&check(&old_only),&[old_only],"worker").is_err(),"an old image alone cannot prove the current page");
+    assert_eq!(old_only["images"][0]["page_epoch"],1);
+    assert_eq!(old_only["current_page"]["page_epoch"],2);
+    assert!(visual::validate_check(&root.0,&current,&check(&old_only),&[old_only],"worker").is_ok(),"the model decides how to use the earlier capture");
 
     let latest=visual::save(&root.0,&current,json!({"browser_session_id":"session","page_id":"page","page_epoch":2}),&png(80,60)).unwrap()["artifact_id"].as_str().unwrap().to_owned();
     let mut body=json!({"messages":[]});let comparison=visual::prepare_request(&state,"worker","fake-model",&current,&[old.clone(),latest.clone()],"check slide",&mut body).await.unwrap();
-    assert_eq!(comparison["images"][0]["current_result"],false);assert_eq!(comparison["images"][1]["current_result"],true);
+    assert_eq!(comparison["images"][0]["page_epoch"],1);assert_eq!(comparison["images"][1]["page_epoch"],2);
     let mut valid=check(&comparison);valid["observed_facts"].as_array_mut().unwrap().push(json!({"artifact_id":old,"region":"before","fact":"historical comparison image"}));
-    assert!(visual::validate_check(&root.0,&current,&valid,&[comparison.clone()],"worker").is_ok(),"before/after comparison remains valid when a fact cites the current result");
+    assert!(visual::validate_check(&root.0,&current,&valid,&[comparison.clone()],"worker").is_ok(),"before/after observations are preserved");
     valid["observed_facts"]=json!([{"artifact_id":old,"region":"before","fact":"historical comparison image"}]);
-    assert!(visual::validate_check(&root.0,&current,&valid,&[comparison],"worker").is_err(),"historical facts alone cannot establish the current result");
+    assert!(visual::validate_check(&root.0,&current,&valid,&[comparison],"worker").is_ok(),"the host does not judge the sufficiency of historical facts");
 
     let mut changed=current.clone();changed.execution_epoch=2;changed.related_source_versions=json!({"src/app.ts":"v2"});
     let mut body=json!({"messages":[]});let restored=visual::prepare_request(&state,"worker","fake-model",&changed,&[latest],"check slide",&mut body).await.unwrap();
-    assert_eq!(restored["images"][0]["current_result"],false,"restoring a screenshot after a source version change does not refresh its host binding");
-    assert!(visual::validate_check(&root.0,&changed,&check(&restored),&[restored],"worker").is_err());
+    assert_eq!(restored["images"][0]["related_source_versions"]["src/app.ts"],"v1");
+    assert_eq!(restored["related_source_versions"]["src/app.ts"],"v2");
+    assert!(visual::validate_check(&root.0,&changed,&check(&restored),&[restored],"worker").is_ok());
 }
 
 #[tokio::test]
-async fn fresh_capture_after_async_page_change_is_current_and_old_or_source_stale_images_are_rejected() {
+async fn captures_preserve_page_and_source_observations_without_expiry() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
     let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
@@ -175,21 +178,21 @@ async fn fresh_capture_after_async_page_change_is_current_and_old_or_source_stal
     let fresh_id=fresh["artifact_id"].as_str().unwrap().to_owned();
     let fresh_ctx=scheduler_context("task",&scheduler,"w");
     let mut body=json!({"messages":[]});let dispatch=visual::prepare_request(&state,"worker","fake-model",&fresh_ctx,&[old_id.clone(),fresh_id.clone()],"check slide",&mut body).await.unwrap();
-    assert_eq!(dispatch["images"][0]["current_result"],false,"the pre-update screenshot remains historical");
-    assert_eq!(dispatch["images"][1]["current_result"],true,"the screenshot that discovered the async DOM update is host-accepted for the received page epoch");
+    assert!(dispatch["images"][0]["page_epoch"].as_u64().unwrap()<dispatch["images"][1]["page_epoch"].as_u64().unwrap());
+    assert!(dispatch["images"][1]["page_observations"].is_object());
     let artifact=visual::metadata(&root.0,"task",&fresh_id).unwrap();
-    assert_eq!(artifact["execution_epoch"],json!(fresh["visual_artifact"]["execution_epoch"]),"acceptance is a separate host reference; screenshot metadata remains immutable");
+    assert_eq!(artifact["execution_epoch"],json!(fresh["visual_artifact"]["execution_epoch"]),"screenshot metadata remains immutable");
     assert!(fresh_ctx.execution_epoch>artifact["execution_epoch"].as_u64().unwrap() as usize,"scheduler advanced after receiving the screenshot");
 
     let mut versions=scheduler.versions();versions.insert("renderer.ts".into(),"changed-source-hash".into());scheduler.update_versions(&versions);
     let changed_ctx=scheduler_context("task",&scheduler,"w");let mut body=json!({"messages":[]});
     let restored=visual::prepare_request(&state,"worker","fake-model",&changed_ctx,&[fresh_id.clone()],"check slide",&mut body).await.unwrap();
-    assert_eq!(restored["images"][0]["current_result"],false,"a host-current screenshot loses current status after source changes");
+    assert_ne!(restored["images"][0]["related_source_versions"],restored["related_source_versions"]);
     crate::browser_control::cleanup(&root.0,"task").await;
 }
 
 #[tokio::test]
-async fn failed_capture_revokes_the_previous_images_current_result_status() {
+async fn failed_capture_preserves_previous_images() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
     scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"current slide visible","completion":"output","visual_goal":"check slide"}]}),false,false).unwrap();
@@ -199,7 +202,8 @@ async fn failed_capture_revokes_the_previous_images_current_result_status() {
     scheduler.observe("browser_screenshot",&json!({}),&json!({"error":"page changed during capture; visual ownership/state is uncertain"}),true);
     let after=scheduler_context("task",&scheduler,"w");let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
     let mut body=json!({"messages":[]});let dispatch=visual::prepare_request(&state,"worker","fake-model",&after,&[old_id],"check slide",&mut body).await.unwrap();
-    assert_eq!(dispatch["images"][0]["current_result"],false,"an uncertain capture invalidates prior visual currentness");
+    assert_eq!(dispatch["images"][0]["page_epoch"],1);
+    assert_eq!(dispatch["current_page"]["page_epoch"],1,"a failed tool call does not erase the last observed page");
 }
 
 #[tokio::test]
@@ -228,7 +232,7 @@ async fn visual_fallback_uncertain_or_incomplete_results_cannot_be_promoted_to_p
 }
 
 #[tokio::test]
-async fn saved_visual_pass_does_not_satisfy_delivery_after_source_versions_change() {
+async fn saved_visual_observation_survives_source_versions_change() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
     scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"current slide visible","completion":"output","visual_goal":"check slide"}]}),false,false).unwrap();
@@ -238,8 +242,7 @@ async fn saved_visual_pass_does_not_satisfy_delivery_after_source_versions_chang
     let mut body=json!({"messages":[]});let sent=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id],"check slide",&mut body).await.unwrap();
     let saved=visual::validate_check(&root.0,&ctx,&check(&sent),&[sent],"worker").unwrap();scheduler.frame_mut().unwrap().visual_check_result=saved.clone();
     let mut versions=scheduler.versions();versions.insert("renderer.ts".into(),"changed-source-hash".into());scheduler.update_versions(&versions);
-    assert!(scheduler.frame().unwrap().visual_check_result.is_null(),"source version update clears the cached visual result");
-    scheduler.frame_mut().unwrap().visual_check_result=saved;
+    assert_eq!(scheduler.frame().unwrap().visual_check_result,saved,"source changes do not erase the model's previous observation");
     let returned=scheduler.return_work(&json!({"summary":"A visual result exists, but it predates the current renderer source version",
         "limitations":["The current renderer version has not been visually verified"]})).unwrap();
     assert_eq!(scheduler.frame().unwrap().status,crate::work_scheduler::WorkStatus::Done);
@@ -456,4 +459,236 @@ async fn real_visual_observer_reuse_recheck() -> anyhow::Result<()> {
     let response=match response {Ok(raw)=>serde_json::from_str::<Value>(&raw)?,Err(error)=>json!({"assessment":"unavailable","error":error.to_string()})};
     let result=json!({"observer_calls":1,"worker_calls":0,"new_screenshots":0,"reused_images":2,"input_bytes":case["before"]["byte_size"].as_u64().unwrap()+case["after"]["byte_size"].as_u64().unwrap(),"elapsed_ms":start.elapsed().as_millis(),"global_config_changed":false,"response":response});
     std::fs::write(root.join("observer_recheck.json"),serde_json::to_vec_pretty(&result)?)?;println!("Real Observer reuse report: {}",root.join("observer_recheck.json").display());Ok(())
+}
+
+#[test]
+fn visual_new_input_reuses_successful_comparison_but_never_retries_failed_images() {
+    let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+    scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"compare","done_when":"report","completion":"output",
+        "checks":["http-probe: http://127.0.0.1:3000/#ignored"]}]}),false,true).unwrap();
+    assert!(scheduler.permits("http_probe",&json!({"url":"http://127.0.0.1:3000/"})).is_ok(),"declared HTTP identifier whitespace must not reject the same URL");
+    scheduler.frame_mut().unwrap().visual_artifact_ids=vec!["before".into()];
+    assert_eq!(scheduler.visual_input_ids(),vec!["before"]);
+    scheduler.visual_response_received(&json!({"status":"direct","selected_artifact_ids":["before"]}));
+    assert!(scheduler.visual_input_ids().is_empty(),"no new image means no repeated input");
+    scheduler.frame_mut().unwrap().visual_artifact_ids.push("after".into());
+    assert_eq!(scheduler.visual_input_ids(),vec!["before","after"]);
+    scheduler.visual_response_failed(&json!({"status":"direct","selected_artifact_ids":["before","after"]}),"HTTP refusal");
+    assert!(scheduler.visual_input_ids().is_empty());
+    scheduler.frame_mut().unwrap().visual_artifact_ids.push("fresh".into());
+    assert_eq!(scheduler.visual_input_ids(),vec!["fresh"],"a later failed attempt prevents automatic reuse even after earlier success");
+    let restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+    assert_eq!(restored.visual_input_ids(),scheduler.visual_input_ids());
+}
+
+#[tokio::test]
+async fn visual_http_rejection_preserves_original_reason_in_every_role_context() {
+    let root=TestRoot::new();task(&root.0,"task");let ctx=context("task");
+    let id=visual::save(&root.0,&ctx,json!({}),&png(80,60)).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    const REASON:&str="image input unsupported on model m; provider request_id=raw-rejection-42";
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move {axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(||async{(axum::http::StatusCode::BAD_REQUEST,REASON)}))).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root.0,addr);state.observer_provider_url=state.provider_url.clone();supported(&mut state);
+    let input=json!({"identity":ctx.identity,"visual_artifacts":[visual::metadata(&root.0,"task",&id).unwrap()],"request":{"goal":"check slide"}});
+    let error=agent::observer_json_response(&state,"fake-model","review",input,1000,"task",json!({})).await.unwrap_err();
+    let failure=error.downcast_ref::<crate::visual_probe::VisualModelFailure>().unwrap();
+    assert!(format!("{error:#}").contains(REASON));assert_eq!(failure.manifest["status"],"direct");
+    let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+    scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"report rendering","completion":"output"}]}),false,false).unwrap();
+    scheduler.visual_response_failed(&failure.manifest,REASON);
+    let restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+    assert_eq!(restored.frame().unwrap().visual_requests[0]["error"],REASON);
+    assert_eq!(restored.frame().unwrap().visual_check_result["limitations"][0],REASON);
+    let mut restored=restored;restored.return_work(&json!({"summary":"Screenshot exists but visual request failed","limitations":[REASON]})).unwrap();
+    assert_eq!(restored.organizer_input()["current_result"]["visual_requests"][0]["error"],REASON);
+    assert!(agent::load_observer_work_trace(&root.0,"task").unwrap().iter().any(|item|item["type"]=="visual/model_failed"&&item["error"].as_str().unwrap().contains(REASON)));
+    state.visual.capabilities.entry(String::new()).or_default().insert("fake-model".into(),visual::ImageCapability::Unsupported);
+    state.visual.fallback=Some(visual::VisualRoute{provider:"vision".into(),model:"m".into(),url:state.provider_url.clone(),api_key:String::new()});
+    let failed=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id],"check slide",&mut json!({"messages":[]})).await.unwrap();
+    assert_eq!(failed["status"],"unavailable");assert!(failed["visual_service_result"]["limitations"].to_string().contains(REASON));server.abort();
+}
+
+#[tokio::test]
+async fn visual_worker_image_rejection_returns_to_organizer_without_automatic_retry() {
+    #[derive(Default)]
+    struct Rejection { url:String, organizer:AtomicUsize, requests:Mutex<Vec<Value>> }
+    const REASON:&str="this model does not support image input; upstream-id=raw-17";
+    async fn reply(State(script):State<Arc<Rejection>>,Json(body):Json<Value>)->axum::response::Response {
+        use axum::response::IntoResponse;
+        script.requests.lock().unwrap().push(body.clone());
+        if !images(&body).is_empty() {return (axum::http::StatusCode::BAD_REQUEST,REASON).into_response();}
+        let organizer=body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="schedule_task");
+        let calls=if organizer {
+            if script.organizer.fetch_add(1,Ordering::Relaxed)==0 {
+                vec![tool("schedule","schedule_task",json!({"goal":"check slide","return_when":"report visible rendering or its actual limitation","reason":"check pixels","execution_scope":{"visual_goal":"check slide"}}))]
+            }else{
+                assert!(body["messages"].to_string().contains(REASON),"Organizer must receive the original provider rejection");
+                vec![tool("finish","finish_request",json!({"summary":"Captured the screenshot; visual inspection is unavailable.","achieved":false,"unresolved":[REASON]}))]
+            }
+        }else{vec![tool("open","browser_open",json!({"url":script.url})),tool("shot","browser_screenshot",json!({}))]};
+        Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":calls}}]})).into_response()
+    }
+    let root=TestRoot::new();task(&root.0,"task");let script=Arc::new(Rejection{url:fixture(&root.0),..Default::default()});
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();let server_script=script.clone();
+    let server=tokio::spawn(async move{axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(reply)).with_state(server_script)).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root.0,addr);supported(&mut state);
+    agent::run_task(state,"task".into(),"fake-model".into(),"Inspect canvas rendering and preserve any limitations".into(),8,CancellationToken::new(),false,1,vec![],false,false).await.unwrap();
+    assert_eq!(script.requests.lock().unwrap().iter().filter(|body|!images(body).is_empty()).count(),1,"image failures are not silently retried");
+    let conn=agent::open_db(&root.0).unwrap();
+    assert_eq!(conn.query_row("SELECT status FROM agent_tasks WHERE id='task'",[],|row|row.get::<_,String>(0)).unwrap(),"completed");
+    let final_text:String=conn.query_row("SELECT data FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1",[],|row|row.get(0)).unwrap();
+    assert!(final_text.contains(REASON),"final delivery must include the original limitation");
+    let failure:String=conn.query_row("SELECT data FROM agent_task_events WHERE kind='visual/model_failed' ORDER BY seq DESC LIMIT 1",[],|row|row.get(0)).unwrap();
+    assert!(failure.contains(REASON));assert!(!failure.contains("base64"));server.abort();
+}
+
+/// Opt-in actual Organizer/Worker/Observer task, using the existing PPT build and sample.
+/// The external PPT project is read only; reports, database and the sample copy stay here.
+#[tokio::test]
+#[ignore = "real configured provider and browser acceptance; requires PPT demo dist and sample"]
+async fn real_ppt_visual_input_six_stage_acceptance() -> anyhow::Result<()> {
+    let workspace=std::env::current_dir()?;
+    let root=workspace.join(".codex-workspace-mcp").join(format!("visual-input-e2e-{}",visual::new_id()));
+    std::fs::create_dir_all(&root)?;
+    let demo=std::env::var_os("PPT_DEMO_DIST").map(PathBuf::from).unwrap_or_else(||workspace.join("../pptx-editor-engine/dist"));
+    anyhow::ensure!(demo.join("index.html").is_file(),"existing PPT demo dist is required");
+    let fonts=reqwest::Client::new().get("http://127.0.0.1:8080/api/fonts").timeout(Duration::from_secs(5)).send().await?;
+    anyhow::ensure!(fonts.status().is_success(),"start the existing PPT font backend before real acceptance");
+    let sample=std::env::var_os("PPT_SAMPLE_PATH").map(PathBuf::from).or_else(||
+        std::fs::read_dir(demo.parent()?).ok()?.filter_map(Result::ok).map(|entry|entry.path())
+            .find(|path|path.extension().is_some_and(|ext|ext=="pptx"))).ok_or_else(||anyhow::anyhow!("PPT sample is required"))?;
+    std::fs::copy(sample,root.join("sample.pptx"))?;
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;let addr=listener.local_addr()?;
+    let server=tokio::spawn(async move{axum::serve(listener,axum::Router::new().fallback_service(tower_http::services::ServeDir::new(demo))).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root,addr);
+    let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
+    crate::ai_proxy::apply_agent_config(&mut state,&config);
+    let model=state.model_map.get(&state.default_model).cloned().unwrap_or(state.default_model.clone());
+    anyhow::ensure!(state.visual.capability(&state.provider_name,&model)==visual::ImageCapability::Supported,"run --probe-image-input first; this acceptance never guesses image support");
+    // Keep the verified route; lower reasoning for this bounded transport/rendering acceptance.
+    state.reasoning_effort=Some("low".into());state.fast_mode=false;state.enable_subagent=false;
+    let task_id="real-visual-input";task(&root,task_id);
+    let conn=agent::open_db(&root)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_context_debug(task_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0)")?;
+    conn.execute("INSERT INTO agent_context_debug(task_id,enabled) VALUES (?1,1)",[task_id])?;drop(conn);
+    let stop=CancellationToken::new();let watch_stop=stop.clone();let watch_root=root.clone();
+    let watcher=tokio::spawn(async move {
+        let mut sent=std::collections::BTreeMap::new();
+        loop {
+            if let Ok(conn)=agent::open_db(&watch_root) {
+                if let Ok(mut stmt)=conn.prepare("SELECT id,metadata,request_json FROM agent_request_contexts WHERE task_id='real-visual-input'") {
+                    if let Ok(rows)=stmt.query_map([],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?))) {
+                        for row in rows.flatten() {
+                            if let (Ok(meta),Ok(body))=(serde_json::from_str::<Value>(&row.1),serde_json::from_str::<Value>(&row.2)) {
+                                let pixels=images(&body);
+                                if !pixels.is_empty() {sent.insert(row.0,json!({"id":row.0,"metadata":meta,
+                                    "actual_http_images":pixels.iter().map(|bytes|json!({"hash":visual::hash(bytes),"bytes":bytes.len()})).collect::<Vec<_>>()}));}
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::select! {_=watch_stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+        }
+        sent.into_values().collect::<Vec<_>>()
+    });
+    let prompt=format!("验收当前已构建的 PPT 浏览器页面 {addr_url}，工作区 sample.pptx 是真实 8 页示例。由 Organizer 分派六个独立阶段，每阶段有自己的目标和返回条件：1 服务探测（只检查给定 URL，复用探测结果）；2 打开可见浏览器（仅一次）；3 上传 sample.pptx 并等待该上传加载完成（仅一次，后续阶段显式复用上传回执和同一浏览器页面）；4 读取初始页码及总页数；5 截图并实际看图、点击 #btn-next 翻页后再次截图看图，分别描述第 1 页和第 2 页可见内容、页码及空白/裁切/缺失/排版问题，提交绑定真实图片的 visual_check_result；6 browser_diagnostics 记录实际资源/字体和浏览器错误。使用浏览器工具，不读取源码、不启动或修改其他服务、不执行编辑交互。DOM 页码和截图成功各自只是事实。允许如实交付存在限制的结果，最终正文列出所有未确认事项。Observer 按增量上下文观察并在任务完成后复盘，记录有依据的可复用经验。",addr_url=format!("http://{addr}/"));
+    println!("Real six-stage acceptance root: {}",root.display());
+    let start=std::time::Instant::now();
+    let run=agent::run_task(state.clone(),task_id.into(),model.clone(),prompt,48,CancellationToken::new(),false,1,vec![],false,true).await;
+    stop.cancel();let requests=watcher.await?;
+    let conn=agent::open_db(&root)?;
+    let status:String=conn.query_row("SELECT status FROM agent_tasks WHERE id=?1",[task_id],|row|row.get(0))?;
+    let mut stmt=conn.prepare("SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
+    let events=stmt.query_map([task_id],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(seq,kind,data)|json!({"seq":seq,"type":kind,"data":serde_json::from_str::<Value>(&data).unwrap()})).collect::<Vec<_>>();
+    let tools=events.iter().filter(|event|event["type"]=="tool/call").map(|event|event["data"]["name"].clone()).collect::<Vec<_>>();
+    let returned=events.iter().filter(|event|event["type"]=="worker/yield").map(|event|event["data"]["output"].clone()).collect::<Vec<_>>();
+    let checks=events.iter().filter(|event|event["type"]=="visual/check_result").map(|event|event["data"]["result"].clone()).collect::<Vec<_>>();
+    let final_text=events.iter().rev().find(|event|event["type"]=="assistant/message").map(|event|event["data"]["message"]["content"].clone());
+    let report=json!({"route":{"provider":state.provider_name,"model":model},"status":status,"error":run.as_ref().err().map(|e|format!("{e:#}")),
+        "elapsed_ms":start.elapsed().as_millis() as u64,"reasoning_effort":"low","tools":tools,"task_returns":returned,"visual_checks":checks,
+        "actual_image_requests":requests,"final_content":final_text,"events":events});
+    std::fs::write(root.join("report.json"),serde_json::to_vec_pretty(&report)?)?;
+    drop(stmt);drop(conn);
+    // Recreate state and HTTP handlers after normal startup cleanup, as a page refresh does.
+    agent::recover_orphaned_tasks(&root).await?;
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await?;let restore_addr=listener.local_addr()?;
+    let restore=tokio::spawn(async move {axum::serve(listener,axum::Router::new()
+        .route("/agent/tasks/{task}/events",axum::routing::get(agent::get_events))
+        .route("/agent/tasks/{task}/visual-artifacts/{id}/image",axum::routing::get(visual::image_route)).with_state(state)).await.unwrap()});
+    let restored:Value=reqwest::get(format!("http://{restore_addr}/agent/tasks/{task_id}/events")).await?.json().await?;
+    let mut restored_images=0;
+    for event in report["events"].as_array().unwrap().iter().filter(|event|event["type"]=="tool/result") {
+        if let Some(id)=event["data"]["meta"]["result"]["visual_artifact"]["artifact_id"].as_str() {
+            let response=reqwest::get(format!("http://{restore_addr}/agent/tasks/{task_id}/visual-artifacts/{id}/image")).await?;
+            anyhow::ensure!(response.status().is_success(),"saved image could not be restored");
+            let bytes=response.bytes().await?;
+            anyhow::ensure!(visual::hash(&bytes)==event["data"]["meta"]["result"]["visual_artifact"]["content_hash"],"restored image changed");restored_images+=1;
+        }
+    }
+    // Startup removes transient execution/debug snapshots by design. Verify
+    // each durable tool, Flow, role, visual and memory event instead.
+    let durable=report["events"].as_array().unwrap().iter().filter(|event| {
+        let kind=event["type"].as_str().unwrap();
+        !kind.starts_with("execution/") && !matches!(kind,"scheduler/state"|"worker/work_state"|"worker/source_working_set"|"assistant/delta"|"organizer/request_metrics"|"debug/context_request"|"debug/context_end")
+    }).collect::<Vec<_>>();
+    let history_preserved=durable.iter().all(|event|restored["events"].as_array().into_iter().flatten()
+        .any(|saved|saved["seq"]==event["seq"] && saved["type"]==event["type"] && saved["data"]==event["data"]));
+    std::fs::write(root.join("restoration.json"),serde_json::to_vec_pretty(&json!({"event_count":restored["events"].as_array().map(Vec::len),"durable_event_count":durable.len(),"history_preserved":history_preserved,"restored_images":restored_images}))?)?;
+    restore.abort();server.abort();crate::browser_control::cleanup(&root,task_id).await;
+    println!("Real six-stage report: {}",root.join("report.json").display());
+    run?;
+    anyhow::ensure!(status=="completed","real task did not complete: {status}");
+    anyhow::ensure!(tools.iter().filter(|tool|**tool=="browser_open").count()==1 && tools.iter().filter(|tool|**tool=="browser_upload").count()==1,"page/upload was not reused");
+    anyhow::ensure!(returned.len()>=6,"six independent stages were not returned");
+    anyhow::ensure!(tools.iter().any(|tool|*tool=="browser_diagnostics") && restored_images>=2,"diagnostics and before/after images are required");
+    anyhow::ensure!(!checks.is_empty() && !requests.is_empty(),"real image requests and image-bound model judgments are required");
+    anyhow::ensure!(checks.iter().any(|check|check["actor"]=="worker" && check["input_mode"]=="direct"
+        && check["artifact_ids"].as_array().is_some_and(|ids|ids.len()>=2)
+        && check["observed_facts"].as_array().is_some_and(|facts|facts.len()>=2)),"Worker must return an actual two-image comparison, including an honest issue or limitation");
+    anyhow::ensure!(requests.iter().any(|request|request["metadata"]["actor"]=="worker"
+        && request["actual_http_images"].as_array().is_some_and(|images|images.len()==2 && images[0]["hash"]!=images[1]["hash"])),"before/after Worker request must contain distinct actual pixels");
+    anyhow::ensure!(report["events"].as_array().unwrap().iter().any(|event|event["type"]=="observer/retrospective"
+        && event["data"]["status"]=="completed" && event["data"]["memoryRecorded"]==true),"real full retrospective and grounded memory are required");
+    anyhow::ensure!(history_preserved,"durable history was lost after cleanup");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real Observer inspection of a completed six-stage report; requires VISUAL_ACCEPTANCE_REPORT"]
+async fn real_visual_observer_six_stage_reuse_recheck() -> anyhow::Result<()> {
+    let path=PathBuf::from(std::env::var("VISUAL_ACCEPTANCE_REPORT")?);let root=path.parent().unwrap();
+    let report:Value=serde_json::from_slice(&std::fs::read(&path)?)?;
+    let check=report["visual_checks"].as_array().unwrap().iter().find(|check|check["actor"]=="worker"
+        && check["artifact_ids"].as_array().is_some_and(|ids|ids.len()==2)).ok_or_else(||anyhow::anyhow!("real Worker pair is required"))?;
+    let dispatch=&check["visual_request"];let task=check["identity"]["task_id"].as_str().unwrap();
+    let mut state=agent::tests::flow_test_state(root,"127.0.0.1:1".parse()?);
+    let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;crate::ai_proxy::apply_agent_config(&mut state,&config);
+    let model=report["route"]["model"].as_str().unwrap();
+    state.observer_provider=state.provider_name.clone();state.observer_provider_url=state.provider_url.clone();state.observer_api_key=state.api_key.clone();
+    anyhow::ensure!(state.visual.capability(&state.observer_provider,model)==visual::ImageCapability::Supported,"requires verified configured image support");
+    let conn=agent::open_db(root)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_context_debug(task_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0)")?;
+    conn.execute("INSERT OR REPLACE INTO agent_context_debug(task_id,enabled) VALUES (?1,1)",[task])?;
+    let before:i64=conn.query_row("SELECT COUNT(*) FROM agent_visual_artifacts",[],|row|row.get(0))?;
+    let input=json!({"identity":check["identity"],"request":{"goal":check["checked_goal"]},"visual_artifacts":check["artifacts"],
+        "execution_epoch":dispatch["execution_epoch"],"related_source_versions":dispatch["related_source_versions"],
+        "task_page":dispatch["current_page"]});
+    let started=std::time::Instant::now();
+    let raw=agent::observer_json_response(&state,model,include_str!("../prompts/observer_system.md"),input,2400,task,
+        json!({"stage":"saved_image_recheck","review_id":"real-reuse-recheck","identity":check["identity"]})).await?;
+    let result:Value=serde_json::from_str(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim())?;
+    let actual:String=conn.query_row("SELECT request_json FROM agent_request_contexts WHERE task_id=?1 ORDER BY id DESC LIMIT 1",[task],|row|row.get(0))?;
+    let actual:Value=serde_json::from_str(&actual)?;let pixels=images(&actual);
+    let after:i64=conn.query_row("SELECT COUNT(*) FROM agent_visual_artifacts",[],|row|row.get(0))?;
+    std::fs::write(root.join("observer_recheck.json"),serde_json::to_vec_pretty(&json!({"raw_response":raw,"result":result,
+        "elapsed_ms":started.elapsed().as_millis() as u64,"new_captures":after-before,
+        "actual_http_images":pixels.iter().map(|bytes|json!({"hash":visual::hash(bytes),"bytes":bytes.len()})).collect::<Vec<_>>()}))?)?;
+    anyhow::ensure!(pixels.len()==2 && before==after,"Observer must reuse both saved pictures without recapturing");
+    anyhow::ensure!(result["visual_check_result"]["check_id"].is_string()
+        && result["visual_check_result"]["observed_facts"].as_array().is_some_and(|facts|facts.len()>=2),"Observer must return valid image-bound facts");
+    anyhow::ensure!(pixels.iter().zip(result["visual_request"]["images"].as_array().unwrap()).all(|(bytes,image)|
+        image["input_hash"]==visual::hash(bytes)),"actual Observer request pixels must match the recorded image inputs");
+    Ok(())
 }

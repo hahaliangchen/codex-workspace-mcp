@@ -24,8 +24,10 @@ export function visualRecords(events: readonly AgentEvent[], node?: FlowNodeData
     if (event.type === 'observer/node_review') {
       for (const artifact of (((data.result as VisualRecord | undefined)?.visual_artifacts ?? []) as unknown[])) add(artifact)
     }
-    if (event.type === 'visual/model_received' || event.type === 'visual/service_result') {
-      const manifest = data.manifest as VisualRecord | undefined
+    if (event.type === 'visual/model_received' || event.type === 'visual/service_result' || event.type === 'visual/model_failed') {
+      const original = data.manifest as VisualRecord | undefined
+      const manifest = event.type === 'visual/model_failed' && original
+        ? { ...original, dispatch_status: original.status, status: 'request_failed', error: data.error } : original
       if (!manifest || (node && !visualMatchesNode((manifest.identity ?? {}) as VisualRecord, node))) continue
       dispatches.push(manifest)
       for (const artifact of [...(manifest.images ?? []) as unknown[], ...(manifest.selected_images ?? []) as unknown[]]) add(artifact, true)

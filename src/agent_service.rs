@@ -34,8 +34,6 @@ const ORGANIZER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const SUBAGENT_MAX_STEPS: usize = 12;
 const MAX_STEP_LIMIT: usize = 100;
 const MAX_TOOL_OUTPUT_CHARS: usize = 300_000;
-const OBSERVER_HISTORY_TASK_LIMIT: usize = 5;
-const OBSERVER_HISTORY_MESSAGE_LIMIT: i64 = 16;
 const OBSERVER_MAX_TOKENS: usize = 3072;
 const OBSERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(test))]
@@ -275,7 +273,12 @@ pub struct ContinueTaskRequest {
     pub fast_mode: Option<bool>,
     #[serde(default)]
     pub permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    pub resume_target: Option<ResumeTarget>,
 }
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ResumeTarget { pub work_id:String, pub revision:usize, pub request_id:usize }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateTaskRequest {
@@ -304,6 +307,7 @@ enum ResumeLoad {
     ChildTask,
     Busy,
     ModelUnavailable,
+    InvalidNode(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,7 +425,7 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
     Ok(())
 }
 
-/// Remove execution-only snapshots after a task has reached a terminal state.
+/// Replace repeated execution snapshots with one resumable Flow record after a run ends.
 /// The execution history (tools, progress, Flow and messages), task metadata,
 /// Observer conclusions, notebook data, memories and code indexes are retained.
 fn cleanup_terminal_task_data(
@@ -438,6 +442,23 @@ fn cleanup_terminal_task_data(
         }
     }
     let task_selector = format!("SELECT id FROM agent_tasks WHERE {task_filter}");
+    // One continuation record replaces the repeated execution snapshots. Keep
+    // the exact current frame so a paused node can resume after cleanup.
+    let sessions={
+        let mut stmt=tx.prepare(&format!("SELECT task_id,data FROM agent_task_events e WHERE task_id IN ({task_selector}) AND kind='execution/commit' AND seq=(SELECT MAX(seq) FROM agent_task_events WHERE task_id=e.task_id AND kind='execution/commit')"))?;
+        let rows=stmt.query_map([task_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id,raw) in sessions {
+        let mut data:Value=serde_json::from_str(&raw)?;
+        let worker=tx.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/work_state' ORDER BY seq DESC LIMIT 1",
+            [&id],|row|row.get::<_,String>(0)).optional()?;
+        if let Some(state)=worker.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).and_then(|data|data.get("state").cloned()) {
+            data["worker_state"]=state;
+        }
+        tx.execute("DELETE FROM agent_task_events WHERE task_id=?1 AND kind='flow/session'",[&id])?;
+        append_event_tx(&tx,&id,"flow/session",&data,None)?;
+    }
     let sql = format!(
         "DELETE FROM agent_task_events WHERE task_id IN ({task_selector}) AND (
             kind IN ('scheduler/state','worker/work_state',
@@ -614,77 +635,6 @@ fn observer_output_failed(output: &str) -> bool {
     })
 }
 
-fn observer_keywords(text: &str) -> Vec<String> {
-    let mut keywords = Vec::new();
-    let mut ascii_word = String::new();
-    let mut cjk_word = Vec::new();
-    let flush_ascii = |word: &mut String, out: &mut Vec<String>| {
-        if word.chars().count() >= 3 {
-            out.push(word.to_lowercase());
-        }
-        word.clear();
-    };
-    let flush_cjk = |word: &mut Vec<char>, out: &mut Vec<String>| {
-        for pair in word.windows(2) {
-            out.push(pair.iter().collect());
-        }
-        word.clear();
-    };
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            flush_cjk(&mut cjk_word, &mut keywords);
-            ascii_word.push(ch);
-        } else if ('\u{3400}'..='\u{9fff}').contains(&ch) {
-            flush_ascii(&mut ascii_word, &mut keywords);
-            cjk_word.push(ch);
-        } else {
-            flush_ascii(&mut ascii_word, &mut keywords);
-            flush_cjk(&mut cjk_word, &mut keywords);
-        }
-    }
-    flush_ascii(&mut ascii_word, &mut keywords);
-    flush_cjk(&mut cjk_word, &mut keywords);
-    let stop = ["the", "and", "for", "with", "from", "run", "command", "file", "true", "false"];
-    let mut seen = std::collections::HashSet::new();
-    keywords.retain(|word| !stop.contains(&word.as_str()) && seen.insert(word.clone()));
-    keywords.into_iter().take(12).collect()
-}
-
-pub(crate) async fn observer_memory_context(
-    workspace: Arc<crate::tools::Workspace>,
-    search_text: String,
-) -> Vec<Value> {
-    tokio::task::spawn_blocking(move || {
-        let mut found = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for query in observer_keywords(&search_text) {
-            let Ok(response) = workspace.search_work_memory(crate::memory::SearchWorkMemoryRequest {
-                workspace_root: workspace.root().display().to_string(),
-                query,
-                limit: 2,
-            }) else { continue };
-            for memory in response.matches {
-                if !crate::memory::observer_sources_current(workspace.root(),&memory) {continue;}
-                if !seen.insert((memory.time_unix, memory.summary.clone())) { continue; }
-                found.push(json!({
-                    "time_unix": memory.time_unix,
-                    "summary": memory.summary.chars().take(500).collect::<String>(),
-                    "kind": memory.kind,
-                    "applies_to": memory.applies_to.chars().take(500).collect::<String>(),
-                    "source_task_id": memory.source_task_id,
-                    "source_refs": memory.source_refs,
-                    "files_changed": memory.files_changed,
-                    "implementation": memory.implementation.chars().take(900).collect::<String>(),
-                    "tests": memory.tests.chars().take(400).collect::<String>(),
-                    "risks": memory.risks.chars().take(400).collect::<String>(),
-                }));
-                if found.len() >= 5 { return found; }
-            }
-        }
-        found
-    }).await.unwrap_or_default()
-}
-
 fn observer_excerpt(text: &str, limit: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= limit {
@@ -697,124 +647,6 @@ fn observer_excerpt(text: &str, limit: usize) -> String {
         chars[..head].iter().collect::<String>(),
         chars[chars.len() - tail..].iter().collect::<String>()
     )
-}
-
-fn observer_history_messages(
-    conn: &rusqlite::Connection,
-    task_id: &str,
-    limit: i64,
-) -> anyhow::Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
-        "SELECT seq,timestamp,kind,data FROM agent_task_events \
-         WHERE task_id=?1 AND kind IN ('user/message','assistant/message') \
-         ORDER BY seq DESC LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![task_id, limit], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (seq, time, kind, raw) = row?;
-        let Ok(data) = serde_json::from_str::<Value>(&raw) else { continue };
-        let text = model_text(data.pointer("/message/content").unwrap_or(&Value::Null));
-        if text.trim().is_empty() { continue }
-        messages.push(json!({
-            "source_id":format!("{task_id}:{seq}"),
-            "time":time,
-            "role":if kind == "user/message" { "user" } else { "assistant" },
-            "text":observer_excerpt(&text, 1600),
-        }));
-    }
-    messages.reverse();
-    Ok(messages)
-}
-
-fn load_observer_history_context(
-    root: &std::path::Path,
-    task_id: &str,
-    prompt: &str,
-) -> anyhow::Result<Value> {
-    let conn = open_db(root)?;
-    let current = observer_history_messages(&conn, task_id, 24)?;
-    let terms: Vec<String> = observer_keywords(prompt).into_iter()
-        .filter(|term| !["我的", "我们", "这个", "那个", "一下", "帮我", "现在", "分析"].contains(&term.as_str()))
-        .take(8).collect();
-    let mut related = Vec::new();
-    if !terms.is_empty() {
-        let filters = terms.iter().map(|_| {
-            "(instr(lower(t.prompt),lower(?))>0 OR EXISTS (\
-                SELECT 1 FROM agent_task_events e WHERE e.task_id=t.id \
-                AND e.kind IN ('user/message','assistant/message') \
-                AND instr(lower(CASE WHEN json_valid(e.data) \
-                    THEN json_extract(e.data,'$.message.content') ELSE '' END),lower(?))>0))"
-        }).collect::<Vec<_>>().join(" OR ");
-        let sql = format!(
-            "SELECT t.id,t.prompt,t.updated_at FROM agent_tasks t \
-             WHERE t.parent_task_id IS NULL AND t.id<>? AND ({filters}) \
-             ORDER BY t.updated_at DESC LIMIT 160"
-        );
-        let mut bindings = vec![task_id.to_owned()];
-        for term in &terms {
-            bindings.push(term.clone());
-            bindings.push(term.clone());
-        }
-        let candidates: Vec<(String, String, i64)> = {
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(bindings.iter()), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let mut scored = Vec::new();
-        for (id, task_prompt, updated_at) in candidates {
-            let messages = observer_history_messages(&conn, &id, OBSERVER_HISTORY_MESSAGE_LIMIT)?;
-            let prompt_lower = task_prompt.to_lowercase();
-            let conversation_lower = messages.iter()
-                .filter_map(|message| message.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>().join(" ").to_lowercase();
-            let score: usize = terms.iter().map(|term| {
-                usize::from(prompt_lower.contains(term)) * 3
-                    + usize::from(conversation_lower.contains(term))
-            }).sum();
-            scored.push((score, updated_at, json!({
-                "task_id":id,
-                "updated_at":updated_at,
-                "prompt":observer_excerpt(&task_prompt, 800),
-                "messages":messages,
-            })));
-        }
-        scored.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
-        related = scored.into_iter().take(OBSERVER_HISTORY_TASK_LIMIT)
-            .map(|(_, _, task)| task).collect();
-    }
-    let prior_notes: Vec<Value> = {
-        let mut stmt = conn.prepare(
-            "SELECT kind,data FROM agent_task_events WHERE task_id=?1 \
-             AND kind IN ('observer/consult','observer/consult_reply') ORDER BY seq DESC LIMIT 8",
-        )?;
-        let rows = stmt.query_map([task_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut notes = Vec::new();
-        for row in rows {
-            let (kind, raw) = row?;
-            if let Ok(data) = serde_json::from_str::<Value>(&raw) {
-                notes.push(json!({"kind":kind,"data":data}));
-            }
-        }
-        notes.reverse();
-        notes
-    };
-    Ok(json!({
-        "current_conversation":current,
-        "relevant_past_conversations":related,
-        "prior_observer_notes":prior_notes,
-    }))
 }
 
 fn worker_visual_context(task:&str,scheduler:&crate::work_scheduler::WorkScheduler)->crate::visual_artifacts::VisualContext {
@@ -844,25 +676,57 @@ pub(crate) async fn observer_json_response(
     task_id: &str,
     mut trace_metadata: Value,
 ) -> anyhow::Result<String> {
-    let system = format!("{}\n\n{system}", include_str!("../prompts/shared_reasoning.md").trim());
+    let system = format!("{}\n\n{system}\nUse read_session_history only when this input lacks information needed for your answer. Saved history is available on demand; do not request it merely to reconstruct everything.", include_str!("../prompts/shared_reasoning.md").trim());
     let mut request_body = json!({"model":model,"stream":false,"max_tokens":max_tokens,
-        "messages":[{"role":"system","content":system},{"role":"user","content":context.to_string()}]});
+        "messages":[{"role":"system","content":system},{"role":"user","content":context.to_string()}],
+        "tools":[crate::session_history::tool()],"tool_choice":"auto"});
     let visual_context=crate::visual_artifacts::VisualContext {identity:context["identity"].clone(),execution_epoch:context["execution_epoch"].as_u64().unwrap_or(0) as usize,related_source_versions:context["related_source_versions"].clone(),current_page:context["task_page"].clone(),host_current_artifact_ids:context["host_current_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),allowed_artifact_ids:context["allowed_visual_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),..Default::default()};
     let ids=context["visual_artifacts"].as_array().into_iter().flatten().filter_map(|item|item["artifact_id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
     let visual_dispatch=crate::visual_artifacts::prepare_request(state,"observer",model,&visual_context,&ids,context["request"]["goal"].as_str().unwrap_or("review current visual delivery"),&mut request_body).await?;
     trace_metadata["visual_dispatch"]=visual_dispatch.clone();
     trace_metadata["actor"] = json!("observer");
-    let trace = crate::request_context::record(state.workspace.root(),task_id,trace_metadata,&request_body).await;
+    let trace = crate::request_context::record(state.workspace.root(),task_id,trace_metadata.clone(),&request_body).await;
     let result = tokio::time::timeout(OBSERVER_REQUEST_TIMEOUT, async {
-        let response = state.client.post(format!(
-            "{}/chat/completions", state.observer_provider_url.trim_end_matches('/')
-        )).bearer_auth(&state.observer_api_key).header("x-codex-visual-dispatch","task-owned").json(&request_body).send().await?;
-        let status = response.status();
-        let body: Value = response.json().await?;
-        anyhow::ensure!(status.is_success(), "observer model returned {status}: {}", body.get("error").map(Value::to_string).unwrap_or_else(|| "request failed".into()));
-        let raw = body.pointer("/choices/0/message/content").map(model_text).unwrap_or_default();
-        anyhow::ensure!(!raw.trim().is_empty(), "observer returned an empty response");
-        Ok((raw,body.get("usage").cloned().unwrap_or(Value::Null)))
+        // A small ordinary tool loop lets Observer retrieve missing history.
+        // It does not dispatch Worker tasks or change the scheduler.
+        for lookup_round in 0..=4 {
+            if lookup_round==4 {request_body.as_object_mut().unwrap().remove("tools");request_body.as_object_mut().unwrap().remove("tool_choice");}
+            let followup_trace=if lookup_round>0 {
+                let mut metadata=trace_metadata.clone();metadata["history_lookup_round"]=json!(lookup_round);
+                crate::request_context::record(state.workspace.root(),task_id,metadata,&request_body).await
+            } else {None};
+            let response=async {
+                let response = state.client.post(format!("{}/chat/completions", state.observer_provider_url.trim_end_matches('/')))
+                    .bearer_auth(&state.observer_api_key).header("x-codex-visual-dispatch","task-owned").json(&request_body).send().await?;
+                crate::visual_probe::successful_response(response).await?.json::<Value>().await.map_err(anyhow::Error::from)
+            }.await;
+            crate::request_context::finish(followup_trace,if response.is_ok(){"completed"}else{"failed"},
+                json!({"response":response.as_ref().ok(),"error":response.as_ref().err().map(|error|format!("{error:#}"))})).await;
+            let body=response?;let message=&body["choices"][0]["message"];
+            let calls=message["tool_calls"].as_array().filter(|calls|!calls.is_empty());
+            if let Some(calls)=calls {
+                anyhow::ensure!(lookup_round<4,"Observer history lookup limit reached");
+                anyhow::ensure!(calls.len()<=4,"too many Observer history reads in one request");
+                request_body["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":message["content"],"tool_calls":calls}));
+                for call in calls {
+                    let args=call["function"]["arguments"].as_str().unwrap_or("{}");
+                    let output=if call["function"]["name"]=="read_session_history" {
+                        match serde_json::from_str::<Value>(args) {
+                            Ok(args)=>crate::session_history::read(state.workspace.root(),task_id,&args).await,
+                            Err(error)=>Err(error.into()),
+                        }
+                    } else {Err(anyhow::anyhow!("Observer tool is not available: {}",call["function"]["name"]))};
+                    let result=output.unwrap_or_else(|error|json!({"error":format!("{error:#}")}));
+                    emit(state.workspace.root(),task_id,"observer/history_read",json!({"review_id":context["review_id"],"arguments":args,"result":result})).await?;
+                    request_body["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":call["id"],"content":result.to_string()}));
+                }
+                continue;
+            }
+            let raw=message.get("content").map(model_text).unwrap_or_default();
+            anyhow::ensure!(!raw.trim().is_empty(), "observer returned an empty response");
+            return Ok((raw,body.get("usage").cloned().unwrap_or(Value::Null)));
+        }
+        anyhow::bail!("Observer returned no answer after reading history")
     }).await.context("observer request timed out").and_then(|value| value);
     match result {
         Ok((mut raw,usage)) => {
@@ -884,37 +748,23 @@ pub(crate) async fn observer_json_response(
             Ok(raw)
         },
         Err(error) => {
+            if !ids.is_empty() {
+                emit(state.workspace.root(),task_id,"visual/model_failed",json!({"manifest":visual_dispatch,"actor":"observer",
+                    "review_id":context["review_id"],"error":format!("{error:#}")})).await?;
+            }
             crate::request_context::finish(trace,if error.is::<tokio::time::error::Elapsed>() {"timeout"}else{"failed"},
                 json!({"error":format!("{error:#}")})).await;
-            Err(error)
+            if ids.is_empty() {Err(error)}else{Err(crate::visual_probe::VisualModelFailure {manifest:visual_dispatch,error}.into())}
         },
     }
 }
 
-async fn observer_session_context(
-    state: &AgentServiceState,
-    root: &std::path::Path,
-    task_id: &str,
+fn observer_session_context(
     prompt: &str,
     scheduler: &crate::work_scheduler::WorkScheduler,
-) -> anyhow::Result<Value> {
-    let read_root = root.to_path_buf();
-    let read_id = task_id.to_owned();
-    let read_prompt = prompt.to_owned();
-    let (history, mut memories) = tokio::join!(
-        tokio::task::spawn_blocking(move || {
-            load_observer_history_context(&read_root, &read_id, &read_prompt)
-        }),
-        observer_memory_context(state.workspace.clone(), prompt.to_owned()),
-    );
-    let mut context = history??;
-    for (index, memory) in memories.iter_mut().enumerate() {
-        memory["source_id"] = json!(format!("memory:{index}"));
-    }
-    context["current_request"] = json!(prompt);
-    context["relevant_work_memories"] = json!(memories);
-    context["http_observations"] = scheduler.worker_http_observations();
-    Ok(context)
+) -> Value {
+    json!({"current_request":prompt,"current_work":scheduler.worker_input(prompt),
+        "history":{"tool":"read_session_history","scope":"Read saved messages or task results only when the current input is insufficient; scope=project searches other conversations in this workspace."}})
 }
 
 fn observer_string_list(value: Option<&Value>, limit: usize, char_limit: usize) -> Vec<String> {
@@ -970,7 +820,7 @@ pub(crate) fn load_observer_trace_since(root: &std::path::Path, task_id: &str, a
             | "assistant/message" | "observer/consult" | "observer/consult_reply"
             | "observer/plan_review" | "observer/progress_review"
             | "subagent/start" | "subagent/end" | "turn/end" | "user/message"
-            | "organizer/decision" | "worker/yield" | "visual/model_received" | "visual/check_result") {
+            | "organizer/decision" | "worker/yield" | "visual/model_received" | "visual/model_failed" | "visual/service_result" | "visual/check_result") {
             continue;
         }
         let Ok(data) = serde_json::from_str::<Value>(&raw) else { continue };
@@ -1050,6 +900,8 @@ pub(crate) fn load_observer_trace_since(root: &std::path::Path, task_id: &str, a
                 entry["visual_check_result"]=data["output"]["visual_check_result"].clone();
             },
             "visual/model_received" => entry["dispatch"]=data["manifest"].clone(),
+            "visual/model_failed" => {entry["dispatch"]=data["manifest"].clone();entry["error"]=data["error"].clone();},
+            "visual/service_result" => {entry["dispatch"]=data["manifest"].clone();entry["result"]=data["result"].clone();},
             "visual/check_result" => entry["result"]=data["result"].clone(),
             _ => {}
         }
@@ -1384,6 +1236,7 @@ pub async fn continue_task(
     let req_effort = request.reasoning_effort.clone();
     let req_fast = request.fast_mode;
     let req_permission = request.permission_mode;
+    let resume_target=request.resume_target.clone();
     let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<ResumeLoad> {
         let mut conn = open_db(&root)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1409,6 +1262,18 @@ pub async fn continue_task(
             }).collect::<anyhow::Result<Vec<_>>>()?
         };
         let (history, turn, subagent_used) = history_from_events(&root, &events);
+        if let Some(target)=&resume_target {
+            let scheduler=events.iter().rev().find_map(|(kind,data)| {
+                let saved=match kind.as_str() {"execution/commit"|"flow/session"=>data.get("scheduler"),"scheduler/state"=>data.get("state"),_=>None}?;
+                serde_json::from_value::<crate::work_scheduler::WorkScheduler>(saved.clone()).ok()
+            });
+            let valid=scheduler.as_ref().is_some_and(|scheduler|scheduler.request_completed!=Some(true)
+                && scheduler.request_started_turn==target.request_id && scheduler.current==target.work_id
+                && scheduler.frames.get(&target.work_id).is_some_and(|frame|frame.order.revision==target.revision
+                    && frame.status!=crate::work_scheduler::WorkStatus::Done && frame.invalidated_by_plan_revision.is_none()));
+            if !valid {return Ok(ResumeLoad::InvalidNode("该节点已完成、已废弃或不再是当前暂停节点；请刷新任务流。".into()));}
+            append_event_tx(&tx,&read_id,"flow/resume_requested",&json!({"turn":turn,"target":target}),None)?;
+        }
         let permission_mode = req_permission.unwrap_or_else(|| events.iter().rev()
             .find(|(kind, _)| kind == "turn/start")
             .and_then(|(_, data)| data.get("permission_mode"))
@@ -1443,6 +1308,7 @@ pub async fn continue_task(
         Ok(Ok(ResumeLoad::ChildTask)) => return (StatusCode::BAD_REQUEST, Json(json!({"error":"subagent tasks cannot receive follow-up messages"}))).into_response(),
         Ok(Ok(ResumeLoad::Busy)) => return (StatusCode::CONFLICT, Json(json!({"error":"task is still running"}))).into_response(),
         Ok(Ok(ResumeLoad::ModelUnavailable)) => return (StatusCode::CONFLICT, Json(json!({"error":"task model is no longer configured"}))).into_response(),
+        Ok(Ok(ResumeLoad::InvalidNode(error))) => return (StatusCode::CONFLICT, Json(json!({"error":error}))).into_response(),
         _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"could not load task history"}))).into_response(),
     };
     if !state.use_provider(&provider_name) {
@@ -1848,16 +1714,6 @@ const FILE_GUIDANCE_TOOLS: &[&str] = &[
     "edit_file",
 ];
 
-/// Memory tools that let the worker look up past work.
-const MEMORY_SEARCH_TOOLS: &[&str] = &[
-    "list_work_memory",
-    "search_work_memory",
-    "list_architecture_memory",
-    "search_architecture_memory",
-    "list_symbol_business_context",
-    "search_symbol_business_context",
-];
-
 /// Symbol index tools follow the list_*/search_*_symbols, read_*_symbol,
 /// index_*_workspace, and *_index_status naming pattern.
 fn is_symbol_index_tool(name: &str) -> bool {
@@ -1894,7 +1750,7 @@ fn tool_guidance(names: &[&str]) -> Vec<String> {
         );
     }
     if has("search_code_map") {
-        lines.push("For an unknown functionality, search_code_map returns responsibilities and entry points grouped by source file or saved functional area across languages. A group says what related code does; do not request call-chain context as a routine prerequisite. Read a listed definition directly when details are needed. Preserve a learned single definition/file role with record_symbol_business_context; preserve a related group of files/functions with record_architecture_memory using area, summary, key_files and key_symbols. Missing descriptions are unknown, never invented from names. Do not annotate an entire repository or add investigation solely to populate the map.".to_owned());
+        lines.push("For an unknown functionality, search_code_map returns responsibilities and entry points grouped by source file or saved functional area across languages. A group says what related code does; do not request call-chain context as a routine prerequisite. Read a listed definition directly when details are needed. Optionally preserve a learned definition/file role with record_symbol_business_context, using belongs_to_area to identify related code. Missing descriptions are unknown, never invented from names. Do not annotate an entire repository, write general task memories, or add investigation solely to populate the map.".to_owned());
     }
     if has("record_symbol_business_context") {
         lines.push("Symbol search/list/read results include description.text, status, source, scope, qualified_name and code_hash. Ordinary symbol searches match responsibilities and task keywords as well as identifiers; no separate business-context lookup is required. Current descriptions are navigation hints; stale ones need checking against the present source. After understanding an important entry point or module, optionally save one concise reusable responsibility with record_symbol_business_context, task-wording keywords, and expected_code_hash copied from the read result (description.code_hash for symbol reads, code_hash for file reads). Use file_path + qualified_name, or a symbol_id; scope=file describes the module rather than every function. Do not enumerate code, make extra reads, or postpone the answer just to annotate it. Obey any user restriction on saving memory; the Worker works independently of Observer descriptions.".to_owned());
@@ -1905,9 +1761,8 @@ fn tool_guidance(names: &[&str]) -> Vec<String> {
                 .to_owned(),
         );
     }
-    let search_memory = MEMORY_SEARCH_TOOLS.iter().any(|name| has(name));
-    if search_memory {
-        lines.push("When a needed historical decision or prior project finding can shorten this task, make one focused search_work_memory query early with a small limit (for example 3). Observer memories include applicable task types, source paths, and route shortcuts. Check current code when a claim depends on the present implementation; general discussion does not require this check. Do not repeatedly list or search the same memories.".to_owned());
+    if has("read_session_history") {
+        lines.push("Use the current work packet and preceding result first. For a specific missing earlier message, decision or tool result, use read_session_history by keyword, role, node or turn. scope=project searches conversations saved in this workspace; use a returned task_id/read_reference to read the relevant original. Conversation history and code indexes are the normal information sources, not a required startup routine. Saved symbol responsibility descriptions locate code by function. Separate memory tools remain available for explicitly requested memory work, not routine task bookkeeping.".to_owned());
     }
     if has("install_dependencies") { lines.push("Prefer install_dependencies for npm dependencies. Use run_project_script for named package.json scripts: foreground for build/check, background=true with a local ready_url/ready_port for dev/start. Query incremental logs through get_project_process using process_id and after_seq=next_seq. Process running does not prove readiness. Stop only owned processes through stop_project_process.".to_owned()); }
     if has("http_probe") {
@@ -1924,7 +1779,7 @@ fn tool_guidance(names: &[&str]) -> Vec<String> {
     }
     if has("report_progress") {
         lines.push(
-            "Use report_progress for concise current-work purpose, actual known conditions and new findings, batched with substantive work. Organizer owns planning and node selection; reports do not complete work. Return sufficient output, a concrete blocker or need_split with yield_work. Correct or retire earlier findings by stable ID; do not repeat investigation just to update memory. Explain the reason for a necessary lookup, without private chain-of-thought."
+            "Use report_progress to record your purpose, known conditions and findings. The host associates the report with the executing task, saves it and forwards it; no task or node ID is needed. Correct or retire earlier findings by their stable finding ID."
                 .to_owned(),
         );
     }
@@ -2393,7 +2248,7 @@ fn notebook_worker_request(messages: &[Value], base: usize, starts: &[usize], ow
             "fresh_source_reserve_chars":crate::task_notebook::SOURCE_LEARNING_RESERVE},"recent_source_chars":initial_source_budget-source_budget,
         "source_working_set":sources.metadata(),
         "raw_step_nodes":starts.iter().enumerate().map(|(index,start)|json!({"step":index+1,"raw_start":start,"node_id":owners.get(start)})).collect::<Vec<_>>(),
-        "note":"All materials remain in the durable notebook. Only the current node/action's selected pages enter source context. Reports and action renaming preserve selection; tree navigation saves/restores each node's own pages. source_material_ids or replace_context explicitly narrow/replace selection. Oversize additions do not evict selected code."});
+        "note":"All materials remain in the durable notebook. Only the current node/action's selected pages enter source context. Reports preserve selection; tree navigation saves/restores each node's own pages. Use recall_work with include_material=true, focused ranges and replace_context=true to replace selected pages. Oversize additions do not evict selected code."});
     (scoped,metadata)
 }
 
@@ -2417,19 +2272,11 @@ fn consult_observer_tool() -> Value {
     })
 }
 
-fn observer_response_schema() -> Value {
-    json!({"type":"array","minItems":1,"items":{"type":"object","required":["id","disposition","reason"],"properties":{
-        "id":{"type":"string","description":"Stable ID of a delivered Observer message"},
-        "disposition":{"type":"string","enum":["accepted","adjusted","declined","resolved"]},
-        "reason":{"type":"string","description":"Concrete action you will take, why you disagree, or what actually resolved the issue"}
-    }}})
-}
-
 fn recall_work_tool() -> Value {
     json!({"type":"function","function":{"name":"recall_work",
         "description":"Search conclusions first, or activate only version-checked source pages needed for the current action. Use material_ids, focused line ranges and include_material=true. replace_context replaces the previous selection; action_id changes actions. All materials remain in the notebook, independently of the small active context. include_history explicitly retrieves the finding timeline. tool_call_ids recover historical original tool results; use result_field and result_offset for large pages. No Observer dependency.",
         "parameters":{"type":"object","properties":{"query":{"type":"string"},
-            "action_id":{"type":"string","description":"Stable ID of the next concrete operation, such as editing one definition; not the whole feature or plan. The ID is a label; use replace_context or source_material_ids explicitly to change selected pages."},
+            "action_id":{"type":"string","description":"Optional label for the current source retrieval. Use include_material=true and replace_context to change selected pages."},
             "replace_context":{"type":"boolean","description":"When include_material=true, replace the active pages with only the focused material pages requested by this call. Default adds without evicting existing pages."},
             "material_ids":{"type":"array","items":{"type":"integer"}},"include_material":{"type":"boolean"},
             "include_history":{"type":"boolean","description":"Retrieve historical finding revisions explicitly. Normal context contains only current findings and unresolved conflicts."},
@@ -2447,27 +2294,10 @@ fn recall_work_tool() -> Value {
 fn report_progress_tool() -> Value {
     json!({"type":"function","function":{
         "name":"report_progress",
-        "description":"Report substantive work, findings or results with actual work tools. Simple tasks need no plan. Reassess direct mode when discoveries reveal separate dependent subproblems, including minimal features or changes in one file. Judge actual dependencies, not tool count or duration. Change organization and perform substantive work together. For complex tasks create plan.mode=tree with one root; split only real subproblems using node_updates and parent_id. Enter a child with current_node_id; finish with node_result and return to its parent. Switching alone never completes a tree node. Use incremental updates, not repeated whole-plan rewrites. Tool use does not wait for reporting or Observer. A report records intent on the current node and never returns the task: take the next actual operation in the same response, or return with yield_work.",
-        "parameters":{"type":"object","required":["current_node_id","purpose","known_conditions","next_action","findings","open_questions"],"properties":{
-            "current_node_id":{"type":"string","description":"Current tree node, or a short action label for direct work without a plan."},
-            "work_organization":{"type":"object","required":["mode","reason"],"description":"Optional explanation when choosing or changing work organization. Reconsider direct mode when discoveries reveal separate dependent subproblems; explain their concrete dependency. Choosing tree requires initializing plan.mode=tree in this same report if no tree exists. No extra classification round is needed.","properties":{
-                "mode":{"type":"string","enum":["direct","tree"]},"reason":{"type":"string","description":"Why a single bounded action is enough, or which actual dependent problems require separate focused nodes. Do not use tool count, duration or number of files as the reason."}
-            }},
-            "edit_targets":{"type":"array","items":{"type":"string"},"description":"Files planned for edits. Listing files does not inject their source."},
-            "action_id":{"type":"string","description":"Stable ID of this concrete operation (not the entire feature), independent of Flow nodes. Change it when moving to another operation; it does not itself clear pages. Explicitly select the smallest needed pages."},
-            "resume_tree":{"type":"boolean","description":"On a new human follow-up that continues the same complex task, explicitly restore the previous saved task tree. Do not use for a changed/unrelated task. Restored source pages are version checked."},
-            "source_material_ids":{"type":"array","items":{"type":"integer"},"description":"Keep only these already activated material pages for the action; [] clears source context. To fetch different or narrower pages, use recall_work with line ranges and replace_context=true."},
-            "carry_material_ids":{"type":"array","items":{"type":"integer"},"description":"On a tree-node switch, explicitly carry only these active old-node material pages into the new node. Other raw source stays with its owner; returning restores the parent's selected pages."},
-            "node_updates":{"type":"array","maxItems":128,"description":"Incrementally add/update tree nodes. New nodes require id, title, objective, done_when and parent_id (null only for the root). No extra planning round is required.","items":{"type":"object","required":["id"],"properties":{
-                "id":{"type":"string"},"parent_id":{"type":["string","null"]},"title":{"type":"string"},"kind":{"type":"string"},"objective":{"type":"string"},"done_when":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},"resume":{"type":"boolean","description":"Set only for a blocked or paused node; pending nodes are dispatched directly, and completed/skipped nodes are sealed and repaired with action=revisit."}
-            }}},
-            "node_result":{"type":"object","required":["node_id","status","summary"],"properties":{
-                "node_id":{"type":"string"},"status":{"type":"string","enum":["completed","blocked","skipped"]},"summary":{"type":"string","description":"Actual outcome and limits against done_when, not a promise. Completed child results are available to the parent without replaying the child's history."},
-                "material_ids":{"type":"array","items":{"type":"integer"}},"finding_ids":{"type":"array","items":{"type":"string"}}
-            }},
+        "description":"Record your current purpose, known conditions and findings. The host associates the report with the executing task, saves it and forwards it. No task or node ID is needed.",
+        "parameters":{"type":"object","required":["purpose","known_conditions","findings"],"properties":{
             "purpose":{"type":"string","description":"Concise user-facing objective for this step; not private reasoning"},
              "known_conditions":{"type":"array","items":{"type":"string"},"description":"Relevant user constraints, prior findings, or current state already known"},
-             "open_questions":{"type":"array","items":{"type":"string"},"description":"Current concrete unknowns and the decision each affects; supply [] when investigation is sufficient. This replaces the previous list."},
              "findings":{"type":"array","items":{"type":"object","required":["id","text"],"properties":{
                  "id":{"type":"string","description":"Stable short key; reuse it to correct or supersede a previous finding"},
                  "topic":{"type":"string","description":"Stable key for the exact question/entity/scope. Related alternative claims must share this topic; do not group unrelated facts just because they share a file."},
@@ -2478,18 +2308,7 @@ fn report_progress_tool() -> Value {
                  "supersedes":{"type":"array","items":{"type":"string"},"description":"IDs replaced after confirmation. Include all incompatible IDs and verification; age alone does not prove the new claim."},
                  "verification":{"type":"object","properties":{"basis":{"type":"string","enum":["source","user"]},"summary":{"type":"string"},"material_ids":{"type":"array","items":{"type":"integer"}},"quote":{"type":"string","description":"Exact current human instruction when basis=user"}},"description":"For a correction: what was checked and which currently available material IDs support it. Runtime verifies source availability/version or that the quoted human instruction exists."},
                  "status":{"type":"string","enum":["confirmed","assumed","needs_recheck","obsolete"]}
-             }},"description":"Persist meaningful findings across context changes; correct by stable ID instead of appending contradictory conclusions"},
-             "observer_responses":observer_response_schema(),
-            "next_action":{"type":"string","description":"The concrete action this step is about to take"},
-            "plan":{"type":"object","description":"Optional. For a complex task initialize mode=tree; then use node_updates. Direct discussion and short tasks do not need Flow.","required":["mode","nodes"],"properties":{
-                "mode":{"type":"string","enum":["tree"]},
-                "nodes":{"type":"array","minItems":1,"maxItems":128,"items":{"type":"object","required":["id","title","parent_id","objective","done_when"],"properties":{
-                    "id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":["string","null"]},"objective":{"type":"string"},"done_when":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}}
-                }}},
-                "edges":{"type":"array","items":{"type":"object","required":["source","target"],"properties":{
-                    "id":{"type":"string"},"source":{"type":"string"},"target":{"type":"string"},"label":{"type":"string"}
-                }}}
-            }}
+             }},"description":"Persist meaningful findings across context changes; correct by stable ID instead of appending contradictory conclusions"}
         }}
     }})
 }
@@ -2606,6 +2425,29 @@ async fn refresh_scheduler_versions(scheduler:&mut crate::work_scheduler::WorkSc
 
 /// Restore only explicitly completed requests into a fresh plan. Local queue exhaustion
 /// and a blocked run must retain their deliveries and execution pointer.
+async fn request_goal_from_events(root:std::path::PathBuf,task:String,request_turn:usize)->anyhow::Result<Option<String>> {
+    tokio::task::spawn_blocking(move ||->anyhow::Result<Option<String>> {
+        let conn=open_db(&root)?;
+        let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='user/message' AND json_extract(data,'$.turn')=?2 ORDER BY seq LIMIT 1",
+            params![task,request_turn],|row|row.get::<_,String>(0)).optional()?;
+        Ok(raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|data|data["model_content"].as_str().or_else(||data.pointer("/message/content/0/text").and_then(Value::as_str)).map(str::to_owned)))
+    }).await?
+}
+
+fn bind_progress_report(arguments: &str, current_node: &str) -> anyhow::Result<Value> {
+    let mut report: Value = serde_json::from_str(arguments)?;
+    let fields = report.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("report_progress arguments must be a JSON object"))?;
+    // Old requests may still contain routing or planning fields. A report only
+    // records information; its owner always comes from the executing frame.
+    // Keep older informational fields readable without asking new calls for them.
+    fields.retain(|key, _| matches!(key.as_str(),
+        "purpose" | "known_conditions" | "findings" | "next_action" | "open_questions"));
+    fields.insert("current_node_id".to_owned(), json!(current_node));
+    Ok(report)
+}
+
 fn restore_execution_session(
     previous_tree: &crate::flow_tree::TaskTree,
     mut previous_scheduler: Option<crate::work_scheduler::WorkScheduler>,
@@ -2636,8 +2478,8 @@ fn restore_execution_session(
             && (previous_scheduler.is_none() || scheduler_completed)
     } else { scheduler_completed };
     if completed {
-        let archived_requests = previous_scheduler.map(|s| s.archived_requests).unwrap_or_default();
-        (crate::flow_tree::TaskTree::default(), crate::work_scheduler::WorkScheduler { archived_requests, ..Default::default() }, true)
+        let scheduler=previous_scheduler.map(|scheduler|scheduler.after_completed_request(previous_tree)).unwrap_or_default();
+        (crate::flow_tree::TaskTree::default(), scheduler, true)
     } else {
         restored_tree.resume_unachieved_request();
         let mut scheduler = previous_scheduler.unwrap_or_default();
@@ -2774,6 +2616,15 @@ fn apply_organizer_decision(
                 anyhow::ensure!(decision.get("node_id").is_none(),"select accepts task_id only; do not substitute a Flow node ID");
                 anyhow::ensure!(scheduler.available_select_task_ids().iter().any(|id|id==task_id),
                     "select task_id '{task_id}' is not an active unfinished work order; available task IDs: [{}]",scheduler.available_select_task_ids().join(", "));
+                if let Some(revision)=decision["target_revision"].as_u64() {
+                    anyhow::ensure!(scheduler.frames.get(task_id).is_some_and(|frame|frame.order.revision==revision as usize),"resume_task revision no longer matches this work_id");
+                }
+                if tree.enabled() {
+                    let node=&scheduler.frames[task_id].order.node_id;
+                    let paused=matches!(tree.snapshot()["nodes"][node]["status"].as_str(),Some("blocked"|"paused"));
+                    tree.apply(&if paused {json!({"node_updates":[{"id":node,"resume":true}],"current_node_id":node})}
+                        else {json!({"current_node_id":node})})?;
+                }
             }
             if decision["action"]=="revisit" {
                 let target=decision["target_node_id"].as_str().filter(|id|!id.is_empty())
@@ -2890,7 +2741,7 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
             "method"|"tool_calls"=>"Return one exposed scheduling action or a read-only Organizer lookup method.",
             _=>"Correct the named field to match its tool schema and the current execution path.",
         };
-        let allowed=if field_path=="method"||field_path=="tool_calls" {json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"])}
+        let allowed=if field_path=="method"||field_path=="tool_calls" {json!(["schedule_task","read_task_result","read_flow_page","read_session_history","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"])}
             else if field_path=="completion" {json!(["output","write","check","write_check",null])}
             else {Value::Null};
         return json!({"error_code":code,"rule_id":code,"field_path":field_path,"rejected_value":rejected,
@@ -2910,9 +2761,9 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
             else {"INVALID_WORK_FIELD"};
         let fingerprint=organizer_error_fingerprint(code,field_path,submitted.is_some(),&rejected);
         let (expected_shape,allowed_values)=if code=="REMOVED_FLOW_PROTOCOL" {
-            ("Flow state and node results are host-managed. Use an exposed scheduling method or a direct read-only Organizer lookup.",json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"]))
+            ("Flow state and node results are host-managed. Use an exposed scheduling method or a direct read-only Organizer lookup.",json!(["schedule_task","read_task_result","read_flow_page","read_session_history","search_work_memory","search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"]))
         } else if code=="INVALID_DEPENDENCY_INPUT" {
-            ("Use schedule_task.inputs with an exact work_id or node_id of a returned task, optional matching revision, and only fields listed on the delivery. TASK_NOT_RETURNED means wait for that task's return; TASK_DEPRECATED means it is history only. A browser upload receipt is a dependency only while its session, page and attempt are active; check process.current_facts.browser for the current page before scheduling a fresh open/upload.",json!({"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"],"current_browser_state":process["current_facts"]["browser"]}))
+            ("Use schedule_task.inputs with an exact work_id or node_id of a returned task, optional matching revision, and only fields listed on the delivery. TASK_NOT_RETURNED means wait for that task's return; TASK_DEPRECATED means it is history only. Page observations and upload availability are separate: an empty upload list does not mean no page exists, and null page availability means not checked. Read the preceding result and recorded page before deciding whether an open or upload is needed. A browser upload receipt is a dependency only while its session, page and attempt are active.",json!({"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"],"browser_observations":process["current_facts"]["browser"],"browser_uploads":process["current_facts"]["browser_uploads"],"browser_scope":process["current_facts"]["browser_scope"]}))
         } else if code=="INVALID_PPTX_CONTRACT" {
             ("Set execution_scope.browser_document_path to the exact workspace-relative .pptx path; this field cannot contain a page URL.",json!({"required_fields":["execution_scope.browser_document_path"],"available_dependency_deliveries":process["available_dependency_deliveries"],"browser_upload_availability":process["browser_upload_availability"]}))
         } else if code=="INVALID_CHECK_IDENTIFIER" {
@@ -2934,7 +2785,7 @@ fn organizer_contract_feedback(error:&anyhow::Error,decision:&Value,scheduler:&c
             if continuation {json!(["continue","subtask","replace"])}else{json!(["continue"])})
     } else if message.contains("flow_update")||message.contains("node_result") {
         ("REMOVED_FLOW_PROTOCOL","method","Flow updates and node results are host-managed. Use a scheduling method or a direct read-only Organizer lookup.",
-            json!(["schedule_task","read_task_result","read_flow_page","search_work_memory","search_architecture_memory","search_symbol_business_context",
+            json!(["schedule_task","read_task_result","read_flow_page","read_session_history","search_work_memory","search_architecture_memory","search_symbol_business_context",
                 "search_project_symbols","read_project_symbol","read_source_material","revisit_task","finish_request"]))
     } else if message.contains("target_node_id")||message.contains("revisit target") {
         ("INVALID_REVISIT_TARGET","target_node_id","Use an ID from process.available_revisit_targets.",process["available_revisit_targets"].clone())
@@ -2965,12 +2816,13 @@ fn organizer_field_path_pointer(path:&str)->String {
 }
 
 fn organizer_read_action(action:&str)->bool {
-    matches!(action,"read_task_result"|"read_flow_page"|"search_work_memory"|"search_architecture_memory"
+    matches!(action,"read_task_result"|"read_flow_page"|"read_session_history"|"search_work_memory"|"search_architecture_memory"
         |"search_symbol_business_context"|"search_project_symbols"|"read_project_symbol"|"read_source_material")
 }
 
 async fn execute_organizer_read(
     state:&AgentServiceState,
+    task_id:&str,
     scheduler:&crate::work_scheduler::WorkScheduler,
     notebook:&mut crate::task_notebook::Notebook,
     decision:&Value,
@@ -2982,6 +2834,7 @@ async fn execute_organizer_read(
     match action.as_str() {
         "read_task_result"=>scheduler.read_task_result(decision),
         "read_flow_page"=>scheduler.read_flow_page(decision),
+        "read_session_history"=>crate::session_history::read(state.workspace.root(),task_id,decision).await,
         "search_work_memory"|"search_architecture_memory"|"search_symbol_business_context"=>{
             let workspace=state.workspace.clone();
             let query=decision["query"].as_str().unwrap_or("").trim().to_owned();
@@ -3046,7 +2899,7 @@ async fn execute_organizer_read(
 }
 
 pub(crate) async fn run_task(
-    state: AgentServiceState,
+    mut state: AgentServiceState,
     task_id: String,
     model: String,
     prompt: String,
@@ -3059,6 +2912,12 @@ pub(crate) async fn run_task(
     ban_run_command: bool,
 ) -> anyhow::Result<()> {
     let ban_run_command = ban_run_command || user_bans_run_command(&prompt);
+    // Mock unit scenarios use a short timeout; real-provider opt-in tests use
+    // the documented model request budget rather than a one-second fixture budget.
+    #[cfg(test)]
+    let organizer_timeout=if std::env::var("CODEX_REAL_MODEL_ACCEPTANCE").as_deref()==Ok("1") {Duration::from_secs(60)}else{ORGANIZER_REQUEST_TIMEOUT};
+    #[cfg(not(test))]
+    let organizer_timeout=ORGANIZER_REQUEST_TIMEOUT;
     let root = state.workspace.root().to_path_buf();
     let model_prompt = crate::composer_catalog::expand_prompt(&root, &prompt);
     let observer_model = if state.observer_inherits_model { model.clone() } else { state.observer_model.clone() };
@@ -3077,8 +2936,6 @@ pub(crate) async fn run_task(
         "message":{"id":uuid_like(),"role":"user","content":[{"type":"text","text":prompt}],"source":{"kind":"user"}}
     }), Some("append")).await?;
 
-    emit(&root,&task_id,"flow/plan",json!({"turn":turn,"mode":"direct","replaceCurrentTurn":true,
-        "nodes":[{"id":"request","title":truncate(&prompt,160),"kind":"worker","objective":prompt,"status":"running"}],"edges":[]})).await?;
     let mut messages = vec![json!({"role":"system","content":""}), json!({"role":"user","content":model_prompt})];
     let base_messages = messages.len();
     let mut step_starts = Vec::new();
@@ -3095,10 +2952,10 @@ pub(crate) async fn run_task(
     let history_task = task_id.clone();
     let (mut work_state, mut observer_inbox, legacy_revisions) = tokio::task::spawn_blocking(move || -> anyhow::Result<(crate::worker_work_state::WorkState, crate::worker_work_state::ObserverInbox, Vec<Value>)> {
         let conn = open_db(&history_root)?;
-        let previous = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/work_state' ORDER BY seq DESC LIMIT 1", [&history_task], |row| row.get::<_,String>(0)).optional()?;
+        let previous = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind IN ('worker/work_state','flow/session') ORDER BY seq DESC LIMIT 1", [&history_task], |row| row.get::<_,String>(0)).optional()?;
         let inbox = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='observer/inbox_state' ORDER BY seq DESC LIMIT 1", [&history_task], |row|row.get::<_,String>(0)).optional()?;
         let mut work:crate::worker_work_state::WorkState=previous.and_then(|text|serde_json::from_str::<Value>(&text).ok())
-            .and_then(|data|serde_json::from_value(data["state"].clone()).ok()).unwrap_or_default();
+            .and_then(|data|serde_json::from_value(data.get("worker_state").or_else(||data.get("state")).cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
         let mut statement=conn.prepare("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='worker/progress' ORDER BY seq")?;
         let mut observations=Vec::new();
         for row in statement.query_map([&history_task],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))? {
@@ -3125,7 +2982,7 @@ pub(crate) async fn run_task(
     let restored_commit = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(crate::flow_tree::TaskTree, crate::work_scheduler::WorkScheduler)>> {
         let conn = open_db(&commit_root)?;
         let raw = conn.query_row(
-            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='execution/commit' ORDER BY seq DESC LIMIT 1",
+            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind IN ('execution/commit','flow/session') ORDER BY seq DESC LIMIT 1",
             [&commit_task], |row| row.get::<_, String>(0)
         ).optional()?;
         if let Some(raw_str) = raw {
@@ -3152,7 +3009,7 @@ pub(crate) async fn run_task(
         }).await??
     };
     let (sched_root, sched_task) = (root.clone(), task_id.clone());
-    let previous_scheduler = if let Some((_, sched)) = restored_commit {
+    let mut previous_scheduler = if let Some((_, sched)) = restored_commit {
         Some(sched)
     } else {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::work_scheduler::WorkScheduler>> {
@@ -3163,25 +3020,40 @@ pub(crate) async fn run_task(
         }).await??
     };
 
+    if let Some(previous)=previous_scheduler.as_mut().filter(|scheduler|scheduler.request_goal.is_empty()) {
+        let request_turn=if previous.request_started_turn>0 {previous.request_started_turn}else{turn.saturating_sub(1).max(1)};
+        previous.request_goal=request_goal_from_events(root.clone(),task_id.clone(),request_turn).await?.unwrap_or_default();
+    }
     let (restored_tree, mut scheduler, is_completed_previous_session) =
         restore_execution_session(&previous_tree, previous_scheduler);
     task_tree = restored_tree;
+    if is_completed_previous_session {
+        work_state=crate::worker_work_state::WorkState::default();
+        work_state.resume(&prompt);
+    }
 
     if scheduler.request_started_turn == 0 {
         scheduler.request_started_turn = if !is_completed_previous_session && turn > 1
             && (task_tree.enabled() || !scheduler.frames.is_empty()) { turn - 1 } else { turn };
+    }
+    // Read the original human message by request identity, not the latest
+    // follow-up such as "continue". Legacy snapshots didn't retain this text.
+    if scheduler.request_goal.is_empty() {
+        scheduler.request_goal=request_goal_from_events(root.clone(),task_id.clone(),scheduler.request_started_turn).await?
+            .unwrap_or_else(||prompt.clone());
     }
     // Legacy unscoped advice belongs to the restored goal, never a new goal
     // after successful completion. New inbox snapshots persist that identity.
     if is_completed_previous_session { observer_inbox.start_request(turn.saturating_sub(1)); }
     observer_inbox.set_scope(&scheduler);
     observer_inbox.start_turn();
+    let mut worker_observer_cursor=observer_inbox.message_cursor();
     observer.set_scope(&scheduler,&prompt);
     if state.observer_enabled {
         emit(&root,&task_id,"observer/inbox_state",json!({"turn":turn,"step":0,"state":observer_inbox.snapshot()})).await?;
     }
     if !is_completed_previous_session && turn > 1 && !prompt.is_empty()
-        && (task_tree.enabled() || !scheduler.frames.is_empty()) {
+        && (task_tree.enabled() || !scheduler.frames.is_empty() || !scheduler.request_goal.is_empty()) {
         // Every unfinished goal gets a request-level decision, even if its last
         // dispatched packet already finished. Preserve that packet's delivery.
         let resumable = scheduler.frame().filter(|f| f.status != crate::work_scheduler::WorkStatus::Done
@@ -3196,6 +3068,31 @@ pub(crate) async fn run_task(
         }));
     }
     scheduler.prepare_legacy_check_migration();
+    let (resume_root,resume_task)=(root.clone(),task_id.clone());
+    let resume_target=tokio::task::spawn_blocking(move ||->anyhow::Result<Option<ResumeTarget>> {
+        let conn=open_db(&resume_root)?;
+        let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='flow/resume_requested' AND json_extract(data,'$.turn')=?2 ORDER BY seq DESC LIMIT 1",
+            params![resume_task,turn],|row|row.get::<_,String>(0)).optional()?;
+        Ok(raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).and_then(|data|serde_json::from_value(data["target"].clone()).ok()))
+    }).await??;
+    if let Some(target)=resume_target {
+        anyhow::ensure!(scheduler.request_started_turn==target.request_id && scheduler.current==target.work_id
+            && scheduler.revision()==target.revision,"resume target changed before execution");
+        anyhow::ensure!(scheduler.select_task(Some(&target.work_id))?,"requested node could not resume");
+        if task_tree.enabled() {
+            let node=scheduler.node();
+            let paused=matches!(task_tree.snapshot()["nodes"][node]["status"].as_str(),Some("blocked"|"paused"));
+            task_tree.apply(&if paused {json!({"node_updates":[{"id":node,"resume":true}],"current_node_id":node})}
+                else {json!({"current_node_id":node})})?;
+        }
+        emit(&root,&task_id,"flow/node_resumed",json!({"turn":turn,"target":target,"main_task":scheduler.main_task_summary()})).await?;
+    }
+    emit(&root,&task_id,"flow/request_overview",json!({"turn":turn,"main_task":scheduler.main_task_summary(),
+        "previous_main_tasks":scheduler.organizer_input()["previous_main_tasks"]})).await?;
+    let mut initial_plan=scheduler.unified_flow_plan(task_tree.enabled().then_some(&task_tree));
+    initial_plan["turn"]=json!(turn);initial_plan["replaceCurrentTurn"]=json!(true);
+    crate::observer_service::commit(&root,&task_id,json!({"commit_id":format!("{turn}:0:continuation"),"turn":turn,"step":0,
+        "scheduler":scheduler.snapshot(),"task_tree":task_tree.snapshot(),"flow_plan":initial_plan}),Vec::new()).await?;
     let mut organizer_error=organizer_resume_decision_error(scheduler.pending_handoff()).unwrap_or(Value::Null);
     let mut organizer_request_error=organizer_resume_request_error(scheduler.pending_handoff()).unwrap_or(Value::Null);
     let mut organizer_contract_fingerprints=HashSet::new();
@@ -3229,7 +3126,8 @@ pub(crate) async fn run_task(
             scheduler.refresh_browser_upload_validity(&root,&task_id).await;
             scheduler.save_selection(source_working_set.snapshot());
             emit(&root,&task_id,"organizer/start",json!({"turn":turn,"step":step,"nodeId":scheduler.node()})).await?;
-            let organizer_advice=crate::observer_service::annotate_advice(observer_inbox.unhandled(),&scheduler);
+            let organizer_advice=crate::observer_service::annotate_advice(observer_inbox.unhandled(),&scheduler)
+                .iter().map(crate::session_history::observer_message).collect::<Vec<_>>();
             let mut organizer_input=json!({"schema_version":1,"turn":turn,"human_request":model_prompt,
                 "capabilities":{"permissions":state.permission_mode.guidance(),"can_write":state.permission_mode.allows("edit_file"),
                     "available_tools":local_tools(&state.workspace,state.tool_catalog.as_deref(),ban_run_command).iter()
@@ -3243,22 +3141,21 @@ pub(crate) async fn run_task(
                         "capability":serde_json::to_value(state.visual.capability(&state.provider_name,&model)).unwrap_or(Value::Null),
                         "fallback_available":state.visual.fallback.is_some()}},
                 "process":scheduler.organizer_input_with_freshness(&root),
-                "relevant_facts":work_state.request_context(scheduler.node(),&prompt,turn,&[]),
-                "observer_advice":organizer_advice.clone(),"historical_observer_advice":observer_inbox.historical(),
-                "observer_messages":crate::observer_service::annotate_advice(observer_inbox.messages(),&scheduler),
+                "observer_messages":organizer_advice,
+                "history":{"tool":"read_session_history","scope":"Current conversation by default; scope=project searches other conversations in this workspace. Read relevant originals using returned task_id/read_reference only when needed."},
                 "late_delivery_review_notifications":observer_inbox.late_delivery_notifications(),"last_decision_error":organizer_error,
                 "last_request_error":organizer_request_error,"read_task_results":organizer_read_results});
             let mut request_failures_for_decision=0usize;
             let decision=loop {
                 let request=crate::work_organizer::decide(&state,&model,&task_id,turn,step,scheduler.node(),organizer_input.clone(),
-                    &cancel,ORGANIZER_REQUEST_TIMEOUT).await;
+                    &cancel,organizer_timeout).await;
                 if cancel.is_cancelled() {
                     observer.finish("cancelled").await?;finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;
                     return Ok(());
                 }
                 match request {
                     Ok(decision) if decision["action"].as_str().is_some_and(organizer_read_action)=>{
-                        let read=execute_organizer_read(&state,&scheduler,&mut notebook,&decision,turn,step,&mut organizer_source_chars).await;
+                        let read=execute_organizer_read(&state,&task_id,&scheduler,&mut notebook,&decision,turn,step,&mut organizer_source_chars).await;
                         match read {
                             Ok(result)=>{
                                 let query_key=crate::source_read::query_fingerprint(&decision);
@@ -3361,6 +3258,7 @@ pub(crate) async fn run_task(
             match applied {
                 Ok((mut next,tree,decision))=>{
                     if next.request_started_turn == 0 { next.request_started_turn = turn; }
+                    if next.request_goal.is_empty() {next.request_goal=prompt.clone();}
                     let consumed_advice_ids=organizer_advice.iter().filter_map(|item|item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
                     let consumed_advice=observer_inbox.record_organizer_consumption(&consumed_advice_ids,&decision,turn,step);
                     for advice in &consumed_advice {
@@ -3501,12 +3399,7 @@ pub(crate) async fn run_task(
         let mut tools = local_tools(&state.workspace, state.tool_catalog.as_deref(), ban_run_command);
         tools.retain(|tool| tool.pointer("/function/name").and_then(Value::as_str)
             .is_some_and(|name| state.permission_mode.allows(name)));
-        let mut progress_schema=report_progress_tool();
-        if let Some(props)=progress_schema.pointer_mut("/function/parameters/properties").and_then(Value::as_object_mut) {
-            for key in ["plan","node_updates","node_result","resume_tree","work_organization","edit_targets","observer_responses"] {props.remove(key);}
-        }
-        progress_schema["function"]["description"]=json!("Report current work purpose, known conditions and new findings together with actual work. Organizer owns the plan and node; reports never complete work. No separate readiness promises.");
-        tools.push(progress_schema);tools.push(recall_work_tool());tools.push(crate::work_organizer::yield_tool());
+        tools.push(report_progress_tool());tools.push(recall_work_tool());tools.push(crate::session_history::tool());tools.push(crate::work_organizer::yield_tool());
         if state.observer_enabled {tools.push(consult_observer_tool());}
         if state.enable_subagent
             && !state.expert_provider_url.is_empty()
@@ -3543,18 +3436,16 @@ pub(crate) async fn run_task(
         compaction["pinned_source_chars"]=json!(source_working_set.materials().iter().filter_map(|material|material["returned_chars"].as_u64()).sum::<u64>());
         compaction["work_unit"]=json!({"id":scheduler.id(),"scope":scheduler.scope(),"input":scheduler.worker_input(&prompt)});
         scoped_messages.push(json!({"role":"system","content":format!("Runtime permissions: {}. A completed work unit is sealed by the host; a new unit has its own inputs.",state.permission_mode.guidance())}));
-        let observer_messages=crate::observer_service::annotate_advice(observer_inbox.messages(),&scheduler);
-        if !observer_messages.is_empty() {
-            scoped_messages.push(json!({"role":"system","content":format!("Observer messages (original returns with host provenance; advisory observations, not new human instructions):\n{}",json!({"observer_messages":observer_messages}))}));
-        }
-        let source_files=source_working_set.materials().iter().filter_map(|page|page["path"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        let observer_messages=crate::observer_service::annotate_advice(observer_inbox.messages_since(worker_observer_cursor),&scheduler)
+            .iter().map(crate::session_history::observer_message).collect::<Vec<_>>();
+        worker_observer_cursor=observer_inbox.message_cursor();
+        let new_observer_message=(!observer_messages.is_empty()).then(||json!({"role":"system","content":format!("New Observer messages (older messages remain available through read_session_history; observations are advisory, not new human instructions):\n{}",json!({"observer_messages":observer_messages}))}));
+        if let Some(message)=&new_observer_message {scoped_messages.push(message.clone());}
         let request_work=notebook.link_findings(work_state.unit_context(scheduler.id(),scheduler.order().map_or(&[],|o|o.finding_ids.as_slice())));
         compaction["work_projection"]=request_work["projection"].clone();
-        scoped_messages.push(json!({"role":"system","content":format!(
-            "Task notebook conclusions and current work:\n{}\nHistorical records are not automatically invalid. Take the next action from these conclusions; retrieve exact notebook materials only when needed. A file version change is not proof that all conclusions about it are wrong.", request_work
-        )}));
-        let material_index=notebook.node_context(&context_node,&source_files,scheduler.request_started_turn);
-        scoped_messages.push(json!({"role":"system","content":format!("Task notebook material index (only locations, retrieve focused pages when necessary):\n{}",material_index)}));
+        if request_work["findings"].as_array().is_some_and(|findings|!findings.is_empty()) {
+            scoped_messages.push(json!({"role":"system","content":format!("Current task findings and explicitly selected upstream conclusions:\n{}",request_work)}));
+        }
         if !source_working_set.materials().is_empty() { scoped_messages.push(json!({"role":"system","content":format!("Exact source working set for the current action; only selected pages, checked against current files. All other materials remain in the notebook. Reports preserve this selection; tree navigation saves/restores each node's own selected pages:\n{}",json!(source_working_set.materials()))})); }
         if scheduler.finished {
             scoped_messages=vec![json!({"role":"system","content":"Deliver the verified process result below to the human concisely. Tools are omitted because execution finished. Do not investigate or promise more work; preserve actual checks and limitations."}),
@@ -3567,6 +3458,7 @@ pub(crate) async fn run_task(
             }));
         }
         step_starts.push(messages.len());
+        if let Some(message)=new_observer_message {messages.push(message);}
         let mut body = json!({
             "model":model,"messages":scoped_messages,"tools":tools,"tool_choice":"auto","stream":true
         });
@@ -3590,8 +3482,7 @@ pub(crate) async fn run_task(
             body["service_tier"] = json!("fast");
         }
         let visual_context=worker_visual_context(&task_id,&scheduler);
-        let mut visual_ids=scheduler.frame().map(|f|f.visual_artifact_ids.iter().rev().filter(|id|!f.seen_visual_artifact_ids.contains(id)).take(crate::visual_artifacts::MAX_IMAGES).cloned().collect::<Vec<_>>()).unwrap_or_default();
-        visual_ids.reverse(); // Select the newest materials, present before/after in selection order.
+        let visual_ids=scheduler.visual_input_ids();
         let visual_dispatch=crate::visual_artifacts::prepare_request(&state,"worker",&model,&visual_context,&visual_ids,scheduler.order().map(|o|o.visual_goal.as_deref().unwrap_or(&o.goal)).unwrap_or(&prompt),&mut body).await?;
         compaction["visual_dispatch"]=visual_dispatch.clone();
         let process_identity = crate::work_executor::WorkExecutor::capture_identity(&scheduler, step);
@@ -3661,15 +3552,15 @@ pub(crate) async fn run_task(
                 let progress_calls=calls.iter().filter(|call|call.name=="report_progress").collect::<Vec<_>>();
                 let mut progress_results=HashMap::<String,String>::new();
                 for call in progress_calls {
-                    let mut args=serde_json::from_str::<Value>(&call.arguments).unwrap_or(json!({}));
-                    let invalid=["plan","node_updates","node_result","resume_tree","work_organization","edit_targets"].iter().any(|key|args.get(*key).is_some());
-                    if invalid || args["current_node_id"].as_str().is_some_and(|id|id!=scheduler.node()) {
-                        progress_results.insert(call.call_id.clone(),json!({"error":"Organizer owns planning and node selection. Report only the current work; yield_work returns an output or need_split."}).to_string());continue;
-                    }
-                    args["current_node_id"]=json!(scheduler.node());
+                    let args=match bind_progress_report(&call.arguments,scheduler.node()) {
+                        Ok(args)=>args,
+                        Err(error)=>{
+                            progress_results.insert(call.call_id.clone(),json!({"error":format!("Invalid report_progress arguments: {error}")}).to_string());
+                            continue;
+                        }
+                    };
                     scheduler.record_progress(&args,turn,step);
                     for revision in work_state.report_at(&args,turn,step,source_working_set.materials(),&prompt) {emit(&root,&task_id,"worker/finding_revision",revision).await?;}
-                    source_working_set.select_action(&args);
                     latest_worker_progress=json!({
                         "turn": turn,
                         "step": step,
@@ -3683,8 +3574,7 @@ pub(crate) async fn run_task(
                         "findings": args["findings"]
                     });
                     emit(&root,&task_id,"worker/progress",latest_worker_progress.clone()).await?;
-                    progress_results.insert(call.call_id.clone(),json!({"reported":true,"finding_updates":work_state.finding_receipts(&args),"done":scheduler.done(),
-                        "task_returned":false,"guidance":"Recorded on the current node. This task continues with you: take the actual next operation now, or return with yield_work. A report alone does not hand off."}).to_string());
+                    progress_results.insert(call.call_id.clone(),json!({"reported":true,"finding_updates":work_state.finding_receipts(&args)}).to_string());
                 }
 
                 let mut visible_content = Vec::new();
@@ -3852,6 +3742,8 @@ pub(crate) async fn run_task(
                             }
                         }
                         }
+                    } else if call.name == "read_session_history" {
+                        crate::session_history::read(&root,&task_id,&args).await
                     } else if call.name == "consult_observer" {
                         if !state.observer_enabled {
                             Err(anyhow::anyhow!("Observer assistance is not enabled for this task. Continue with your own judgment."))
@@ -3861,17 +3753,8 @@ pub(crate) async fn run_task(
                                 "turn":turn,"step":step,"callId":call.call_id,"question":question,
                             })).await?;
                             let observer_query = format!("{prompt}\n{question}");
-                            let observer_context = tokio::select! {
-                                _ = cancel.cancelled() => {
-                                    return Ok(crate::work_executor::ToolRoundOutput { operations_count: project_operations,
-                                        repeated_reads: repeated_read_calls.saturating_sub(repeats_at_start), disposition: crate::work_executor::RoundDisposition::Cancelled });
-                                }
-                                result = observer_session_context(&state, &root, &task_id, &observer_query, &scheduler) => result
-                            };
-                            let observer_context = observer_context.unwrap_or_else(|error| json!({
-                                "context_unavailable":error.to_string(),"current_request":prompt,
-                            }));
-                            let obs_system = "You are an optional read-only Observer. The Worker is independent and asked for help. Use relevant project memories and prior task conversations when available, but follow the current request. Give concise, concrete guidance for the exact question. Do not inspect code syntax or try to take over execution. Return JSON: {\"answer\":\"...\"}.";
+                            let observer_context = observer_session_context(&observer_query,&scheduler);
+                            let obs_system = "You are an optional read-only Observer. The Worker is independent and asked for help. Use the supplied current input first; if a specific earlier fact is missing, use read_session_history, with scope=project for other conversations in this workspace. Memory is a separate capability, not routine task history. Give concise, concrete guidance for the exact question. Do not inspect code syntax or try to take over execution. Return JSON: {\"answer\":\"...\"}.";
                             let consult_identity=crate::observer_service::identity(&task_id,&scheduler,scheduler.id());
                             let mut consult_metadata=consult_identity.clone();
                             consult_metadata["turn"]=json!(turn);consult_metadata["step"]=json!(step);
@@ -4095,7 +3978,7 @@ pub(crate) async fn run_task(
                         "toolCallId":call.call_id,"content":[{"type":"text","text":bounded}],"isError":is_error
                     });
                     emit_surface(&root,&task_id,"tool/result",json!({
-                        "turn":turn,"step":step,"message":result_message,
+                        "turn":turn,"step":step,"flowNodeId":active_flow_node,"message":result_message,
                         "meta":{"durationMs":started.elapsed().as_millis(),"result":result},
                     }),Some("append")).await?;
                     messages.push(crate::format_translate::openai_chat_tool_result_message(&call, &bounded));
@@ -4145,11 +4028,24 @@ pub(crate) async fn run_task(
                 return Ok(());
             }
             Err(error) => {
-                crate::request_context::finish(request_trace.take(),"execution_error",json!({})).await;
                 let message=format!("{error:#}");
+                crate::request_context::finish(request_trace.take(),"execution_error",json!({"error":message,"visual_dispatch":visual_dispatch})).await;
+                let visual_failure=error.downcast_ref::<crate::visual_probe::VisualModelFailure>();
+                if visual_failure.is_some() {
+                    scheduler.visual_response_failed(&visual_dispatch,&message);
+                    emit(&root,&task_id,"visual/model_failed",json!({"turn":turn,"step":step,"actor":"worker","manifest":visual_dispatch,"error":message})).await?;
+                }
                 attach_handoff_error(&mut scheduler.handoff,"execution_error",
                     json!({"stage":"worker_execution","error":message,"work_id":process_identity.work_id,
-                        "node_id":process_identity.node_id,"revision":process_identity.revision}));
+                        "node_id":process_identity.node_id,"revision":process_identity.revision,"visual_request":visual_dispatch}));
+                let image_request_failed=visual_failure.is_some() && visual_dispatch["status"]=="direct";
+                if image_request_failed {
+                    if visual_failure.and_then(|failure|failure.error.downcast_ref::<crate::visual_probe::HttpModelFailure>()).is_some_and(|failure|
+                        crate::visual_probe::explicitly_rejects_images(failure.status,&failure.body)) {
+                        state.visual.capabilities.entry(state.provider_name.clone()).or_default().insert(model.clone(),crate::visual_artifacts::ImageCapability::Unsupported);
+                    }
+                    messages.push(json!({"role":"system","content":format!("The previous model request with image content failed: {message}. Its failed visual dispatch is {}. No tools from that request ran and the images were not visually verified. Use the raw failure and existing task facts to decide the next action; selecting an image again requires an explicit view_image call.",visual_dispatch)}));
+                }
                 let flow_plan=scheduler.unified_flow_plan(if task_tree.enabled(){Some(&task_tree)}else{None});
                 crate::observer_service::commit(&root,&task_id,json!({
                     "commit_id":format!("{turn}:{step}:{}:execution-error",scheduler.plan_revision),
@@ -4157,6 +4053,13 @@ pub(crate) async fn run_task(
                     "worker_state":work_state.snapshot(),"flow_plan":flow_plan.clone(),
                     "active_node_id":flow_plan["active_node_id"],"active_path":flow_plan["active_path"]
                 }),Vec::new()).await?;
+                if image_request_failed {
+                    observer.set_scope(&scheduler,&prompt);observer.notify();
+                    emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step,"reason":"image_request_failed","error":message})).await?;
+                    // Return the failure to Organizer's ordinary decision path.
+                    // No fixed image retry or host business judgment is added.
+                    continue;
+                }
                 fail_turn(&state, &root, &task_id, turn, step, &observer_model, &prompt, message,
                     "WORKER_EXECUTION_FAILED","worker_execution").await?;
                 observer.finish("failed").await?;
@@ -4746,6 +4649,7 @@ pub(crate) mod tests {
             "list_work_memory",
             "search_work_memory",
             "record_work_memory",
+            "read_session_history",
             "run_program",
             "spawn_subagent",
         ];
@@ -4756,7 +4660,7 @@ pub(crate) mod tests {
         assert!(prompt.contains("@relative/path"));
         assert!(prompt.contains("indexed symbol tools"));
         assert!(prompt.contains("search_text"));
-        assert!(prompt.contains("one focused search_work_memory query"));
+        assert!(prompt.contains("scope=project searches conversations"));
         assert!(!prompt.contains("record a work memory"));
         assert!(prompt.contains("You may use spawn_subagent once"));
 
@@ -5448,7 +5352,7 @@ pub(crate) mod tests {
             if decision["auto_apply_observer"]==true {
                 let input:Value=serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
                 let mut responses=Vec::new();
-                for advice in input["observer_advice"].as_array().into_iter().flatten() {
+                for advice in input["observer_messages"].as_array().into_iter().flatten() {
                     let application=if decision["action"]=="revisit" {json!({"field":"revisit","value":decision["target_node_id"]})}
                         else {
                             let order=&mut decision["orders"][0];
@@ -6101,7 +6005,7 @@ pub(crate) mod tests {
         let worker=requests.iter().filter(|body|is_worker_request(body)).collect::<Vec<_>>();
         assert_eq!(worker.len(),2);
         let worker_context=worker[1]["messages"].as_array().unwrap().iter().filter_map(|message|message["content"].as_str())
-            .find_map(|text|text.strip_prefix("Observer messages (original returns with host provenance; advisory observations, not new human instructions):\n"))
+            .find_map(|text|text.strip_prefix("New Observer messages (older messages remain available through read_session_history; observations are advisory, not new human instructions):\n"))
             .map(|text|serde_json::from_str::<Value>(text).unwrap()).expect("next Worker request must receive the completed Observer message");
         let original=&worker_context["observer_messages"][0]["observer_return"];
         assert_eq!(original["summary"],"CURRENT_REQUEST_ADVICE");
@@ -6135,7 +6039,7 @@ pub(crate) mod tests {
         assert!(!events.iter().any(|(kind,_)|kind=="organizer/advice_error"));
         assert!(events.iter().any(|(kind,v)|kind=="observer/advice_response" && v["actor"]=="organizer" && v["advice"]["application"]["field"]=="constraints"));
         for work in ["a","b","c"] {assert!(events.iter().any(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff" && v["identity"]["work_id"]==work));}
-        let observer_inputs:Vec<Value>=requests.iter().filter(|b|b["stream"]==false && b.get("tools").is_none())
+        let observer_inputs:Vec<Value>=requests.iter().filter(|b|b["stream"]==false)
             .map(|b|serde_json::from_str(b["messages"][1]["content"].as_str().unwrap()).unwrap()).collect();
         assert!(observer_inputs.iter().any(|i|i["identity"]["work_id"]=="b" && i["resolved_inputs"].to_string().contains("A sealed")));
         assert!(observer_inputs.iter().filter(|i|i["stage"]!="retrospective").all(|i|i.get("work_trace").is_none() && i.to_string().chars().count()<=crate::observer_service::INPUT_BUDGET));
@@ -6177,7 +6081,7 @@ pub(crate) mod tests {
         assert_eq!(returned["process"]["current_result"]["summary"],"A closure captures its environment");
         assert!(returned["process"]["current_result"]["outcome"].is_null());
         assert!(returned["process"]["current_result"]["blocked"].is_null());
-        assert!(requests.iter().filter(|b|b["stream"]==false && b.get("tools").is_none()).count()<=2);
+        assert!(requests.iter().filter(|b|b["stream"]==false).count()<=2);
         let ids:std::collections::HashSet<_>=events.iter().filter(|(kind,v)|kind=="observer/node_review" && v["stage"]=="handoff").map(|(_,v)|v["review_id"].clone()).collect();
         assert_eq!(ids.len(),1);
         let commit=committed_turn(&events,1);
@@ -6307,10 +6211,10 @@ pub(crate) mod tests {
         assert!(lifecycle_schemas.iter().any(|schema|schema==&json!(["continue","subtask","replace"])));
         // The lifecycle decision sees the unresolved advice belonging to the
         // old goal. Once replacement commits, only the new goal's advice enters.
-        assert!(inputs[1]["observer_advice"].to_string().contains("CANCELLED_DRAG_ADVICE"));
-        assert!(inputs[2]["observer_advice"].to_string().contains("CURRENT_REQUEST_ADVICE"));
-        assert!(!inputs[2]["observer_advice"].to_string().contains("CANCELLED_DRAG_ADVICE"));
-        assert_eq!(inputs[2]["observer_advice"][0]["request_id"],2);
+        assert!(inputs[1]["observer_messages"].to_string().contains("CANCELLED_DRAG_ADVICE"));
+        assert!(inputs[2]["observer_messages"].to_string().contains("CURRENT_REQUEST_ADVICE"));
+        assert!(!inputs[2]["observer_messages"].to_string().contains("CANCELLED_DRAG_ADVICE"));
+        assert_eq!(inputs[2]["observer_messages"][0]["request_id"],2);
         let inbox = &events.iter().rev().find(|(kind,_)|kind=="observer/inbox_state").unwrap().1["state"];
         assert_eq!(inbox["request_id"],2);
         let items:Vec<_> = inbox["items"].as_object().unwrap().values().collect();
@@ -6493,7 +6397,7 @@ pub(crate) mod tests {
         let feedback=organizer_contract_feedback(&resume_error,&resume_decision,&scheduler,&tree);
         assert_eq!(feedback["error_code"],"REMOVED_FLOW_PROTOCOL");
         assert_eq!(feedback["field_path"],"flow_update.node_updates[0].resume");
-        assert_eq!(feedback["allowed_values"],json!(["schedule_task","read_task_result","read_flow_page","search_work_memory",
+        assert_eq!(feedback["allowed_values"],json!(["schedule_task","read_task_result","read_flow_page","read_session_history","search_work_memory",
             "search_architecture_memory","search_symbol_business_context","search_project_symbols","read_project_symbol","read_source_material",
             "revisit_task","finish_request"]));
         assert!(feedback["expected_shape"].as_str().unwrap().contains("host-managed"));

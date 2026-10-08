@@ -29,6 +29,7 @@ pub fn yield_tool() -> Value {
     json!({"type":"function","function":{"name":"yield_work","description":"Return this work's actual output, concrete blocker, request to split, or upstream problem to Organizer. This seals the current invocation; do not promise future work.","parameters":{"type":"object","properties":{
         "summary":{"type":"string","minLength":1},"outcome":{"type":"string","enum":["completed","blocked","need_split","upstream_problem"],
             "description":"Optional Worker-reported assessment. Omit it when no categorical outcome is known; the host records invocation status as done and never supplies a default success outcome."},
+        "reason":{"type":"string","description":"Concrete cause of a blocked, negative, split or upstream-dependent result, including the observed failure and missing capability or input. This is delivered intact to Organizer; do not just promise another attempt."},
         "blocked":{"type":"boolean"},"need_split":{"type":"boolean"},
         "upstream_problem":{"type":"object","properties":{
             "node_id":{"type":"string"},"revision":{"type":"integer"},"field":{"type":"string"},"reason":{"type":"string"},"material_ids":{"type":"array","items":{"type":"integer"}}
@@ -79,6 +80,10 @@ fn organizer_tools(input:&Value)->Vec<Value> {
                 "project_observation":{"type":"object"}}},
             "request_action":request_action_schema(input)
         },"required":["goal","return_when","reason"]}}});
+    let resume=json!({"type":"function","function":{"name":"resume_task",
+        "description":"Continue an existing unfinished node without creating another node or replacing its task contract. Use a work_id and revision from process.resumable_tasks when the user continues the same goal.",
+        "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"revision":{"type":"integer","minimum":1},
+            "reason":{"type":"string","minLength":1},"request_action":request_action_schema(input)},"required":["work_id","revision","reason"]}}});
     let read=json!({"type":"function","function":{"name":"read_task_result",
         "description":"Read exact selected fields from any completed task instance by work_id, including historical/deprecated revisions. The response labels whether it is historical and dependency-eligible. Raw source and operation materials remain in the notebook.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"node_id":{"type":"string"},
@@ -116,7 +121,7 @@ fn organizer_tools(input:&Value)->Vec<Value> {
             "reason":{"type":"string","minLength":1},"repair_goal":{"type":"string","maxLength":2400},
             "replacement_checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000}},
             "request_action":request_action_schema(input)},"required":["target_node_id","reason"]}}});
-    vec![schedule,read,flow,work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit]
+    vec![schedule,resume,read,flow,crate::session_history::tool(),work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit]
 }
 
 fn host_work_id(task_id:&str,turn:usize,step:usize)->String {
@@ -162,6 +167,16 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             if decision["request_action"]=="subtask" {decision["preserve_current"]=json!(true);}
             Ok(decision)
         },
+        "resume_task"=>{
+            let work_id=args["work_id"].as_str().filter(|id|!id.trim().is_empty()).ok_or_else(||
+                contract_error("RESUME_TARGET_REQUIRED","work_id",args.get("work_id"),"provide the existing unfinished work_id"))?;
+            let revision=args["revision"].as_u64().filter(|revision|*revision>0).ok_or_else(||
+                contract_error("RESUME_REVISION_REQUIRED","revision",args.get("revision"),"provide the existing node revision"))?;
+            if args["reason"].as_str().is_none_or(|reason|reason.trim().is_empty()) {return Err(contract_error("RESUME_REASON_REQUIRED","reason",args.get("reason"),"state why this existing task continues"));}
+            let mut decision=json!({"action":"select","task_id":work_id,"target_revision":revision,"reason":args["reason"]});
+            if let Some(action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=action.clone();}
+            Ok(decision)
+        },
         "read_task_result"=>{
             if args["work_id"].as_str().is_none_or(str::is_empty)&&args["node_id"].as_str().is_none_or(str::is_empty) {
                 return Err(contract_error("RESULT_REFERENCE_REQUIRED","work_id",args.get("work_id"),"provide a completed work_id or node_id"));
@@ -170,6 +185,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
                 "fields":args.get("fields").cloned().unwrap_or_else(||json!([]))}))
         },
         "read_flow_page"=>Ok(json!({"action":"read_flow_page","cursor":args["cursor"],"limit":args.get("limit").cloned().unwrap_or(json!(50))})),
+        "read_session_history"=>{let mut decision=args;decision["action"]=json!(name);Ok(decision)},
         "search_work_memory"|"search_architecture_memory"|"search_symbol_business_context"=>{
             let query=args["query"].as_str().unwrap_or("").trim();
             if query.is_empty(){return Err(contract_error("SEARCH_QUERY_REQUIRED","query",args.get("query"),"provide a focused query"));}
@@ -222,7 +238,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
 }
 
 pub fn is_organizer_tool(name:&str)->bool {
-    matches!(name,"schedule_task"|"read_task_result"|"read_flow_page"|"search_work_memory"|"search_architecture_memory"
+    matches!(name,"schedule_task"|"resume_task"|"read_task_result"|"read_flow_page"|"read_session_history"|"search_work_memory"|"search_architecture_memory"
         |"search_symbol_business_context"|"search_project_symbols"|"read_project_symbol"|"read_source_material"|"finish_request"|"revisit_task")
 }
 
@@ -294,7 +310,7 @@ async fn receive(state:&AgentServiceState,body:&Value,cancel:&CancellationToken,
     };
     *status=Some(response.status().as_u16());
     *headers_ms=Some(started.elapsed().as_millis() as u64);
-    let response=response.error_for_status().map_err(|error|Interrupted::Failed(error.into()))?;
+    let response=crate::visual_probe::successful_response(response).await.map_err(Interrupted::Failed)?;
     let mut phase="waiting_first_delta";
     progress.emit(phase,&accumulator.stats(),*headers_ms,started.elapsed().as_millis() as u64).await;
     let mut last_progress=Instant::now();

@@ -55,6 +55,8 @@ struct ModelCapabilities {
     fast_mode: bool,
     #[serde(default)]
     image_input:crate::visual_artifacts::ImageCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_probe: Option<Value>,
 }
 
 fn built_in_capabilities(model: &str) -> ModelCapabilities {
@@ -65,6 +67,7 @@ fn built_in_capabilities(model: &str) -> ModelCapabilities {
             default_effort: Some("max".into()),
             fast_mode: true,
             image_input:Default::default(),
+            image_probe:None,
         }
     } else {
         ModelCapabilities::default()
@@ -351,6 +354,16 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         for model_id in provider.model_map.keys() {
             models.entry(model_id.clone()).or_insert_with(|| built_in_capabilities(model_id));
         }
+        for (model, capability) in models {
+            if capability.image_probe.as_ref().is_some_and(|probe| provider.api_type != "openai-completions"
+                || probe["route_fingerprint"] != crate::visual_probe::route_fingerprint(&provider.url,model)) {
+                capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
+            }
+            if capability.image_input == crate::visual_artifacts::ImageCapability::Supported
+                && (provider.api_type != "openai-completions" || !verified_image_support(capability, &provider.url, model)) {
+                capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
+            }
+        }
     }
     Ok(config)
 }
@@ -531,6 +544,71 @@ fn nonempty(value: Option<String>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn verified_image_support(capability: &ModelCapabilities, url: &str, model: &str) -> bool {
+    capability.image_probe.as_ref().is_some_and(|probe|
+        probe["status"] == "verified" && probe["capability"] == "supported"
+        && probe["request"]["contains_image_content"] == true
+        && probe["route_fingerprint"] == crate::visual_probe::route_fingerprint(url,model))
+}
+
+fn image_probe_route(config: &AiProxyConfig, provider: &str, model: &str) -> anyhow::Result<crate::visual_artifacts::VisualRoute> {
+    let route = config.providers.get(provider).ok_or_else(||anyhow::anyhow!("provider is not configured; save settings first"))?;
+    anyhow::ensure!(route.api_type == "openai-completions", "image probe currently requires an OpenAI Chat Completions route");
+    let model = route.model_map.get(model).ok_or_else(||anyhow::anyhow!("model is not configured; save settings first"))?;
+    Ok(crate::visual_artifacts::VisualRoute { provider:provider.into(),model:model.clone(),url:route.url.clone(),api_key:route.api_key.clone() })
+}
+
+fn persist_image_probe(path: &Path, revision: &str, provider: &str, model: &str, report: &Value) -> anyhow::Result<(AiProxyConfig,String)> {
+    anyhow::ensure!(disk_revision(path)? == revision, "settings changed during image verification; run it again on the saved route");
+    let mut config = load_config(path)?;
+    let route = image_probe_route(&config,provider,model)?;
+    anyhow::ensure!(report["route_fingerprint"] == crate::visual_probe::route_fingerprint(&route.url,&route.model), "image probe route changed");
+    let capability = config.model_capabilities.entry(provider.into()).or_default().entry(model.into()).or_default();
+    capability.image_input = serde_json::from_value(report["capability"].clone())?;
+    capability.image_probe = Some(report.clone());
+    let generation_path = generation_settings_path(path);
+    let mut generation = read_yaml(&generation_path,json!({}))?;
+    generation["model_capabilities"] = serde_json::to_value(&config.model_capabilities)?;
+    write_yaml_atomic(&generation_path,&generation)?;
+    Ok((config,disk_revision(path)?))
+}
+
+#[derive(Deserialize)]
+struct ImageProbeRequest { revision:String, provider:String, model:String }
+
+async fn probe_agent_image_input(State(state): State<AiProxyState>, headers: HeaderMap, Json(input): Json<ImageProbeRequest>) -> Response {
+    if !trusted_settings_request(&headers) {
+        return (StatusCode::FORBIDDEN,Json(json!({"error":"settings are only available to the local page"}))).into_response();
+    }
+    let result = async {
+        let config = load_config(&state.config_path)?;
+        anyhow::ensure!(disk_revision(&state.config_path)? == input.revision, "settings changed; reload before image verification");
+        let route = image_probe_route(&config,&input.provider,&input.model)?;
+        let report = crate::visual_probe::probe(&state.client,&route).await?;
+        let _guard = state.settings_write.lock().await;
+        let (config,revision) = persist_image_probe(&state.config_path,&input.revision,&input.provider,&input.model,&report)?;
+        let view = settings_view(&config,revision);
+        *state.config.write().await = config;
+        Ok::<_,anyhow::Error>(json!({"probe":report,"settings":view}))
+    }.await;
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST,Json(json!({"error":format!("{error:#}")}))).into_response(),
+    }
+}
+
+pub(crate) async fn probe_default_image_input(path: &Path) -> anyhow::Result<Value> {
+    let revision = disk_revision(path)?;
+    let config = load_config(path)?;
+    let provider = config.orchestrator_provider.as_deref().ok_or_else(||anyhow::anyhow!("main provider is not configured"))?;
+    let model = config.orchestrator_model.as_deref().ok_or_else(||anyhow::anyhow!("main model is not configured"))?;
+    let route = image_probe_route(&config,provider,model)?;
+    let report = crate::visual_probe::probe(&Client::new(),&route).await?;
+    // Store evidence without touching profile routing, credentials, or fallback settings.
+    persist_image_probe(path,&revision,provider,model,&report)?;
+    Ok(report)
+}
+
 fn save_settings(
     config_path: &Path,
     request: SettingsEdit,
@@ -583,7 +661,17 @@ fn save_settings(
         let configured = draft.model_capabilities.unwrap_or_else(|| config.model_capabilities.get(&id).cloned().unwrap_or_default());
         let mut capabilities = HashMap::new();
         for model in &draft.models {
-            let capability = configured.get(model).cloned().unwrap_or_else(|| built_in_capabilities(model));
+            let mut capability = configured.get(model).cloned().unwrap_or_else(|| built_in_capabilities(model));
+            // A settings payload cannot manufacture successful probe evidence.
+            capability.image_probe = config.model_capabilities.get(&id).and_then(|models|models.get(model))
+                .and_then(|previous|previous.image_probe.clone());
+            if capability.image_probe.as_ref().is_some_and(|probe| draft.api_type != "openai-completions"
+                || probe["route_fingerprint"] != crate::visual_probe::route_fingerprint(url.as_str(),model)) {
+                capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
+            }
+            anyhow::ensure!(capability.image_input != crate::visual_artifacts::ImageCapability::Supported
+                || (draft.api_type == "openai-completions" && verified_image_support(&capability, url.as_str(), model)),
+                "provider {id} model {model}: verify image input on the saved route before marking it supported");
             anyhow::ensure!(capability.reasoning_efforts.iter().all(|effort| matches!(effort.as_str(), "none" | "low" | "medium" | "high" | "xhigh" | "max")), "provider {id} model {model} has an unsupported reasoning effort");
             anyhow::ensure!(capability.reasoning_efforts.iter().collect::<std::collections::HashSet<_>>().len() == capability.reasoning_efforts.len(), "provider {id} model {model} has duplicate reasoning efforts");
             anyhow::ensure!(capability.default_effort.as_ref().is_none_or(|effort| capability.reasoning_efforts.contains(effort)), "provider {id} model {model} default effort is not in its supported levels");
@@ -1470,6 +1558,7 @@ pub async fn run(
             get(get_agent_settings).put(put_agent_settings),
         )
         .route("/agent/settings/discover", post(discover_agent_models))
+        .route("/agent/settings/probe-image", post(probe_agent_image_input))
         .route("/agent/plugins", get(plugin_tree))
         .merge(agent_routes)
         .with_state(state)
@@ -1589,5 +1678,35 @@ mod tests {
 
         assert_eq!(provider.url, "https://cheap.example/v1");
         assert_eq!(model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn image_probe_evidence_is_persisted_and_bound_to_the_saved_route() {
+        let root=std::env::temp_dir().join(format!("codex-image-config-{}",crate::visual_artifacts::new_id()));
+        let path=root.join("profiles/web/cordis.patch.yml");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut patch=json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"https://first.example/v1","api":"openai-completions","models":[{"id":"m"}]}}}},
+            {"id":"agent-default-model","config":{"provider":"test","model":"m"}}]);
+        write_yaml_atomic(&path,&patch).unwrap();
+        let generation=generation_settings_path(&path);
+        write_yaml_atomic(&generation,&json!({"custom_setting":"retain me"})).unwrap();
+        let report=json!({"status":"verified","capability":"supported","request":{"contains_image_content":true},
+            "route_fingerprint":crate::visual_probe::route_fingerprint("https://first.example/v1","m"),"response_body":"image-only challenge passed"});
+        let original=disk_revision(&path).unwrap();
+        let (_,revision)=persist_image_probe(&path,&original,"test","m",&report).unwrap();
+        assert_ne!(revision,original);
+        assert_eq!(read_yaml(&generation,json!({})).unwrap()["custom_setting"],"retain me");
+        let config=load_config(&path).unwrap();let capability=&config.model_capabilities["test"]["m"];
+        assert_eq!(capability.image_input,crate::visual_artifacts::ImageCapability::Supported);
+        assert_eq!(capability.image_probe.as_ref().unwrap(),&report);
+        assert!(persist_image_probe(&path,&original,"test","m",&report).is_err(),"stale revisions cannot overwrite settings");
+        patch[0]["config"]["providers"]["test"]["api"]=json!("anthropic-messages");write_yaml_atomic(&path,&patch).unwrap();
+        assert_eq!(load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,crate::visual_artifacts::ImageCapability::Unknown,"a Chat Completions probe cannot verify another protocol");
+        patch[0]["config"]["providers"]["test"]["api"]=json!("openai-completions");
+        patch[0]["config"]["providers"]["test"]["baseURL"]=json!("https://second.example/v1");write_yaml_atomic(&path,&patch).unwrap();
+        assert_eq!(load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,crate::visual_artifacts::ImageCapability::Unknown);
+        let edit:SettingsEdit=serde_json::from_value(json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"https://second.example/v1","api_type":"openai-completions","models":["other"],
+            "model_capabilities":{"other":{"image_input":"supported","image_probe":report}}}]})).unwrap();
+        assert!(save_settings(&path,edit).unwrap_err().to_string().contains("verify image input"),"UI payloads cannot manufacture support evidence");
+        let _=std::fs::remove_dir_all(root);
     }
 }

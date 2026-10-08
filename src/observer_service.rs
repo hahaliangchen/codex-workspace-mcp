@@ -127,7 +127,10 @@ pub fn pack(mut input: Value, _path: &[Value], memories: &[Value]) -> Value {
             "upstream_problem":compact(&input["delivery"]["handoff"]["upstream_problem"],800)},
         "current_node":{"goal":input["current_node"]["goal"],"done_when":input["current_node"]["done_when"]},
         "observed_at":input["observed_at"],"node_state":node_state(&input["node_facts"]),
-        "current_facts":{"http_observations":fact_texts(&input["current_facts"]["http_observations"]),"browser":compact(&input["current_facts"]["browser"],600)},
+        "current_facts":{"http_observations":fact_texts(&input["current_facts"]["http_observations"]),
+            "browser":compact(&input["current_facts"]["browser"],600),
+            "browser_uploads":compact(&input["current_facts"]["browser_uploads"],600),
+            "browser_scope":input["current_facts"]["browser_scope"]},
         "visual_artifacts":input["visual_artifacts"],"visual_check_result":input["visual_check_result"],"visual_capture":input["visual_capture"],"allowed_visual_artifact_ids":input["allowed_visual_artifact_ids"]});
     // Keep the sender's message separate from optional summaries of logs and
     // source material. The current handoff must survive context budgeting.
@@ -578,9 +581,16 @@ async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Valu
     let root=state.workspace.root().to_path_buf();let trace_task=task.to_owned();
     let trace=tokio::task::spawn_blocking(move ||agent_service::load_observer_work_trace(&root,&trace_task)).await??;
     let turn=trace.iter().filter_map(|entry|entry["turn"].as_u64()).max().unwrap_or(1);
+    let mut path=scope["frames"].as_object().into_iter().flat_map(|frames|frames.values()).collect::<Vec<_>>();
+    path.sort_by_key(|frame|frame["sequence"].as_u64().unwrap_or(0));
+    let flow=path.iter().map(|frame|json!({"node_id":frame["order"]["node_id"],"status":frame["status"],
+        "goal":short(frame["order"]["goal"].as_str().unwrap_or(""),240),"superseded":frame["invalidated_by_plan_revision"],
+        "returned_at":frame["returned_at"],"summary":frame["output"]["summary"].as_str().map(|text|short(text,600)),
+        "outcome":frame["output"]["outcome"],"retained_operations_count":frame["operations"].as_array().map(Vec::len)})).collect::<Vec<_>>();
     let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
         "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
-        "final_result":scope["final_result"],"work_trace":trace,
+        "final_result":scope["final_result"],"flow_overview":flow,
+        "history":{"tool":"read_session_history","scope":"Read exact actions or original returns only for a specific question about this route."},
         "known_read_targets":agent_service::observer_known_read_targets(&trace,task,24)});
     let raw=agent_service::observer_json_response(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
         json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]})).await?;
@@ -604,7 +614,6 @@ async fn run(
 ) {
     let root = state.workspace.root();
     let mut cached_request = Value::Null;
-    let mut memories = Vec::new();
     let mut attempted = BTreeSet::new();
     let mut last_trace_seq = -1;
     let mut rescan = true;
@@ -690,7 +699,6 @@ async fn run(
             cached_request = current["request_id"].clone();
             last_trace_seq = rows.iter().filter(|(input,status,_)|status=="completed" && input["identity"]["request_id"]==cached_request)
                 .filter_map(|(_,_,result)|result["reviewed_through_seq"].as_i64()).max().unwrap_or(-1);
-            memories = tokio::select! {_=stop.cancelled()=>break,result=agent_service::observer_memory_context(state.workspace.clone(),current["goal"].as_str().unwrap_or("").to_owned())=>result};
         }
         // Only versioned targets already observed by Worker can support facts.
         let (trace_root, trace_task) = (root.to_path_buf(), task.clone());
@@ -742,7 +750,7 @@ async fn run(
             continue;
         }
         let _ = save(root, &task, &input, "reviewing", Value::Null).await;
-        let packed = pack(input.clone(), &[], &memories);
+        let packed = pack(input.clone(), &[], &[]);
         let started = Instant::now();
         let mut metadata = input["identity"].clone();
         metadata["nodeId"] = input["identity"]["node_id"].clone();
@@ -771,8 +779,7 @@ async fn run(
                 if let Some(id)=id.as_str() {if let Ok(item)=crate::visual_artifacts::metadata(root,&task,id) {if crate::visual_artifacts::authorize(&item,&visual_context).is_ok() {images.push(item);}}}
             }
             images.reverse();
-            let stale=!images.is_empty() && !images.iter().any(|item|crate::visual_artifacts::is_current_result(item,&visual_context));
-            if input["visual_required"]==true && input["stage"]!="assignment" && (images.is_empty() || stale) {
+            if input["visual_required"]==true && input["stage"]!="assignment" && images.is_empty() {
                 anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"visual instance changed before capture");
                 match crate::browser_control::observe_page_snapshot(root,&visual_context,&input["task_page"]).await {
                     Ok(snapshot)=>{
@@ -819,12 +826,18 @@ async fn run(
                 }
             },
             Err(error) => {
+                let visual_failure=error.downcast_ref::<crate::visual_probe::VisualModelFailure>();
+                let visual_request=visual_failure.map(|failure|failure.manifest.clone()).unwrap_or(Value::Null);
+                let result=json!({"assessment":"uncertain","message":format!("{error:#}"),"visual_request":visual_request,
+                    "visual_check_result":visual_failure.map(|failure|json!({"assessment":"unavailable","actor":"observer",
+                        "identity":failure.manifest["identity"],"model_route":failure.manifest["model_route"],"input_mode":"request_failed",
+                        "artifact_ids":failure.manifest["selected_artifact_ids"],"visual_request":failure.manifest,"limitations":[format!("{error:#}")]}))});
                 let _ = save(
                     root,
                     &task,
                     &input,
                     if error.is::<tokio::time::error::Elapsed>() {"timeout"}else{"failed"},
-                    json!({"assessment":"uncertain","message":format!("{error:#}")}),
+                    result,
                 )
                 .await;
             }

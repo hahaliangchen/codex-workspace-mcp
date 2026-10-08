@@ -43,3 +43,13 @@ test('request view folds image bytes without modifying the real request body', (
   assert.match(foldImageData(body).messages[0].content[0].image_url.url, /图片数据已折叠/)
   assert.equal(body.messages[0].content[0].image_url.url, 'data:image/png;base64,AAAA')
 })
+test('failed image requests retain selected pictures and the original provider reason after reload', () => {
+  const picture = artifact('rejected', identity(2, 2, 3))
+  const events = [{ type: 'visual/model_failed', data: { error: 'HTTP 400: image input unsupported', manifest: { identity: picture.identity, status: 'direct', images: [picture], actor: 'worker' } } }]
+  const records = visualRecords(JSON.parse(JSON.stringify(events)), node)
+  assert.equal(records.dispatches[0].status, 'request_failed')
+  assert.equal(records.dispatches[0].dispatch_status, 'direct')
+  assert.equal(records.dispatches[0].error, events[0].data.error)
+  assert.equal(records.artifacts[0].artifact_id, 'rejected')
+  assert.equal(records.checks.length, 0)
+})

@@ -1,0 +1,9 @@
+.card { margin: 20px auto; padding: 16px 18px; max-width: 860px; border: 1px solid var(--codex-border, #e5e7eb); border-radius: 14px; background: var(--codex-bg-main, #fff); font-size: 14px; line-height: 1.6; }
+.card p { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.heading, .actions { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.heading span, .summary, .node span { color: var(--codex-text-secondary, #6b7280); }
+.actions { justify-content: flex-end; margin-top: 12px; }
+.card button { padding: 6px 12px; border: 1px solid var(--codex-border, #e5e7eb); border-radius: 8px; background: transparent; color: inherit; cursor: pointer; }
+.card button:disabled { opacity: .5; cursor: default; }
+.node { display: grid; gap: 6px; margin-top: 12px; padding: 12px; border-radius: 10px; background: var(--codex-bg-secondary, #f7f8fa); }
+.node button { justify-self: start; }

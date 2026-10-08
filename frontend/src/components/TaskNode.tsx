@@ -91,7 +91,7 @@ export const TaskNode = memo(function TaskNode({
   data,
   selected,
 }: NodeProps<Node<FlowNodeData>>) {
-  const meta = KIND_META[data.kind] || {
+  const meta = data.isMainTask ? { label: '主任务', className: styles.kindPlan ?? '', accentClass: styles.accentPlan ?? '', icon: '⚪' } : KIND_META[data.kind] || {
     label: data.kind || '步骤',
     className: styles.kindPlan ?? '',
     accentClass: styles.accentPlan ?? '',
