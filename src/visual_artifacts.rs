@@ -238,7 +238,7 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
         let captured=manifest["selected_images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>();
         manifest["image_input_unavailable"]=json!({"reason":if capability==ImageCapability::Unknown {"image capability of this model is unknown and no fallback visual service is configured"}else{"this model does not accept images and no fallback visual service is configured"},
             "captured_artifact_ids":captured});
-        messages.push(json!({"role":"system","content":format!("Image input is unavailable for this request: {}. The screenshots {captured:?} exist and can be delivered to the user, but you did not see them. Do not capture again or claim any visual observation. Return now with yield_work: cite these artifact IDs, set visual_check_result.assessment=\"unavailable\", and list the missing visual inspection under limitations.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or(""))}));
+        messages.push(json!({"role":"system","content":format!("Image input is unavailable for this request: {}. The screenshots {captured:?} exist and can be delivered to the user, but this request did not receive their image content.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or(""))}));
     }
     let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
         "checked_goal":goal,"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
@@ -311,7 +311,15 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
     result["model_route"]=request.map(|r|r["model_route"].clone()).unwrap_or(Value::Null);result["input_mode"]=request.map(|r|r["status"].clone()).unwrap_or(json!("not_received"));
     result["source_binding"]=json!({"execution_epoch":context.execution_epoch,"related_source_versions":context.related_source_versions,"current_page":context.current_page});
     result["current_result_artifact_ids"]=json!(artifacts.iter().filter(|artifact|is_current_result(artifact,context)).map(|artifact|artifact["artifact_id"].clone()).collect::<Vec<_>>());
-    if let Some(request)=request {result["visual_service_route"]=request["visual_service_route"].clone();result["visual_service_result_id"]=request["visual_service_result_id"].clone();}
+    if let Some(request)=request {
+        // Preserve the same dispatch record for successes and failures. A
+        // missing model input must not erase why the host did not send it.
+        result["visual_request"]=request.clone();
+        result["capability"]=request["capability"].clone();
+        result["image_input_unavailable"]=request["image_input_unavailable"].clone();
+        result["visual_service_route"]=request["visual_service_route"].clone();
+        result["visual_service_result_id"]=request["visual_service_result_id"].clone();
+    }
     let id=new_id();result["check_id"]=json!(id);
     connection(root)?.execute("INSERT INTO agent_visual_checks(id,task_id,metadata) VALUES (?1,?2,?3)",params![id,context.task_id(),result.to_string()])?;
     Ok(result)

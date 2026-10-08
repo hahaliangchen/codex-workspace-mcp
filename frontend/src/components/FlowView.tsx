@@ -674,11 +674,11 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
                 <div className={styles.section}>
                   <div className={styles.sectionTitle}>
                     <span>🧭</span>
-                    <span>{flow.nodeReviews.length > 0 ? '已有节点复盘汇总' : '历史 Observer 工作路径复盘'}</span>
+                    <span>Observer 工作路径复盘</span>
                   </div>
                   <div className={styles.retrospectiveCard}>
                     {flow.observerRetrospective.status === 'reviewing' && (
-                      <div className={styles.retrospectiveStatusTip}>⏳ 完成前复盘工作路径中…</div>
+                      <div className={styles.retrospectiveStatusTip}>⏳ 任务已结束，正在复盘工作路径…</div>
                     )}
                     {flow.observerRetrospective.summary && (
                       <p className={styles.retrospectiveSummary}>{flow.observerRetrospective.summary}</p>

@@ -89,6 +89,49 @@ async fn visual_dispatch_capability_budget_restore_and_result_binding_are_explic
 }
 
 #[tokio::test]
+async fn unavailable_visual_message_survives_worker_restore_and_observer_http() {
+    let root=TestRoot::new();task(&root.0,"task");
+    let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+    scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check slide","done_when":"report rendering","completion":"output","visual_goal":"check slide"}]}),false,false).unwrap();
+    let ctx=scheduler_context("task",&scheduler,"w");
+    let artifact=visual::save(&root.0,&ctx,json!({}),&png(80,60)).unwrap();let id=artifact["artifact_id"].as_str().unwrap().to_owned();
+    async fn reply(Json(body):Json<Value>)->Json<Value> {
+        let dispatch=manifest(&body);
+        Json(json!({"choices":[{"message":{"content":json!({"assessment":"uncertain","summary":"Image input unavailable",
+            "diagnostic":{"original_reason":"image capability unknown; no fallback"},"recommendations":[],
+            "visual_check_result":{"assessment":"unavailable","request_trace_id":dispatch["request_trace_id"],"checked_goal":"check slide",
+                "artifact_ids":dispatch["selected_artifact_ids"],"limitations":["No image input was sent"]}}).to_string()}}]}))
+    }
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move {axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(reply))).await.unwrap();});
+    let mut state=agent::tests::flow_test_state(&root.0,address);state.observer_provider_url=state.provider_url.clone();
+    let mut body=json!({"messages":[]});
+    let dispatch=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id.clone()],"check slide",&mut body).await.unwrap();
+    assert_eq!(dispatch["status"],"unknown_capability");assert!(images(&body).is_empty());
+    assert!(!body.to_string().contains("Return now with yield_work"),"a capability diagnostic does not decide when Worker must stop unrelated work");
+    scheduler.visual_response_received(&dispatch);
+    let mut restored:crate::work_scheduler::WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+    let worker_check=json!({"assessment":"unavailable","request_trace_id":dispatch["request_trace_id"],"checked_goal":"check slide","artifact_ids":[id],"limitations":["No image input was sent"]});
+    let checked=visual::validate_check(&root.0,&ctx,&worker_check,&restored.frame().unwrap().visual_requests,"worker").unwrap();
+    assert_eq!(checked["visual_request"],dispatch);assert_eq!(checked["input_mode"],"unknown_capability");assert_eq!(checked["model_route"],dispatch["model_route"]);
+    restored.frame_mut().unwrap().visual_check_result=checked.clone();
+    let worker_return=json!({"summary":"Capture completed; image capability unknown", "limitations":["No fallback"],"visual_check_result":worker_check,
+        "diagnostic":{"original_reason":"image capability unknown; no fallback"}});
+    restored.return_work(&worker_return).unwrap();let organizer=restored.organizer_input();
+    assert_eq!(organizer["current_result"]["worker_return"],worker_return);
+    assert_eq!(organizer["current_result"]["visual_check_result"],checked);
+    let observer_context=json!({"identity":ctx.identity,"execution_epoch":ctx.execution_epoch,"related_source_versions":ctx.related_source_versions,
+        "task_page":ctx.current_page,"visual_artifacts":[artifact],"request":{"goal":"check slide"}});
+    let raw=agent::observer_json_response(&state,"fake-model","Review current result",observer_context,2000,"task",json!({})).await.unwrap();
+    let result:Value=serde_json::from_str(&raw).unwrap();
+    assert_eq!(result["visual_check_result"]["input_mode"],"unknown_capability");
+    assert_eq!(result["visual_check_result"]["model_route"],dispatch["model_route"]);
+    assert_eq!(result["visual_check_result"]["image_input_unavailable"],dispatch["image_input_unavailable"]);
+    assert_eq!(result["observer_return"]["diagnostic"]["original_reason"],"image capability unknown; no fallback");
+    server.abort();
+}
+
+#[tokio::test]
 async fn visual_pass_requires_a_current_image_and_a_fact_from_it() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut before=context("task");before.execution_epoch=0;before.related_source_versions=json!({"src/app.ts":"v1"});
@@ -226,7 +269,7 @@ async fn server(script:Arc<Script>)->(std::net::SocketAddr,tokio::task::JoinHand
     let app=axum::Router::new().route("/v1/chat/completions",post(chat)).with_state(script);
     (address,tokio::spawn(async move{axum::serve(listener,app).await.unwrap();}))
 }
-fn fixture(root:&Path)->String {let path=root.join("slide.html");std::fs::write(&path,"<html><body><canvas id='slide' width='800' height='450'></canvas><script>const c=document.querySelector('canvas').getContext('2d');c.fillStyle='#bb2255';c.fillRect(0,0,800,450);c.fillStyle='white';c.font='40px sans-serif';c.fillText('Canvas slide',40,90)</script></body></html>").unwrap();format!("file:///{}",path.to_string_lossy().replace('\\',"/"))}
+fn fixture(root:&Path)->String {let path=root.join("slide.html");std::fs::write(&path,"<html><body><canvas id='slide' width='800' height='450'></canvas><script>const c=document.querySelector('canvas').getContext('2d');c.fillStyle='#bb2255';c.fillRect(0,0,800,450);c.fillStyle='white';c.font='40px sans-serif';c.fillText('Canvas slide',40,90)</script></body></html>").unwrap();reqwest::Url::from_file_path(&path).unwrap().to_string()}
 
 #[tokio::test]
 async fn visual_worker_runtime_sends_real_images_without_an_observer_or_extra_receipt_round() {
@@ -276,7 +319,7 @@ async fn visual_fallback_is_one_explicit_service_call_and_never_claims_role_imag
 #[tokio::test]
 async fn visual_browser_pages_are_task_owned_and_observer_cannot_follow_replaced_instances() {
     let root=TestRoot::new();let workspace=crate::tools::Workspace::new(&root.0).unwrap();let a=context("a");let b=context("b");
-    let a_url=fixture(&root.0);let other=root.0.join("other.html");std::fs::write(&other,"<html><body>Task B</body></html>").unwrap();let b_url=format!("file:///{}",other.to_string_lossy().replace('\\',"/"));
+    let a_url=fixture(&root.0);let other=root.0.join("other.html");std::fs::write(&other,"<html><body>Task B</body></html>").unwrap();let b_url=reqwest::Url::from_file_path(&other).unwrap().to_string();
     let a_args=json!({"url":a_url});let b_args=json!({"url":b_url});
     let (first,second)=tokio::join!(crate::browser_control::execute_scoped(&workspace,&a,"browser_open",&a_args),crate::browser_control::execute_scoped(&workspace,&b,"browser_open",&b_args));
     let first=first.unwrap();let second=second.unwrap();assert_ne!(first["page"]["page_id"],second["page"]["page_id"]);
@@ -312,8 +355,10 @@ async fn visual_observer_reuses_worker_images_or_captures_once_without_touching_
         crate::observer_service::commit(&root.0,"task",json!({"commit_id":"visual_handoff"}),vec![input]).await.unwrap();
         let mut observer=crate::observer_service::ObserverSession::start(state.clone(),"fake-model".into(),"task".into(),&CancellationToken::new());observer.set_scope(&scheduler,"check slide");
         let reviews=tokio::time::timeout(Duration::from_secs(8),async {loop {let reviews=observer.reviews().await.unwrap();if !reviews.is_empty(){return reviews;}
-            let count=agent::open_db(&root.0).unwrap().query_row("SELECT COUNT(*) FROM agent_observations WHERE status='completed'",[],|row|row.get::<_,i64>(0)).unwrap();if count==1{return vec![];}tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
-        assert!(reviews.is_empty());observer.finish("completed").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
+        assert_eq!(reviews.len(),1,"an Observer result without recommendations is still delivered");
+        assert!(reviews[0]["suggestions"].as_array().unwrap().is_empty());
+        assert_eq!(reviews[0]["observer_return"]["summary"],"review");observer.finish("completed").await.unwrap();
         let requests=script.requests.lock().unwrap();assert_eq!(requests.len(),1);assert_eq!(images(&requests[0]).len(),if reuse {2}else{1});
         if reuse {let dispatch=manifest(&requests[0]);assert!(dispatch["images"][0]["page_epoch"].as_u64().unwrap()<dispatch["images"][1]["page_epoch"].as_u64().unwrap());}
         let conn=agent::open_db(&root.0).unwrap();assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_visual_artifacts",[],|row|row.get::<_,i64>(0)).unwrap(),if reuse {2}else{1},"before/after reuse causes no recapture; missing input captures once");
@@ -372,9 +417,9 @@ async fn real_ppt_visual_acceptance() -> anyhow::Result<()> {
         // Use the same explicitly probed main route for a separate Observer context.
         state.observer_provider=state.provider_name.clone();state.observer_provider_url=state.provider_url.clone();state.observer_api_key=state.api_key.clone();
         let context=json!({"identity":ctx.identity,"request":{"goal":goal},"visual_artifacts":[before["visual_artifact"],after["visual_artifact"]],"delivery":{"before_state":before_state,"after_state":after_state}});
-        let start=std::time::Instant::now();let result=tokio::time::timeout(Duration::from_secs(12),agent::observer_json_response(&state,&model,
-            "Review this visual delivery independently and concisely. Output JSON with assessment on_track|adjust|uncertain, summary and visual_check_result. In visual_check_result cite the Host visual dispatch request_trace_id, exact checked_goal and artifact_ids; expected_visible_result; assessment pass|issue|uncertain|unavailable; record observed_facts with artifact_id, region, fact and limitations. Only assess visible facts.",context,1400,"real-ppt",json!({"acceptance":true}))).await;
-        let observer=match result {Ok(Ok(raw))=>serde_json::from_str::<Value>(&raw).unwrap_or(json!({"assessment":"uncertain","raw":raw})),Ok(Err(error))=>json!({"assessment":"unavailable","error":error.to_string()}),Err(_)=>json!({"assessment":"uncertain","error":"Observer 12s acceptance budget exceeded"})};
+        let start=std::time::Instant::now();let result=agent::observer_json_response(&state,&model,
+            "Review this visual delivery independently and concisely. Output JSON with assessment on_track|adjust|uncertain, summary and visual_check_result. In visual_check_result cite the Host visual dispatch request_trace_id, exact checked_goal and artifact_ids; expected_visible_result; assessment pass|issue|uncertain|unavailable; record observed_facts with artifact_id, region, fact and limitations. Only assess visible facts.",context,1400,"real-ppt",json!({"acceptance":true})).await;
+        let observer=match result {Ok(raw)=>serde_json::from_str::<Value>(&raw).unwrap_or(json!({"assessment":"uncertain","raw":raw})),Err(error)=>json!({"assessment":"unavailable","error":error.to_string()})};
         report["observer_calls"]=json!(1);report["image_reuse"]=json!(2);
         report["cases"].as_array_mut().unwrap().push(json!({"case":"delete_visual_node","before":before["visual_artifact"],"after":after["visual_artifact"],"before_state":before_state,"after_state":after_state,"node_state":node_state,"worker":worker,"observer":observer,"observer_elapsed_ms":start.elapsed().as_millis(),"new_observer_screenshots":0}));
     }
@@ -407,8 +452,8 @@ async fn real_visual_observer_reuse_recheck() -> anyhow::Result<()> {
     state.visual.capabilities.entry(state.provider_name.clone()).or_default().insert(model.into(),visual::ImageCapability::Supported);
     state.observer_provider=state.provider_name.clone();state.observer_provider_url=state.provider_url.clone();state.observer_api_key=state.api_key.clone();
     let input=json!({"identity":case["after"]["identity"],"request":{"goal":case["worker"]["manifest"]["checked_goal"]},"visual_artifacts":[case["before"],case["after"]],"delivery":{"node_state":case["node_state"]}});
-    let start=std::time::Instant::now();let response=tokio::time::timeout(Duration::from_secs(12),agent::observer_json_response(&state,model,"Review the before/after slide images independently. Be concise. Return JSON with assessment on_track|adjust|uncertain, summary and visual_check_result using the complete host-provided structure. Preserve every binding field verbatim and replace placeholders with visible facts.",input,1400,"real-ppt",json!({"acceptance_recheck":true}))).await;
-    let response=match response {Ok(Ok(raw))=>serde_json::from_str::<Value>(&raw)?,Ok(Err(error))=>json!({"assessment":"unavailable","error":error.to_string()}),Err(_)=>json!({"assessment":"uncertain","error":"12s Observer budget exceeded"})};
+    let start=std::time::Instant::now();let response=agent::observer_json_response(&state,model,"Review the before/after slide images independently. Be concise. Return JSON with assessment on_track|adjust|uncertain, summary and visual_check_result using the complete host-provided structure. Preserve every binding field verbatim and replace placeholders with visible facts.",input,1400,"real-ppt",json!({"acceptance_recheck":true})).await;
+    let response=match response {Ok(raw)=>serde_json::from_str::<Value>(&raw)?,Err(error)=>json!({"assessment":"unavailable","error":error.to_string()})};
     let result=json!({"observer_calls":1,"worker_calls":0,"new_screenshots":0,"reused_images":2,"input_bytes":case["before"]["byte_size"].as_u64().unwrap()+case["after"]["byte_size"].as_u64().unwrap(),"elapsed_ms":start.elapsed().as_millis(),"global_config_changed":false,"response":response});
     std::fs::write(root.join("observer_recheck.json"),serde_json::to_vec_pretty(&result)?)?;println!("Real Observer reuse report: {}",root.join("observer_recheck.json").display());Ok(())
 }

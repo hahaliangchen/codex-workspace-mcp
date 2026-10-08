@@ -201,7 +201,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             if summary.is_empty() {return Err(contract_error("FINISH_SUMMARY_REQUIRED","summary",args.get("summary"),"finish_request.summary is required and must be nonempty"));}
             let achieved=args["achieved"].as_bool().ok_or_else(||contract_error("FINISH_ACHIEVED_REQUIRED","achieved",args.get("achieved"),"finish_request.achieved must be a boolean"))?;
             let unresolved=args["unresolved"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).collect::<Vec<_>>();
-            let final_summary=if achieved||unresolved.is_empty(){summary.to_owned()}else{format!("{summary}\n\n未解决：{}",unresolved.join("；"))};
+            let final_summary=if unresolved.is_empty(){summary.to_owned()}else{format!("{summary}\n\n未确认或未解决事项：\n\n- {}",unresolved.join("\n- "))};
             let mut decision=json!({"action":if achieved{"finish"}else{"blocked"},"achieved":achieved,
                 "unresolved":unresolved,"summary":final_summary,"reason":args.get("reason").cloned().unwrap_or(json!(summary))});
             if let Some(request_action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=request_action.clone();}

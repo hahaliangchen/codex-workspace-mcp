@@ -466,7 +466,8 @@ fn advice_content(review:&Value)->Value {
     suggestions.sort();suggestions.dedup();
     let mut findings=review["findings"].as_array().into_iter().flatten().map(|item|text(item.get("reason").unwrap_or(item))).collect::<Vec<_>>();
     findings.sort();findings.dedup();
-    json!({"summary":text(&review["summary"]),"suggestions":suggestions,"findings":findings,"target":text(&review["target"])})
+    json!({"summary":text(&review["summary"]),"suggestions":suggestions,"findings":findings,"target":text(&review["target"]),
+        "observer_return":review["observer_return"],"visual_check_result":review["visual_check_result"],"visual_request":review["visual_request"],"review_status":review["review_status"]})
 }
 
 fn same_advice_issue(item:&Value,review:&Value,request_id:usize)->bool {
@@ -503,6 +504,13 @@ impl ObserverInbox {
         }
     }
     pub fn unhandled(&self)->Vec<Value> {self.pending().into_iter().filter(|item|item["disposition"]=="unread"&&item["organizer_consumption"].is_null()).collect()}
+    /// The same original messages go to Worker and Organizer. Archival and
+    /// receipt metadata label history; they do not delete the sender's words.
+    pub fn messages(&self)->Vec<Value> {
+        let mut messages=self.items.values().filter(|item|item["request_id"]==self.request_id).cloned().collect::<Vec<_>>();
+        messages.sort_by_key(|item|item["id"].as_str().and_then(|id|id.strip_prefix("advice_")).and_then(|id|id.parse::<usize>().ok()).unwrap_or(0));
+        messages
+    }
     pub fn historical(&self)->Vec<Value> {
         self.items.values().filter(|item|item["request_id"]==self.request_id && item["archived"]==true).rev().take(4).cloned().collect()
     }
@@ -615,11 +623,12 @@ impl ObserverInbox {
         if let Some(previous)=previous.as_ref().and_then(Value::as_str).and_then(|id|self.items.get_mut(id)) {
             previous["archived"]=json!(true);previous["superseded_by_advice_id"]=json!(id);
         }
-        self.items.insert(id.clone(), json!({"id":id,"issue_key":short(key, 80),
+        self.items.insert(id.clone(), json!({"id":id,"issue_key":key,
             "request_id":request_id,"identity":review["identity"],"review_id":review["review_id"],"source_event_id":review["source_event_id"],"source_event_seq":review["source_event_seq"],"turn":review["turn"],"stage":review["stage"],
             "observed_at":review["observed_at"],"execution_revision":review["execution_revision"],
             "archived":request_id != self.request_id || (!review["identity"].is_null() && !self.scope.is_null() && !crate::observer_service::applies(&review["identity"],&self.scope)),
-            "category":category,"visual_artifacts":review["visual_artifacts"],"visual_check_result":review["visual_check_result"],
+            "category":category,"review_status":review["review_status"],"visual_artifacts":review["visual_artifacts"],"visual_check_result":review["visual_check_result"],"visual_request":review["visual_request"],
+            "observer_return":review["observer_return"],
             "summary":review["summary"],"suggestions":review["suggestions"],"findings":review["findings"],"target":review["target"],"supersedes_advice_id":previous,
             "origin_step":review["step"],"latest_step":review["step"],"node_id":review["node_id"],
             "delivered":false,"disposition":"unread","reason":""}));

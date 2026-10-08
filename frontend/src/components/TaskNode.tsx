@@ -4,6 +4,18 @@ import type { FlowNodeData } from '../model.ts'
 import styles from './TaskNode.module.css'
 
 const KIND_META: Record<string, { label: string; className: string; accentClass: string; icon: string }> = {
+  worker: {
+    label: '任务',
+    className: styles.kindCoding ?? '',
+    accentClass: styles.accentCoding ?? '',
+    icon: '🔵',
+  },
+  goal: {
+    label: '总目标',
+    className: styles.kindPlan ?? '',
+    accentClass: styles.accentPlan ?? '',
+    icon: '⚪',
+  },
   research: {
     label: '探索',
     className: styles.kindResearch ?? '',

@@ -47,6 +47,8 @@ Agent 的原生程序、安装、脚本运行和停止操作需要“完全访�
 
 下一次把 `after_seq` 设为上次返回的 `next_seq`。`has_more` 表示本次长度限制下还有日志；`log_gap` 表示更早日志已被内存环形缓冲淘汰。省略游标时返回最近日志。停止使用同一 `process_id` 调用 `stop_project_process`，重复停止返回已退出状态。
 
+端口归属检测支持 Windows、Linux 和 macOS：Windows 使用系统 TCP 表，Linux 通过 `/proc/net/tcp*` 的 socket inode 与进程文件描述符关联，macOS 使用系统 `/usr/sbin/lsof` 的字段输出；再根据父进程链核对监听者是否属于当前托管进程。IPv4、IPv6 和通配监听地址均参与匹配，精确地址优先。HTTP/TCP 连通性检测与归属检测同时通过，才报告就绪；权限不足、进程退出或系统检测失败会保留具体原因，不将其他进程的服务认作目标项目。
+
 ## 执行与日志
 
 宿主直接启动 `node npm-cli.js`，参数按数组传递，不拼接 PowerShell 命令，也不打开终端窗口。启动前会检查所选 package.json 脚本及 npm 会运行的 `pre<name>`、`post<name>` 脚本是否直接调用 PowerShell 或 `.ps1` 文件，并用相同的 Node/npm、项目目录和继承环境读取 npm 实际生效的 `script-shell`；如果该 shell 是 PowerShell，宿主拒绝运行。依赖安装还会检查项目的 `preinstall`、`install`、`postinstall`、`prepublish`、`preprepare`、`prepare`、`postprepare` 脚本，检查发生在启动 npm 之前，适用于 `install` 和 `ci`。Agent 不得把 PowerShell 脚本改由 Node/Python 转发；遇到拒绝结果时报告具体脚本名和能力缺口。`run_program` 本身始终直接启动 allowlist 程序，不调用 npm shell。

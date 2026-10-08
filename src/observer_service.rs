@@ -117,10 +117,10 @@ fn node_state(facts: &Value) -> Value {
 
 /// Goal, decision and delivery summary are protected. Optional fields are
 /// admitted by priority; pathological protected inputs report budget overflow.
-pub fn pack(mut input: Value, path: &[Value], memories: &[Value]) -> Value {
+pub fn pack(mut input: Value, _path: &[Value], memories: &[Value]) -> Value {
     let mut packed = json!({"identity":input["identity"],"review_id":input["review_id"],"source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],
         "organizer_decision_id":input["organizer_decision_id"],"stage":input["stage"],"request":input["request"],
-        "organizer_decision":compact(&input["organizer_decision"],1500),"delivery":{"summary":input["delivery"]["summary"],
+        "organizer_decision":input["organizer_decision"],"delivery":{"summary":input["delivery"]["summary"],
             "status":input["delivery"]["status"],"exported_data":compact(&input["delivery"]["exported_data"],1200),
             "handoff_summary":input["delivery"]["handoff"]["summary"],"intent":input["delivery"]["handoff"]["intent"],
             "stall":input["delivery"]["handoff"]["stall"],
@@ -129,23 +129,17 @@ pub fn pack(mut input: Value, path: &[Value], memories: &[Value]) -> Value {
         "observed_at":input["observed_at"],"node_state":node_state(&input["node_facts"]),
         "current_facts":{"http_observations":fact_texts(&input["current_facts"]["http_observations"]),"browser":compact(&input["current_facts"]["browser"],600)},
         "visual_artifacts":input["visual_artifacts"],"visual_check_result":input["visual_check_result"],"visual_capture":input["visual_capture"],"allowed_visual_artifact_ids":input["allowed_visual_artifact_ids"]});
+    // Keep the sender's message separate from optional summaries of logs and
+    // source material. The current handoff must survive context budgeting.
+    packed["delivery"]["worker_return"]=input["delivery"]["handoff"]["worker_return"].clone();
+    packed["visual_requests"]=input["visual_requests"].clone();
+    packed["resolved_inputs"]=input["resolved_inputs"].clone();
+    packed["recent_activity"]=input["recent_activity"].clone();
+    packed["activity_since_seq"]=input["activity_since_seq"].clone();
+    packed["plan_overview"]=input["plan_overview"].clone();
     let optional = [
-        ("node_operations", compact(&input["node_facts"]["operations"], 1600)),
-        ("activity_summary", compact(&input["activity_summary"], 700)),
-        ("resolved_inputs", compact(&input["resolved_inputs"], 1200)),
         ("materials", compact(&input["materials"], 400)),
-        ("plan_overview", compact(&input["plan_overview"], 300)),
         ("known_read_targets", input["known_read_targets"].take()),
-        (
-            "path_summary",
-            json!(
-                path.iter()
-                    .rev()
-                    .take(6)
-                    .map(|v| compact(v, 600))
-                    .collect::<Vec<_>>()
-            ),
-        ),
         (
             "related_memory",
             json!(
@@ -207,15 +201,17 @@ pub fn observation(
             if stage == "handoff" { "sealed" } else { stage }
         )
     };
-    let total=scheduler.flow_directory_page(0,1)["total"].as_u64().unwrap_or(0) as usize;
-    let plan_overview=scheduler.flow_directory_page(total.saturating_sub(6),6)["entries"].clone();
+    let plan_overview=scheduler.frames.values().map(|frame|json!({"work_id":frame.order.id,"node_id":frame.order.node_id,
+        "revision":frame.order.revision,"status":frame.status,"superseded":frame.invalidated_by_plan_revision.is_some(),
+        "goal":short(&frame.order.goal,160),"upstream_ids":frame.order.upstream_ids,
+        "summary":frame.output.as_ref().and_then(|output|output["summary"].as_str()).map(|summary|short(summary,240))})).collect::<Vec<_>>();
     json!({"identity":id,"review_id":review_id,"source_event_id":source_event_id,
         "organizer_decision_id":decision["decision_id"],"stage":stage,"turn":turn,"step":step,
         "request":{"goal":prompt,"boundary":compact(&scheduler.goal_boundary,900),"constraints":order.map(|o|&o.constraints)},
         "organizer_decision":decision,"current_node":{"goal":order.map(|o|&o.goal),"done_when":order.map(|o|&o.done_when)},
         "execution_epoch":frame.map(|f|f.epoch),"related_source_versions":frame.map(|f|&f.versions),
         "visual_required":order.is_some_and(|o|o.visual_goal.is_some() || o.constraints.iter().any(|c|c=="requires_visual")),
-        "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
+        "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"visual_requests":frame.map(|f|&f.visual_requests),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
         "resolved_inputs":packet["upstream_outputs"],"http_observations":packet["http_observations"],"materials":materials,"activity_summary":activity,
         "node_facts":scheduler.observer_facts(work),"current_facts":scheduler.current_facts(),
         "observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
@@ -319,7 +315,6 @@ fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .take(3)
     {
         let adjustment = item
             .as_str()
@@ -334,18 +329,21 @@ fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
             adjustment.split_whitespace().collect::<Vec<_>>().join(" ")
         );
         recommendations.push(json!({"issue_key":item["issue_key"].as_str().or_else(||raw["issue_key"].as_str()).filter(|key|!key.trim().is_empty()).map(str::to_owned).unwrap_or_else(||format!("recommendation_{}",crate::symbol_description::content_hash(key_text.as_bytes()))),
-            "target":item["target"].as_str().unwrap_or("organizer"),"adjustment":short(adjustment,700),
+            "target":item["target"].as_str().unwrap_or("organizer"),"adjustment":adjustment,
             "source_event_ids":[input["source_event_id"]]}));
     }
-    let findings=raw["findings"].as_array().into_iter().flatten().take(3).map(|item|json!({"reason":short(item["reason"].as_str().or_else(||item.as_str()).unwrap_or(""),600),"source_event_ids":[input["source_event_id"]]})).collect::<Vec<_>>();
+    let findings=raw["findings"].as_array().into_iter().flatten().map(|item|json!({"reason":item["reason"].as_str().or_else(||item.as_str()).unwrap_or(""),"source_event_ids":[input["source_event_id"]]})).collect::<Vec<_>>();
     json!({"assessment":raw["assessment"].as_str().filter(|s|matches!(*s,"on_track"|"needs_adjustment"|"uncertain")).unwrap_or("uncertain"),
-        "summary":short(raw["summary"].as_str().unwrap_or(""),900),"findings":findings,
+        "summary":raw["summary"],"findings":findings,
+        "observer_return":raw.get("observer_return").unwrap_or(&raw),
         "recommendations":recommendations,"reusable_lessons":raw["reusable_lessons"],"elapsed_ms":elapsed as u64,
-        "visual_artifacts":input["visual_artifacts"],"visual_check_result":raw["visual_check_result"],"visual_capture":input["visual_capture"]})
+        "visual_artifacts":input["visual_artifacts"],"visual_check_result":raw["visual_check_result"],"visual_request":raw["visual_request"],"visual_capture":input["visual_capture"]})
 }
 
 pub struct ObserverSession {
     enabled: bool,
+    state: Option<AgentServiceState>,
+    model: String,
     root: PathBuf,
     task: String,
     wake: mpsc::Sender<()>,
@@ -366,6 +364,8 @@ impl Drop for ObserverSession {
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let mut cleanup = Self {
                     enabled: true,
+                    state: None,
+                    model: self.model.clone(),
                     root: self.root.clone(),
                     task: self.task.clone(),
                     wake: self.wake.clone(),
@@ -399,6 +399,8 @@ impl ObserverSession {
         cancel: &CancellationToken,
     ) -> Self {
         let enabled = state.observer_enabled;
+        let retrospective_state = state.clone();
+        let retrospective_model = model.clone();
         let root = state.workspace.root().to_path_buf();
         let (wake, receiver) = mpsc::channel(1);
         let (scope, scopes) = watch::channel(Value::Null);
@@ -420,6 +422,8 @@ impl ObserverSession {
         });
         Self {
             enabled,
+            state: Some(retrospective_state),
+            model: retrospective_model,
             root,
             task,
             wake,
@@ -436,7 +440,8 @@ impl ObserverSession {
     }
     pub fn set_scope(&self, scheduler: &crate::work_scheduler::WorkScheduler, prompt: &str) {
         self.scope.send_replace(json!({"request_id":scheduler.request_started_turn,"plan_revision":scheduler.plan_revision,
-            "frames":scheduler.frames,"goal":prompt,"finished":scheduler.finished}));
+            "frames":scheduler.frames,"goal":prompt,"finished":scheduler.finished,
+            "final_result":scheduler.final_result,"request_completed":scheduler.request_completed}));
         self.notify();
     }
     pub async fn model_permit(&self) -> Result<OwnedSemaphorePermit> {
@@ -465,19 +470,24 @@ impl ObserverSession {
         let rows = records(self.root.clone(), self.task.clone()).await?;
         let mut reviews = Vec::new();
         for (input, status, result) in rows {
-            if status != "completed" {
+            if !matches!(status.as_str(),"completed"|"failed"|"timeout"|"cancelled") {
                 continue;
             }
             let id = input["review_id"].as_str().unwrap_or("").to_owned();
             if !self.seen.insert(id) {
                 continue;
             }
-            for item in result["recommendations"].as_array().into_iter().flatten() {
+            let recommendations=result["recommendations"].as_array().cloned().unwrap_or_default();
+            // An observation with no recommendation is still a message, in
+            // particular when it explains an unavailable capability.
+            let recommendations=if recommendations.is_empty() {vec![json!({"issue_key":"observation","target":"organizer"})]}else{recommendations};
+            for item in &recommendations {
                 reviews.push(json!({"request_id":input["identity"]["request_id"],"identity":input["identity"],"review_id":input["review_id"],
                     "source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],"turn":input["turn"],"stage":input["stage"],"step":input["step"],"node_id":input["identity"]["node_id"],
                     "observed_at":input["observed_at"],"execution_revision":input["identity"]["revision"],
-                    "category":"planning","issue_key":item["issue_key"],"summary":result["summary"],"suggestions":[item["adjustment"]],"target":item["target"],"findings":result["findings"],
-                    "visual_artifacts":result["visual_artifacts"],"visual_check_result":result["visual_check_result"]}));
+                    "category":"planning","review_status":status,"issue_key":item["issue_key"],"summary":result.get("summary").or_else(||result.get("message")),"suggestions":item["adjustment"].as_str().map(|text|json!([text])).unwrap_or(json!([])),"target":item["target"],"findings":result["findings"],
+                    "observer_return":result.get("observer_return").unwrap_or(&result),
+                    "visual_artifacts":result["visual_artifacts"],"visual_check_result":result["visual_check_result"],"visual_request":result["visual_request"]}));
             }
         }
         Ok(reviews)
@@ -545,11 +555,41 @@ impl ObserverSession {
                 unevaluated += 1;
             }
         }
-        agent_service::emit(&self.root,&self.task,"observer/retrospective",json!({"status":"completed","outcome":outcome,
-            "summary":format!("{completed} 次节点观察已完成，{unevaluated} 项未评估；不追加模型调用。"),
+        let mut result=json!({"status":"completed","outcome":outcome,
+            "summary":format!("{completed} 次节点观察已完成，{unevaluated} 项未评估。"),
             "pathReview":summaries.iter().rev().take(6).filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
-            "completedReviews":completed,"unevaluatedReviews":unevaluated,"observerElapsedMs":elapsed,"extraWorkerRounds":0})).await
+            "completedReviews":completed,"unevaluatedReviews":unevaluated,"observerElapsedMs":elapsed,"extraWorkerRounds":0});
+        if (outcome=="completed" && scope["finished"]==true) || matches!(outcome,"failed"|"max_steps") {
+            if let Some(state)=&self.state {
+                agent_service::emit(&self.root,&self.task,"observer/retrospective_start",json!({"outcome":outcome,"turn":scope["request_id"]})).await?;
+                match retrospective(state,&self.model,&self.task,&scope,outcome).await {
+                    Ok(review)=>{
+                        for (key,value) in review.as_object().into_iter().flatten() {result[key]=value.clone();}
+                    },
+                    Err(error)=>{result["status"]=json!("unavailable");result["message"]=json!(format!("{error:#}"));},
+                }
+            }
+        }
+        agent_service::emit(&self.root,&self.task,"observer/retrospective",result).await
     }
+}
+
+async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str)->Result<Value> {
+    let root=state.workspace.root().to_path_buf();let trace_task=task.to_owned();
+    let trace=tokio::task::spawn_blocking(move ||agent_service::load_observer_work_trace(&root,&trace_task)).await??;
+    let turn=trace.iter().filter_map(|entry|entry["turn"].as_u64()).max().unwrap_or(1);
+    let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
+        "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
+        "final_result":scope["final_result"],"work_trace":trace,
+        "known_read_targets":agent_service::observer_known_read_targets(&trace,task,24)});
+    let raw=agent_service::observer_json_response(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
+        json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]})).await?;
+    let report:Value=serde_json::from_str(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim())?;
+    anyhow::ensure!(report.is_object(),"Observer retrospective must return a JSON object");
+    let mut result=agent_service::save_observer_lessons(state,task,scope["goal"].as_str().unwrap_or(""),&report,&trace).await?;
+    result["observer_return"]=report.get("observer_return").unwrap_or(&report).clone();
+    result["turn"]=json!(turn);
+    Ok(result)
 }
 
 async fn run(
@@ -566,6 +606,7 @@ async fn run(
     let mut cached_request = Value::Null;
     let mut memories = Vec::new();
     let mut attempted = BTreeSet::new();
+    let mut last_trace_seq = -1;
     let mut rescan = true;
     loop {
         if !rescan {
@@ -589,11 +630,7 @@ async fn run(
             }
         };
         let mut pending = Vec::new();
-        let mut path = Vec::new();
-        for (input, status, result) in &rows {
-            if status == "completed" && valid_instance(&input["identity"], &current) {
-                path.push(json!({"identity":input["identity"],"summary":result["summary"],"delivery":input["delivery"]}));
-            }
+        for (input, status, _result) in &rows {
             if !matches!(status.as_str(), "pending" | "unassessed" | "reviewing")
                 || attempted.contains(&observation_version_key(input))
             {
@@ -651,12 +688,14 @@ async fn run(
         }
         if cached_request != current["request_id"] {
             cached_request = current["request_id"].clone();
+            last_trace_seq = rows.iter().filter(|(input,status,_)|status=="completed" && input["identity"]["request_id"]==cached_request)
+                .filter_map(|(_,_,result)|result["reviewed_through_seq"].as_i64()).max().unwrap_or(-1);
             memories = tokio::select! {_=stop.cancelled()=>break,result=agent_service::observer_memory_context(state.workspace.clone(),current["goal"].as_str().unwrap_or("").to_owned())=>result};
         }
         // Only versioned targets already observed by Worker can support facts.
         let (trace_root, trace_task) = (root.to_path_buf(), task.clone());
         let trace = tokio::task::spawn_blocking(move || {
-            agent_service::load_observer_work_trace(&trace_root, &trace_task)
+            agent_service::load_observer_trace_since(&trace_root, &trace_task,last_trace_seq)
         })
         .await
         .ok()
@@ -667,6 +706,10 @@ async fn run(
         .collect::<Vec<_>>();
         input["known_read_targets"] =
             json!(agent_service::observer_known_read_targets(&trace, &task, 8));
+        input["activity_since_seq"]=json!(last_trace_seq);
+        input["recent_activity"]=json!(trace.iter().filter(|entry|entry["type"]!="flow/plan" && entry["type"]!="worker/progress")
+            .filter(|entry|entry["type"]!="assistant/message" || entry["text"].is_string()).collect::<Vec<_>>());
+        let reviewed_through_seq=trace.iter().filter_map(|entry|entry["seq"].as_i64()).max().unwrap_or(last_trace_seq);
         if input["stage"] == "progress" {
             if let Ok(seq) = commit(
                 root,
@@ -699,7 +742,7 @@ async fn run(
             continue;
         }
         let _ = save(root, &task, &input, "reviewing", Value::Null).await;
-        let packed = pack(input.clone(), &path, &memories);
+        let packed = pack(input.clone(), &[], &memories);
         let started = Instant::now();
         let mut metadata = input["identity"].clone();
         metadata["nodeId"] = input["identity"]["node_id"].clone();
@@ -717,7 +760,7 @@ async fn run(
         }
         let result = tokio::select! {biased;_=stop.cancelled()=>{
         let _=save(root,&task,&input,"unassessed",json!({"assessment":"uncertain","reason":"observation stopped"})).await;break;},
-        result=tokio::time::timeout(Duration::from_secs(12),async {
+        result=async {
             let _permit=model_gate.acquire().await?;
             anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"observation no longer applies");
             let mut visual_input=input.clone();
@@ -748,9 +791,9 @@ async fn run(
             anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"visual instance changed before model request");
             let raw=agent_service::observer_json_response(&state,&model,include_str!("../prompts/observer_system.md"),packed,1400,&task,metadata).await?;
             Ok::<_,anyhow::Error>((raw,visual_input))
-        })=>result};
+        }=>result};
         match result {
-            Ok(Ok((raw,input))) => match serde_json::from_str::<Value>(
+            Ok((raw,input)) => match serde_json::from_str::<Value>(
                 raw.trim()
                     .trim_start_matches("```json")
                     .trim_end_matches("```")
@@ -758,30 +801,11 @@ async fn run(
             ) {
                 Ok(raw) => {
                     let review = normalize(raw, &input, started.elapsed().as_millis());
-                    let mut lessons = Value::Null;
-                    if applies(&input["identity"], &scope.borrow().clone())
-                        && !review["reusable_lessons"].is_null()
-                    {
-                        let mut reusable=review["reusable_lessons"].clone();
-                        if review["visual_artifacts"].as_array().is_some_and(|images|!images.is_empty()) {
-                            if let Some(facts)=reusable["work_findings"].as_array_mut() {for fact in facts {
-                                if fact["evidence_kind"].is_null() {fact["evidence_kind"]=json!("visual_observation");}
-                                fact["visual_artifact_ids"]=json!(review["visual_artifacts"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>());
-                            }}
-                        }
-                        lessons = agent_service::save_observer_lessons(
-                            &state,
-                            &task,
-                            current["goal"].as_str().unwrap_or(""),
-                            &reusable,
-                            &trace,
-                        )
-                        .await
-                        .unwrap_or(Value::Null);
-                    }
                     let mut review = review;
-                    review["lessons_recorded"] = lessons;
+                    review["lessons_recorded"] = Value::Null;
+                    review["reviewed_through_seq"]=json!(reviewed_through_seq);
                     let _ = save(root, &task, &input, "completed", review).await;
+                    last_trace_seq=reviewed_through_seq;
                 }
                 Err(error) => {
                     let _ = save(
@@ -789,28 +813,18 @@ async fn run(
                         &task,
                         &input,
                         "failed",
-                        json!({"assessment":"uncertain","message":error.to_string()}),
+                        json!({"assessment":"uncertain","message":error.to_string(),"observer_return":raw}),
                     )
                     .await;
                 }
             },
-            Ok(Err(error)) => {
+            Err(error) => {
                 let _ = save(
                     root,
                     &task,
                     &input,
-                    "failed",
-                    json!({"assessment":"uncertain","message":short(&error.to_string(),500)}),
-                )
-                .await;
-            }
-            Err(_) => {
-                let _ = save(
-                    root,
-                    &task,
-                    &input,
-                    "timeout",
-                    json!({"assessment":"uncertain","message":"Observer timed out"}),
+                    if error.is::<tokio::time::error::Elapsed>() {"timeout"}else{"failed"},
+                    json!({"assessment":"uncertain","message":format!("{error:#}")}),
                 )
                 .await;
             }
@@ -821,6 +835,46 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ongoing_context_contains_new_activity_without_repeated_history() {
+        let failure=json!({"capability":"unknown","image_input_unavailable":{"reason":"model has no configured image input"}});
+        let recent=json!([{"seq":401,"tool":"browser_screenshot","failed":false},
+            {"seq":402,"type":"visual/model_received","dispatch":failure}]);
+        let packed=pack(json!({"request":{"goal":"load the presentation"},
+            "node_facts":{"operations":[{"outcome":"old history".repeat(20_000)}]},
+            "activity_summary":{"tools":[{"outcome":"old history".repeat(20_000)}]},
+            "recent_activity":recent,"activity_since_seq":400,
+            "plan_overview":[{"work_id":"earlier","status":"done"},{"work_id":"current","status":"running"}],
+            "visual_requests":[failure]}),&[json!({"delivery":"old original return".repeat(20_000)})],&[]);
+        assert_eq!(packed["recent_activity"],recent);
+        assert_eq!(packed["visual_requests"][0],failure);
+        assert_eq!(packed["plan_overview"].as_array().unwrap().len(),2);
+        assert!(packed.get("activity_summary").is_none());
+        assert!(packed.get("node_operations").is_none());
+        assert!(packed.get("path_summary").is_none());
+        assert!(packed.to_string().chars().count()<2000);
+    }
+    #[test]
+    fn communication_keeps_original_returns_and_all_recommendations() {
+        let worker_return=json!({"summary":"原始失败链".repeat(400),"limitations":["能力未知".repeat(400)],
+            "diagnostic":{"reason":"original failure", "extra_fields":(0..20).collect::<Vec<_>>()}});
+        let packed=pack(json!({"delivery":{"handoff":{"worker_return":worker_return}}}),&[],&[]);
+        assert_eq!(packed["delivery"]["worker_return"],worker_return);
+        let observer_return=json!({"summary":"Observer原始消息".repeat(400),"failure":{"reason":"unavailable model", "details":(0..20).collect::<Vec<_>>()},
+            "findings":(0..5).map(|i|json!({"reason":format!("finding {i}"),"detail":"original detail"})).collect::<Vec<_>>(),
+            "recommendations":(0..5).map(|i|json!({"adjustment":format!("{i}:{}","建议".repeat(800)),"extra":"original field"})).collect::<Vec<_>>()});
+        let normalized=normalize(observer_return.clone(),&json!({"source_event_id":"event"}),1);
+        assert_eq!(normalized["observer_return"],observer_return);
+        assert_eq!(normalized["summary"],observer_return["summary"]);
+        assert_eq!(normalized["recommendations"].as_array().unwrap().len(),5);
+        assert_eq!(normalized["findings"].as_array().unwrap().len(),5);
+        assert_eq!(normalized["recommendations"][4]["adjustment"],observer_return["recommendations"][4]["adjustment"]);
+        let mut inbox=crate::worker_work_state::ObserverInbox::default();inbox.start_request(1);
+        inbox.insert(&json!({"request_id":1,"summary":normalized["summary"],"suggestions":[],"observer_return":normalized["observer_return"]}));
+        assert_eq!(inbox.messages()[0]["observer_return"],observer_return);
+        let restored:crate::worker_work_state::ObserverInbox=serde_json::from_value(inbox.snapshot()).unwrap();
+        assert_eq!(restored.messages(),inbox.messages());
+    }
     #[test]
     fn default_issue_keys_follow_adjustments_instead_of_array_positions() {
         let input = json!({"source_event_id":"assignment"});
@@ -930,7 +984,7 @@ mod tests {
             same_activity,Value::Null,Value::Null);
 
         let (wake,_wake_rx)=mpsc::channel(1);let (scope,_scope_rx)=watch::channel(Value::Null);let (progress,mut progress_rx)=watch::channel(None);
-        let session=ObserverSession{enabled:true,root:PathBuf::new(),task:"task".into(),wake,scope,progress,stop:CancellationToken::new(),job:None,
+        let session=ObserverSession{enabled:true,state:None,model:String::new(),root:PathBuf::new(),task:"task".into(),wake,scope,progress,stop:CancellationToken::new(),job:None,
             model_gate:std::sync::Arc::new(Semaphore::new(1)),progress_revision:AtomicU64::new(0),seen:BTreeSet::new(),finished:false,cleanup_on_drop:false};
         session.progress(before);
         let first=progress_rx.borrow_and_update().clone().unwrap();

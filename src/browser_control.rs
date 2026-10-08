@@ -573,7 +573,7 @@ async fn screenshot(root:&Path,context:&crate::visual_artifacts::VisualContext,s
 }
 
 async fn launch(visible:bool) -> Result<Session> {
-    let browser = browser_path().context("no Chrome or Edge is installed; browser interaction is unavailable")?;
+    let browser = browser_path().context("no executable Chrome, Edge or Chromium was found; set AGENT_BROWSER_PATH to its executable path")?;
     let session_id=crate::visual_artifacts::new_id();
     let dir = std::env::temp_dir().join(format!("codex-agent-browser-{session_id}"));
     std::fs::create_dir_all(&dir)?;
@@ -614,18 +614,71 @@ async fn page_socket(port: u16) -> Result<String> {
 }
 
 fn browser_path() -> Option<std::path::PathBuf> {
+    find_browser(std::env::var_os("AGENT_BROWSER_PATH").as_deref(), &browser_candidates())
+}
+
+fn find_browser(explicit: Option<&std::ffi::OsStr>, candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    // An explicit but invalid path must not silently select a different browser.
+    if let Some(path) = explicit {
+        let path = std::path::PathBuf::from(path);
+        return browser_executable(&path).then_some(path);
+    }
+    candidates.iter().find(|path| browser_executable(path)).cloned()
+}
+
+fn browser_executable(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else { return false };
+    if !metadata.is_file() { return false; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 { return false; }
+    }
+    true
+}
+
+fn browser_candidates() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        candidates.push(Path::new(&local).join(r"Google\Chrome\Application\chrome.exe"));
+    #[cfg(windows)]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(Path::new(&local).join(r"Google\Chrome\Application\chrome.exe"));
+            candidates.push(Path::new(&local).join(r"Microsoft\Edge\Application\msedge.exe"));
+        }
+        if let Some(program) = std::env::var_os("PROGRAMFILES") {
+            candidates.push(Path::new(&program).join(r"Google\Chrome\Application\chrome.exe"));
+            candidates.push(Path::new(&program).join(r"Microsoft\Edge\Application\msedge.exe"));
+        }
+        if let Some(program) = std::env::var_os("PROGRAMFILES(X86)") {
+            candidates.push(Path::new(&program).join(r"Google\Chrome\Application\chrome.exe"));
+            candidates.push(Path::new(&program).join(r"Microsoft\Edge\Application\msedge.exe"));
+        }
     }
-    if let Some(program) = std::env::var_os("PROGRAMFILES") {
-        candidates.push(Path::new(&program).join(r"Google\Chrome\Application\chrome.exe"));
-        candidates.push(Path::new(&program).join(r"Microsoft\Edge\Application\msedge.exe"));
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![std::path::PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") { roots.push(Path::new(&home).join("Applications")); }
+        for root in roots {
+            for app in ["Google Chrome.app/Contents/MacOS/Google Chrome", "Microsoft Edge.app/Contents/MacOS/Microsoft Edge", "Chromium.app/Contents/MacOS/Chromium"] {
+                candidates.push(root.join(app));
+            }
+        }
     }
-    if let Some(program) = std::env::var_os("PROGRAMFILES(X86)") {
-        candidates.push(Path::new(&program).join(r"Microsoft\Edge\Application\msedge.exe"));
+    let names: &[&str] = if cfg!(windows) { &["chrome.exe", "msedge.exe", "chromium.exe"] }
+        else { &["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "microsoft-edge-stable"] };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths).filter(|path| path.is_absolute()) {
+            for name in names { candidates.push(directory.join(name)); }
+        }
     }
-    candidates.into_iter().find(|path| path.is_file())
+    #[cfg(target_os = "linux")]
+    {
+        for directory in ["/usr/bin", "/usr/local/bin", "/snap/bin"] {
+            for name in names { candidates.push(Path::new(directory).join(name)); }
+        }
+        candidates.extend(["/opt/google/chrome/chrome", "/opt/microsoft/msedge/msedge"].map(std::path::PathBuf::from));
+    }
+    candidates
 }
 
 async fn eval(ws: &str, expression: &str) -> Result<Value> {
@@ -727,6 +780,29 @@ async fn recv(stream: &mut TcpStream) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
+    fn browser_discovery_honors_explicit_paths_and_skips_non_executables() {
+        let root = std::env::temp_dir().join(format!("browser-discovery-{}", crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let absent = root.join("missing");
+        let directory = root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let browser = root.join("Chrome with spaces");
+        std::fs::write(&browser, "fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(find_browser(None, std::slice::from_ref(&browser)).is_none());
+            std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let candidates = vec![absent.clone(), directory, browser.clone()];
+        assert_eq!(find_browser(None, &candidates), Some(browser.clone()));
+        assert_eq!(find_browser(Some(browser.as_os_str()), &[]), Some(browser));
+        assert!(find_browser(Some(absent.as_os_str()), &candidates).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn page_change_during_capture_is_uncertain() {
         let before=json!({"url":"http://localhost/","dom":"old"});
         let after=json!({"url":"http://localhost/","dom":"new"});
@@ -756,7 +832,7 @@ mod tests {
         let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-slide-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
         let file = root.join("codex-browser-slide.html");
         std::fs::write(&file, "<html><body><h1>Slide 1</h1><div id='slide-list'><div class='slide-item'>Slide 1</div></div><div id='page-indicator' class='page-info'>1 / 1</div><div class='loading' hidden>Loading</div></body></html>").unwrap();
-        let url = format!("file:///{}", file.display().to_string().replace('\\', "/"));
+        let url = reqwest::Url::from_file_path(&file).unwrap().to_string();
         let workspace=crate::tools::Workspace::new(file.parent().unwrap()).unwrap();
         let opened = execute(&workspace,"browser_open",&json!({"url":url})).await.unwrap();
         assert_eq!(opened["title"].as_str().unwrap_or(""), "");
@@ -786,7 +862,7 @@ mod tests {
         let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-lifecycle-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
         let workspace=crate::tools::Workspace::new(&root).unwrap();let context=crate::visual_artifacts::VisualContext::mcp(workspace.root());
         let html=root.join("page.html");std::fs::write(&html,"<html><body>browser lifecycle</body></html>").unwrap();
-        let url=format!("file:///{}",html.to_string_lossy().replace('\\',"/"));
+        let url=reqwest::Url::from_file_path(&html).unwrap().to_string();
         execute_scoped(&workspace,&context,"browser_open",&json!({"url":url})).await.unwrap();
         let key=session_key(workspace.root(),context.task_id());let page=sessions().lock().await.get(&key).cloned().unwrap();
         {let mut guard=page.lock().await;guard.as_mut().unwrap().visible=true;}
@@ -801,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_keeps_dom_node_on_one_connection_and_checks_change_with_windows_unicode_path() {
+    async fn upload_keeps_dom_node_on_one_connection_and_checks_change_with_unicode_path() {
         if browser_path().is_none() { return; }
         let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-upload-{}",crate::visual_artifacts::new_id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -809,7 +885,7 @@ mod tests {
         std::fs::write(&html,"<html><body><input id='pptx' type='file' style='display:none' accept='.pptx'><p id='event'></p><script>document.querySelector('#pptx').addEventListener('change',e=>document.querySelector('#event').textContent='changed:'+e.target.files[0].name)</script></body></html>").unwrap();
         std::fs::write(&sample,b"temporary pptx fixture").unwrap();
         let workspace=crate::tools::Workspace::new(&root).unwrap();let context=crate::visual_artifacts::VisualContext::mcp(workspace.root());
-        let url=format!("file:///{}",html.to_string_lossy().replace('\\',"/"));
+        let url=reqwest::Url::from_file_path(&html).unwrap().to_string();
         execute_scoped(&workspace,&context,"browser_open",&json!({"url":url})).await.unwrap();
         let assigned=execute_scoped(&workspace,&context,"browser_upload",&json!({"path":"演示 文件.pptx","selector":"#pptx"})).await.unwrap();
         assert_eq!(assigned["status"],"file_assigned","{assigned}");

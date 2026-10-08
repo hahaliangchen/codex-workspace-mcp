@@ -83,7 +83,7 @@ function titleOf(row: TrajectoryRow): string {
     case 'observer/plan_review': return 'Observer · 计划建议'
     case 'observer/progress_review': return 'Observer · 进度观察'
     case 'observer/retrospective_start': return 'Observer · 开始复盘'
-    case 'observer/retrospective': return 'Observer · 已有节点复盘汇总'
+    case 'observer/retrospective': return 'Observer · 工作路径复盘'
     case 'observer/error': return 'Observer 不可用'
     case 'observer/cancelled': return 'Observer 检查已取消'
     case 'step/end': return t('trajectory.stepEnd', { step: row.step ?? '' })

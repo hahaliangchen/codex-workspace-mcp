@@ -802,7 +802,7 @@ function flowStatus(value: unknown): FlowNodeStatus {
 function createFlowNode(
   id: string,
   turn?: number,
-  title = '工作者任务',
+  title = '任务',
   kind = 'step',
   description?: string,
   status: FlowNodeStatus = 'ready',
@@ -1386,12 +1386,12 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const argsStr = argumentsOf(data.arguments)
         const flowNodeId = stringOf(data.flowNodeId)
         const targetId = flowNodeId
-          ? nodeKey(flowNodeId, turn)
+          ? nodeKey(nodeToWorkMap.get(nodeKey(flowNodeId, turn)) ?? flowNodeId, turn)
           : activeNodeId ?? nodeKey('worker', turn)
         if (callId) callsToNode.set(callId, targetId)
         let targetNode = nodeMap.get(targetId)
         if (!targetNode) {
-          targetNode = createFlowNode(targetId, turn, taskLabel || '工作者执行任务', 'worker', taskLabel, 'running')
+          targetNode = createFlowNode(targetId, turn, taskLabel || '执行任务', 'worker', taskLabel, 'running')
           nodeMap.set(targetId, targetNode)
         }
         targetNode.tools.push({ id: callId, name, input: argsStr })

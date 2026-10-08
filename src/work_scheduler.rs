@@ -891,6 +891,11 @@ impl WorkScheduler {
         // Keep only the result Organizer needs to route next. Full exports,
         // source and execution history remain available to Worker/notebook.
         let mut compacted=organizer_compact(&compact,0);
+        // The routing projection is not the message. Deliver the original
+        // Worker return without truncating text, arrays, or diagnostic fields.
+        compacted["worker_return"]=output["worker_return"].clone();
+        compacted["visual_check_result"]=output["visual_check_result"].clone();
+        compacted["visual_requests"]=output["visual_requests"].clone();
         let mut omissions=Vec::new();let mut omitted_total=0;
         organizer_omissions(&compact,"current_result",0,&mut omissions,&mut omitted_total);
         if omitted_total>0 {
@@ -937,6 +942,7 @@ impl WorkScheduler {
                 "plan_revision": output["plan_revision"],
                 "goal": output["goal"],
                 "visual_artifact_ids":output["visual_artifact_ids"],"visual_check_result":output["visual_check_result"],
+                "worker_return":output["worker_return"],"visual_requests":output["visual_requests"],
                 "done": output["done"],
                 "summary": output["summary"],
             });
@@ -1023,6 +1029,7 @@ impl WorkScheduler {
                 let mut deliverable = json!({
                     "id": output["id"],
                     "visual_artifact_ids":output["visual_artifact_ids"],"visual_check_result":output["visual_check_result"],
+                    "worker_return":output["worker_return"],"visual_requests":output["visual_requests"],
                     "node_id": output["node_id"],
                     "revision": output["revision"],
                     "plan_revision": output["plan_revision"],
@@ -1255,7 +1262,7 @@ impl WorkScheduler {
         self.finished = true;
         self.request_completed = Some(!blocked);
         if !blocked { self.handoff = None; }
-        self.final_result = limited(summary, 6000);
+        self.final_result = summary.to_owned();
         Ok(())
     }
 
@@ -1960,7 +1967,7 @@ impl WorkScheduler {
             "checks": f.checked.keys().collect::<Vec<_>>(),
             "versions": f.versions,
             "operations": f.operations,
-            "visual_artifact_ids":f.visual_artifact_ids,"visual_check_result":f.visual_check_result,
+            "visual_artifact_ids":f.visual_artifact_ids,"visual_check_result":f.visual_check_result,"visual_requests":f.visual_requests,
             "resource_availability": exported_data.get("browser_upload_availability")
         });
         self.frames.get_mut(&frame_id).unwrap().output = Some(output.clone());
@@ -1971,8 +1978,7 @@ impl WorkScheduler {
     pub fn visual_response_received(&mut self,manifest:&Value) {
         if manifest["status"]=="no_images" {return;}
         if let Some(frame)=self.frames.get_mut(&self.current) {
-            if matches!(manifest["status"].as_str(),Some("direct"|"fallback")) {frame.visual_requests.push(manifest.clone());}
-            if frame.visual_requests.len()>8 {frame.visual_requests.remove(0);}
+            frame.visual_requests.push(manifest.clone());
             for id in manifest["selected_artifact_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
                 if !frame.seen_visual_artifact_ids.iter().any(|old|old==id) {frame.seen_visual_artifact_ids.push(id.to_owned());}
             }
@@ -2808,6 +2814,7 @@ mod tests {
         let frame=scheduler.frame().unwrap();
         let compact=scheduler.compact_current_result(frame,&output);
         assert!(compact["summary"].as_str().unwrap().len()<submitted["summary"].as_str().unwrap().len());
+        assert_eq!(compact["worker_return"],submitted,"the original message is delivered alongside its routing summary");
         assert_eq!(scheduler.output().unwrap()["worker_return"],submitted);
     }
 

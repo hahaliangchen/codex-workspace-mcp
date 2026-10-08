@@ -720,10 +720,16 @@ async fn probe(record: &Record, args: &Value) -> Result<()> {
         });
         let Some(port) = port else { break };
         let host = meta.ready_url.as_ref().and_then(|url| reqwest::Url::parse(url).ok()).and_then(|url| url.host_str().map(|host| host.trim_matches(['[', ']']).to_owned())).unwrap_or_else(|| "127.0.0.1".into());
-        let ownership = listener_ownership(port, &host, meta.pid);
+        let owner_host = host.clone();
+        let ownership = tokio::task::spawn_blocking(move || listener_ownership(port, &owner_host, meta.pid)).await?;
         let page = if ownership.owned {
             if let Some(url) = meta.ready_url.clone() { page_status(&client, &url).await }
-            else { PageStatus { ready: true, detail: "tcp listener belongs to the managed process group; no HTTP page was requested".into() } }
+            else {
+                let connected = tokio::time::timeout(Duration::from_millis(750), tokio::net::TcpStream::connect((host.as_str(), port)))
+                    .await.is_ok_and(|result| result.is_ok());
+                PageStatus { ready: connected, detail: if connected { "TCP listener belongs to the managed process group and accepts connections".into() }
+                    else { format!("managed listener does not accept connections on {host}:{port}") } }
+            }
         } else {
             PageStatus { ready: false, detail: ownership.detail.clone() }
         };
@@ -782,6 +788,14 @@ impl EndpointFilter {
         let unspecified = [0u8; 16];
         let mut loopback = [0u8; 16];
         loopback[15] = 1;
+        // Node commonly listens on :: with dual-stack enabled. A subsequent
+        // HTTP/TCP probe checks that the requested IPv4 address is reachable.
+        if matches!(self, Self::V4(_) | Self::Localhost) {
+            if address == &unspecified { return BindMatch::Wildcard; }
+            if address[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] {
+                return self.match_v4(u32::from_be_bytes(address[12..].try_into().unwrap()));
+            }
+        }
         match self {
             Self::V6(expected) if address == expected => BindMatch::Exact,
             Self::V6(_) if address == &unspecified => BindMatch::Wildcard,
@@ -886,8 +900,107 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
     let _ = std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() + std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>();
     Ok(prefer_exact(exact, wildcard))
 }
-#[cfg(not(windows))]
-fn listener_pids(_port: u16, _host: &str) -> Result<Vec<u32>> { anyhow::bail!("listener ownership is only resolved on Windows in this build") }
+#[cfg(target_os = "linux")]
+fn linux_tcp_listener(line: &str) -> Option<(std::net::IpAddr, u16, u64)> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.get(3)? != &"0A" { return None; }
+    let (address, port) = fields.get(1)?.rsplit_once(':')?;
+    let port = u16::from_str_radix(port, 16).ok()?;
+    // procfs encodes each address word in native byte order, including tcp6.
+    let address = match address.len() {
+        8 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_str_radix(address, 16).ok()?.to_ne_bytes())),
+        32 => {
+            let mut bytes = [0; 16];
+            for (index, word) in address.as_bytes().chunks_exact(8).enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?.to_ne_bytes());
+            }
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes))
+        }
+        _ => return None,
+    };
+    Some((address, port, fields.get(9)?.parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
+fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
+    let target = EndpointFilter::parse(host);
+    let mut exact = Vec::new();
+    let mut wildcard = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let text = match std::fs::read_to_string(table) {
+            Ok(text) => text,
+            Err(error) if table.ends_with("tcp6") && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("could not read {table}")),
+        };
+        for line in text.lines().skip(1) {
+            let Some((address, local_port, inode)) = linux_tcp_listener(line) else { continue };
+            if local_port != port { continue; }
+            let matched = match address {
+                std::net::IpAddr::V4(address) => target.match_v4(u32::from(address)),
+                std::net::IpAddr::V6(address) => target.match_v6(&address.octets()),
+            };
+            match matched {
+                BindMatch::Exact => exact.push(inode),
+                BindMatch::Wildcard => wildcard.push(inode),
+                BindMatch::None => {},
+            }
+        }
+    }
+    let inodes: std::collections::BTreeSet<_> = if exact.is_empty() { wildcard } else { exact }.into_iter().collect();
+    if inodes.is_empty() { return Ok(Vec::new()); }
+    let mut resolved = std::collections::BTreeSet::new();
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else { continue };
+        for descriptor in descriptors.flatten() {
+            let Ok(link) = std::fs::read_link(descriptor.path()) else { continue };
+            let Some(inode) = link.to_str().and_then(|value| value.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()) else { continue };
+            if inodes.contains(&inode) { resolved.insert(inode); pids.push(pid); }
+        }
+    }
+    ensure!(resolved == inodes, "listener socket owners are unavailable in /proc (permission denied or process exited)");
+    Ok(prefer_exact(pids, Vec::new()))
+}
+
+// lsof's field output avoids dependence on localized column headings and
+// preserves bracketed IPv6 addresses. Also compiled in tests on Linux.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_listener_pids(text: &str, port: u16, host: &str) -> Vec<u32> {
+    let target = EndpointFilter::parse(host);
+    let mut pid = None;
+    let mut exact = Vec::new();
+    let mut wildcard = Vec::new();
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix('p') { pid = value.parse::<u32>().ok(); }
+        let Some((pid, name)) = pid.zip(line.strip_prefix('n')) else { continue };
+        let Some((address, local_port)) = name.rsplit_once(':') else { continue };
+        if local_port.parse::<u16>().ok() != Some(port) { continue; }
+        let matched = if address == "*" { BindMatch::Wildcard }
+            else if let Ok(address) = address.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+                match address {
+                    std::net::IpAddr::V4(address) => target.match_v4(u32::from(address)),
+                    std::net::IpAddr::V6(address) => target.match_v6(&address.octets()),
+                }
+            } else { BindMatch::None };
+        match matched { BindMatch::Exact => exact.push(pid), BindMatch::Wildcard => wildcard.push(pid), BindMatch::None => {} }
+    }
+    prefer_exact(exact, wildcard)
+}
+
+#[cfg(target_os = "macos")]
+fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
+        .output().context("could not run system lsof")?;
+    // lsof uses exit 1 with empty output when there are no matching sockets.
+    ensure!(output.status.success() || output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty(),
+        "lsof failed: {}", String::from_utf8_lossy(&output.stderr));
+    Ok(lsof_listener_pids(&String::from_utf8_lossy(&output.stdout), port, host))
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn listener_pids(_port: u16, _host: &str) -> Result<Vec<u32>> { anyhow::bail!("listener ownership is unsupported on this operating system") }
 
 #[cfg(windows)]
 fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
@@ -916,7 +1029,34 @@ fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
         false
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn process_parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces and parentheses; fields after its final ')' start
+    // with state, then ppid.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_parent(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "ppid="]).output().ok()?;
+    output.status.success().then_some(())?;
+    std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
+    let mut cursor = pid;
+    let mut seen = std::collections::BTreeSet::new();
+    while cursor != 0 && seen.len() < 128 && seen.insert(cursor) {
+        let Some(parent) = process_parent(cursor) else { return false };
+        if parent == ancestor { return true; }
+        cursor = parent;
+    }
+    false
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn process_is_descendant(_pid: u32, _ancestor: u32) -> bool { false }
 
 #[cfg(windows)]
@@ -941,7 +1081,16 @@ fn process_name(pid: u32) -> String {
         String::new()
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim().to_owned()
+}
+#[cfg(target_os = "macos")]
+fn process_name(pid: u32) -> String {
+    std::process::Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()
+        .filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()).unwrap_or_default()
+}
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn process_name(_pid: u32) -> String { String::new() }
 
 #[cfg(test)]
@@ -950,6 +1099,40 @@ mod tests {
     use std::process::Stdio;
     #[cfg(not(windows))]
     use std::path::Path;
+
+    #[test]
+    fn lsof_fields_filter_address_family_port_and_prefer_exact_binding() {
+        let output = "p10\nn*:5173\np11\nn127.0.0.1:5173\np12\nn[::1]:5173\np13\nn10.1.2.3:5173\np14\nn127.0.0.1:9999\n";
+        assert_eq!(super::lsof_listener_pids(output, 5173, "127.0.0.1"), vec![11]);
+        assert_eq!(super::lsof_listener_pids(output, 5173, "::1"), vec![12]);
+        assert_eq!(super::lsof_listener_pids(output, 5173, "localhost"), vec![11, 12]);
+        assert_eq!(super::lsof_listener_pids(output, 5173, "10.1.2.4"), vec![10]);
+        assert!(super::lsof_listener_pids(output, 4321, "localhost").is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[test]
+    fn proc_tcp_tables_decode_native_words_and_ignore_connected_sockets() {
+        let v4 = "0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345";
+        assert_eq!(super::linux_tcp_listener(v4), Some(("127.0.0.1".parse().unwrap(), 5173, 12345)));
+        let v6 = "0: 00000000000000000000000001000000:1435 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 12346";
+        assert_eq!(super::linux_tcp_listener(v6), Some(("::1".parse().unwrap(), 5173, 12346)));
+        let mapped = v6.replace("00000000000000000000000001000000", "0000000000000000FFFF00000100007F");
+        assert_eq!(super::linux_tcp_listener(&mapped).unwrap().0, "::ffff:127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert!(super::linux_tcp_listener(&v4.replace(" 0A ", " 01 ")).is_none());
+        assert!(super::linux_tcp_listener("invalid").is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[tokio::test]
+    async fn dual_stack_wildcard_listener_is_found_from_ipv4() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::]:0").await else { return };
+        let port = listener.local_addr().unwrap().port();
+        // Platforms with IPv6-only sockets cannot provide this dual-stack case.
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() { return; }
+        let pids = super::listener_pids(port, "127.0.0.1").unwrap();
+        assert!(pids.contains(&std::process::id()), "{pids:?}");
+    }
 
     #[test]
     fn powershell_script_detection_covers_direct_commands_and_configured_paths() {
@@ -1166,7 +1349,7 @@ mod tests {
         let _=std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn wait_seconds_bypasses_pending_snapshot_and_waits_for_delayed_readiness() {
         if node_npm().is_err(){return;}
@@ -1221,13 +1404,8 @@ mod tests {
         let other_family = listener_ownership(port, "::1", 1);
         assert!(!other_family.owned, "{}", other_family.detail);
         assert!(other_family.detail.contains("nothing is listening"), "{}", other_family.detail);
-        let wildcard = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
-        let loopback = listener_ownership(port, "127.0.0.1", 1);
-        assert!(!loopback.owned, "{}", loopback.detail);
-        assert!(loopback.detail.contains("pid"), "{}", loopback.detail);
         assert_eq!(prefer_exact(vec![7], vec![9]), vec![7]);
         assert_eq!(prefer_exact(vec![], vec![9, 9]), vec![9]);
-        drop(wildcard);
         drop(listener);
         if std::env::var("LIVE_PORT_CHECK").is_ok() {
             let loopback_live = listener_ownership(3000, "127.0.0.1", 1);
