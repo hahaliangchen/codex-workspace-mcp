@@ -136,8 +136,9 @@ export function useSession(taskId: string | undefined, onSettled: () => void): S
   useEffect(() => {
     if (!taskId || !task || live(task)) return
     if (!['completed', 'failed', 'max_steps'].includes(task.status)) return
-    if (!events.some(event => event.type === 'observer/config' && event.data.enabled === true)) return
-    if (events.some(event => event.type === 'observer/retrospective')) return
+    const currentTurnEvents = events.slice(Math.max(0, events.findLastIndex(event => event.type === 'turn/start')))
+    if (!currentTurnEvents.some(event => event.type === 'observer/config' && event.data.enabled === true)) return
+    if (currentTurnEvents.some(event => event.type === 'observer/retrospective')) return
     const run = generation.current
     const deadline = Date.now() + 65_000
     const timer = window.setInterval(() => {

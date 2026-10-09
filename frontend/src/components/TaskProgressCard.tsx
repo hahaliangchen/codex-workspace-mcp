@@ -13,7 +13,7 @@ export function TaskProgressCard({ events, running, disabled, onResume, onContin
   const progress = taskProgress(events)
   if (!progress?.goal) return null
   return <section className={styles.card} aria-label="主任务进展">
-    <div className={styles.heading}><strong>主任务</strong><span>{progress.completed ? '已完成' : running ? '进行中' : '未完成 · 待继续'}</span></div>
+    <div className={styles.heading}><strong>主任务</strong><span>{running ? '进行中' : progress.completed ? '目标已达成' : '执行已结束 · 目标未完全达成'}</span></div>
     <p>{progress.goal}</p>
     {progress.summary && <details><summary>主任务结论</summary><p className={styles.summary}>{progress.summary}</p></details>}
     {progress.unresolved.length > 0 && <ul>{progress.unresolved.map((item, index) => <li key={index}>{item}</li>)}</ul>}

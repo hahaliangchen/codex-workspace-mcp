@@ -104,19 +104,14 @@ impl WorkExecutor {
         scheduler.needs_organizer()
     }
 
-    /// Validates whether a tool operation is permitted for the active task process.
-    pub fn check_permits(scheduler: &WorkScheduler, tool_name: &str, args: &Value) -> Result<()> {
-        scheduler.permits(tool_name, args)
+    /// Prevents execution after the active invocation has already returned.
+    pub fn ensure_active_work(scheduler: &WorkScheduler) -> Result<()> {
+        scheduler.ensure_active_work()
     }
 
     /// Handles a yield_work tool call by delegating to scheduler.return_work.
     pub fn handle_yield_work(scheduler: &mut WorkScheduler, args: &Value) -> Result<Value> {
         scheduler.return_work(args)
-    }
-
-    /// Filters available tools for the active task process based on its completion contract and current state.
-    pub fn filter_tools(scheduler: &WorkScheduler, tools: &mut Vec<Value>) {
-        scheduler.filter_tools(tools);
     }
 
     /// Executes the model, the host's tool adapter, and local result archival within

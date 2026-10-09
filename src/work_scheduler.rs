@@ -366,6 +366,22 @@ fn copy_worker_result(output:&Value, target:&mut Value) {
     }
 }
 
+/// One handoff record for the receiving Worker. Preserve original return
+/// fields without nesting a second copy of the same summary/exported facts.
+fn worker_delivery(mut delivery:Value)->Value {
+    let Some(object)=delivery.as_object_mut() else {return delivery;};
+    if let Some(Value::Object(original))=object.remove("worker_return") {
+        for (key,value) in original {
+            if let (Some(Value::Object(existing)),Value::Object(fields))=(object.get_mut(&key),&value) {
+                for (field,value) in fields {existing.insert(field.clone(),value.clone());}
+            } else {
+                object.insert(key,value);
+            }
+        }
+    }
+    delivery
+}
+
 fn organizer_handoff(handoff:&Value)->Value {
     let mut compact=json!({});
     for field in ["done","blocked","need_split","outcome","failure_stage","resumable","intent",
@@ -1523,13 +1539,6 @@ impl WorkScheduler {
         Some(result)
     }
 
-    /// The host already knows the latest sample for this URL is no longer
-    /// current, so a new observation needs no extra justification.
-    fn http_previous_sample_invalid(&self,args:&Value)->bool {
-        self.http_probe_results.get(&crate::http_probe::check_key(args)).and_then(|entry|entry["sample_id"].as_str())
-            .and_then(|id|self.http_observation_samples.get(id)).is_some_and(|sample|!self.http_sample_freshness(sample).0)
-    }
-
     /// Previous sample for the same URL, reported with a new observation so the
     /// Worker sees why it was not reused.
     pub fn http_previous_sample(&self,args:&Value)->Value {
@@ -1690,54 +1699,13 @@ impl WorkScheduler {
         samples
     }
 
-    fn may_edit(f: &WorkFrame) -> bool {
-        !f.order.edit_targets.is_empty()
-    }
-
-    pub fn permits(&self, name: &str, args: &Value) -> Result<()> {
+    /// A returned invocation cannot execute further calls from the same batch.
+    /// Task checks and edit targets are planning facts, not tool permissions.
+    pub fn ensure_active_work(&self) -> Result<()> {
         ensure!(!self.finished && !self.done(), "work is done; the host is handing off its result");
         ensure!(self.handoff.is_none(), "work yielded; remaining operations must wait for Organizer's next assignment");
-        let f = self.frame().ok_or_else(|| anyhow::anyhow!("no active work order"))?;
-        if matches!(name, "edit_file" | "replace_range" | "write_file") {
-            ensure!(Self::may_edit(f), "this work has no authorized repair targets; yield the concrete missing scope to Organizer");
-            ensure!(f.order.edit_targets.iter().any(|p| path(p) == path(args["path"].as_str().unwrap_or(""))), "edit target is outside this work order; yield the concrete missing scope to Organizer");
-            ensure!(!self.verification_due(), "the declared files were written; execute the outstanding checks now");
-        }
-        if name=="http_probe" {
-            let c=crate::http_probe::check_key(args);
-            let previous=self.http_probe_results.get(&c);
-            let reason=args["reason"].as_str().is_some_and(|reason|!reason.trim().is_empty());
-            let reusable=self.reusable_http_probe(args).is_some();
-            ensure!(previous.is_none()||reason||reusable||self.http_previous_sample_invalid(args),
-                "this URL was already probed at {}; reuse that sample or include reason explaining why a new HTTP observation is needed",
-                previous.and_then(|entry|entry["sample_id"].as_str()).and_then(|id|self.http_observation_samples.get(id)).and_then(|sample|sample["sampled_at"].as_str()).unwrap_or("an earlier time"));
-        }
-        if crate::project_process::is_check(name) && name != "get_project_process" {
-            let c = crate::project_process::check_key(name, args);
-            if self.verification_due() {
-                ensure!(f.order.checks.contains(&c), "verification work accepts only its declared check commands");
-            }
-            let http_refresh=name=="http_probe"&&args["reason"].as_str().is_some_and(|reason|!reason.trim().is_empty());
-            let http_reuse=name=="http_probe"&&(self.reusable_http_probe(args).is_some()||self.http_previous_sample_invalid(args));
-            ensure!(f.checked.get(&c) != Some(&f.epoch)||http_refresh||http_reuse, "this command already succeeded for the current versions; reuse its recorded result");
-        }
-        if self.verification_due() {
-            ensure!(crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "read_session_history" | "stop_project_process"), "the current work awaits its declared checks; broader investigation belongs in another work order");
-        }
+        ensure!(self.frame().is_some(), "no active work order");
         Ok(())
-    }
-
-    pub fn filter_tools(&self, tools: &mut Vec<Value>) {
-        tools.retain(|tool| {
-            let name = tool.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            if self.verification_due() {
-                return crate::project_process::is_check(name) || matches!(name, "yield_work" | "report_progress" | "read_session_history" | "stop_project_process");
-            }
-            if matches!(name, "edit_file" | "replace_range" | "write_file") {
-                return self.frame().is_some_and(Self::may_edit);
-            }
-            true
-        });
     }
 
     pub fn observe(&mut self, name: &str, args: &Value, result: &Value, failed: bool) {
@@ -1897,6 +1865,7 @@ impl WorkScheduler {
             .or_else(|| result.get("stdout")).map(|value| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())).unwrap_or_default();
         f.operations.push(json!({
             "tool": name,
+            "artifact_id":result["artifact_id"],
             "at":now_ms(),
             "page":page,
             "closed_page":result["closed_page"],
@@ -1978,11 +1947,10 @@ impl WorkScheduler {
 
     pub fn return_work(&mut self, args: &Value) -> Result<Value> {
         self.refresh_http_check_validity();
-        ensure!(args.to_string().len() <= 32_000, "work return is too large; return conclusions and material IDs");
         let summary = args["summary"].as_str().unwrap_or("").trim();
         ensure!(!summary.is_empty(), "yield_work requires actual findings/outcome or a concrete blocker");
-        ensure!(args.get("limitations").is_none_or(|value|value.as_array().is_some_and(|items|items.len()<=16&&items.iter().all(Value::is_string))),
-            "yield_work.limitations must contain at most 16 short strings");
+        ensure!(args.get("limitations").is_none_or(|value|value.as_array().is_some_and(|items|items.iter().all(Value::is_string))),
+            "yield_work.limitations must be an array of strings");
         let frame_id=self.current.clone();
         let f = self.frames.get(&frame_id).cloned().ok_or_else(|| anyhow::anyhow!("no active work"))?;
         ensure!(f.status!=WorkStatus::Done,"this task return is already sealed; schedule a new task or revisit its node");
@@ -2060,20 +2028,11 @@ impl WorkScheduler {
 
     pub fn visual_input_ids(&self) -> Vec<String> {
         let Some(frame)=self.frame() else {return vec![];};
-        let mut selected=frame.visual_artifact_ids.iter().rev().filter(|id|!frame.seen_visual_artifact_ids.contains(id))
+        // Capturing a screenshot is not a request to inspect its pixels.
+        // Only an explicit view_image method selects model image input.
+        let selected=frame.visual_artifact_ids.iter().rev().filter(|id|!frame.seen_visual_artifact_ids.contains(id)
+            && frame.operations.iter().any(|operation|operation["tool"]=="view_image" && operation["artifact_id"].as_str()==Some(id.as_str())))
             .take(crate::visual_artifacts::MAX_IMAGES).cloned().collect::<Vec<_>>();
-        if selected.is_empty() {return selected;}
-        // A new selected image may need the previous successful image as its
-        // comparison context. Failed/unavailable requests are never retried here.
-        for id in frame.visual_artifact_ids.iter().rev() {
-            if selected.len()>=crate::visual_artifacts::MAX_IMAGES {break;}
-            if !selected.contains(id) && frame.visual_requests.iter().rev().find(|request|
-                request["selected_artifact_ids"].as_array().is_some_and(|ids|ids.iter().any(|item|item.as_str()==Some(id.as_str()))))
-                    .is_some_and(|request|matches!(request["status"].as_str(),Some("direct"|"fallback"))) {
-                selected.push(id.clone());
-            }
-        }
-        selected.sort_by_key(|id|frame.visual_artifact_ids.iter().position(|item|item==id));
         selected
     }
 
@@ -2106,17 +2065,6 @@ impl WorkScheduler {
                 "revision": self.revision(),
             }));
         }
-    }
-
-    /// Keep the latest reports on the node. They describe intent and known
-    /// conditions; only a Worker return seals the invocation.
-    pub fn record_progress(&mut self, args: &Value, turn: usize, step: usize) {
-        let Some(frame) = self.frames.get_mut(&self.current) else { return; };
-        if frame.status == WorkStatus::Done { return; }
-        frame.progress.push(json!({"turn":turn,"step":step,"at":now_ms(),
-            "purpose":organizer_compact(&args["purpose"],0),"known_conditions":organizer_compact(&args["known_conditions"],0),
-            "next_action":organizer_compact(&args["next_action"],0)}));
-        if frame.progress.len() > 6 { frame.progress.remove(0); }
     }
 
     pub fn attach_return_data(&mut self, findings: &Value, materials: &[Value]) {
@@ -2157,19 +2105,23 @@ impl WorkScheduler {
     /// Carry the immediately preceding invocation's result and material index,
     /// even when the Organizer didn't declare a dependency. This is context,
     /// not a success receipt or an implicit import of another node's source.
-    fn previous_step(&self)->Option<Value> {
+    fn previous_step(&self,upstream:&[Value])->Option<Value> {
         let ordered=self.execution_order();
         let position=ordered.iter().position(|frame|frame.order.id==self.current)?;
         let previous=ordered[..position].iter().rev().find(|frame|frame.status!=WorkStatus::Ready)?;
-        let result=previous.output.as_ref().map(|output| {
-            let mut result=self.compact_current_result(previous,output);
-            result.as_object_mut().unwrap().remove("worker_return");
-            result
+        let already_delivered=upstream.iter().any(|delivery|delivery["id"]==previous.order.id);
+        let result=previous.output.as_ref().filter(|_|!already_delivered).map(|output| {
+            let mut result=output.clone();
+            // The completed invocation's tool ledger stays in saved history;
+            // its actual returned result is the next invocation's handoff.
+            result.as_object_mut().unwrap().remove("operations");
+            worker_delivery(result)
         });
         Some(json!({"work_id":previous.order.id,"node_id":previous.order.node_id,"revision":previous.order.revision,
             "goal":previous.order.goal,"status":self.path_status(previous),"returned":previous.output.is_some(),
             "historical":previous.invalidated_by_plan_revision.is_some(),"result":result,
-            "latest_report":previous.progress.last(),"material_directory":previous.source_selection["materials"],
+            "latest_report":if already_delivered {None}else{previous.progress.last()},"material_directory":previous.source_selection["materials"],
+            "delivery_location":if already_delivered {"upstream_outputs"}else{"previous_step.result"},
             "result_reference":{"method":"read_task_result","work_id":previous.order.id},
             "note":"A report is intent, not a returned result. Material references require version-checked notebook recall; historical results do not establish current resource availability."}))
     }
@@ -2177,7 +2129,8 @@ impl WorkScheduler {
     pub fn worker_input(&self, human_request: &str) -> Value {
         let upstream = self.order()
             .and_then(|o| self.resolve_dependency_deliveries(o).ok())
-            .unwrap_or_default();
+            .unwrap_or_default().into_iter().map(worker_delivery).collect::<Vec<_>>();
+        let previous=self.previous_step(&upstream);
         json!({
             "human_request": human_request,
             "request_id":self.request_started_turn,
@@ -2185,16 +2138,16 @@ impl WorkScheduler {
             "main_task_goal":self.request_goal,
             "current_work": self.order(),
             "upstream_outputs": upstream,
-            "previous_step": self.previous_step(),
+            "previous_step": previous,
             "http_observations":self.worker_http_observations(),
             "done": self.done(),
             "organizer_handoff": self.frame().map(|f| &f.organizer_guidance),
             "verification_due": self.verification_due(),
-            "actual_operations": self.frame().map(|f| &f.operations),
-            // Image blocks are transient, but their dispatch bindings and
-            // failures remain available for later tool/return decisions.
+            // This invocation continues through its original tool messages.
+            // Replaying its ledger here would represent each action twice.
+            // Visual delivery results also remain in the original messages;
+            // do not repeat them in a separate request ledger here.
             "visual_artifact_ids":self.frame().map(|f|&f.visual_artifact_ids),
-            "visual_requests":self.frame().map(|f|&f.visual_requests),
             "visual_check_result":self.frame().map(|f|&f.visual_check_result),
             "check_failures": self.frame().map(|f| &f.check_errors),
             "source_epoch": self.frame().map(|f| f.epoch),
@@ -2262,7 +2215,13 @@ impl WorkScheduler {
                     &&browser_page_key(&operation["page"]).as_ref()==Some(&key)&&operation["page"]["url"]==page["url"]&&operation["title"].is_string())
                     .map(|operation|operation["title"].clone())
                     .or_else(||previous.map(|previous|previous["title"].clone())).unwrap_or(Value::Null);
-                pages.insert(key,json!({"page":page,"title":title,"observed_at":observed_at,
+                let mut observed_page=page.clone();
+                if observed_page["display_mode"].is_null() {
+                    observed_page["display_mode"]=operation.map(|operation|operation["display_mode"].clone())
+                        .filter(Value::is_string).or_else(||previous.map(|previous|previous["page"]["display_mode"].clone()))
+                        .unwrap_or(Value::Null);
+                }
+                pages.insert(key,json!({"page":observed_page,"title":title,"observed_at":observed_at,
                     "observation":"page_returned","live_availability":{"available":null,"reason":"not_checked"},
                     "observed_by":{"work_id":frame.order.id,"node_id":frame.order.node_id,"revision":frame.order.revision},
                     "last_tool":operation.map(|operation|operation["tool"].clone()),
@@ -2516,17 +2475,6 @@ impl WorkScheduler {
         json!({
             "schema_version":WORK_SCHEDULER_SCHEMA_VERSION,
             "main_task":self.main_task_summary(),
-            "previous_main_tasks":self.archived_requests.iter().rev().take(1).map(|archive|{
-                let mut summary=archive.scheduler.get("main_task").cloned().unwrap_or_else(||
-                    serde_json::from_value::<WorkScheduler>(archive.scheduler.clone()).map(|scheduler|scheduler.main_task_summary()).unwrap_or(Value::Null));
-                if summary.is_object() {
-                    summary["historical"]=json!(true);
-                    summary["history_reference"]=json!({"source":"historical Flow summaries and version-checked task notebook",
-                        "note":"read_task_result addresses the current human goal, not archived human goals"});
-                    for step in summary["steps"].as_array_mut().into_iter().flatten() {step.as_object_mut().unwrap().remove("result_reference");}
-                }
-                summary
-            }).collect::<Vec<_>>(),
             "current_work": current_work,
             "request_id":self.request_started_turn,
             "current_node": self.node(),
@@ -2980,6 +2928,76 @@ mod tests {
             completion: Completion::Output,
             ..WorkOrder::default()
         }
+    }
+
+    #[test]
+    fn long_original_return_and_many_limitations_reach_next_worker_without_field_cuts() {
+        let mut scheduler=WorkScheduler::default();scheduler.enqueue(vec![output_order()],false,false).unwrap();scheduler.activate_next().unwrap();
+        let diagnostic=format!("{} ORIGINAL_DIAGNOSTIC_TAIL","完整诊断".repeat(12000));
+        let submitted=json!({"summary":"Actual Worker conclusion","diagnostic":diagnostic,
+            "limitations":(0..24).map(|index|format!("Original limitation {index}")).collect::<Vec<_>>()});
+        let output=scheduler.return_work(&submitted).unwrap();assert_eq!(output["worker_return"],submitted);
+        scheduler.enqueue(vec![WorkOrder{id:"next".into(),node_id:"next_node".into(),goal:"continue".into(),done_when:"return".into(),completion:Completion::Output,..Default::default()}],false,false).unwrap();
+        scheduler.activate_next().unwrap();let packet=scheduler.worker_input("continue");let returned=&packet["previous_step"]["result"];
+        assert_eq!(returned["diagnostic"],diagnostic);assert_eq!(returned["limitations"],submitted["limitations"]);
+        assert_eq!(packet.to_string().matches("ORIGINAL_DIAGNOSTIC_TAIL").count(),1);
+    }
+
+    #[test]
+    fn worker_handoff_delivers_one_original_result_without_replaying_own_operations() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![output_order()],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        scheduler.observe("browser_upload",&json!({"path":"demo.pptx"}),
+            &json!({"status":"file_assigned","upload_attempt_id":"one-upload"}),false);
+        assert!(scheduler.worker_input("load the PPT").get("actual_operations").is_none());
+        assert_eq!(scheduler.frame().unwrap().operations.len(),1,"the saved tool ledger must remain intact");
+        let diagnostic=format!("{}TAIL","original provider failure ".repeat(180));
+        scheduler.return_work(&json!({"summary":"upload-return-only-once","outcome":"completed",
+            "exported_data":{"page_id":"page","loaded":true,"extra":"preserved-original-export"},
+            "limitations":[diagnostic],"diagnostic":{"message":diagnostic}})).unwrap();
+        scheduler.enqueue(vec![WorkOrder{id:"next".into(),node_id:"work_next".into(),
+            goal:"read the page".into(),done_when:"return page state".into(),
+            dependency_inputs:vec![json!({"work_id":"start","fields":["page_id","loaded"]})],
+            completion:Completion::Output,..WorkOrder::default()}],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let input=scheduler.worker_input("read the page");
+        let upstream=&input["upstream_outputs"][0];
+        assert_eq!(upstream["diagnostic"]["message"],diagnostic);
+        assert_eq!(upstream["limitations"][0],diagnostic);
+        assert_eq!(upstream["exported_data"]["extra"],"preserved-original-export");
+        assert!(upstream.get("worker_return").is_none());
+        assert!(upstream.get("operations").is_none());
+        assert!(input["previous_step"]["result"].is_null());
+        assert_eq!(input["previous_step"]["delivery_location"],"upstream_outputs");
+        assert_eq!(input["previous_step"]["work_id"],"start");
+        assert_eq!(input.to_string().matches("upload-return-only-once").count(),1);
+        assert_eq!(scheduler.frames["start"].operations.len(),1);
+        assert_eq!(scheduler.frames["start"].output.as_ref().unwrap()["worker_return"]["diagnostic"]["message"],diagnostic);
+    }
+
+    #[test]
+    fn undeclared_previous_handoff_preserves_long_original_fields_once() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![output_order()],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let original=format!("{}TAIL","image input unavailable ".repeat(180));
+        scheduler.return_work(&json!({"summary":"previous-return-only-once","outcome":"blocked",
+            "reason":original,"limitations":[original],"provider_diagnostic":{"detail":original}})).unwrap();
+        scheduler.enqueue(vec![WorkOrder{id:"next".into(),node_id:"work_next".into(),
+            goal:"handle the limitation".into(),done_when:"return an assessment".into(),
+            completion:Completion::Output,..WorkOrder::default()}],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        let input=scheduler.worker_input("handle the limitation");
+        let previous=&input["previous_step"]["result"];
+        assert_eq!(input["upstream_outputs"],json!([]));
+        assert_eq!(input["previous_step"]["delivery_location"],"previous_step.result");
+        assert_eq!(previous["reason"],original);
+        assert_eq!(previous["limitations"][0],original);
+        assert_eq!(previous["provider_diagnostic"]["detail"],original);
+        assert!(previous.get("worker_return").is_none());
+        assert!(previous.get("operations").is_none());
+        assert_eq!(input.to_string().matches("previous-return-only-once").count(),1);
     }
 
     #[test]
@@ -4075,18 +4093,16 @@ mod tests {
     }
 
     #[test]
-    fn report_only_rounds_continue_the_task_and_only_a_bounded_stall_hands_off() {
+    fn idle_rounds_continue_the_task_and_only_a_bounded_stall_hands_off() {
         let mut scheduler=WorkScheduler::default();
         scheduler.enqueue(vec![task("start","Start the editor")],false,false).unwrap();
         scheduler.activate_next().unwrap();
-        scheduler.record_progress(&json!({"purpose":"Start the editor","next_action":"run the dev script"}),1,1);
         scheduler.finish_round(0,0);
-        assert!(!scheduler.needs_organizer(),"one report-only round stays with the Worker");
+        assert!(!scheduler.needs_organizer(),"one idle round stays with the Worker");
         scheduler.finish_round(1,0);
         scheduler.finish_round(0,0);
         scheduler.finish_round(0,0);
         assert!(!scheduler.needs_organizer(),"an actual operation resets the stall count");
-        assert_eq!(scheduler.frame().unwrap().progress.len(),1);
         scheduler.finish_round(0,0);
         let handoff=scheduler.pending_handoff().unwrap();
         assert_eq!(handoff["done"],false);
@@ -4134,7 +4150,8 @@ mod tests {
         let mut scheduler=WorkScheduler::default();
         scheduler.enqueue(vec![task("upload","Upload the PPTX")],false,false).unwrap();
         scheduler.activate_next().unwrap();
-        scheduler.record_progress(&json!({"purpose":"Upload","next_action":"choose the file input"}),1,2);
+        // Old snapshots remain readable; new invocations use original messages.
+        scheduler.frame_mut().unwrap().progress.push(json!({"purpose":"Upload","next_action":"choose the file input"}));
         scheduler.apply(&json!({"action":"work","reason":"the upload page changed; reopen first","orders":[task("reopen","Reopen the editor")]}),false,false).unwrap();
         let old=&scheduler.frames["upload"];
         assert!(old.invalidated_by_plan_revision.is_some());
@@ -4234,6 +4251,29 @@ mod tests {
     }
 
     #[test]
+    fn restored_browser_facts_keep_new_visible_mode_separate_from_closed_headless_session() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![task("browser","Open a visible browser")],false,false).unwrap();scheduler.activate_next().unwrap();
+        let old=json!({"browser_session_id":"old","page_id":"blank","page_epoch":0,"url":"about:blank"});
+        scheduler.observe("browser_read",&json!({}),&json!({"page":old,"display_mode":"headless"}),false);
+        scheduler.observe("browser_close",&json!({}),&json!({"closed":true,"closed_page":{"browser_session_id":"old","page_id":"blank","display_mode":"headless"}}),false);
+        let new=json!({"browser_session_id":"new","page_id":"editor","page_epoch":1,"url":"http://localhost:3000/"});
+        // Older saved page identities lacked display_mode; recover it from the
+        // exact page's actual operation rather than guessing from another page.
+        scheduler.observe("browser_open",&json!({"visible":true}),&json!({"page":new,"display_mode":"visible_window"}),false);
+        let restored:WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+        let facts=restored.current_facts();let pages=facts["browser"].as_array().unwrap();
+        let old=pages.iter().find(|page|page["page"]["browser_session_id"]=="old").unwrap();
+        let new=pages.iter().find(|page|page["page"]["browser_session_id"]=="new").unwrap();
+        assert_eq!(old["observation"],"closed");assert_eq!(old["page"]["display_mode"],"headless");
+        assert_eq!(new["observation"],"page_returned");assert_eq!(new["page"]["display_mode"],"visible_window");
+        let observer=crate::observer_service::observation("task",&restored,restored.id(),1,1,"handoff","goal",&Value::Null,Value::Null,Value::Null,Value::Null);
+        let packed=crate::observer_service::pack(observer,&[],&[]);
+        assert_eq!(packed["task_page"]["browser_session_id"],"new");
+        assert!(packed.get("current_facts").is_none(),"the original conversation provides facts without a second generated history");
+    }
+
+    #[test]
     fn current_page_state_survives_a_deprecated_producer_and_stale_old_receipt() {
         let mut scheduler=WorkScheduler::default();
         let page=|session:&str,epoch:u64|json!({"browser_session_id":session,"page_id":"p1","page_epoch":epoch,"url":"http://127.0.0.1:5173/"});
@@ -4302,7 +4342,6 @@ mod tests {
         let id=scheduler.frame().unwrap().http_observation_ids[0].clone();
         scheduler.http_observation_samples.get_mut(&id).unwrap()["sampled_at"]=
             json!((chrono::Utc::now()-chrono::Duration::seconds(120)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true));
-        scheduler.permits("http_probe",&json!({"url":url})).unwrap();
         let mut fresh=http_sample(url,Some(200),0);
         scheduler.record_http_probe(&json!({"url":url}),&mut fresh,"call-2");
         assert_eq!(fresh["previous_sample"]["cache_invalidation_reason"],"expired");

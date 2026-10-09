@@ -224,7 +224,6 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
         manifest["visual_service_result_validated"]=json!(validated);
         manifest["visual_service_response"]=raw_service_response;
         manifest["visual_service_result"]=result.clone();manifest["visual_service_route"]=fallback_metadata["model_route"].clone();
-        messages.push(json!({"role":"system","content":format!("Host visual service result (the current role did not receive images): {}. Source images: {}. Preserve this provenance; do not claim your own direct image inspection.",result,manifest["images"])}));
         crate::agent_service::emit(state.workspace.root(),context.task_id(),"visual/service_result",json!({"manifest":manifest,"result":result,"elapsed_ms":started.elapsed().as_millis()})).await?;
     } else {
         manifest["status"]=json!(if capability==ImageCapability::Unknown {"unknown_capability"}else{"unavailable"});manifest["selected_images"]=manifest["images"].take();manifest["images"]=json!([]);
@@ -233,12 +232,20 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
             if state.visual.fallback.is_some() {"image capability of this model is unknown; the configured fallback is used only after explicit image rejection"}else{"image capability of this model is unknown and no fallback visual service is configured"}
         }else{"this model does not accept images and no fallback visual service is configured"},
             "captured_artifact_ids":captured});
-        messages.push(json!({"role":"system","content":format!("Image input is unavailable for this request: {}. The screenshots {captured:?} exist and can be delivered to the user, but this request did not receive their image content.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or(""))}));
     }
     let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
         "checked_goal":goal,"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
         "observed_facts":[{"artifact_id":manifest["images"][0]["artifact_id"],"region":"describe the inspected region","fact":"replace this with actual visible evidence"}],"issues":[],"limitations":[]});
-    messages.push(json!({"role":"system","content":format!("Host visual dispatch: {}. For visual_check_result use this JSON structure: {}. Preserve checked_goal, request_trace_id and artifact references so the observation can be associated with its inputs. Capture metadata and this request's page/source observations are recorded facts; you decide whether the supplied screenshots are sufficient for the goal and whether another capture is needed. Describe visible facts and any relevant limitations. Only direct means this role received real image content blocks; fallback evidence comes from the named visual service and should retain that attribution. unavailable/unknown means image content was not delivered. Screenshot or DOM status alone is not a visual assessment.",manifest,contract)}));
+    let delivery_note=if manifest["images"].as_array().is_some_and(Vec::is_empty) {
+        format!("Image input is unavailable for this request: {}. Captured images remain available to the user, but their pixels were not delivered to this model.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or("see the complete unavailable or visual_service_result fields"))
+    }else{String::new()};
+    let message=json!({"role":"system","content":format!("Host visual dispatch: {}. {} For visual_check_result use this JSON structure: {}. Preserve checked_goal, request_trace_id and artifact references so the observation can be associated with its inputs. Capture metadata and this request's page/source observations are recorded facts; you decide whether the supplied screenshots are sufficient for the goal and whether another capture is needed. Describe visible facts and any relevant limitations. Only direct means this role received real image content blocks; fallback evidence comes from the named visual service and should retain that attribution. unavailable/unknown means image content was not delivered. Screenshot or DOM status alone is not a visual assessment.",manifest,delivery_note,contract)});
+    // Save exactly the text delivered to the model, before its request starts.
+    // Other roles and history read this same result; image blocks stay transient.
+    crate::agent_service::emit(state.workspace.root(),context.task_id(),"visual/input_result",json!({
+        "turn":context.identity["request_id"],"identity":context.identity,"actor":actor,
+        "request_trace_id":manifest["request_trace_id"],"message":message})).await?;
+    messages.push(message);
     Ok(manifest)
 }
 
@@ -258,13 +265,13 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
     }
     if let Some(request)=request {
         ensure!(request["checked_goal"]==goal,"checked_goal must match the actual visual request goal");
-        // An unavailable/uncertain result may cite the screenshots that were
-        // selected but could not be delivered to the model.
+        // A limitation report may cite authorized historical captures across
+        // requests; a positive pixel claim must refer to an actual sent image.
         let undelivered_allowed=!matches!(assessment,"pass"|"issue");
-        for id in ids {
+        for id in ids.iter().filter(|_|!undelivered_allowed) {
             let sent=request["images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==*id);
-            let selected=undelivered_allowed&&request["selected_images"].as_array().into_iter().flatten().any(|image|image["artifact_id"]==*id);
-            ensure!(sent||selected,"visual result cites an image never sent in the referenced request");
+
+            ensure!(sent,"visual result cites an image never sent in the referenced request");
         }
     }
     if matches!(assessment,"pass"|"issue") {

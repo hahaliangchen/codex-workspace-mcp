@@ -35,7 +35,7 @@ pub fn yield_tool() -> Value {
             "node_id":{"type":"string"},"revision":{"type":"integer"},"field":{"type":"string"},"reason":{"type":"string"},"material_ids":{"type":"array","items":{"type":"integer"}}
         },"required":["node_id","reason"]},
         "findings":{"type":"array","items":{"type":"object"}},"material_ids":{"type":"array","items":{"type":"integer"}},
-        "finding_ids":{"type":"array","items":{"type":"string"}},"limitations":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":1200},
+        "finding_ids":{"type":"array","items":{"type":"string"}},"limitations":{"type":"array","items":{"type":"string"},
             "description":"Worker-reported remaining limits. Use [] only when you have confirmed there are none; omit when unknown."},
         "suggested_children":{"type":"array","maxItems":16,
             "description":"For need_split, return concise child goals, dependencies and completion conditions for Organizer.",
@@ -90,7 +90,7 @@ fn organizer_tools(input:&Value)->Vec<Value> {
             "fields":{"type":"array","maxItems":16,"items":{"type":"string"}}},
             "anyOf":[{"required":["work_id"]},{"required":["node_id"]}]}}});
     let flow=json!({"type":"function","function":{"name":"read_flow_page",
-        "description":"Read a compact chronological page of flow nodes, up to 50. The initial input already contains page 1. Follow next_cursor until the flow total has been covered when older history can affect the decision.",
+        "description":"Read a compact chronological page of flow nodes, up to 50. Use a returned next_cursor to read another page only when needed.",
         "parameters":{"type":"object","properties":{"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":[]}}});
     let memory_search=|name:&str,description:&str|json!({"type":"function","function":{"name":name,"description":description,
         "parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":4}},"required":["query"]}}});
@@ -102,13 +102,13 @@ fn organizer_tools(input:&Value)->Vec<Value> {
         "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"query":{"type":"string","minLength":1,"maxLength":1000},
             "file_path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":5}},"required":["language","query"]}}});
     let read_symbol=json!({"type":"function","function":{"name":"read_project_symbol",
-        "description":"Read one known symbol definition and its responsibility description from the existing project index. Source is saved in the task notebook; the Organizer receives a short excerpt and a material reference.",
+        "description":"Read one known symbol definition and its responsibility description from the existing project index. Source is saved in the task notebook; the Organizer receives the complete method result and a material reference.",
         "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"symbol_id":{"type":"string"},"file_path":{"type":"string"},"name":{"type":"string"},
             "include_context":{"type":"boolean"}},"required":["language"],"anyOf":[{"required":["symbol_id"]},{"required":["file_path","name"]}]}}});
     let read_material=json!({"type":"function","function":{"name":"read_source_material",
-        "description":"Read a focused version-checked notebook source page by material ID or query. Returns at most 2,000 source characters per call and states any omitted range; full materials remain available to Worker.",
+        "description":"Read a focused version-checked notebook source page by material ID or query. Choose the needed line range; results include paging references when a tool page is incomplete.",
         "parameters":{"type":"object","properties":{"query":{"type":"string","maxLength":1000},"material_ids":{"type":"array","maxItems":4,"items":{"type":"integer"}},
-            "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}},"anyOf":[{"required":["query"]},{"required":["material_ids"]}]}}});
+            "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"max_chars":{"type":"integer","minimum":1000,"maximum":60000}},"anyOf":[{"required":["query"]},{"required":["material_ids"]}]}}});
     let finish=json!({"type":"function","function":{"name":"finish_request",
         "description":"Deliver the user-facing result. The task invocation may have ended without meeting the overall goal; report that honestly.",
         "parameters":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":6000},
@@ -210,7 +210,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
                 return Err(contract_error("MATERIAL_REFERENCE_REQUIRED","query",args.get("query"),"provide a focused query or material_ids"));
             }
             Ok(json!({"action":"read_source_material","query":args["query"],"material_ids":args["material_ids"],
-                "start_line":args["start_line"],"end_line":args["end_line"],"max_chars":2000}))
+                "start_line":args["start_line"],"end_line":args["end_line"],"max_chars":args["max_chars"]}))
         },
         "finish_request"=>{
             let summary=args["summary"].as_str().unwrap_or("").trim();
@@ -251,7 +251,17 @@ const PROGRESS_INTERVAL:Duration=Duration::from_millis(1000);
 fn decision_from_message(message:&Value,task_id:&str,turn:usize,step:usize)->Result<Value> {
     let calls=message.get("tool_calls").and_then(Value::as_array)
         .ok_or_else(||contract_error("TOOL_CALL_REQUIRED","tool_calls",Some(message),"Organizer must return one scheduling method"))?;
-    if calls.len()!=1 {return Err(contract_error("ONE_METHOD_PER_DECISION","tool_calls",Some(&json!(calls)),"Organizer must return exactly one scheduling method per invocation"));}
+    if calls.len()>1 && calls.iter().all(|call|call.pointer("/function/name").and_then(Value::as_str)
+        .is_some_and(|name|is_organizer_tool(name) && !matches!(name,"schedule_task"|"resume_task"|"revisit_task"|"finish_request"))) {
+        let mut reads=Vec::new();
+        for call in calls {
+            let name=call["function"]["name"].as_str().unwrap();
+            let args=serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))?;
+            reads.push(normalize_decision(name,args,task_id,turn,step)?);
+        }
+        return Ok(json!({"action":"read_many","reads":reads}));
+    }
+    if calls.len()!=1 {return Err(contract_error("ONE_METHOD_PER_DECISION","tool_calls",Some(&json!(calls)),"Return one state-changing scheduling method; independent read methods may share a response"));}
     let name=calls[0].pointer("/function/name").and_then(Value::as_str)
         .ok_or_else(||contract_error("METHOD_REQUIRED","method",Some(&calls[0]),"Organizer method name is missing"))?;
     #[cfg(test)]
@@ -344,17 +354,18 @@ pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usi
     cancel:&CancellationToken, timeout:Duration) -> Result<Value> {
     let construction_started=Instant::now();
     let tools=organizer_tools(&input);
-    let mut body=json!({"model":model,"stream":true,"messages":[
-        {"role":"system","content":include_str!("../prompts/organizer_system.md")},
-        {"role":"user","content":input.to_string()}
-    ],"tools":tools,"tool_choice":"auto"});
+    let mut messages=vec![json!({"role":"system","content":include_str!("../prompts/organizer_system.md")})];
+    messages.extend(crate::session_history::organizer_messages(state.workspace.root(),task_id,&input).await?);
+    let mut body=json!({"model":model,"stream":true,"messages":messages,"tools":tools,"tool_choice":"auto"});
     if let Some(effort)=state.reasoning_effort.as_deref(){body["reasoning_effort"]=json!(effort);}
     if state.fast_mode {body["service_tier"]=json!("fast");}
+    let context_window=crate::context_window::prepare(&mut body,2)?;
     let request_construction_ms=construction_started.elapsed().as_millis() as u64;
     let request_bytes=body.to_string().len();
     let metadata=json!({"actor":"organizer","stage":"organization","turn":turn,"step":step,"nodeId":node,
         "request_id":input["process"]["request_id"],"workId":input["process"]["current_work"]["id"],"revision":input["process"]["current_revision"],
-        "plan_revision":input["process"]["plan_revision"],"request_construction_ms":request_construction_ms,"request_bytes":request_bytes});
+        "plan_revision":input["process"]["plan_revision"],"request_construction_ms":request_construction_ms,"request_bytes":request_bytes,
+        "context_window":context_window});
     let trace=crate::request_context::record(state.workspace.root(),task_id,metadata.clone(),&body).await;
     let progress=Progress{state,task_id,turn,step,node};
     let request_started=Instant::now();
@@ -368,7 +379,12 @@ pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usi
     stats["response_complete_ms"]=Value::Null;
     let (result,outcome)=match received {
         Ok(())=>match accumulator.finish() {
-            Ok(completed)=>{stats=completed.stats.clone();(completed_decision(completed,task_id,turn,step),None)},
+            Ok(completed)=>{
+                stats=completed.stats.clone();
+                crate::agent_service::emit(state.workspace.root(),task_id,"organizer/method_message",
+                    json!({"turn":turn,"step":step,"message":completed.message})).await?;
+                (completed_decision(completed,task_id,turn,step),None)
+            },
             Err(error)=>(Err(error),None),
         },
         Err(Interrupted::Failed(error))=>(Err(error),None),
@@ -401,6 +417,17 @@ pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_read_methods_share_one_completed_response() {
+        let calls=[("read_task_result",json!({"work_id":"upload","fields":["worker_return"]})),
+            ("read_session_history",json!({"event_seq":42}))].into_iter().enumerate().map(|(index,(name,args))|
+            json!({"id":format!("read_{index}"),"function":{"name":name,"arguments":args.to_string()}})).collect::<Vec<_>>();
+        let decision=decision_from_message(&json!({"tool_calls":calls}),"task",1,1).unwrap();
+        assert_eq!(decision["action"],"read_many");
+        assert_eq!(decision["reads"][0]["work_id"],"upload");
+        assert_eq!(decision["reads"][1]["event_seq"],42);
+    }
 
     #[test]
     fn malformed_organizer_decisions_have_structured_contract_errors() {

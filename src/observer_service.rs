@@ -1,5 +1,6 @@
 //! Advisory node reviews. SQLite commits own boundary work; a bounded wakeup is
-//! only a notification. There is one model call per session, never a Worker gate.
+//! only a notification. Each completed execution iteration gets one temporary
+//! observation; final retrospective reads the complete task, never a Worker gate.
 use crate::agent_service::{self, AgentServiceState};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -7,14 +8,13 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-// The Observer receives a compact, structured snapshot with a roughly 12k-token budget.
-pub const INPUT_BUDGET: usize = 48_000;
+// Current task view; 256k is a maximum, not a target snapshot size.
+pub const INPUT_BUDGET: usize = crate::context_window::MAX_TOKENS;
 
 pub fn identity(task: &str, scheduler: &crate::work_scheduler::WorkScheduler, work: &str) -> Value {
     let order = scheduler.frames.get(work).map(|frame| &frame.order);
@@ -29,11 +29,8 @@ pub fn applies(identity: &Value, scope: &Value) -> bool {
 fn observation_version_key(input:&Value)->String {
     let identity=&input["identity"];
     let instance=format!("{}:{}:{}:{}:{}",identity["task_id"],identity["request_id"],identity["work_id"],identity["revision"],identity["plan_revision"]);
-    if let Some(sequence)=input["source_event_seq"].as_i64() {
-        return format!("event:{instance}:{sequence}");
-    }
-    if let Some(revision)=input["progress_sequence"].as_u64() {
-        return format!("progress:{instance}:{revision}");
+    if input["turn"].is_u64() && input["step"].is_u64() {
+        return format!("iteration:{instance}:{}:{}",input["turn"],input["step"]);
     }
     format!("review:{}",input["review_id"].as_str().unwrap_or(""))
 }
@@ -49,122 +46,11 @@ fn valid_instance(identity: &Value, scope: &Value) -> bool {
         && identity["node_id"] == frame["order"]["node_id"]
 }
 
-fn short(value: &str, limit: usize) -> String {
-    value.chars().take(limit).collect()
-}
-const ARRAY_ITEMS: usize = 12;
+/// Advice dates describe provenance; the recipient judges applicability.
+pub fn annotate_advice(items: Vec<Value>, _scheduler: &crate::work_scheduler::WorkScheduler) -> Vec<Value> { items }
 
-/// Shortens long text and long lists but keeps every object key: a status code
-/// or sample time must not vanish because it sorts after other fields.
-fn compact(value: &Value, limit: usize) -> Value {
-    match value {
-        Value::String(text) => json!(short(text, limit)),
-        Value::Array(items) => {
-            let mut kept = items
-                .iter()
-                .take(ARRAY_ITEMS)
-                .map(|v| compact(v, (limit / 2).max(160)))
-                .collect::<Vec<_>>();
-            if items.len() > ARRAY_ITEMS {
-                kept.push(json!({"omitted_items":items.len()-ARRAY_ITEMS}));
-            }
-            json!(kept)
-        }
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), compact(v, (limit / 2).max(160))))
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
-}
-
-/// Late or replayed advice is matched against the node's newer facts. It stays
-/// visible, but the Organizer is told the current facts take precedence.
-pub fn annotate_advice(items: Vec<Value>, scheduler: &crate::work_scheduler::WorkScheduler) -> Vec<Value> {
-    items
-        .into_iter()
-        .map(|mut item| {
-            let work = item["identity"]["work_id"].as_str().unwrap_or("");
-            let latest = scheduler.latest_fact_at(work);
-            if let Some(observed) = item["observed_at"].as_u64() {
-                if latest > observed {
-                    item["based_on_older_facts"] = json!(true);
-                    item["newer_facts_at"] = json!(latest);
-                }
-            }
-            item
-        })
-        .collect()
-}
-
-fn fact_texts(facts: &Value) -> Value {
-    json!(facts.as_array().into_iter().flatten().filter_map(|fact|fact["text"].as_str()).map(|text|short(text,400)).collect::<Vec<_>>())
-}
-
-/// The node's actual state: status, reports (intent), returned result and the
-/// recorded HTTP/process/browser/check values with their times.
-fn node_state(facts: &Value) -> Value {
-    if facts.is_null() {
-        return Value::Null;
-    }
-    let mut state = compact(facts, 1200);
-    if let Some(object) = state.as_object_mut() {
-        object.remove("operations");
-    }
-    state
-}
-
-/// Goal, decision and delivery summary are protected. Optional fields are
-/// admitted by priority; pathological protected inputs report budget overflow.
-pub fn pack(mut input: Value, _path: &[Value], memories: &[Value]) -> Value {
-    let mut packed = json!({"identity":input["identity"],"review_id":input["review_id"],"source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],
-        "organizer_decision_id":input["organizer_decision_id"],"stage":input["stage"],"request":input["request"],
-        "organizer_decision":input["organizer_decision"],"delivery":{"summary":input["delivery"]["summary"],
-            "status":input["delivery"]["status"],"exported_data":compact(&input["delivery"]["exported_data"],1200),
-            "handoff_summary":input["delivery"]["handoff"]["summary"],"intent":input["delivery"]["handoff"]["intent"],
-            "stall":input["delivery"]["handoff"]["stall"],
-            "upstream_problem":compact(&input["delivery"]["handoff"]["upstream_problem"],800)},
-        "current_node":{"goal":input["current_node"]["goal"],"done_when":input["current_node"]["done_when"]},
-        "observed_at":input["observed_at"],"node_state":node_state(&input["node_facts"]),
-        "current_facts":{"http_observations":fact_texts(&input["current_facts"]["http_observations"]),
-            "browser":compact(&input["current_facts"]["browser"],600),
-            "browser_uploads":compact(&input["current_facts"]["browser_uploads"],600),
-            "browser_scope":input["current_facts"]["browser_scope"]},
-        "visual_artifacts":input["visual_artifacts"],"visual_check_result":input["visual_check_result"],"visual_capture":input["visual_capture"],"allowed_visual_artifact_ids":input["allowed_visual_artifact_ids"]});
-    // Keep the sender's message separate from optional summaries of logs and
-    // source material. The current handoff must survive context budgeting.
-    packed["delivery"]["worker_return"]=input["delivery"]["handoff"]["worker_return"].clone();
-    packed["visual_requests"]=input["visual_requests"].clone();
-    packed["resolved_inputs"]=input["resolved_inputs"].clone();
-    packed["recent_activity"]=input["recent_activity"].clone();
-    packed["activity_since_seq"]=input["activity_since_seq"].clone();
-    packed["plan_overview"]=input["plan_overview"].clone();
-    let optional = [
-        ("materials", compact(&input["materials"], 400)),
-        ("known_read_targets", input["known_read_targets"].take()),
-        (
-            "related_memory",
-            json!(
-                memories
-                    .iter()
-                    .take(3)
-                    .map(|v| compact(v, 800))
-                    .collect::<Vec<_>>()
-            ),
-        ),
-    ];
-    for (key, value) in optional {
-        let mut candidate = packed.clone();
-        candidate[key] = value;
-        if candidate.to_string().chars().count() + 150 <= INPUT_BUDGET {
-            packed = candidate;
-        }
-    }
-    let size = packed.to_string().chars().count();
-    packed["budget"] = json!({"limit_chars":INPUT_BUDGET,"protected_overflow":size>INPUT_BUDGET,"packed_chars":size});
-    packed
-}
+/// Forward original method arguments and sender returns without field cuts.
+pub fn pack(input: Value, _path: &[Value], _memories: &[Value]) -> Value { input }
 
 pub fn observation(
     task: &str,
@@ -175,7 +61,7 @@ pub fn observation(
     stage: &str,
     prompt: &str,
     decision: &Value,
-    activity: Value,
+    _activity: Value,
     delivery: Value,
     materials: Value,
 ) -> Value {
@@ -204,21 +90,16 @@ pub fn observation(
             if stage == "handoff" { "sealed" } else { stage }
         )
     };
-    let plan_overview=scheduler.frames.values().map(|frame|json!({"work_id":frame.order.id,"node_id":frame.order.node_id,
-        "revision":frame.order.revision,"status":frame.status,"superseded":frame.invalidated_by_plan_revision.is_some(),
-        "goal":short(&frame.order.goal,160),"upstream_ids":frame.order.upstream_ids,
-        "summary":frame.output.as_ref().and_then(|output|output["summary"].as_str()).map(|summary|short(summary,240))})).collect::<Vec<_>>();
     json!({"identity":id,"review_id":review_id,"source_event_id":source_event_id,
         "organizer_decision_id":decision["decision_id"],"stage":stage,"turn":turn,"step":step,
-        "request":{"goal":prompt,"boundary":compact(&scheduler.goal_boundary,900),"constraints":order.map(|o|&o.constraints)},
-        "organizer_decision":decision,"current_node":{"goal":order.map(|o|&o.goal),"done_when":order.map(|o|&o.done_when)},
+        "request":{"goal":prompt},
+        "organizer_decision":decision,"current_node":{"goal":order.map(|o|&o.goal),"done_when":order.map(|o|&o.done_when),"constraints":order.map(|o|&o.constraints)},
         "execution_epoch":frame.map(|f|f.epoch),"related_source_versions":frame.map(|f|&f.versions),
         "visual_required":order.is_some_and(|o|o.visual_goal.is_some() || o.constraints.iter().any(|c|c=="requires_visual")),
         "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"visual_requests":frame.map(|f|&f.visual_requests),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
-        "resolved_inputs":packet["upstream_outputs"],"http_observations":packet["http_observations"],"materials":materials,"activity_summary":activity,
-        "node_facts":scheduler.observer_facts(work),"current_facts":scheduler.current_facts(),
+        "resolved_inputs":packet["upstream_outputs"],"materials":materials,
         "observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-        "delivery":delivery,"plan_overview":plan_overview,
+        "delivery":delivery,
         "defer_until_handoff":stage=="assignment" && order.is_some_and(|o|o.final_answer && o.completion==crate::work_scheduler::Completion::Output)})
 }
 
@@ -253,6 +134,9 @@ pub async fn commit(root: &Path, task: &str, data: Value, observations: Vec<Valu
             source_seq
         };
         for mut input in observations {
+            // Assignment messages are already in the task conversation. Observe
+            // only after the execution iteration has produced its results.
+            if input["stage"] == "assignment" { continue; }
             input["source_event_seq"]=json!(source_seq);
             let inserted=tx.execute("INSERT OR IGNORE INTO agent_observations(task_id,review_id,request_id,input,status) VALUES (?1,?2,?3,?4,'pending')",
                 params![task,input["review_id"].as_str(),input["identity"]["request_id"].as_u64(),input.to_string()])?;
@@ -331,11 +215,12 @@ fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
             "{target}:{}",
             adjustment.split_whitespace().collect::<Vec<_>>().join(" ")
         );
-        recommendations.push(json!({"issue_key":item["issue_key"].as_str().or_else(||raw["issue_key"].as_str()).filter(|key|!key.trim().is_empty()).map(str::to_owned).unwrap_or_else(||format!("recommendation_{}",crate::symbol_description::content_hash(key_text.as_bytes()))),
-            "target":item["target"].as_str().unwrap_or("organizer"),"adjustment":adjustment,
-            "source_event_ids":[input["source_event_id"]]}));
+        let mut recommendation=item.as_object().cloned().map(Value::Object).unwrap_or_else(||json!({"adjustment":adjustment}));
+        recommendation["issue_key"]=json!(item["issue_key"].as_str().or_else(||raw["issue_key"].as_str()).filter(|key|!key.trim().is_empty()).map(str::to_owned).unwrap_or_else(||format!("recommendation_{}",crate::symbol_description::content_hash(key_text.as_bytes()))));
+        if recommendation["target"].is_null() {recommendation["target"]=json!("organizer");}
+        recommendations.push(recommendation);
     }
-    let findings=raw["findings"].as_array().into_iter().flatten().map(|item|json!({"reason":item["reason"].as_str().or_else(||item.as_str()).unwrap_or(""),"source_event_ids":[input["source_event_id"]]})).collect::<Vec<_>>();
+    let findings=raw["findings"].clone();
     json!({"assessment":raw["assessment"].as_str().filter(|s|matches!(*s,"on_track"|"needs_adjustment"|"uncertain")).unwrap_or("uncertain"),
         "summary":raw["summary"],"findings":findings,
         "observer_return":raw.get("observer_return").unwrap_or(&raw),
@@ -351,11 +236,9 @@ pub struct ObserverSession {
     task: String,
     wake: mpsc::Sender<()>,
     scope: watch::Sender<Value>,
-    progress: watch::Sender<Option<Value>>,
     stop: CancellationToken,
     job: Option<tokio::task::JoinHandle<()>>,
     model_gate: std::sync::Arc<Semaphore>,
-    progress_revision: AtomicU64,
     seen: BTreeSet<String>,
     finished: bool,
     cleanup_on_drop: bool,
@@ -373,11 +256,9 @@ impl Drop for ObserverSession {
                     task: self.task.clone(),
                     wake: self.wake.clone(),
                     scope: self.scope.clone(),
-                    progress: self.progress.clone(),
                     stop: self.stop.clone(),
                     job: self.job.take(),
                     model_gate: self.model_gate.clone(),
-                    progress_revision: AtomicU64::new(self.progress_revision.load(Ordering::Relaxed)),
                     seen: BTreeSet::new(),
                     finished: false,
                     cleanup_on_drop: false,
@@ -407,7 +288,6 @@ impl ObserverSession {
         let root = state.workspace.root().to_path_buf();
         let (wake, receiver) = mpsc::channel(1);
         let (scope, scopes) = watch::channel(Value::Null);
-        let (progress, progresses) = watch::channel(None);
         let stop = cancel.child_token();
         let model_gate = std::sync::Arc::new(Semaphore::new(1));
         let call_gate = model_gate.clone();
@@ -418,7 +298,6 @@ impl ObserverSession {
                 task.clone(),
                 receiver,
                 scopes,
-                progresses,
                 stop.clone(),
                 call_gate,
             ))
@@ -431,11 +310,9 @@ impl ObserverSession {
             task,
             wake,
             scope,
-            progress,
             stop,
             job,
             model_gate,
-            progress_revision: AtomicU64::new(0),
             seen: BTreeSet::new(),
             finished: false,
             cleanup_on_drop: true,
@@ -453,17 +330,6 @@ impl ObserverSession {
     pub fn notify(&self) {
         if self.enabled {
             let _ = self.wake.try_send(());
-        }
-    }
-    pub fn progress(&self, mut input: Value) {
-        if self.enabled {
-            let revision=self.progress_revision.fetch_add(1,Ordering::Relaxed).saturating_add(1);
-            let review_id=format!("{}:update-{revision}",input["review_id"].as_str().unwrap_or("progress"));
-            input["review_id"]=json!(review_id);
-            input["source_event_id"]=json!(format!("progress:{}",input["review_id"].as_str().unwrap_or("progress")));
-            input["progress_sequence"]=json!(revision);
-            self.progress.send_replace(Some(input));
-            self.notify();
         }
     }
     pub async fn reviews(&mut self) -> Result<Vec<Value>> {
@@ -584,22 +450,34 @@ async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Valu
     let mut path=scope["frames"].as_object().into_iter().flat_map(|frames|frames.values()).collect::<Vec<_>>();
     path.sort_by_key(|frame|frame["sequence"].as_u64().unwrap_or(0));
     let flow=path.iter().map(|frame|json!({"node_id":frame["order"]["node_id"],"status":frame["status"],
-        "goal":short(frame["order"]["goal"].as_str().unwrap_or(""),240),"superseded":frame["invalidated_by_plan_revision"],
-        "returned_at":frame["returned_at"],"summary":frame["output"]["summary"].as_str().map(|text|short(text,600)),
+        "goal":frame["order"]["goal"],"superseded":frame["invalidated_by_plan_revision"],
+        "returned_at":frame["returned_at"],"summary":frame["output"]["summary"].as_str().map(str::to_owned),
         "outcome":frame["output"]["outcome"],"retained_operations_count":frame["operations"].as_array().map(Vec::len)})).collect::<Vec<_>>();
+    let task_history=crate::session_history::task_process(state.workspace.root(),task,scope["request_id"].as_u64().unwrap_or(1) as usize).await?;
     let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
         "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
-        "final_result":scope["final_result"],"flow_overview":flow,
+        "final_result":scope["final_result"],"flow_overview":flow,"task_history":task_history,
         "history":{"tool":"read_session_history","scope":"Read exact actions or original returns only for a specific question about this route."},
         "known_read_targets":agent_service::observer_known_read_targets(&trace,task,24)});
     let raw=agent_service::observer_json_response(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
         json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]})).await?;
     let report:Value=serde_json::from_str(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim())?;
     anyhow::ensure!(report.is_object(),"Observer retrospective must return a JSON object");
-    let mut result=agent_service::save_observer_lessons(state,task,scope["goal"].as_str().unwrap_or(""),&report,&trace).await?;
-    result["observer_return"]=report.get("observer_return").unwrap_or(&report).clone();
+    // Routine retrospectives belong to conversation history. Keep the explicit
+    // memory tools available, but do not turn a task review into a memory write.
+    let original=report.get("observer_return").unwrap_or(&report);
+    let mut result=json!({"status":"completed","summary":original["summary"],"pathReview":original["path_review"],
+        "shorteningOpportunities":original["shortening_opportunities"],"workFindings":original["work_findings"],
+        "routeShortcuts":original["route_shortcuts"].as_array().into_iter().flatten().map(|item|{let mut item=item.clone();item["lookFirst"]=item["look_first"].clone();item}).collect::<Vec<_>>(),"memoryRecorded":false,"stored":false,"observer_return":original});
     result["turn"]=json!(turn);
     Ok(result)
+}
+
+fn iteration_records(process:&Value,after_seq:i64,through_seq:i64)->Vec<Value> {
+    process["records"].as_array().into_iter().flatten()
+        .filter(|entry|entry["seq"].as_i64().is_some_and(|seq|seq>after_seq && seq<=through_seq)
+            && entry["kind"]!="observer/node_review")
+        .cloned().collect()
 }
 
 async fn run(
@@ -608,14 +486,11 @@ async fn run(
     task: String,
     mut wake: mpsc::Receiver<()>,
     scope: watch::Receiver<Value>,
-    mut progress: watch::Receiver<Option<Value>>,
     stop: CancellationToken,
     model_gate: std::sync::Arc<Semaphore>,
 ) {
     let root = state.workspace.root();
-    let mut cached_request = Value::Null;
     let mut attempted = BTreeSet::new();
-    let mut last_trace_seq = -1;
     let mut rescan = true;
     loop {
         if !rescan {
@@ -656,35 +531,15 @@ async fn run(
                 .await;
                 continue;
             }
-            if input["stage"] == "assignment"
-                && rows.iter().any(|(other, _, _)| {
-                    other["identity"] == input["identity"] && other["stage"] == "handoff"
-                })
-            {
-                let _ = save(
-                    root,
-                    &task,
-                    input,
-                    "merged",
-                    json!({"reason":"included in handoff"}),
-                )
-                .await;
-                continue;
-            }
-            if input["defer_until_handoff"] == true {
+            if input["stage"] == "assignment" {
+                let _ = save(root,&task,input,"merged",json!({"reason":"assignment is included in execution messages"})).await;
                 continue;
             }
             pending.push(input.clone());
         }
-        pending.sort_by_key(|v| if v["stage"] == "handoff" { 0 } else { 1 });
+        pending.sort_by_key(|v|v["source_event_seq"].as_i64().unwrap_or(i64::MAX));
         rescan = pending.len() > 1;
-        let input = pending.first().cloned().or_else(|| {
-            let value = progress.borrow_and_update().clone()?;
-            if !applies(&value["identity"], &current) {
-                return None;
-            }
-            Some(value)
-        });
+        let input = pending.first().cloned();
         let Some(mut input) = input else {
             continue;
         };
@@ -695,46 +550,23 @@ async fn run(
         if stop.is_cancelled() {
             break;
         }
-        if cached_request != current["request_id"] {
-            cached_request = current["request_id"].clone();
-            last_trace_seq = rows.iter().filter(|(input,status,_)|status=="completed" && input["identity"]["request_id"]==cached_request)
-                .filter_map(|(_,_,result)|result["reviewed_through_seq"].as_i64()).max().unwrap_or(-1);
-        }
-        // Only versioned targets already observed by Worker can support facts.
-        let (trace_root, trace_task) = (root.to_path_buf(), task.clone());
-        let trace = tokio::task::spawn_blocking(move || {
-            agent_service::load_observer_trace_since(&trace_root, &trace_task,last_trace_seq)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| e["turn"].as_u64().unwrap_or(0) >= current["request_id"].as_u64().unwrap_or(0))
-        .collect::<Vec<_>>();
-        input["known_read_targets"] =
-            json!(agent_service::observer_known_read_targets(&trace, &task, 8));
-        input["activity_since_seq"]=json!(last_trace_seq);
-        input["recent_activity"]=json!(trace.iter().filter(|entry|entry["type"]!="flow/plan" && entry["type"]!="worker/progress")
-            .filter(|entry|entry["type"]!="assistant/message" || entry["text"].is_string()).collect::<Vec<_>>());
-        let reviewed_through_seq=trace.iter().filter_map(|entry|entry["seq"].as_i64()).max().unwrap_or(last_trace_seq);
-        if input["stage"] == "progress" {
-            if let Ok(seq) = commit(
-                root,
-                &task,
-                json!({"commit_id":input["source_event_id"],"observation_only":true}),
-                vec![input.clone()],
-            )
-            .await
-            {
-                input["source_event_seq"] = json!(seq);
-                let persisted_key=observation_version_key(&input);
-                if persisted_key!=attempt_key {
-                    attempted.remove(&attempt_key);
-                    attempted.insert(persisted_key);
-                }
-            }
-        }
+        let process = match crate::session_history::task_process(root,&task,current["request_id"].as_u64().unwrap_or(1) as usize).await {
+            Ok(process)=>process,
+            Err(error)=> { let _=save(root,&task,&input,"failed",json!({"message":format!("{error:#}")})).await; continue; }
+        };
+        // Message boundaries belong to execution, not to when an asynchronous
+        // review happened to finish. A delayed review cannot absorb a later
+        // iteration or replay an earlier one.
+        let through_seq=input["source_event_seq"].as_i64().unwrap_or(i64::MAX);
+        let after_seq=rows.iter().filter(|(previous,_,_)|previous["stage"]!="assignment"
+            && previous["identity"]["request_id"]==input["identity"]["request_id"])
+            .filter_map(|(previous,_,_)|previous["source_event_seq"].as_i64())
+            .filter(|seq|*seq<through_seq).max().unwrap_or(-1);
+        let trace=iteration_records(&process,after_seq,through_seq);
+        input["activity_since_seq"]=json!(after_seq);
+        input["activity_through_seq"]=json!(through_seq);
+        input["recent_activity"]=json!(trace);
+        let reviewed_through_seq=through_seq;
         if stop.is_cancelled() {
             break;
         }
@@ -750,7 +582,6 @@ async fn run(
             continue;
         }
         let _ = save(root, &task, &input, "reviewing", Value::Null).await;
-        let packed = pack(input.clone(), &[], &[]);
         let started = Instant::now();
         let mut metadata = input["identity"].clone();
         metadata["nodeId"] = input["identity"]["node_id"].clone();
@@ -771,33 +602,9 @@ async fn run(
         result=async {
             let _permit=model_gate.acquire().await?;
             anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"observation no longer applies");
-            let mut visual_input=input.clone();
-            let mut visual_context=crate::visual_artifacts::VisualContext {identity:input["identity"].clone(),execution_epoch:input["execution_epoch"].as_u64().unwrap_or(0) as usize,related_source_versions:input["related_source_versions"].clone(),current_page:input["task_page"].clone(),source_event_id:input["source_event_id"].as_str().unwrap_or("").to_owned(),
-                host_current_artifact_ids:input["host_current_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),allowed_artifact_ids:input["allowed_visual_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),..Default::default()};
-            let mut images=Vec::new();
-            for id in input["visual_artifact_ids"].as_array().into_iter().flatten().chain(if input["stage"]=="assignment" {input["allowed_visual_artifact_ids"].as_array()}else{None}.into_iter().flatten()).rev().take(crate::visual_artifacts::MAX_IMAGES) {
-                if let Some(id)=id.as_str() {if let Ok(item)=crate::visual_artifacts::metadata(root,&task,id) {if crate::visual_artifacts::authorize(&item,&visual_context).is_ok() {images.push(item);}}}
-            }
-            images.reverse();
-            if input["visual_required"]==true && input["stage"]!="assignment" && images.is_empty() {
-                anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"visual instance changed before capture");
-                match crate::browser_control::observe_page_snapshot(root,&visual_context,&input["task_page"]).await {
-                    Ok(snapshot)=>{
-                        let artifact=snapshot["visual_artifact"].clone();
-                        let page=json!({"browser_session_id":artifact["browser_session_id"],"page_id":artifact["page_id"],"page_epoch":artifact["page_epoch"],"url":artifact["url"],"viewport":artifact["viewport"]});
-                        let artifact_id=artifact["artifact_id"].as_str().unwrap_or("").to_owned();
-                        visual_context.current_page=page.clone();visual_context.host_current_artifact_ids=if artifact_id.is_empty(){Vec::new()}else{vec![artifact_id.clone()]};
-                        visual_input["task_page"]=page;visual_input["host_current_artifact_ids"]=json!(visual_context.host_current_artifact_ids);
-                        images=vec![artifact];visual_input["visual_capture"]=json!({"tool":"observe_page_snapshot","calls":1,"status":"captured"});
-                    },
-                    Err(error)=>{images.clear();visual_input["visual_capture"]=json!({"tool":"observe_page_snapshot","calls":1,"status":"uncertain","reason":error.to_string()});},
-                }
-            }else {visual_input["visual_capture"]=json!({"calls":0,"reused":images.len()});}
-            visual_input["visual_artifacts"]=json!(images);
-            let mut packed=packed;for field in ["visual_artifacts","visual_capture","allowed_visual_artifact_ids","host_current_artifact_ids","execution_epoch","related_source_versions","task_page"] {packed[field]=visual_input[field].clone();}
-            anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"visual instance changed before model request");
+            let packed=pack(input.clone(),&[],&[]);
             let raw=agent_service::observer_json_response(&state,&model,include_str!("../prompts/observer_system.md"),packed,1400,&task,metadata).await?;
-            Ok::<_,anyhow::Error>((raw,visual_input))
+            Ok::<_,anyhow::Error>((raw,input.clone()))
         }=>result};
         match result {
             Ok((raw,input)) => match serde_json::from_str::<Value>(
@@ -812,7 +619,6 @@ async fn run(
                     review["lessons_recorded"] = Value::Null;
                     review["reviewed_through_seq"]=json!(reviewed_through_seq);
                     let _ = save(root, &task, &input, "completed", review).await;
-                    last_trace_seq=reviewed_through_seq;
                 }
                 Err(error) => {
                     let _ = save(
@@ -862,17 +668,17 @@ mod tests {
         assert_eq!(packed["recent_activity"],recent);
         assert_eq!(packed["visual_requests"][0],failure);
         assert_eq!(packed["plan_overview"].as_array().unwrap().len(),2);
-        assert!(packed.get("activity_summary").is_none());
+        assert_eq!(packed["activity_summary"]["tools"][0]["outcome"],"old history".repeat(20_000));
         assert!(packed.get("node_operations").is_none());
         assert!(packed.get("path_summary").is_none());
-        assert!(packed.to_string().chars().count()<2000);
+        assert!(packed.to_string().chars().count()>2000,"pack must not silently discard original fields");
     }
     #[test]
     fn communication_keeps_original_returns_and_all_recommendations() {
         let worker_return=json!({"summary":"原始失败链".repeat(400),"limitations":["能力未知".repeat(400)],
             "diagnostic":{"reason":"original failure", "extra_fields":(0..20).collect::<Vec<_>>()}});
         let packed=pack(json!({"delivery":{"handoff":{"worker_return":worker_return}}}),&[],&[]);
-        assert_eq!(packed["delivery"]["worker_return"],worker_return);
+        assert_eq!(packed["delivery"]["handoff"]["worker_return"],worker_return);
         let observer_return=json!({"summary":"Observer原始消息".repeat(400),"failure":{"reason":"unavailable model", "details":(0..20).collect::<Vec<_>>()},
             "findings":(0..5).map(|i|json!({"reason":format!("finding {i}"),"detail":"original detail"})).collect::<Vec<_>>(),
             "recommendations":(0..5).map(|i|json!({"adjustment":format!("{i}:{}","建议".repeat(800)),"extra":"original field"})).collect::<Vec<_>>()});
@@ -961,85 +767,98 @@ mod tests {
         let input = observation("task", &scheduler, "start", 1, 2, "handoff", "start the editor", &json!({"reason":"start"}),
             Value::Null, json!({"summary":"started","status":"done","exported_data":{"wide":wide}}), Value::Null);
         let packed = pack(input, &[], &[]);
-        let http = &packed["node_state"]["http_observations"][0];
-        assert_eq!(http["http_status"], 200);
-        assert!(http["sampled_at"].is_string());
-        assert_eq!(packed["node_state"]["processes"][0]["process_id"], "proc-7");
-        assert_eq!(packed["node_state"]["processes"][0]["running"], true);
-        assert_eq!(packed["node_state"]["checks"][0]["passed"], true);
-        assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"], 23, "no key is dropped by position");
-        assert!(packed["delivery"].get("exported_fields").is_none());
-        assert!(packed["current_facts"]["http_observations"][0].as_str().unwrap().contains("HTTP 200 at"));
+        assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"],23);
+        assert!(packed.get("node_state").is_none(),"original calls and results are delivered by the conversation, not a generated fact catalog");
+        assert!(packed.get("current_facts").is_none());
         assert!(packed["observed_at"].is_u64());
     }
 
-    #[tokio::test]
-    async fn latest_progress_snapshot_replaces_failure_with_same_node_recovery_facts() {
-        let url="http://127.0.0.1:38194/api/fonts";
-        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
-        scheduler.apply(&json!({"action":"work","reason":"inspect and start the font service","orders":[
-            {"id":"fonts","node_id":"fonts","goal":"Make the font service answer","done_when":"capture actual service and HTTP state","completion":"output"}]}),false,false).unwrap();
-        scheduler.activate_next().unwrap();
-        let failed_at=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
-        scheduler.observe("http_probe",&json!({"url":url}),&json!({"url":url,"sampled_at":failed_at,"elapsed_ms":5,"reachable":false,
-            "http_status":Value::Null,"error_kind":"connection_refused","error_message":"connection refused","check_passed":false,
-            "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
-        let same_activity=json!({"purpose":"Probe and start the endpoint","actions":[{"tool":"http_probe","failed":true,"sampled_at":failed_at}]});
-        let before=observation("task",&scheduler,"fonts",1,2,"progress","bring up the font service",&json!({"reason":"check the service"}),
-            same_activity.clone(),Value::Null,Value::Null);
-
-        let success_at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        let process_observation=json!({"sampled_at":success_at,"processes":[{"process_id":"font-service-8080","running":true,"ready":true,
-            "ready_url":"http://127.0.0.1:38194/","ready_port":38194}]});
-        scheduler.observe("run_project_script",&json!({"script":"dev","background":true}),&json!({"process_id":"font-service-8080","running":true,
-            "ready":true,"ready_url":"http://127.0.0.1:38194/","process_observation":process_observation}),false);
-        let after=observation("task",&scheduler,"fonts",1,3,"progress","bring up the font service",&json!({"reason":"check the service"}),
-            same_activity,Value::Null,Value::Null);
-
-        let (wake,_wake_rx)=mpsc::channel(1);let (scope,_scope_rx)=watch::channel(Value::Null);let (progress,mut progress_rx)=watch::channel(None);
-        let session=ObserverSession{enabled:true,state:None,model:String::new(),root:PathBuf::new(),task:"task".into(),wake,scope,progress,stop:CancellationToken::new(),job:None,
-            model_gate:std::sync::Arc::new(Semaphore::new(1)),progress_revision:AtomicU64::new(0),seen:BTreeSet::new(),finished:false,cleanup_on_drop:false};
-        session.progress(before);
-        let first=progress_rx.borrow_and_update().clone().unwrap();
-        session.progress(after);
-        let latest=progress_rx.borrow_and_update().clone().unwrap();
-        assert_ne!(first["review_id"],latest["review_id"],"each refreshed snapshot gets its own durable review identity");
-        assert_eq!(latest["progress_sequence"],2);
-        assert_eq!(latest["node_facts"]["processes"][0]["process_id"],"font-service-8080");
-        assert_eq!(latest["node_facts"]["processes"][0]["running"],true);
-        assert_eq!(latest["node_facts"]["process_observation_sampled_at"],success_at);
-        assert_eq!(latest["activity_summary"],first["activity_summary"],"identical compressed activity is still a distinct persisted snapshot version");
-        assert!(latest["activity_summary"].to_string().contains(&failed_at),"the action history retains the prior failure timestamp");
-    }
-
     #[test]
-    fn observer_snapshot_deduplication_uses_revision_or_persisted_event_sequence_not_activity_text() {
+    fn iteration_identity_survives_commit_and_stage_changes() {
         let identity=json!({"task_id":"task","request_id":7,"work_id":"fonts","revision":2,"plan_revision":4});
-        let mut first=json!({"identity":identity,"review_id":"progress:update-1","progress_sequence":1,
-            "activity_summary":{"same":"compressed text"}});
-        let first_key=observation_version_key(&first);
-        first["activity_summary"]=json!({"same":"compressed text","different_raw_history":"omitted"});
-        assert_eq!(observation_version_key(&first),first_key,"compression/content changes do not invent a new snapshot version");
-        let second=json!({"identity":identity,"review_id":"progress:update-2","progress_sequence":2,
-            "activity_summary":{"same":"compressed text"}});
-        assert_ne!(observation_version_key(&second),first_key,"a new progress revision is independently reviewed even with the same compressed activity");
-
+        let mut first=json!({"identity":identity,"turn":7,"step":2,"stage":"progress","review_id":"progress"});
+        let key=observation_version_key(&first);
         first["source_event_seq"]=json!(991);
-        let persisted_key=observation_version_key(&first);
-        let replay=json!({"identity":identity,"review_id":"different transient review id","progress_sequence":9,"source_event_seq":991,
-            "activity_summary":{"changed":true}});
-        assert_eq!(observation_version_key(&replay),persisted_key,"the durable event version wins across replay and compaction");
+        first["stage"]=json!("handoff");
+        first["review_id"]=json!("persisted");
+        assert_eq!(observation_version_key(&first),key,"persisting or waking cannot invent another iteration");
+        first["step"]=json!(3);
+        assert_ne!(observation_version_key(&first),key,"the next real Worker round gets its own observation");
     }
 
     #[test]
-    fn advice_written_before_newer_node_facts_is_marked_as_older() {
+    fn iteration_context_preserves_complete_messages_without_later_rounds() {
+        let failure="failure-details".repeat(2000);
+        let process=json!({"records":[
+            {"seq":2,"kind":"tool/result","payload":{"old":"earlier"}},
+            {"seq":3,"kind":"tool/result","payload":{"error":failure}},
+            {"seq":4,"kind":"observer/node_review","payload":{"self":"review"}},
+            {"seq":5,"kind":"worker/yield","payload":{"return":"complete"}},
+            {"seq":6,"kind":"tool/result","payload":{"future":"later iteration"}}]});
+        assert_eq!(iteration_records(&process,2,5),vec![process["records"][1].clone(),process["records"][3].clone()]);
+    }
+
+    #[tokio::test]
+    async fn queued_iterations_are_observed_once_in_order_with_temporary_context() {
+        use axum::{Json,routing::post};
+        use std::sync::{Arc,Mutex};
+        let root=std::env::temp_dir().join(format!("observer-temporary-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        agent_service::open_db(&root).unwrap().execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','goal','fake','running',0,0)",[]).unwrap();
+        let captured=Arc::new(Mutex::new(Vec::<Value>::new()));let received=captured.clone();
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+        let server=tokio::spawn(async move {
+            axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
+                let received=received.clone();async move {
+                    received.lock().unwrap().push(body);
+                    Json(json!({"choices":[{"message":{"role":"assistant","content":"{\"assessment\":\"on_track\",\"summary\":\"PREVIOUS_OBSERVER_REPLY\"}"}}]}))
+                }
+            }))).await.unwrap();
+        });
+        let mut state=agent_service::tests::flow_test_state(&root,address);state.observer_enabled=true;state.observer_provider_url=state.provider_url.clone();
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+        scheduler.apply(&json!({"action":"work","reason":"inspect","orders":[{"id":"w","node_id":"w","goal":"goal","done_when":"return","completion":"output"}]}),false,false).unwrap();
+        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&CancellationToken::new());
+        // Queue all rounds before setting the scope, simulating a slow Observer.
+        let assignment=observation("task",&scheduler,"w",1,1,"assignment","goal",&json!({}),Value::Null,Value::Null,Value::Null);
+        commit(&root,"task",json!({"commit_id":"assignment"}),vec![assignment]).await.unwrap();
+        for (step,marker,stage) in [(2,"FIRST_FAILURE","progress"),(3,"SECOND_RECOVERY","progress"),(4,"THIRD_RETURN","handoff")] {
+            let call=format!("call_{step}");
+            agent_service::emit(&root,"task","tool/call",json!({"turn":1,"step":step,"callId":call,"name":"workspace_info","arguments":"{}"})).await.unwrap();
+            agent_service::emit(&root,"task","tool/result",json!({"turn":1,"step":step,"message":{"toolCallId":call,"isError":step==2},"meta":{"result":{"marker":marker}}})).await.unwrap();
+            let input=observation("task",&scheduler,"w",1,step,stage,"goal",&json!({}),Value::Null,Value::Null,Value::Null);
+            let data=json!({"commit_id":format!("round-{step}")});
+            commit(&root,"task",data.clone(),vec![input.clone()]).await.unwrap();
+            commit(&root,"task",data,vec![input]).await.unwrap();
+        }
+        observer.set_scope(&scheduler,"goal");
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                if records(root.clone(),"task".into()).await.unwrap().iter().filter(|(_,status,_)|status=="completed").count()==3 {break;}
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        for _ in 0..10 {observer.notify();}
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let requests=captured.lock().unwrap().clone();assert_eq!(requests.len(),3,"assignment, replay and wakeups are not new rounds");
+        for (index,marker) in ["FIRST_FAILURE","SECOND_RECOVERY","THIRD_RETURN"].iter().enumerate() {
+            let text=requests[index]["messages"].to_string();assert!(text.contains(marker));
+            for other in ["FIRST_FAILURE","SECOND_RECOVERY","THIRD_RETURN"] {if other!=*marker {assert!(!text.contains(other),"each round gets only its original messages");}}
+            assert!(!text.contains("PREVIOUS_OBSERVER_REPLY"));
+            assert_eq!(requests[index]["messages"].as_array().unwrap().len(),4,"context does not accumulate prior reviews");
+        }
+        observer.finish("interrupted").await.unwrap();drop(observer);server.abort();std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn advice_dates_are_transmitted_without_host_applicability_judgment() {
         let scheduler = started_service();
         let latest = scheduler.latest_fact_at("start");
         let advice = |observed_at: u64| json!({"id":"advice_1","identity":identity("task",&scheduler,"start"),
             "observed_at":observed_at,"summary":"the startup result lacks a status code"});
         let annotated = annotate_advice(vec![advice(latest - 5_000), advice(latest + 1)], &scheduler);
-        assert_eq!(annotated[0]["based_on_older_facts"], true);
-        assert_eq!(annotated[0]["newer_facts_at"], latest);
+        assert_eq!(annotated[0],advice(latest-5_000));
+        assert_eq!(annotated[1],advice(latest+1));
         assert!(annotated[1].get("based_on_older_facts").is_none());
     }
 
@@ -1052,7 +871,10 @@ mod tests {
             &[],
         );
         assert_eq!(packed["request"]["goal"], goal);
-        assert_eq!(packed["budget"]["protected_overflow"], true);
+        assert!(packed.get("budget").is_none());
+        let mut body=json!({"messages":[{"role":"system","content":"observe"},{"role":"user","content":crate::session_history::plain_context(&packed)}]});
+        assert!(crate::context_window::prepare(&mut body,2).is_err());
+        assert!(body["messages"][1]["content"].as_str().unwrap().contains(&goal));
     }
     #[tokio::test]
     async fn durable_fast_boundaries_and_commit_replay_keep_each_delivery_once() {
@@ -1095,7 +917,7 @@ mod tests {
             }
         }
         let records = records(root.clone(), task.into()).await.unwrap();
-        assert_eq!(records.len(), 6);
+        assert_eq!(records.len(), 3);
         assert_eq!(
             records
                 .iter()

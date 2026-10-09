@@ -97,6 +97,8 @@ AI Proxy 日志统一走 `proxy_log`，外部模块不再自己实现文件日�
 
 实际验收与复现方法见 [视觉输入实施记录](docs/agent_visual_input_implementation_2026-10-08.md)。业务截图和完整本机配置保存在忽略的验收目录中。
 
+浏览器会话由显式的 `browser_open` 创建，并在创建时选择 `visible`。读取、等待、诊断、截图和交互工具不会隐式启动 Chrome；没有会话时返回 `browser_session_missing`，由 AI 决定下一步。页面事实保留实际 `display_mode`、会话及页面标识，已关闭的旧会话与新页面分别呈现。
+
 ### 兼容代理的图片转述
 
 面向文本模型的兼容代理会：
@@ -272,7 +274,7 @@ AI Proxy（默认 `127.0.0.1:3001`）新增独立任务接口，不依赖 Codex 
 - `DELETE /agent/tasks/{task_id}`：取消运行中的任务。
 - `POST /agent/tasks/{task_id}/flow/nodes/{node_id}/interrupt`：中断当前活动节点并结束本轮，任务进入可继续的 `interrupted` 状态；`node_id` 使用 Worker 计划里的节点 ID 加轮次前缀（例如 `turn_2:inspect_shapes`）。
 
-事件使用 dsh 的 `turn/start`、`user/message`、`step/start`、`assistant/delta`、`assistant/message`、`tool/call`、`tool/result`、`step/end` 和 `turn/end` 类型；Flow 记录 Worker 的 `flow/plan`、`flow/node_state` 和 `worker/progress`，委派时还记录 `subagent/start`、`subagent/end`。Observer 另记录计划/进度观察、历史咨询和任务结束复盘事件；复盘结论会在有可复用发现时写入工作记忆。Agent 顺序调用本地文件、索引和记忆工具，并提供工作区内的原生 `run_program`（仅 cargo、git、node、python，argv 参数数组，无 shell），以及独立的 loopback HTTP 探测。历史保存在工作区 `.codex-workspace-mcp/codex_state.db` 中。模型文字增量、最终回复、步骤汇报和普通工具调用均记录为事件；续聊从事件重建历史。Flow 图由 Worker 当前计划和执行轨迹生成。旧轮次中断的工具调用会补一条中断结果。
+事件使用 dsh 的 `turn/start`、`user/message`、`step/start`、`assistant/delta`、`assistant/message`、`tool/call`、`tool/result`、`step/end` 和 `turn/end` 类型；Flow 从任务分配、交接和普通工具调用读取过程记录，旧版 `worker/progress` 历史仍兼容，委派时还记录 `subagent/start`、`subagent/end`。Observer 另记录计划/进度观察、历史咨询和任务结束复盘事件；复盘结论作为普通聊天消息显示并保存在会话历史中。Agent 顺序调用本地文件、索引和记忆工具，并提供工作区内的原生 `run_program`（仅 cargo、git、node、python，argv 参数数组，无 shell），以及独立的 loopback HTTP 探测。历史保存在工作区 `.codex-workspace-mcp/codex_state.db` 中。模型文字增量、最终回复、交接和普通工具调用均记录为事件；续聊从事件重建历史。Flow 图由 Worker 当前计划和执行轨迹生成。旧轮次中断的工具调用会补一条中断结果。
 
 ```powershell
 cargo run
@@ -316,11 +318,11 @@ http://127.0.0.1:3000/mcp
 Worker 每轮共用文件、行范围、四种语言符号读取的内容哈希与已读范围。重叠部分通过 `read_coverage.previously_read_ranges` 标明，默认只返回新增行。大块源码按完整行缩减，未返回的范围明确列在 `not_returned_ranges` 中，且不会算作已读；无需逐页穷举。文件内容变化自动失效，文件写入或外部命令后也会清理覆盖记录。需要原文用于修改，或原文已经离开当前上下文时，可指定 `force_read: true` 和具体 `reread_reason`。这些参数属于 Worker 工具层，直接 MCP 文件读取仍返回原始完整结果。零散 `new_lines` 不应当作完整函数替换。
 
 
-### Worker 工作记录与 Observer 意见回应
+### Worker 工作记录与 Observer 消息
 
-Worker 独立保存本会话的已读文件、内容版本、已得到的信息、待确认问题和成功执行的动作，并以事件形式持久化。每次模型请求带上精简的工作记录；可通过 `recall_work` 按文件、结论 ID 或主题找回旧记录，不必为恢复结论重读源码。进度汇报的 `findings` 使用稳定 ID 更新和纠正结论，`open_questions` 明确哪些未知信息仍会影响下一步。跨轮只标记历史来源，不自动推翻结论；文件版本变化以 `source_version_changed` 提醒，是否改变结论由实际相关源码决定，用户撤销涉及的结论仍标为待复核。连续仅汇报和内部协商的轮次独立计数，改写进度文案无法清除提醒。
+普通说明、方法及完整结果、失败原因、能力限制和阶段交接就是工作记录，不再提供额外的 `report_progress` 工具。Worker 的当前调用通过原始聊天消息继续；Organizer、Observer 和历史查询读取同一份按顺序保存的记录。需要旧信息时调用 `read_session_history` 或按需读取已有材料，不额外生成一份进度文档。
 
-Observer 存在时，意见自动进入下一次 Worker 请求，并保留稳定 ID。Worker 阅读并评估建议，在下一次实质进度汇报的 `observer_responses` 中记录采纳、调整、不采纳或解决的决定，与实际工具调用合并；不再提供独立回执工具，回执不阻挡代码操作或正常结束。已读意见仅作为工作记录保留，相同回执不重复生成回应事件。观察者不审批 Worker 的行动，也不覆盖用户要求与运行权限。关闭 Observer 时，Worker 的独立流程不受影响。
+视觉输入的实际交付结果在请求发出前作为原始消息保存，并保留在 Worker 后续上下文中。截图捕获与图像输入交付分别记录；模型能力未知、没有备用服务等原因完整可读，宿主不根据这些事实替 AI 决定是否需要再次查看。Observer 意见直接进入后续上下文，无须专门回执，也不审批 Worker 的行动。
 
 ### 每轮文件改动、Diff 与撤销
 
@@ -334,7 +336,7 @@ Agent 的 `write_file`、`replace_range`、`edit_file` 保存真实修改前后�
 
 任务流顶栏的「调试：开/关」控制当前会话后续请求的记录，默认关闭，设置保存在工作区数据库中。开启后，节点抽屉显示请求列表；「全部请求」同时包含规划前的未分配节点请求及 Observer 复盘。归属是请求发起时的节点，不把本次响应中新规划的节点当成请求前已知节点。关闭后停止记录并隐藏查看入口，已有日志保留；关闭期间和功能上线前的请求无法补回。
 
-Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息顺序、系统指令、历史摘要、工作状态、观察者意见和工具定义，不记录请求头、鉴权凭据或供应商 URL。正文未经日志模块二次裁剪，单独保存在 `.codex-workspace-mcp/codex_state.db` 的 `agent_request_contexts` 中；普通 SSE 仅通知日志 ID，不携带完整正文，也不将日志重新送入模型。日志写入失败不阻断任务，服务日志报告失败。
+Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息顺序、系统指令、原始交接、观察者意见和工具定义，不记录请求头、鉴权凭据或供应商 URL。正文未经日志模块二次裁剪，单独保存在 `.codex-workspace-mcp/codex_state.db` 的 `agent_request_contexts` 中；普通 SSE 仅通知日志 ID，不携带完整正文，也不将日志重新送入模型。日志写入失败不阻断任务，服务日志报告失败。
 
 查看界面支持按轮次、步骤、角色和节点选择，展开原始消息、复制请求、加载更早请求，以及与上一条同角色请求比较新增/变更和移除消息。Worker 元数据明确原始历史窗口的移除、单条截短和当前限制，摘要替代历史不等于完整原文仍在上下文中。字符/字节量不伪装为 token 估算；仅在供应商返回时保留 usage。请求结果区记录 Worker 等待响应头、首个有效流输出、完整流响应及模型调用耗时，可与轨迹中的工具耗时区分。Observer 请求中断/超时、模型错误及正常完成有独立状态；进程被直接杀死时尚未结束的请求仍可能保留为请求中。
 
@@ -378,7 +380,7 @@ Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息
 
 ### 源码工作集、结论时间线与执行恢复
 
-- 记事本完整保存已发现材料，模型上下文只注入当前动作需要的源码页面。Worker 先从结论和材料索引决定下一步，再按材料 ID 与行范围获取最小片段。`action_id` 标记具体动作而不隐式丢弃材料；`source_material_ids` 缩小已有选择，`recall_work replace_context=true` 更换页面。节点内汇报保留页面，任务树切换保存和恢复各节点的独立选择。100000 字符是单次请求源码的合计上限，保留页面最多 80000 字符，不是需要填满的目标；超预算新增页面明确标记未激活，不挤掉已有待修改代码。完整材料始终留在记事本，取回没有三份数量限制。工作集描述保存在任务事件中，并在使用前检查当前版本。调试请求显示当前动作、选中页面和未激活原因。
+- 记事本完整保存已发现材料，原始工具返回保留在模型会话中，不再二次生成源码节选或重复注入工作集。Worker 可按材料 ID 与行范围主动读取需要的片段。`action_id` 标记具体动作而不隐式丢弃材料；`source_material_ids` 缩小已有选择，`recall_work replace_context=true` 更换页面。节点内汇报保留页面，任务树切换保存和恢复各节点的独立选择。100000 字符是单次请求源码的合计上限，保留页面最多 80000 字符，不是需要填满的目标；超预算新增页面明确标记未激活，不挤掉已有待修改代码。完整材料始终留在记事本，取回没有三份数量限制。工作集描述保存在任务事件中，并在使用前检查当前版本。调试请求显示当前动作、选中页面和未激活原因。
 - 材料取回与工作集不再限制为 3 份；`recall_work` 根据字符预算返回显式指定的材料，未返回项放在 `deferred`，长内容继续使用分页。近期搜索结果与有效的进度工具参数也保留，避免重新搜索位置或模仿缺少必填字段的历史调用。
 - 结论使用稳定的 `id` 与精确的 `topic`。`conflicts_with` 声明冲突；同一 topic 的不同声明也会进入待确认状态。确认后填写 `supersedes` 和 `verification`（当前源码材料 ID 与确认说明，或当前用户原文），运行时核对来源是否可用，再将被替代声明标记为历史。未经确认的冲突修改不能直接覆盖同一 ID 的已确认声明。普通无冲突结论尊重 Worker 的状态，不因未填写额外确认字段自动降成假设；来源变化或冲突的结论仍需要确认。
 - `worker/finding_revision` 独立保存修订、发现冲突、确认、来源变化和替代事件，包含时间、轮次、步骤、文件版本和来源范围。旧会话尽量从原汇报事件补回记录时间，无法证明确认来源的旧声明单列待核对。正常上下文只带当前结论及待处理冲突；`recall_work include_history=true` 或 `/agent/tasks/{id}/notebook/history?before={seq}` 按需分页查询历史。前端任务记事本分别展示当前、冲突、历史和时间线。
@@ -402,7 +404,13 @@ Worker 和 Observer 在发送前记录最终 JSON 请求体，包含实际消息
 
 任务的信息入口为**项目内会话历史 + 代码索引**。默认请求提供当前任务、前一步结果和精简 Flow；缺少具体历史信息时再查询，缺少代码位置时按职责描述定位。记忆系统保留为独立能力，不作为例行任务记录或启动时必查的入口。
 
+256k 是上下文视野的最大范围，不是固定填充大小。新角色消息、失败状态和原始诊断完整传递，Worker 不固定丢弃两步以前的消息。旧任务保留在历史中，不自动给新任务附带旧任务摘要；当前信息不足或达到容量时，以当前任务和最新完整消息为基础，角色按需查询所缺的历史，不继续搬入一个满载的历史窗口。不同模型没有共用的分词器，发送前采用保守 token 估算并预留输出空间；源码页面仍使用独立缓存和按需选择。Observer 在任务结束后把过程得失与改进建议展示在聊天中，例行复盘不自动写入工作记忆。
+
 Worker、Organizer、Observer 共用 `read_session_history`，直接读取当前工作区已有的会话事件，不新增历史数据库：
+
+同一个 Worker 通过本任务原始工具调用和返回接续执行，工作包不再重复注入自己的 `actual_operations`。下一任务接收一次上游交接，包含已完成操作的返回结论、导出数据及失败和限制；原始返回字段合入同一记录。若前一任务已在 `upstream_outputs` 中交付，`previous_step` 只引用它，不再发送第二份结果。完整工具过程仍保存在会话历史，需要核查时按需读取。
+
+结束复盘提供当前主任务的完整时间线，包括角色原始消息、工具调用与返回、失败恢复和此前 Observer 意见；跨轮续任务仍属于同一主任务。节点摘要只用于定位阶段。超过 256k 容量时明确标记未读过程，通过历史引用继续读取，分页保留 `after_seq` 和 `request_id`；不截短新消息，也不混入被替换主任务的迟到意见。API 的 `completed` 表示执行结束，`turn/end` 同时传递 Organizer 判断的 `goal_achieved` 和 `unresolved`；聊天区分别展示执行状态、目标达成情况及未确认事项。
 
 - 默认读当前会话，可按 `query`、`role`、`node_id`、`turn` 筛选；记录保留原文、角色和采样时间，按事件顺序返回。
 - `scope=project` 查找同项目的相关会话，每个会话返回一条最近匹配记录、简短需求和 `read_reference`。只查当前工作区数据库，不跨项目。
@@ -429,13 +437,12 @@ Related reads return at most eight local interface/type/enum definitions and 120
 source characters across two reference levels. Parent/sibling outlines contain
 positions and short signatures, not whole class bodies. Relative named/default
 imports are supported; package aliases, namespace imports, re-exports and compiler
-binding resolution are not inferred. Each returned type is independently saved in
-the task notebook before it is projected into the Worker request. Main edit source
-gets retention priority over optional related types.
+binding resolution are not inferred. Each returned type is saved in the task notebook and its original method result
+remains in the Worker conversation. The host does not build a second source projection.
 
-Worker requests select findings from the current turn, selected/edited files and
-matching task terms. Unrelated old conflicts and legacy claims remain available
-through the notebook/UI, rather than being replayed wholesale on every request.
+Worker requests retain original messages for the current invocation. Earlier task
+returns arrive through one handoff; missing history and source material can be
+read explicitly. The host does not select findings by task keywords.
 The new request_sizes debug metadata separates message, system, work-state and
 tool-schema character counts. These are character counts, not estimated tokens.
 
@@ -448,6 +455,10 @@ Independent prerequisite reads/checks should share a tool batch. Verification
 failures from missing dependencies/generated modules must be reported separately
 from whether the implementation passed; missing imports do not prove correctness.
 
+工具列表按用户权限和用户明确禁止的操作过滤，Worker 自行选择工具及调用顺序。
+任务的 `checks`、`verification_due`、`completion` 和 `edit_targets` 用于描述目标及记录事实，
+不会隐藏工具或阻止浏览器、读写文件与检查在同一任务中执行。任务返回后，宿主停止该次调用的后续操作。
+
 ### 可选递归任务树与节点上下文
 
 复杂任务的 `plan.mode=tree` 有且只有一个根节点。节点包含 `parent_id`、`objective`、`done_when` 和 `constraints`；Worker 发现真实子问题后才扩展树。`node_result` 明确记录完成、受阻或跳过的实际结果；父节点不能在子问题尚未处理时完成。根节点明确完成后进入最终总结，不再继续查询。
@@ -457,3 +468,9 @@ from whether the implementation passed; missing imports do not prove correctness
 `flow/tree_state` 持久化结构、实际状态和源码页面指针，不存重复正文。后续同目标任务可显式 `resume_tree=true` 恢复；新任务不自动接管旧树。结束文字不自动将未完成节点标成完成。前端显示父子层次、当前路径、目标/完成条件、约束与返回结果；简单任务显示直接处理，调试模式仍可查看模型请求和记事本。Observer 独立提供意见与复盘，Organizer 根据实际返回决定节点派发与整体结束，Worker 执行当前任务并交付结果。
 
 直接处理是暂时的组织选择。发现各自有目标与完成条件、结果又互相依赖的子问题时，Worker 应在下一次实际工作汇报中升级为任务树，简述 work_organization 的原因并同批创建树；无需单独分类、重启调查或补造已完成节点。功能名为“最小”或仅改一个文件不能替代依赖判断；调用次数、耗时和普通报错也不作为强制启用阈值。决策保存在工作记录和调试请求中，恢复提示同样允许真实子问题拆解。
+
+### 角色消息与工具上下文
+
+Organizer 读取按原始时间顺序传来的方法调用、分配回执、Worker 原始返回、Observer 消息和请求失败。Worker 保留本节点的完整调用参数与工具返回；不再把这些消息加工成另一份事实摘要或源码节选。Observer 日常观察是临时 AI 调用：每个 Worker 执行迭代结束后只触发一次，按原始顺序接收该迭代完整消息，不累计此前观察的输入和回复；缺少相关信息时主动读取历史。节点创建本身不调用模型，重复唤醒不产生新观察。结束复盘另行读取当前任务的完整过程，包括请求超时与恢复。独立只读 Organizer 查询可以同轮返回多个结果。
+
+发给模型的历史描述保留方法名、参数、完整结果、失败状态和来源，不重复投递事件 JSON 外壳；原始业务结构化数据和 API 工具调用协议仍然保留。只有达到 256k 视野容量时才移出旧消息，角色按需回读原会话，不自动填满窗口。截图不自动触发附图或 Observer 截图；Worker 显式调用 `view_image` 才请求图像输入，能力不足的原始返回仍正常传递。

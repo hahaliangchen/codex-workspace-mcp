@@ -9,7 +9,7 @@ export interface ToolResult {
 }
 
 export type TurnEndReason =
-  | { readonly kind: 'completed' }
+  | { readonly kind: 'completed'; readonly goalAchieved?: boolean | undefined; readonly unresolved?: readonly string[] | undefined }
   | { readonly kind: 'aborted' }
   | { readonly kind: 'error'; readonly message: string; readonly code: string | undefined }
 
@@ -19,6 +19,7 @@ export type ChatItem =
   | { readonly kind: 'assistant'; readonly key: string; readonly text: string; readonly reasoning: string; readonly time: number; readonly streaming: boolean; readonly turn: number; readonly step: number }
   | { readonly kind: 'progress'; readonly key: string; readonly purpose: string; readonly knownConditions: readonly string[]; readonly nextAction: string; readonly time: number }
   | { readonly kind: 'observer'; readonly key: string; readonly summary: string; readonly suggestions: readonly string[]; readonly time: number }
+  | { readonly kind: 'retrospective'; readonly key: string; readonly text: string; readonly time: number }
   | {
     readonly kind: 'tool'
     readonly key: string
@@ -84,8 +85,10 @@ function argumentsOf(value: unknown): string {
 }
 
 function reasonOf(value: unknown): TurnEndReason {
-  const reason = (value ?? {}) as { kind?: unknown; error?: { message?: unknown; code?: unknown } }
-  if (reason.kind === 'completed') return { kind: 'completed' }
+  const reason = (value ?? {}) as { kind?: unknown; goal_achieved?: unknown; unresolved?: unknown; error?: { message?: unknown; code?: unknown } }
+  if (reason.kind === 'completed') return { kind: 'completed',
+    goalAchieved: typeof reason.goal_achieved === 'boolean' ? reason.goal_achieved : undefined,
+    unresolved: Array.isArray(reason.unresolved) ? reason.unresolved.filter((item): item is string => typeof item === 'string') : undefined }
   if (reason.kind === 'error') {
     return { kind: 'error', message: stringOf(reason.error?.message) ?? '', code: stringOf(reason.error?.code) }
   }
@@ -113,13 +116,24 @@ export function callIdOfResult(event: AgentEvent): string | undefined {
 /** Project an ordered event log into transcript rows; tool results attach to their call. */
 export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[] {
   const results = new Map<string, ToolResult>()
+  const assessments = new Map<number, { goalAchieved: boolean; unresolved: readonly string[] }>()
   for (const event of events) {
+    if (event.type === 'organizer/decision') {
+      const decision = event.data.decision as Record<string, unknown> | undefined
+      if (decision && (decision.action === 'finish' || decision.action === 'blocked')) {
+        assessments.set(numberOf(event.data.turn) ?? 1, {
+          goalAchieved: typeof decision.achieved === 'boolean' ? decision.achieved : decision.action === 'finish',
+          unresolved: Array.isArray(decision.unresolved) ? decision.unresolved.filter((item): item is string => typeof item === 'string') : [],
+        })
+      }
+    }
     if (event.type !== 'tool/result') continue
     const id = callIdOfResult(event)
     if (id !== undefined) results.set(id, resultOf(event))
   }
   const items: ChatItem[] = []
   let turnStartTime: number | undefined
+  let currentTurn = 1
 
   for (const event of events) {
     const key = `${event.type}:${event.seq}`
@@ -127,6 +141,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
       case 'turn/start': {
         turnStartTime = event.time
         const turn = numberOf(event.data.turn) ?? 1
+        currentTurn = turn
         if (turn > 1) items.push({ kind: 'turn', key, turn })
         break
       }
@@ -194,6 +209,17 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
         }
         break
       }
+      case 'observer/retrospective': {
+        const original = event.data.observer_return
+        const report = original && typeof original === 'object' ? original as Record<string, unknown> : event.data
+        const text = [stringOf(report.summary) ?? stringOf(event.data.summary),
+          stringOf(report.path_review) ?? stringOf(event.data.pathReview),
+          ...observerStringList(report.shortening_opportunities ?? event.data.shorteningOpportunities).map(item => `- 下次可改进：${item}`),
+          event.data.status === 'unavailable' ? `复盘未完成：${stringOf(event.data.message) ?? '未返回结果'}` : undefined]
+          .filter(Boolean).join('\n\n')
+        if (text) items.push({ kind: 'retrospective', key, text, time: event.time })
+        break
+      }
       case 'tool/call': {
         const callId = stringOf(event.data.callId) ?? key
         items.push({
@@ -216,10 +242,14 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
       }
       case 'turn/end': {
         const durationMs = turnStartTime !== undefined ? Math.max(0, event.time - turnStartTime) : undefined
+        const reason = reasonOf(event.data.reason)
+        const assessment = assessments.get(numberOf(event.data.turn) ?? currentTurn)
         items.push({
           kind: 'turn-end',
           key,
-          reason: reasonOf(event.data.reason),
+          reason: reason.kind === 'completed' ? { ...reason,
+            goalAchieved: reason.goalAchieved ?? assessment?.goalAchieved,
+            unresolved: reason.unresolved ?? assessment?.unresolved } : reason,
           durationMs,
           time: event.time,
         })
@@ -232,7 +262,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
   // If task is completed/stopped but no turn/end event was recorded:
   if (
     items.length > 0 &&
-    items.at(-1)?.kind !== 'turn-end' &&
+    items.findLastIndex(item => item.kind === 'turn-end') < items.findLastIndex(item => item.kind === 'user' || item.kind === 'turn') &&
     task &&
     (task.status === 'completed' || task.status === 'failed' || task.status === 'interrupted' || task.status === 'cancelled')
   ) {
@@ -242,7 +272,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
     items.push({
       kind: 'turn-end',
       key: `synthetic:turn-end:${task.task_id}`,
-      reason: task.status === 'completed' ? { kind: 'completed' } : { kind: 'aborted' },
+      reason: task.status === 'completed' ? { kind: 'completed', ...assessments.get(currentTurn) } : { kind: 'aborted' },
       durationMs,
       time: task.updated_at,
     })
@@ -408,6 +438,8 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         return { ...base, detail: textOf(messageOf(event).content) }
       case 'assistant/message':
         return { ...base, detail: assistantDisplay(textOf(messageOf(event).content), '').text }
+      case 'visual/input_result':
+        return { ...base, name: '视觉输入结果', detail: textOf(messageOf(event).content) }
       case 'tool/call':
         return { ...base, name: stringOf(data.name), detail: argumentsOf(data.arguments) }
       case 'organizer/progress': {
@@ -1398,7 +1430,6 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
       }
       case 'tool/call': {
         currentTurn = Math.max(currentTurn, turn)
-        if (stringOf(data.name) === 'report_progress') break
         const callId = stringOf(data.callId) ?? ''
         const name = stringOf(data.name) ?? ''
         const argsStr = argumentsOf(data.arguments)

@@ -24,7 +24,10 @@ import { SmoothMarkdown } from './SmoothMarkdown.tsx'
 function TurnEnd({ reason, durationMs }: { reason: TurnEndReason; durationMs?: number | undefined }) {
   const durationText = durationMs !== undefined ? formatDuration(durationMs) : ''
   if (reason.kind === 'completed') {
-    return null
+    return <div className={css.turnNote} role="status">
+      执行已结束{reason.goalAchieved === true ? ' · 目标已达成' : reason.goalAchieved === false ? ' · 目标未完全达成' : ' · 目标达成情况未记录'}
+      {reason.goalAchieved === false && !!reason.unresolved?.length && <ul>{reason.unresolved.map((item, index) => <li key={index}>{item}</li>)}</ul>}
+    </div>
   }
   if (reason.kind === 'aborted') {
     return (
@@ -73,6 +76,11 @@ function Item({
       )
     case 'assistant':
       return <AssistantMessage text={item.text} reasoning={item.reasoning} streaming={item.streaming} />
+    case 'retrospective':
+      return <div className={css.observerAdvice}>
+        <strong>Observer 复盘</strong>
+        <SmoothMarkdown text={item.text} labels={markdownLabels(t)} />
+      </div>
     case 'progress':
       return (
         <div className={css.progressReport}>
@@ -262,7 +270,7 @@ function AssistantTurnView({
       {trackingError && <p role="status" className={css.turnNote}>部分改动未能记录：{trackingError}</p>}
       {!changes && turn.tools.some(item => item.kind === 'tool' && /^(write_file|replace_range|edit_file)$/.test(item.name) && item.result && !item.result.isError) && <p className={css.turnNote}>这轮没有可用的修改前后快照，无法显示准确统计或撤销。</p>}
       {/* 7. Error or Abort notices if any */}
-      {turn.turnEnd && turn.turnEnd.reason.kind !== 'completed' && (
+      {turn.turnEnd && (
         <TurnEnd reason={turn.turnEnd.reason} durationMs={turn.durationMs} />
       )}
     </div>
@@ -271,6 +279,7 @@ function AssistantTurnView({
 
 type ChatNode =
   | { kind: 'user'; item: ChatItem & { kind: 'user' } }
+  | { kind: 'retrospective'; item: ChatItem & { kind: 'retrospective' } }
   | { kind: 'assistant-turn'; turn: AssistantTurnData }
   | { kind: 'turn-end'; item: ChatItem & { kind: 'turn-end' } }
 
@@ -337,6 +346,12 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
       if (item.kind === 'user') {
         flushTurn()
         list.push({ kind: 'user', item })
+        return
+      }
+
+      if (item.kind === 'retrospective') {
+        flushTurn()
+        list.push({ kind: 'retrospective', item })
         return
       }
 

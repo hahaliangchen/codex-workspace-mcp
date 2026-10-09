@@ -92,7 +92,7 @@ pub fn definitions() -> Vec<Value> {
     let url = json!({"type":"string","description":"http(s) or file URL to open."});
     vec![
         json!({"name":"browser_open","description":"Open a URL in the task-owned browser and return its identity, display mode, location, title and visible text. Set visible=true to show the controlled Chrome/Edge window to the user. This does not by itself prove a document or slide loaded.","inputSchema":{"type":"object","required":["url"],"properties":{"url":url,"visible":{"type":"boolean","description":"Show the task-owned browser window. Choose this on the first browser call when the user should see the page; it cannot be changed after the session starts."}}}}),
-        json!({"name":"browser_read","description":"Read the current page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
+        json!({"name":"browser_read","description":"Read the existing task browser page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. This does not create a browser; no existing session returns browser_session_missing. Use browser_open to create a session with the intended visible mode. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
         json!({"name":"browser_wait","description":"Wait up to timeout_ms for a selector, visible text, font loading state or an application-confirmed presentation load after the latest file change. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"document_loaded":{"type":"boolean","description":"Set true to wait for a confirmed upload change, a completed application loading cycle, a valid current/total page indicator, slides, and no explicit load error. A generic DOM snapshot without a correlated load cycle stays unconfirmed."},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
         json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, and the page's recorded requests since navigation: every fetch/XHR call (method, URL, status, time, duration, failure) plus font/resource timing entries. Filter with url_contains (e.g. /api/fonts) and category. request_coverage states what the record cannot see; an empty result means nothing matched in that scope, not that no request happened. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{"url_contains":{"type":"string"},"category":{"type":"string","enum":["all","fetch","xhr","font","resource"]}}}}),
         json!({"name":"browser_click","description":"Click a visible, enabled control. text matches the same label browser_read lists under controls (exact label preferred, then containing); selector is an exact CSS selector and takes precedence. times (1-5) repeats the same click, e.g. to step through slides, before you read the result.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"},"times":{"type":"integer","minimum":1,"maximum":5}}}}),
@@ -114,7 +114,14 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     if name=="browser_close" {return Ok(close_session(workspace.root(),context.task_id()).await);}
     let page=sessions().lock().await.entry(session_key(workspace.root(),context.task_id())).or_default().clone();
     let mut guard=page.lock().await;
-    if guard.is_none() {*guard=Some(launch(name=="browser_open" && args["visible"]==true).await?);}
+    if guard.is_none() {
+        if name!="browser_open" {
+            return Ok(json!({"ok":false,"error_code":"browser_session_missing","stage":"session_lookup",
+                "needed":"No task browser session exists. Use browser_open with the desired URL and visible mode to create one."}));
+        }
+        args["url"].as_str().context("url is required")?;
+        *guard=Some(launch(args["visible"]==true).await?);
+    }
     let session=guard.as_mut().unwrap();
     if name=="browser_open" && args.get("visible").is_some_and(|value|value.as_bool().is_some_and(|visible|visible!=session.visible)) {
         return Ok(json!({"ok":false,"error_code":"browser_visibility_locked","stage":"session_start","needed":"Open the page in a new task browser session with visible set before the first browser call.","display_mode":if session.visible{"visible_window"}else{"headless"},"browser_session_id":session.session_id}));
@@ -135,7 +142,8 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     };
     let state=page_state(&session.ws).await?;
     if !session.signature.is_null() && session.signature!=state {session.epoch+=1;}
-    session.signature=state.clone();result["page"]=json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":state["url"],"viewport":state["viewport"],"identity":context.identity});
+    session.signature=state.clone();result["page"]=json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":state["url"],"viewport":state["viewport"],"identity":context.identity,
+        "display_mode":if session.visible {"visible_window"} else {"headless"}});
     result["display_mode"]=json!(if session.visible {"visible_window"} else {"headless"});
     Ok(result)
 }
@@ -587,7 +595,7 @@ async fn screenshot(root:&Path,context:&crate::visual_artifacts::VisualContext,s
         "capture_seq":session.capture_seq,"captured_at":capture_finished_at,"capture_started_at":capture_started_at,"capture_finished_at":capture_finished_at,
         "url":before["url"],"viewport":before["viewport"],"page_observations":observation,"full_page":full_page,"display_mode":display_mode}),&bytes)?;
     Ok(json!({"artifact_id":artifact["artifact_id"],"visual_artifact":artifact,"captured":true,"display_mode":display_mode,
-        "page":{"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":after["url"],"viewport":after["viewport"]}}))
+        "page":{"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":after["url"],"viewport":after["viewport"],"display_mode":display_mode}}))
 }
 
 async fn launch(visible:bool) -> Result<Session> {
@@ -849,6 +857,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reading_or_interacting_without_a_session_never_launches_a_browser() {
+        let root=std::env::temp_dir().join(format!("browser-no-implicit-session-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let workspace=crate::tools::Workspace::new(&root).unwrap();
+        let context=crate::visual_artifacts::VisualContext::mcp(&root);
+        for name in ["browser_read","browser_wait","browser_diagnostics","browser_click","browser_press_key","browser_upload","browser_screenshot"] {
+            let result=execute_scoped(&workspace,&context,name,&json!({})).await.unwrap();
+            assert_eq!(result["error_code"],"browser_session_missing","{name}: {result}");
+            assert_eq!(result["ok"],false);
+            let page=sessions().lock().await.get(&session_key(&root,context.task_id())).cloned().unwrap();
+            assert!(page.lock().await.is_none(),"{name} must not create a browser process");
+        }
+        assert!(execute_scoped(&workspace,&context,"browser_open",&json!({"visible":true})).await.is_err());
+        assert_eq!(execute_scoped(&workspace,&context,"browser_close",&json!({})).await.unwrap()["closed"],false);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
     async fn opens_a_local_page_and_matches_visible_text() {
         if browser_path().is_none() { return; }
         let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-slide-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
@@ -859,6 +885,7 @@ mod tests {
         let opened = execute(&workspace,"browser_open",&json!({"url":url})).await.unwrap();
         assert_eq!(opened["title"].as_str().unwrap_or(""), "");
         assert_eq!(opened["display_mode"],"headless");
+        assert_eq!(opened["page"]["display_mode"],opened["display_mode"]);
         let page = execute(&workspace,"browser_read",&json!({"expect_text":"Slide 1"})).await.unwrap();
         assert_eq!(page["matched"], true, "{page}");
         assert_eq!(page["slide_count"],1);
