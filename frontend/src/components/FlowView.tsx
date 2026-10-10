@@ -271,9 +271,9 @@ export function FlowView({ events, task, running, onInterruptNode, onResumeNode,
         </div>
 
         <div className={styles.topBarActions}>
-          <button type="button" className={styles.topBarPillBtn} disabled={debugBusy || !task} aria-pressed={debug} onClick={() => { void toggleDebug() }} title="记录此会话后续发送给模型的完整请求；关闭后停止记录并隐藏上下文视图">{debug ? '调试：开' : '调试：关'}</button>
+          <button type="button" className={styles.topBarPillBtn} disabled={debugBusy || !task} aria-pressed={debug} onClick={() => { void toggleDebug() }} title="显示或隐藏上下文详情；规划、执行和观察的完整请求始终记录并在任务结束后保留">{debug ? '上下文：显示' : '上下文：隐藏'}</button>
           {debug && <button type="button" className={styles.topBarPillBtn} onClick={() => setShowRequests(true)}>全部请求</button>}
-          {debugError && <span role="alert" title={debugError}>调试设置失败</span>}
+          {debugError && <span role="alert" title={debugError}>上下文显示设置失败</span>}
           {organizerProgress && (
             <div className={styles.timeBadge} role="status" title={organizerProgressTimings(organizerProgress)}>
               <span>组织者：{organizerPhaseLabel(organizerProgress.phase)}</span>
@@ -377,7 +377,7 @@ export function FlowView({ events, task, running, onInterruptNode, onResumeNode,
         {/* Selected Node Detail Drawer (slides in from right on node click) */}
         {debug && showRequests && task && <div className={styles.drawer}>
           <div className={styles.drawerHeader}>
-            <span className={styles.drawerTitle}>调试 · 全部模型请求</span>
+            <span className={styles.drawerTitle}>上下文 · 全部模型请求</span>
             <button type="button" className={styles.closeButton} onClick={() => { setShowRequests(false); setSelectedNodeId(null) }} title="关闭请求详情">✕</button>
           </div>
           <div className={styles.drawerContent}><TaskNotebookPanel taskId={task.task_id} events={events} /><RequestContextPanel taskId={task.task_id} events={events} /></div>

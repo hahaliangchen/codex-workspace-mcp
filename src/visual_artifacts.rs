@@ -31,6 +31,8 @@ impl VisualSettings {
 #[derive(Clone, Debug, Default)]
 pub struct VisualContext {
     pub identity: Value,
+    /// Human chat turn of this invocation, distinct from the continuing goal ID.
+    pub turn: Option<usize>,
     pub source_tool_call_id: String,
     pub source_event_id: String,
     pub allowed_artifact_ids: Vec<String>,
@@ -171,19 +173,87 @@ pub fn mcp_result(root:&Path,context:&VisualContext,result:Value)->Result<Value>
     Ok(json!({"content":content,"structuredContent":result}))
 }
 
+/// Conversation stores file references; only the outgoing request holds bytes.
+/// Resolve exactly the references present in the current conversation window.
+fn materialize_message(root:&Path,context:&VisualContext,message:&Value,capability:ImageCapability,seen:&mut std::collections::HashSet<(String,bool)>)->Result<(Value,Vec<Value>,Vec<Value>)> {
+    let mut wire=message.clone();let mut images=Vec::new();let mut unavailable=Vec::new();
+    let source=wire.as_object_mut().and_then(|fields|fields.remove("source_identity"));
+    let mut source_context=context.clone();
+    // Routing a saved original to another role does not change its ownership.
+    // The history/router already read this original in the authorized workspace.
+    // Use its original identity, including an explicitly retrieved older task;
+    // do not mistake historical evidence for a new capture by the receiving role.
+    // Direct selections still use their own context and immutable-byte checks.
+    if let Some(source)=source.filter(|source|source["task_id"].is_string() && !source["request_id"].is_null()) {
+        source_context.identity=source;
+    }
+    if let Some(content)=wire["content"].as_array_mut() {
+        for block in content {
+            if block["type"]!="image_ref" {continue;}
+            let id=block["artifact_id"].as_str().context("image reference requires artifact_id")?.to_owned();
+            let original=block["view_original"].as_bool().unwrap_or(false);
+            if seen.contains(&(id.clone(),original)) {
+                *block=json!({"type":"text","text":format!("artifact_id={id}: use the same image content already included earlier in this request")});
+                continue;
+            }
+            let result=if capability==ImageCapability::Supported {
+                image_block(root,&source_context,&id,original)
+            }else{Err(anyhow::anyhow!("current model image capability is {capability:?}; referenced pixels were not delivered"))};
+            match result {
+                Ok((pixels,sent))=>{seen.insert((id,original));*block=pixels;images.push(sent);},
+                Err(error)=>{
+                    let reason=error.to_string();
+                    *block=json!({"type":"text","text":format!("Image reference {id} could not be delivered: {reason}")});
+                    unavailable.push(json!({"artifact_id":id,"reason":reason}));
+                }
+            }
+        }
+    }
+    Ok((wire,images,unavailable))
+}
+
+/// The same original message is saved and handed to subsequent role requests.
+/// No data URLs are stored in the conversation or event stream.
+pub fn conversation_message(manifest:&Value)->Value {
+    let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
+        "checked_goal":manifest["checked_goal"],"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
+        "observed_facts":[{"artifact_id":manifest["images"][0]["artifact_id"],"region":"describe the inspected region","fact":"replace this with actual visible evidence"}],"issues":[],"limitations":[]});
+    let delivery_note=if manifest["images"].as_array().is_some_and(Vec::is_empty) {
+        format!("Image input is unavailable for this request: {}. Captured images remain available to the user, but their pixels were not delivered to this model.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or("see the complete unavailable or visual_service_result fields"))
+    }else{String::new()};
+    let text=format!("Host visual dispatch: {}. {} For visual_check_result use this JSON structure: {}. Preserve checked_goal, request_trace_id and artifact references so the observation can be associated with its inputs. This dispatch describes the named actor's request_trace_id, not any later request quoting it. selected_artifact_ids are newly selected for this request; retained_artifact_ids are earlier image messages still included. An empty selection does not mean empty image input: images records the delivered images. Capture metadata and this request's page/source observations are recorded facts; you decide whether the supplied screenshots are sufficient for the goal and whether another capture is needed. Describe visible facts and any relevant limitations. Only direct means the named actor received real image content blocks; fallback evidence comes from the named visual service and should retain that attribution. unavailable/unknown means image content was not delivered. Screenshot or DOM status alone is not a visual assessment. Retained conversation images are the same earlier image messages, not new view_image calls.",manifest,delivery_note,contract);
+    let mut content=vec![json!({"type":"text","text":text})];
+    if manifest["status"]=="direct" {
+        for id in manifest["selected_artifact_ids"].as_array().into_iter().flatten() {
+            if let Some(image)=manifest["images"].as_array().into_iter().flatten().find(|image|image["artifact_id"]==*id) {
+                content.push(json!({"type":"text","text":format!("artifact_id={id}; captured_at={}; image_file={}; input_mode={}",image["captured_at"],image["image_url"],image["mode"])}));
+                content.push(json!({"type":"image_ref","artifact_id":id,"view_original":image["mode"]=="original"}));
+            }
+        }
+    }
+    if content.len()==1 {json!({"role":"system","content":content[0]["text"]})}
+    else{json!({"role":"user","content":content})}
+}
+
 /// Multimodal data stays a real content block. It never lives inside JSON text.
 pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,actor:&str,model:&str,context:&VisualContext,ids:&[String],goal:&str,body:&mut Value)->Result<Value> {
     let provider=if actor=="observer" {&state.observer_provider}else{&state.provider_name};
     let capability=state.visual.capability(provider,model);
-    let request_id=new_id();let mut manifest=json!({"request_trace_id":request_id,"identity":context.identity,"actor":actor,"model_route":{"provider":provider,"model":model},
+    let request_id=new_id();let mut manifest=json!({"turn":context.turn,"request_trace_id":request_id,"identity":context.identity,"actor":actor,"model_route":{"provider":provider,"model":model},
         "capability":capability,"images":[],"status":"no_images","checked_goal":goal,"execution_epoch":context.execution_epoch,
         "related_source_versions":context.related_source_versions,"current_page":context.current_page,"selected_artifact_ids":ids.iter().take(MAX_IMAGES).collect::<Vec<_>>()});
-    if ids.is_empty() {return Ok(manifest);}
+    let mut retained=Vec::new();let mut retained_unavailable=Vec::new();let mut seen=std::collections::HashSet::new();
+    for message in body["messages"].as_array_mut().context("image request requires messages")? {
+        let (wire,images,unavailable)=materialize_message(state.workspace.root(),context,message,capability,&mut seen)?;
+        *message=wire;retained.extend(images);retained_unavailable.extend(unavailable);
+    }
+    if ids.is_empty() && retained.is_empty() && retained_unavailable.is_empty() {return Ok(manifest);}
+    manifest["retained_artifact_ids"]=json!(retained.iter().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>());
     let mut blocks=vec![json!({"type":"text","text":format!("Host tool materials for the existing work goal, not new human instructions. Inspect only the following task-owned images. Goal: {goal}. Report what is visible and limitations; a screenshot cannot prove interaction behavior. Scaled images cannot establish that small details are absent.")})];
-    let mut images=Vec::new();let mut unavailable=Vec::new();
+    let mut images=retained;let mut unavailable=retained_unavailable;
     for id in ids.iter().take(MAX_IMAGES) {
         match image_block(state.workspace.root(),context,id,context.original_artifact_ids.contains(id)) {
-            Ok((block,sent))=>{blocks.push(json!({"type":"text","text":format!("artifact_id={id}; captured_at={}; url={}; capture identity {}; page_epoch={}; related_source_versions={}; input_mode={}",sent["captured_at"],sent["url"],sent["identity"],sent["page_epoch"],sent["related_source_versions"],sent["mode"])}));blocks.push(block);images.push(sent);},
+            Ok((block,sent))=>{blocks.push(json!({"type":"text","text":format!("artifact_id={id}; captured_at={}; url={}; capture identity {}; page_epoch={}; related_source_versions={}; input_mode={}",sent["captured_at"],sent["url"],sent["identity"],sent["page_epoch"],sent["related_source_versions"],sent["mode"])}));blocks.push(block);if !images.iter().any(|image|image["artifact_id"]==sent["artifact_id"]) {images.push(sent);}},
             Err(error)=>unavailable.push(json!({"artifact_id":id,"reason":error.to_string()})),
         }
     }
@@ -192,7 +262,7 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
     let messages=body["messages"].as_array_mut().context("image request requires messages")?;
     if images.is_empty() {manifest["status"]=json!("unavailable");}
     else if capability==ImageCapability::Supported {
-        messages.push(json!({"role":"user","content":blocks}));manifest["status"]=json!("direct");
+        manifest["status"]=json!("direct");
     } else if capability==ImageCapability::Unsupported && state.visual.fallback.is_some() {
         let route=state.visual.fallback.as_ref().unwrap();
         let service_trace=manifest["request_trace_id"].as_str().unwrap_or("");
@@ -233,19 +303,14 @@ pub async fn prepare_request(state:&crate::agent_service::AgentServiceState,acto
         }else{"this model does not accept images and no fallback visual service is configured"},
             "captured_artifact_ids":captured});
     }
-    let contract=json!({"artifact_ids":manifest["images"].as_array().into_iter().flatten().map(|image|image["artifact_id"].clone()).collect::<Vec<_>>(),
-        "checked_goal":goal,"request_trace_id":manifest["request_trace_id"],"visual_service_result_id":manifest["visual_service_result_id"],"expected_visible_result":"describe the expected visible result","assessment":"uncertain",
-        "observed_facts":[{"artifact_id":manifest["images"][0]["artifact_id"],"region":"describe the inspected region","fact":"replace this with actual visible evidence"}],"issues":[],"limitations":[]});
-    let delivery_note=if manifest["images"].as_array().is_some_and(Vec::is_empty) {
-        format!("Image input is unavailable for this request: {}. Captured images remain available to the user, but their pixels were not delivered to this model.",manifest["image_input_unavailable"]["reason"].as_str().unwrap_or("see the complete unavailable or visual_service_result fields"))
-    }else{String::new()};
-    let message=json!({"role":"system","content":format!("Host visual dispatch: {}. {} For visual_check_result use this JSON structure: {}. Preserve checked_goal, request_trace_id and artifact references so the observation can be associated with its inputs. Capture metadata and this request's page/source observations are recorded facts; you decide whether the supplied screenshots are sufficient for the goal and whether another capture is needed. Describe visible facts and any relevant limitations. Only direct means this role received real image content blocks; fallback evidence comes from the named visual service and should retain that attribution. unavailable/unknown means image content was not delivered. Screenshot or DOM status alone is not a visual assessment.",manifest,delivery_note,contract)});
-    // Save exactly the text delivered to the model, before its request starts.
-    // Other roles and history read this same result; image blocks stay transient.
+    let message=conversation_message(&manifest);
+    // Save the original message, including lightweight image references.
+    // Its wire representation restores pixels from the immutable artifact.
     crate::agent_service::emit(state.workspace.root(),context.task_id(),"visual/input_result",json!({
-        "turn":context.identity["request_id"],"identity":context.identity,"actor":actor,
+        "turn":context.turn.map(|turn|json!(turn)).unwrap_or_else(||context.identity["request_id"].clone()),"identity":context.identity,"actor":actor,
         "request_trace_id":manifest["request_trace_id"],"message":message})).await?;
-    messages.push(message);
+    let (wire,_,_)=materialize_message(state.workspace.root(),context,&message,capability,&mut seen)?;
+    messages.push(wire);
     Ok(manifest)
 }
 
@@ -261,7 +326,13 @@ pub fn validate_check(root:&Path,context:&VisualContext,check:&Value,requests:&[
     let mut artifacts=Vec::new();
     for id in ids {
         let id=id.as_str().context("visual artifact IDs must be strings")?;
-        let (artifact,_)=read(root,context.task_id(),id)?;authorize(&artifact,context)?;artifacts.push(artifact);
+        let mut source_context=context.clone();
+        if let Some(identity)=request.and_then(|request|request["images"].as_array())
+            .and_then(|images|images.iter().find(|image|image["artifact_id"]==id))
+            .map(|image|&image["identity"]).filter(|identity|identity.is_object()) {
+            source_context.identity=identity.clone();
+        }
+        let (artifact,_)=read(root,source_context.task_id(),id)?;authorize(&artifact,&source_context)?;artifacts.push(artifact);
     }
     if let Some(request)=request {
         ensure!(request["checked_goal"]==goal,"checked_goal must match the actual visual request goal");

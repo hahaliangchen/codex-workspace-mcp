@@ -25,6 +25,7 @@ mod proxy_log;
 mod request_context;
 mod session_history;
 mod context_window;
+mod context_rebuild;
 mod task_notebook;
 mod flow_tree;
 mod python_index;

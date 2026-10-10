@@ -1,13 +1,14 @@
 //! Local Chrome/Edge control for the agent. A shell that opens a URL is not this tool.
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
+use rusqlite::OptionalExtension;
 use std::{path::Path, process::Stdio, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, process::Command, time::timeout};
 
 pub const TOOLS: &[&str] = &["browser_open", "browser_read", "browser_wait", "browser_diagnostics", "browser_click", "browser_press_key", "browser_upload", "browser_screenshot", "browser_close", "view_image"];
 pub fn is_tool(name: &str) -> bool { TOOLS.contains(&name) }
 
-struct Session { ws: String, child: tokio::process::Child, profile:std::path::PathBuf, session_id:String, page_id:String, owner:Value, epoch:u64, capture_seq:u64, signature:Value, visible:bool }
+struct Session { ws: String, child: Option<tokio::process::Child>, profile:Option<std::path::PathBuf>, session_id:String, page_id:String, owner:Value, epoch:u64, capture_seq:u64, signature:Value, visible:bool }
 struct CdpConnection { stream: TcpStream, next_id: u64 }
 type Page=std::sync::Arc<tokio::sync::Mutex<Option<Session>>>;
 static SESSIONS:std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<String,Page>>>=std::sync::OnceLock::new();
@@ -15,6 +16,61 @@ fn sessions()->&'static tokio::sync::Mutex<std::collections::HashMap<String,Page
 fn session_key(root:&Path,task:&str)->String {
     let root=root.canonicalize().unwrap_or_else(|_|root.to_path_buf());
     format!("{}:{task}",root.to_string_lossy())
+}
+
+fn connection_record(session:&Session)->Value {
+    json!({"browser_session_id":session.session_id,"page_id":session.page_id,"websocket_url":session.ws,
+        "display_mode":if session.visible{"visible_window"}else{"headless"},"page_epoch":session.epoch,"capture_seq":session.capture_seq})
+}
+
+/// Read the original tool return from this conversation, not a second session registry.
+fn saved_connection(root:&Path,task:&str)->Result<Option<Value>> {
+    let conn=crate::agent_service::open_db(root)?;
+    let raw:Option<String>=conn.query_row("SELECT e.data FROM agent_task_events e
+        WHERE e.task_id=?1 AND e.kind='tool/result' AND (
+          json_type(e.data,'$.meta.result.browser_connection')='object' OR
+          json_type(e.data,'$.meta.result.page.browser_session_id')='text' OR
+          json_extract(e.data,'$.meta.result.closed_page.browser_session_id') IS NOT NULL)
+        ORDER BY e.seq DESC LIMIT 1",[task],|row|row.get(0)).optional()?;
+    let Some(raw)=raw else{return Ok(None)};
+    let data:Value=serde_json::from_str(&raw)?;
+    let result=&data["meta"]["result"];
+    if result["closed"]==true{return Ok(None)};
+    if let Some(record)=result.get("browser_connection") {return Ok(Some(record.clone()))}
+    // Older tool returns already recorded the exact session and page IDs.
+    // The corresponding Chrome profile publishes its existing debugging port.
+    let page=&result["page"];
+    Ok(Some(json!({"browser_session_id":page["browser_session_id"],"page_id":page["page_id"],
+        "display_mode":page.get("display_mode").unwrap_or(&result["display_mode"]),"page_epoch":page["page_epoch"],
+        "capture_seq":result["visual_artifact"]["capture_seq"]})))
+}
+
+async fn reconnect(record:&Value)->Result<Session> {
+    let session_id=record["browser_session_id"].as_str().filter(|id|!id.is_empty()).context("browser connection has no session ID")?;
+    let page_id=record["page_id"].as_str().filter(|id|!id.is_empty()).context("browser connection has no page ID")?;
+    let profile=if session_id.starts_with("visual-")&&session_id.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-') {
+        Some(std::env::temp_dir().join(format!("codex-agent-browser-{session_id}")))
+    }else{None};
+    let ws=if let Some(ws)=record["websocket_url"].as_str() {ws.to_owned()}else {
+        let profile=profile.as_ref().context("legacy browser connection has no websocket URL or host-issued profile")?;
+        let port=std::fs::read_to_string(profile.join("DevToolsActivePort")).context("cannot read the existing Chrome debugging port for the recorded session")?
+            .lines().next().and_then(|value|value.trim().parse::<u16>().ok()).context("recorded Chrome debugging port is invalid")?;
+        format!("ws://127.0.0.1:{port}/devtools/page/{page_id}")
+    };
+    let url=reqwest::Url::parse(&ws).context("invalid browser websocket URL")?;
+    ensure!(url.scheme()=="ws"&&matches!(url.host_str(),Some("127.0.0.1"|"localhost"|"[::1]")),"browser reconnection requires a local Chrome debugging endpoint");
+    ensure!(url.path()==format!("/devtools/page/{page_id}"),"browser websocket URL does not name the recorded page ID");
+    let state=timeout(Duration::from_secs(5),page_state(&ws)).await.context("browser reconnection timed out")?
+        .context("the recorded browser page is unreachable")?;
+    Ok(Session{ws,child:None,profile,session_id:session_id.to_owned(),page_id:page_id.to_owned(),owner:Value::Null,
+        epoch:record["page_epoch"].as_u64().unwrap_or(0),capture_seq:record["capture_seq"].as_u64().unwrap_or(0),signature:state,
+        visible:record["display_mode"]=="visible_window"})
+}
+
+fn reconnection_failure(record:&Value,error:&anyhow::Error)->Value {
+    json!({"ok":false,"error_code":"browser_reconnect_failed","stage":"session_reconnect",
+        "reason":format!("{error:#}"),"browser_connection":record,
+        "needed":"The recorded connection could not be restored. No browser was created and the page was not navigated or uploaded again."})
 }
 pub async fn cleanup(root:&Path,task:&str) {
     let _=close_session(root,task).await;
@@ -42,19 +98,27 @@ pub async fn validate_upload_receipt(root:&Path,task:&str,receipt:&Value)->Value
     let invalid=|reason:&str|json!({"available":false,"reason":reason,"browser_session_id":session_id,
         "page_id":page_id,"upload_attempt_id":attempt_id});
     if session_id.is_empty()||page_id.is_empty()||attempt_id.is_empty() {return invalid("receipt_identity_incomplete");}
-    let page=sessions().lock().await.get(&session_key(root,task)).cloned();
-    let Some(page)=page else {return invalid("browser_session_missing");};
+    let page=sessions().lock().await.entry(session_key(root,task)).or_default().clone();
     let mut guard=page.lock().await;
+    if guard.is_none() {
+        match saved_connection(root,task) {
+            Ok(Some(record))=>match reconnect(&record).await {
+                Ok(session)=>*guard=Some(session),
+                Err(error)=>return json!({"available":false,"reason":"browser_reconnect_failed","details":format!("{error:#}"),"browser_connection":record}),
+            },
+            Ok(None)=>return invalid("browser_session_missing"),
+            Err(error)=>return json!({"available":false,"reason":"browser_connection_history_unavailable","details":format!("{error:#}")}),
+        }
+    }
     let Some(session)=guard.as_mut() else {return invalid("browser_session_closed");};
     if session.session_id!=session_id {return invalid("browser_session_changed");}
     if session.page_id!=page_id {return invalid("browser_page_changed");}
-    if !receipt_page["request_id"].is_null()&&session.owner["request_id"]!=receipt_page["request_id"] {return invalid("browser_request_identity_changed");}
     if receipt_page["page_epoch"].as_u64().is_some_and(|epoch|session.epoch<epoch) {return invalid("browser_page_epoch_changed");}
-    match session.child.try_wait() {
+    if let Some(child)=session.child.as_mut() {match child.try_wait() {
         Ok(Some(_))=>return invalid("browser_process_exited"),
         Err(_)=>return invalid("browser_process_status_unavailable"),
         Ok(None)=>{}
-    }
+    }}
     let token=serde_json::to_string(attempt_id).unwrap_or_else(|_|"\"\"".to_owned());
     let expression=format!(r#"(()=>{{
       const attempt=window.__codexDocumentUploadAttempts?.[{token}];
@@ -75,24 +139,30 @@ pub async fn validate_upload_receipt(root:&Path,task:&str,receipt:&Value)->Value
 }
 
 async fn close_session(root:&Path,task:&str)->Value {
-    let page=sessions().lock().await.remove(&session_key(root,task));
-    if let Some(page)=page {if let Some(mut session)=page.lock().await.take() {
+    let page=sessions().lock().await.get(&session_key(root,task)).cloned();
+    if let Some(page)=page {let mut guard=page.lock().await;if let Some(session)=guard.as_mut() {
         let identity=json!({"browser_session_id":session.session_id,"page_id":session.page_id,"display_mode":if session.visible{"visible_window"}else{"headless"}});
-        let _=session.child.kill().await;let _=timeout(Duration::from_secs(2),session.child.wait()).await;
-        let temp=std::env::temp_dir();
-        if session.profile.parent()==Some(temp.as_path()) && session.profile.file_name().is_some_and(|name|name.to_string_lossy().starts_with("codex-agent-browser-")) {
-            for _ in 0..3 {if std::fs::remove_dir_all(&session.profile).is_ok(){break;}tokio::time::sleep(Duration::from_millis(50)).await;}
+        if let Some(child)=session.child.as_mut() {
+            let _=child.kill().await;let _=timeout(Duration::from_secs(2),child.wait()).await;
+        } else if let Err(error)=call(&session.ws,"Browser.close",json!({})).await {
+            return json!({"ok":false,"error_code":"browser_close_failed","reason":format!("{error:#}"),"browser_connection":connection_record(session)});
         }
+        let temp=std::env::temp_dir();
+        if let Some(profile)=session.profile.as_ref().filter(|profile|profile.parent()==Some(temp.as_path())&&profile.file_name().is_some_and(|name|name.to_string_lossy().starts_with("codex-agent-browser-"))) {
+            for _ in 0..3 {if std::fs::remove_dir_all(profile).is_ok(){break;}tokio::time::sleep(Duration::from_millis(50)).await;}
+        }
+        *guard=None;drop(guard);sessions().lock().await.remove(&session_key(root,task));
         return json!({"ok":true,"closed":true,"status":"closed","closed_page":identity});
     }}
+    sessions().lock().await.remove(&session_key(root,task));
     json!({"ok":true,"closed":false,"status":"no_browser_session"})
 }
 
 pub fn definitions() -> Vec<Value> {
     let url = json!({"type":"string","description":"http(s) or file URL to open."});
-    vec![
+    let mut definitions=vec![
         json!({"name":"browser_open","description":"Open a URL in the task-owned browser and return its identity, display mode, location, title and visible text. Set visible=true to show the controlled Chrome/Edge window to the user. This does not by itself prove a document or slide loaded.","inputSchema":{"type":"object","required":["url"],"properties":{"url":url,"visible":{"type":"boolean","description":"Show the task-owned browser window. Choose this on the first browser call when the user should see the page; it cannot be changed after the session starts."}}}}),
-        json!({"name":"browser_read","description":"Read the existing task browser page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. This does not create a browser; no existing session returns browser_session_missing. Use browser_open to create a session with the intended visible mode. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
+        json!({"name":"browser_read","description":"Read the existing task browser page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. Resumes the original connection from this conversation after a host restart; never creates or navigates a page. browser_session_missing means no connection record; browser_reconnect_failed includes the actual failure reason. Use browser_open only when you intend to open/navigate a page. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
         json!({"name":"browser_wait","description":"Wait up to timeout_ms for a selector, visible text, font loading state or an application-confirmed presentation load after the latest file change. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"document_loaded":{"type":"boolean","description":"Set true to wait for a confirmed upload change, a completed application loading cycle, a valid current/total page indicator, slides, and no explicit load error. A generic DOM snapshot without a correlated load cycle stays unconfirmed."},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
         json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, and the page's recorded requests since navigation: every fetch/XHR call (method, URL, status, time, duration, failure) plus font/resource timing entries. Filter with url_contains (e.g. /api/fonts) and category. request_coverage states what the record cannot see; an empty result means nothing matched in that scope, not that no request happened. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{"url_contains":{"type":"string"},"category":{"type":"string","enum":["all","fetch","xhr","font","resource"]}}}}),
         json!({"name":"browser_click","description":"Click a visible, enabled control. text matches the same label browser_read lists under controls (exact label preferred, then containing); selector is an exact CSS selector and takes precedence. times (1-5) repeats the same click, e.g. to step through slides, before you read the result.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"},"times":{"type":"integer","minimum":1,"maximum":5}}}}),
@@ -101,7 +171,16 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"browser_screenshot","description":"Capture an immutable visual artifact of this task's page and select it for the next normal Worker image request. Capture is not a visual pass. Default viewport; full_page is explicit.","inputSchema":{"type":"object","properties":{"full_page":{"type":"boolean"}}}}),
         json!({"name":"browser_close","description":"Explicitly close this task's controlled browser session. Completed visible sessions remain open until this is called or a replacement page is opened.","inputSchema":{"type":"object","properties":{}}}),
         json!({"name":"view_image","description":"Select a host-issued visual artifact_id for the next image request; only this instance or explicitly exported upstream images are permitted. No arbitrary filesystem paths.","inputSchema":{"type":"object","required":["artifact_id"],"properties":{"artifact_id":{"type":"string"},"original":{"type":"boolean"},"checked_goal":{"type":"string"}}}}),
-    ]
+    ];
+    for definition in &mut definitions {
+        if definition["name"]=="view_image" {continue;}
+        definition["inputSchema"]["properties"]["browser_connection"]=json!({"type":"object",
+            "description":"Original browser_connection returned by a browser tool or read from conversation history. Reconnects that exact page without creating a browser, navigation or upload. Omit to use the current connection or this conversation's latest saved connection. browser_open explicitly navigates; browser_read resumes without navigation.",
+            "required":["browser_session_id","page_id"],"properties":{
+                "browser_session_id":{"type":"string"},"page_id":{"type":"string"},"websocket_url":{"type":"string","description":"Original local CDP page endpoint. Older returns without it can reconnect using their exact host-issued session/page IDs and existing Chrome debugging-port marker."},
+                "display_mode":{"type":"string","enum":["visible_window","headless"]},"page_epoch":{"type":"integer","minimum":0},"capture_seq":{"type":"integer","minimum":0}}});
+    }
+    definitions
 }
 
 pub async fn execute(workspace: &crate::tools::Workspace, name: &str, args: &Value) -> Result<Value> {
@@ -111,13 +190,25 @@ pub async fn execute(workspace: &crate::tools::Workspace, name: &str, args: &Val
 pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::visual_artifacts::VisualContext,name:&str,args:&Value)->Result<Value> {
     if name=="view_image" {let mut result=crate::visual_artifacts::view(workspace.root(),context,args["artifact_id"].as_str().context("artifact_id is required")?)?;result["view_original"]=json!(args["original"]==true);return Ok(result);}
     ensure!(!context.task_id().is_empty(),"browser requires a host-bound task");
-    if name=="browser_close" {return Ok(close_session(workspace.root(),context.task_id()).await);}
     let page=sessions().lock().await.entry(session_key(workspace.root(),context.task_id())).or_default().clone();
     let mut guard=page.lock().await;
+    let explicit=args.get("browser_connection");
+    let different_connection=explicit.is_some_and(|record|guard.as_ref().is_some_and(|session|
+        record["browser_session_id"]!=session.session_id||record["page_id"]!=session.page_id||record["websocket_url"]!=session.ws));
+    if guard.is_none()||different_connection {
+        let record=if let Some(record)=explicit {Some(record.clone())}else if name!="browser_open" {saved_connection(workspace.root(),context.task_id())?}else{None};
+        if let Some(record)=record {
+            match reconnect(&record).await {
+                Ok(session)=>*guard=Some(session),
+                Err(error)=>return Ok(reconnection_failure(&record,&error)),
+            }
+        }
+    }
+    if name=="browser_close" {drop(guard);return Ok(close_session(workspace.root(),context.task_id()).await);}
     if guard.is_none() {
         if name!="browser_open" {
             return Ok(json!({"ok":false,"error_code":"browser_session_missing","stage":"session_lookup",
-                "needed":"No task browser session exists. Use browser_open with the desired URL and visible mode to create one."}));
+                "needed":"No live connection or saved browser_connection was found in this conversation. Supply the original browser_connection to resume a page, or use browser_open if you intend to create one."}));
         }
         args["url"].as_str().context("url is required")?;
         *guard=Some(launch(args["visible"]==true).await?);
@@ -126,7 +217,8 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     if name=="browser_open" && args.get("visible").is_some_and(|value|value.as_bool().is_some_and(|visible|visible!=session.visible)) {
         return Ok(json!({"ok":false,"error_code":"browser_visibility_locked","stage":"session_start","needed":"Open the page in a new task browser session with visible set before the first browser call.","display_mode":if session.visible{"visible_window"}else{"headless"},"browser_session_id":session.session_id}));
     }
-    ensure!(name=="browser_open" || session.owner.is_null() || session.owner["request_id"]==context.identity["request_id"],"page belongs to an earlier request; browser_open must bind the new request's page");
+    // Continuing this conversation rebinds the caller without navigating away
+    // from the document left in the original browser.
     session.owner=context.identity.clone();
     if matches!(name,"browser_open"|"browser_click"|"browser_press_key"|"browser_upload") {session.epoch+=1;}
     let mut result=match name {
@@ -145,6 +237,7 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     session.signature=state.clone();result["page"]=json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":state["url"],"viewport":state["viewport"],"identity":context.identity,
         "display_mode":if session.visible {"visible_window"} else {"headless"}});
     result["display_mode"]=json!(if session.visible {"visible_window"} else {"headless"});
+    result["browser_connection"]=connection_record(session);
     Ok(result)
 }
 
@@ -594,7 +687,7 @@ async fn screenshot(root:&Path,context:&crate::visual_artifacts::VisualContext,s
     let artifact=crate::visual_artifacts::save(root,context,json!({"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":captured_page_epoch,
         "capture_seq":session.capture_seq,"captured_at":capture_finished_at,"capture_started_at":capture_started_at,"capture_finished_at":capture_finished_at,
         "url":before["url"],"viewport":before["viewport"],"page_observations":observation,"full_page":full_page,"display_mode":display_mode}),&bytes)?;
-    Ok(json!({"artifact_id":artifact["artifact_id"],"visual_artifact":artifact,"captured":true,"display_mode":display_mode,
+    Ok(json!({"artifact_id":artifact["artifact_id"],"visual_artifact":artifact,"captured":true,"display_mode":display_mode,"browser_connection":connection_record(session),
         "page":{"browser_session_id":session.session_id,"page_id":session.page_id,"page_epoch":session.epoch,"url":after["url"],"viewport":after["viewport"],"display_mode":display_mode}}))
 }
 
@@ -608,7 +701,7 @@ async fn launch(visible:bool) -> Result<Session> {
     child.args(["--disable-extensions","--no-first-run","--remote-debugging-port=0"])
         .arg(format!("--user-data-dir={}", dir.display()))
         .args(["--window-size=1280,800","about:blank"])
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true);
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(!visible);
     let child = child.spawn().context("could not start the browser")?;
     let port = timeout(Duration::from_secs(8), async {
         let marker = dir.join("DevToolsActivePort");
@@ -623,7 +716,7 @@ async fn launch(visible:bool) -> Result<Session> {
     let ws = page_socket(port).await?;
     call(&ws,"Emulation.setDeviceMetricsOverride",json!({"width":1280,"height":800,"deviceScaleFactor":1,"mobile":false})).await?;
     let page_id=ws.rsplit('/').next().unwrap_or("").to_owned();
-    Ok(Session { ws, child,profile:dir,session_id,page_id,owner:Value::Null,epoch:0,capture_seq:0,signature:Value::Null,visible })
+    Ok(Session { ws, child:Some(child),profile:Some(dir),session_id,page_id,owner:Value::Null,epoch:0,capture_seq:0,signature:Value::Null,visible })
 }
 
 fn page_target(page: &Value) -> bool {
@@ -805,6 +898,93 @@ async fn recv(stream: &mut TcpStream) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn record_return(root:&Path,context:&crate::visual_artifacts::VisualContext,name:&str,result:&Value) {
+        crate::agent_service::open_db(root).unwrap().execute("INSERT OR IGNORE INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'reconnect fixture','test','running',0,0)",[context.task_id()]).unwrap();
+        let call_id=crate::visual_artifacts::new_id();
+        crate::agent_service::emit(root,context.task_id(),"tool/call",json!({"turn":context.identity["request_id"],"name":name,"callId":call_id,"arguments":"{}"})).await.unwrap();
+        crate::agent_service::emit(root,context.task_id(),"tool/result",json!({"turn":context.identity["request_id"],"meta":{"result":result},
+            "message":{"role":"tool","toolCallId":call_id,"content":[{"type":"text","text":result.to_string()}]}})).await.unwrap();
+    }
+    async fn forget_runtime(root:&Path,task:&str) {
+        let page=sessions().lock().await.remove(&session_key(root,task));
+        if let Some(page)=page {if let Some(session)=page.lock().await.as_mut() {
+            // Model the surviving visible browser after the host loses its handles.
+            // Child cannot change kill_on_drop after spawning. Forget only the
+            // test's process handle; the reattached CDP connection closes Chrome.
+            if let Some(child)=session.child.take(){std::mem::forget(child);}
+        }}
+    }
+
+    #[tokio::test]
+    async fn resumes_original_chrome_from_conversation_without_navigation_or_upload() {
+        if browser_path().is_none(){return;}
+        let root=std::env::temp_dir().join(format!("browser-resume-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
+        let workspace=crate::tools::Workspace::new(&root).unwrap();let mut context=crate::visual_artifacts::VisualContext::mcp(&root);context.identity["request_id"]=json!(1);
+        let file=root.join("page.html");std::fs::write(&file,r#"<html><body>
+            <input id="file" type="file"><span id="file-name"></span><span id="page-indicator" class="page-info">Slide 1 / 2</span>
+            <button onclick="window.flips++;document.querySelector('#page-indicator').textContent='Slide 2 / 2'">下一页</button>
+            <script>window.flips=0;window.uploads=0;document.querySelector('#file').addEventListener('change',e=>{window.uploads++;document.querySelector('#file-name').textContent=e.target.files[0].name})</script>
+            </body></html>"#).unwrap();std::fs::write(root.join("保留 文件.pptx"),b"fixture").unwrap();
+        let opened=execute_scoped(&workspace,&context,"browser_open",&json!({"url":reqwest::Url::from_file_path(&file).unwrap().to_string()})).await.unwrap();
+        record_return(&root,&context,"browser_open",&opened).await;
+        let uploaded=execute_scoped(&workspace,&context,"browser_upload",&json!({"path":"保留 文件.pptx","selector":"#file"})).await.unwrap();
+        record_return(&root,&context,"browser_upload",&uploaded).await;
+        let flipped=execute_scoped(&workspace,&context,"browser_click",&json!({"text":"下一页"})).await.unwrap();record_return(&root,&context,"browser_click",&flipped).await;
+        let expression="({flips:window.flips,uploads:window.uploads,file:document.querySelector('#file').files[0].name,origin:performance.timeOrigin,page:document.querySelector('#page-indicator').textContent})";
+        let before=inspect_test_page(&root,&context,expression).await.unwrap();
+        forget_runtime(&root,context.task_id()).await;context.identity["request_id"]=json!(2);
+        let resumed=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();
+        assert!(resumed.get("error_code").is_none(),"{resumed}");
+        assert_eq!(validate_upload_receipt(&root,context.task_id(),&uploaded).await["available"],true,"the original upload receipt remains usable after reconnecting in a new request");
+        assert_eq!(resumed["browser_connection"]["websocket_url"],opened["browser_connection"]["websocket_url"]);
+        assert_eq!(resumed["page"]["page_id"],opened["page"]["page_id"]);
+        assert_eq!(resumed["page"]["identity"]["request_id"],2);
+        assert_eq!(inspect_test_page(&root,&context,expression).await.unwrap(),before,"reconnection must preserve uploaded File, page state and navigation origin");
+        let history=crate::session_history::task_process(&root,context.task_id(),1).await.unwrap();
+        assert!(serde_json::to_string(&crate::session_history::process_messages(&history)).unwrap().contains(opened["browser_connection"]["websocket_url"].as_str().unwrap()));
+        // The same returned record also works explicitly without a live cache.
+        forget_runtime(&root,context.task_id()).await;context.identity["request_id"]=json!(3);
+        let explicit=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":resumed["browser_connection"]})).await.unwrap();
+        assert_eq!(explicit["page"]["page_id"],opened["page"]["page_id"]);
+        assert_eq!(inspect_test_page(&root,&context,expression).await.unwrap(),before);
+        let closed=execute_scoped(&workspace,&context,"browser_close",&json!({})).await.unwrap();assert_eq!(closed["closed"],true,"{closed}");record_return(&root,&context,"browser_close",&closed).await;
+        let after=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();assert_eq!(after["error_code"],"browser_session_missing","closing must not resurrect an older record");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_conversation_page_identity_reconnects_its_exact_existing_chrome() {
+        if browser_path().is_none(){return;}
+        let root=std::env::temp_dir().join(format!("browser-legacy-resume-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
+        let workspace=crate::tools::Workspace::new(&root).unwrap();let context=crate::visual_artifacts::VisualContext::mcp(&root);
+        let file=root.join("page.html");std::fs::write(&file,"<html><body>legacy page</body></html>").unwrap();
+        let opened=execute_scoped(&workspace,&context,"browser_open",&json!({"url":reqwest::Url::from_file_path(&file).unwrap().to_string()})).await.unwrap();
+        let legacy=json!({"page":opened["page"],"display_mode":opened["display_mode"]});record_return(&root,&context,"browser_open",&legacy).await;
+        forget_runtime(&root,context.task_id()).await;
+        let resumed=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();
+        assert_eq!(resumed["browser_connection"]["websocket_url"],opened["browser_connection"]["websocket_url"]);
+        assert_eq!(resumed["page"]["page_id"],opened["page"]["page_id"]);
+        assert_eq!(execute_scoped(&workspace,&context,"browser_close",&json!({})).await.unwrap()["closed"],true);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreachable_recorded_connection_reports_failure_without_replacement() {
+        let root=std::env::temp_dir().join(format!("browser-reconnect-failure-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
+        let workspace=crate::tools::Workspace::new(&root).unwrap();let context=crate::visual_artifacts::VisualContext::mcp(&root);
+        let port=std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let record=json!({"browser_session_id":"recorded-session","page_id":"recorded-page","websocket_url":format!("ws://127.0.0.1:{port}/devtools/page/recorded-page"),"display_mode":"visible_window"});
+        record_return(&root,&context,"browser_read",&json!({"browser_connection":record})).await;
+        let result=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();
+        assert_eq!(result["error_code"],"browser_reconnect_failed");assert_eq!(result["browser_connection"],record);
+        assert!(result["reason"].as_str().unwrap().contains("unreachable"));
+        assert!(sessions().lock().await.get(&session_key(&root,context.task_id())).unwrap().lock().await.is_none());
+        let wrong=json!({"browser_session_id":"recorded-session","page_id":"another-page","websocket_url":record["websocket_url"]});
+        let rejected=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":wrong})).await.unwrap();
+        assert_eq!(rejected["error_code"],"browser_reconnect_failed");assert!(rejected["reason"].as_str().unwrap().contains("recorded page ID"));
+        let _=close_session(&root,context.task_id()).await;std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn browser_discovery_honors_explicit_paths_and_skips_non_executables() {
         let root = std::env::temp_dir().join(format!("browser-discovery-{}", crate::visual_artifacts::new_id()));

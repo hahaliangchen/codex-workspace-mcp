@@ -1,16 +1,10 @@
-//! Advisory node reviews. SQLite commits own boundary work; a bounded wakeup is
-//! only a notification. Each completed execution iteration gets one temporary
-//! observation; final retrospective reads the complete task, never a Worker gate.
+//! End-of-execution retrospectives over the shared original conversation.
+//! Observer has no running review, advisory queue or scheduling authority.
 use crate::agent_service::{self, AgentServiceState};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use std::path::{Path,PathBuf};
 use tokio_util::sync::CancellationToken;
 
 // Current task view; 256k is a maximum, not a target snapshot size.
@@ -22,10 +16,12 @@ pub fn identity(task: &str, scheduler: &crate::work_scheduler::WorkScheduler, wo
         "node_id":order.map(|o|&o.node_id),"revision":order.map(|o|o.revision),"plan_revision":order.map(|o|o.plan_revision)})
 }
 
+#[cfg(test)]
 pub fn applies(identity: &Value, scope: &Value) -> bool {
     valid_instance(identity, scope) && identity["plan_revision"] == scope["plan_revision"]
 }
 
+#[cfg(test)]
 fn observation_version_key(input:&Value)->String {
     let identity=&input["identity"];
     let instance=format!("{}:{}:{}:{}:{}",identity["task_id"],identity["request_id"],identity["work_id"],identity["revision"],identity["plan_revision"]);
@@ -35,6 +31,7 @@ fn observation_version_key(input:&Value)->String {
     format!("review:{}",input["review_id"].as_str().unwrap_or(""))
 }
 
+#[cfg(test)]
 fn valid_instance(identity: &Value, scope: &Value) -> bool {
     let work = identity["work_id"].as_str().unwrap_or("");
     let frame = &scope["frames"][work];
@@ -47,11 +44,14 @@ fn valid_instance(identity: &Value, scope: &Value) -> bool {
 }
 
 /// Advice dates describe provenance; the recipient judges applicability.
+#[cfg(test)]
 pub fn annotate_advice(items: Vec<Value>, _scheduler: &crate::work_scheduler::WorkScheduler) -> Vec<Value> { items }
 
 /// Forward original method arguments and sender returns without field cuts.
+#[cfg(test)]
 pub fn pack(input: Value, _path: &[Value], _memories: &[Value]) -> Value { input }
 
+#[cfg(test)]
 pub fn observation(
     task: &str,
     scheduler: &crate::work_scheduler::WorkScheduler,
@@ -93,19 +93,20 @@ pub fn observation(
     json!({"identity":id,"review_id":review_id,"source_event_id":source_event_id,
         "organizer_decision_id":decision["decision_id"],"stage":stage,"turn":turn,"step":step,
         "request":{"goal":prompt},
-        "organizer_decision":decision,"current_node":{"goal":order.map(|o|&o.goal),"done_when":order.map(|o|&o.done_when),"constraints":order.map(|o|&o.constraints)},
+        "organizer_decision":decision,"current_node":{"goal":order.map(|o|&o.goal),"done_when":order.map(|o|&o.done_when),"constraints":order.map(|o|&o.constraints),"context":order.map(|o|&o.context)},
         "execution_epoch":frame.map(|f|f.epoch),"related_source_versions":frame.map(|f|&f.versions),
         "visual_required":order.is_some_and(|o|o.visual_goal.is_some() || o.constraints.iter().any(|c|c=="requires_visual")),
-        "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"visual_requests":frame.map(|f|&f.visual_requests),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
+        "visual_artifact_ids":frame.map(|f|&f.visual_artifact_ids),"host_current_artifact_ids":frame.map(|f|&f.current_visual_artifact_ids),"visual_check_result":frame.map(|f|&f.visual_check_result),"task_page":frame.map(|f|&f.browser_page),"allowed_visual_artifact_ids":allowed,
         "resolved_inputs":packet["upstream_outputs"],"materials":materials,
         "observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
         "delivery":delivery,
         "defer_until_handoff":stage=="assignment" && order.is_some_and(|o|o.final_answer && o.completion==crate::work_scheduler::Completion::Output)})
 }
 
-/// Insert the execution version and review obligations in the same transaction.
-/// The review PK also makes replayed commits idempotent.
+/// Persist the execution version atomically; this does not schedule Observer.
 pub async fn commit(root: &Path, task: &str, data: Value, observations: Vec<Value>) -> Result<i64> {
+    #[cfg(not(test))]
+    let _ = observations;
     let root = root.to_path_buf();
     let task = task.to_owned();
     tokio::task::spawn_blocking(move ||->Result<i64> {
@@ -133,6 +134,7 @@ pub async fn commit(root: &Path, task: &str, data: Value, observations: Vec<Valu
             }
             source_seq
         };
+        #[cfg(test)]
         for mut input in observations {
             // Assignment messages are already in the task conversation. Observe
             // only after the execution iteration has produced its results.
@@ -146,6 +148,7 @@ pub async fn commit(root: &Path, task: &str, data: Value, observations: Vec<Valu
     }).await?
 }
 
+#[cfg(test)]
 fn event(input: &Value, status: &str, result: Value) -> Value {
     json!({"review_id":input["review_id"],"identity":input["identity"],"source_event_id":input["source_event_id"],
         "organizer_decision_id":input["organizer_decision_id"],"stage":input["stage"],"turn":input["turn"],"step":input["step"],
@@ -153,6 +156,7 @@ fn event(input: &Value, status: &str, result: Value) -> Value {
         "decision":input["organizer_decision"],"delivery":input["delivery"],"result":result})
 }
 
+#[cfg(test)]
 async fn records(root: PathBuf, task: String) -> Result<Vec<(Value, String, Value)>> {
     tokio::task::spawn_blocking(move ||->Result<_> {
         let conn=agent_service::open_db(&root)?;
@@ -162,38 +166,7 @@ async fn records(root: PathBuf, task: String) -> Result<Vec<(Value, String, Valu
     }).await?
 }
 
-async fn save(root: &Path, task: &str, input: &Value, status: &str, result: Value) -> Result<()> {
-    let (root, task, input, status) = (
-        root.to_path_buf(),
-        task.to_owned(),
-        input.clone(),
-        status.to_owned(),
-    );
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut conn = agent_service::open_db(&root)?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute(
-            "UPDATE agent_observations SET status=?3,result=?4 WHERE task_id=?1 AND review_id=?2",
-            params![
-                task,
-                input["review_id"].as_str(),
-                status,
-                result.to_string()
-            ],
-        )?;
-        agent_service::append_event_tx(
-            &tx,
-            &task,
-            "observer/node_review",
-            &event(&input, &status, result),
-            None,
-        )?;
-        tx.commit()?;
-        Ok(())
-    })
-    .await?
-}
-
+#[cfg(test)]
 fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
     let mut recommendations = Vec::new();
     for item in raw
@@ -228,241 +201,55 @@ fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
         "visual_artifacts":input["visual_artifacts"],"visual_check_result":raw["visual_check_result"],"visual_request":raw["visual_request"],"visual_capture":input["visual_capture"]})
 }
 
+/// Observer is a one-shot retrospective after execution has ended.
+/// There is no background reviewer, advisory queue or execution gate.
 pub struct ObserverSession {
     enabled: bool,
-    state: Option<AgentServiceState>,
+    state: AgentServiceState,
     model: String,
     root: PathBuf,
     task: String,
-    wake: mpsc::Sender<()>,
-    scope: watch::Sender<Value>,
-    stop: CancellationToken,
-    job: Option<tokio::task::JoinHandle<()>>,
-    model_gate: std::sync::Arc<Semaphore>,
-    seen: BTreeSet<String>,
+    scope: Value,
     finished: bool,
-    cleanup_on_drop: bool,
 }
-impl Drop for ObserverSession {
-    fn drop(&mut self) {
-        self.stop.cancel();
-        if self.enabled && !self.finished && self.cleanup_on_drop {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let mut cleanup = Self {
-                    enabled: true,
-                    state: None,
-                    model: self.model.clone(),
-                    root: self.root.clone(),
-                    task: self.task.clone(),
-                    wake: self.wake.clone(),
-                    scope: self.scope.clone(),
-                    stop: self.stop.clone(),
-                    job: self.job.take(),
-                    model_gate: self.model_gate.clone(),
-                    seen: BTreeSet::new(),
-                    finished: false,
-                    cleanup_on_drop: false,
-                };
-                // Unexpected Worker errors still terminate observation; this
-                // cleanup only writes status metadata, never calls a model.
-                runtime.spawn(async move {
-                    if let Err(error) = cleanup.finish("interrupted").await {
-                        tracing::warn!(%error,"could not finalize interrupted Observer records");
-                    }
-                });
-            }
-        }
-    }
-}
-
 impl ObserverSession {
-    pub fn start(
-        state: AgentServiceState,
-        model: String,
-        task: String,
-        cancel: &CancellationToken,
-    ) -> Self {
-        let enabled = state.observer_enabled;
-        let retrospective_state = state.clone();
-        let retrospective_model = model.clone();
-        let root = state.workspace.root().to_path_buf();
-        let (wake, receiver) = mpsc::channel(1);
-        let (scope, scopes) = watch::channel(Value::Null);
-        let stop = cancel.child_token();
-        let model_gate = std::sync::Arc::new(Semaphore::new(1));
-        let call_gate = model_gate.clone();
-        let job = enabled.then(|| {
-            tokio::spawn(run(
-                state,
-                model,
-                task.clone(),
-                receiver,
-                scopes,
-                stop.clone(),
-                call_gate,
-            ))
-        });
-        Self {
-            enabled,
-            state: Some(retrospective_state),
-            model: retrospective_model,
-            root,
-            task,
-            wake,
-            scope,
-            stop,
-            job,
-            model_gate,
-            seen: BTreeSet::new(),
-            finished: false,
-            cleanup_on_drop: true,
-        }
+    pub fn start(state:AgentServiceState,model:String,task:String,_cancel:&CancellationToken)->Self {
+        Self {enabled:state.observer_enabled,root:state.workspace.root().to_path_buf(),state,model,task,scope:Value::Null,finished:false}
     }
-    pub fn set_scope(&self, scheduler: &crate::work_scheduler::WorkScheduler, prompt: &str) {
-        self.scope.send_replace(json!({"request_id":scheduler.request_started_turn,"plan_revision":scheduler.plan_revision,
-            "frames":scheduler.frames,"goal":prompt,"finished":scheduler.finished,
-            "final_result":scheduler.final_result,"request_completed":scheduler.request_completed}));
-        self.notify();
+    pub fn set_scope(&mut self,scheduler:&crate::work_scheduler::WorkScheduler,prompt:&str) {
+        self.scope=json!({"request_id":scheduler.request_started_turn,"goal":prompt,
+            "final_result":scheduler.final_result,"request_completed":scheduler.request_completed});
     }
-    pub async fn model_permit(&self) -> Result<OwnedSemaphorePermit> {
-        Ok(self.model_gate.clone().acquire_owned().await?)
-    }
-    pub fn notify(&self) {
-        if self.enabled {
-            let _ = self.wake.try_send(());
-        }
-    }
-    pub async fn reviews(&mut self) -> Result<Vec<Value>> {
-        if !self.enabled {
-            return Ok(vec![]);
-        }
-        let rows = records(self.root.clone(), self.task.clone()).await?;
-        let mut reviews = Vec::new();
-        for (input, status, result) in rows {
-            if !matches!(status.as_str(),"completed"|"failed"|"timeout"|"cancelled") {
-                continue;
-            }
-            let id = input["review_id"].as_str().unwrap_or("").to_owned();
-            if !self.seen.insert(id) {
-                continue;
-            }
-            let recommendations=result["recommendations"].as_array().cloned().unwrap_or_default();
-            // An observation with no recommendation is still a message, in
-            // particular when it explains an unavailable capability.
-            let recommendations=if recommendations.is_empty() {vec![json!({"issue_key":"observation","target":"organizer"})]}else{recommendations};
-            for item in &recommendations {
-                reviews.push(json!({"request_id":input["identity"]["request_id"],"identity":input["identity"],"review_id":input["review_id"],
-                    "source_event_id":input["source_event_id"],"source_event_seq":input["source_event_seq"],"turn":input["turn"],"stage":input["stage"],"step":input["step"],"node_id":input["identity"]["node_id"],
-                    "observed_at":input["observed_at"],"execution_revision":input["identity"]["revision"],
-                    "category":"planning","review_status":status,"issue_key":item["issue_key"],"summary":result.get("summary").or_else(||result.get("message")),"suggestions":item["adjustment"].as_str().map(|text|json!([text])).unwrap_or(json!([])),"target":item["target"],"findings":result["findings"],
-                    "observer_return":result.get("observer_return").unwrap_or(&result),
-                    "visual_artifacts":result["visual_artifacts"],"visual_check_result":result["visual_check_result"],"visual_request":result["visual_request"]}));
-            }
-        }
-        Ok(reviews)
-    }
-    pub async fn finish(&mut self, outcome: &str) -> Result<()> {
-        if !self.enabled || self.finished {
-            return Ok(());
-        }
-        self.finished = true;
-        self.stop.cancel();
-        if let Some(mut job) = self.job.take() {
-            if tokio::time::timeout(Duration::from_secs(2), &mut job)
-                .await
-                .is_err()
-            {
-                job.abort();
-                let _ = job.await;
-            }
-        }
-        let scope = self.scope.borrow().clone();
-        let rows = records(self.root.clone(), self.task.clone()).await?;
-        let mut completed = 0;
-        let mut unevaluated = 0;
-        let mut elapsed = 0;
-        let mut summaries = Vec::new();
-        for (input, status, result) in &rows {
-            if input["identity"]["request_id"] != scope["request_id"] {
-                continue;
-            }
-            if matches!(status.as_str(), "pending" | "unassessed")
-                && input["stage"] == "assignment"
-                && rows.iter().any(|(other, _, _)| {
-                    other["stage"] == "handoff" && other["identity"] == input["identity"]
-                })
-            {
-                save(
-                    &self.root,
-                    &self.task,
-                    input,
-                    "merged",
-                    json!({"reason":"included in handoff"}),
-                )
-                .await?;
-                continue;
-            }
-            if matches!(status.as_str(), "pending" | "reviewing" | "unassessed") {
-                save(
-                    &self.root,
-                    &self.task,
-                    input,
-                    if outcome == "cancelled" {
-                        "cancelled"
-                    } else {
-                        "unassessed"
-                    },
-                    json!({"reason":outcome,"assessment":"uncertain"}),
-                )
-                .await?;
-                unevaluated += 1;
-            } else if status == "completed" {
-                completed += 1;
-                elapsed += result["elapsed_ms"].as_u64().unwrap_or(0);
-                summaries.push(result["summary"].clone());
-            } else if status != "merged" {
-                unevaluated += 1;
-            }
-        }
-        let mut result=json!({"status":"completed","outcome":outcome,
-            "summary":format!("{completed} 次节点观察已完成，{unevaluated} 项未评估。"),
-            "pathReview":summaries.iter().rev().take(6).filter_map(Value::as_str).collect::<Vec<_>>().join("\n"),
-            "completedReviews":completed,"unevaluatedReviews":unevaluated,"observerElapsedMs":elapsed,"extraWorkerRounds":0});
-        if (outcome=="completed" && scope["finished"]==true) || matches!(outcome,"failed"|"max_steps") {
-            if let Some(state)=&self.state {
-                agent_service::emit(&self.root,&self.task,"observer/retrospective_start",json!({"outcome":outcome,"turn":scope["request_id"]})).await?;
-                match retrospective(state,&self.model,&self.task,&scope,outcome).await {
-                    Ok(review)=>{
-                        for (key,value) in review.as_object().into_iter().flatten() {result[key]=value.clone();}
-                    },
-                    Err(error)=>{result["status"]=json!("unavailable");result["message"]=json!(format!("{error:#}"));},
-                }
-            }
-        }
+    pub async fn finish(&mut self,outcome:&str)->Result<()> {
+        if !self.enabled || self.finished {return Ok(());}
+        self.finished=true;
+        // A user cancellation or dropped execution must not start another model request.
+        if !matches!(outcome,"completed"|"failed"|"max_steps") {return Ok(());}
+        let history=crate::session_history::task_process(&self.root,&self.task,self.scope["request_id"].as_u64().unwrap_or(1) as usize).await?;
+        let turn=history["records"].as_array().into_iter().flatten().filter_map(|record|record["turn"].as_u64()).max().unwrap_or(1);
+        agent_service::emit(&self.root,&self.task,"observer/retrospective_start",
+            json!({"outcome":outcome,"request_id":self.scope["request_id"],"turn":turn})).await?;
+        let result=match retrospective(&self.state,&self.model,&self.task,&self.scope,outcome,history,turn).await {
+            Ok(review)=>review,
+            Err(error)=>json!({"status":"unavailable","outcome":outcome,"message":format!("{error:#}"),"memoryRecorded":false,"turn":turn,"request_id":self.scope["request_id"]}),
+        };
         agent_service::emit(&self.root,&self.task,"observer/retrospective",result).await
     }
 }
 
-async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str)->Result<Value> {
-    let root=state.workspace.root().to_path_buf();let trace_task=task.to_owned();
-    let trace=tokio::task::spawn_blocking(move ||agent_service::load_observer_work_trace(&root,&trace_task)).await??;
-    let turn=trace.iter().filter_map(|entry|entry["turn"].as_u64()).max().unwrap_or(1);
-    let mut path=scope["frames"].as_object().into_iter().flat_map(|frames|frames.values()).collect::<Vec<_>>();
-    path.sort_by_key(|frame|frame["sequence"].as_u64().unwrap_or(0));
-    let flow=path.iter().map(|frame|json!({"node_id":frame["order"]["node_id"],"status":frame["status"],
-        "goal":frame["order"]["goal"],"superseded":frame["invalidated_by_plan_revision"],
-        "returned_at":frame["returned_at"],"summary":frame["output"]["summary"].as_str().map(str::to_owned),
-        "outcome":frame["output"]["outcome"],"retained_operations_count":frame["operations"].as_array().map(Vec::len)})).collect::<Vec<_>>();
-    let task_history=crate::session_history::task_process(state.workspace.root(),task,scope["request_id"].as_u64().unwrap_or(1) as usize).await?;
+async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str,task_history:Value,turn:u64)->Result<Value> {
     let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
         "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
-        "final_result":scope["final_result"],"flow_overview":flow,"task_history":task_history,
-        "history":{"tool":"read_session_history","scope":"Read exact actions or original returns only for a specific question about this route."},
-        "known_read_targets":agent_service::observer_known_read_targets(&trace,task,24)});
+        "final_result":scope["final_result"],"task_history":task_history,
+        "history":{"tool":"read_session_history","scope":"Read original process records, or include_context=true to inspect the exact saved Worker/Organizer model inputs referenced by debug/context_request. Input views are not additional executions."}});
     let raw=agent_service::observer_json_response(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
         json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]})).await?;
-    let report:Value=serde_json::from_str(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim())?;
-    anyhow::ensure!(report.is_object(),"Observer retrospective must return a JSON object");
+    let report:Value=match serde_json::from_str::<Value>(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim()) {
+        Ok(report) if report.is_object()=>report,
+        parsed=>return Ok(json!({"status":"unavailable","turn":turn,"request_id":scope["request_id"],
+            "message":parsed.err().map(|error|error.to_string()).unwrap_or_else(||"Observer retrospective must return a JSON object".into()),
+            "observer_return":raw,"memoryRecorded":false})),
+    };
     // Routine retrospectives belong to conversation history. Keep the explicit
     // memory tools available, but do not turn a task review into a memory write.
     let original=report.get("observer_return").unwrap_or(&report);
@@ -473,6 +260,7 @@ async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Valu
     Ok(result)
 }
 
+#[cfg(test)]
 fn iteration_records(process:&Value,after_seq:i64,through_seq:i64)->Vec<Value> {
     process["records"].as_array().into_iter().flatten()
         .filter(|entry|entry["seq"].as_i64().is_some_and(|seq|seq>after_seq && seq<=through_seq)
@@ -480,180 +268,33 @@ fn iteration_records(process:&Value,after_seq:i64,through_seq:i64)->Vec<Value> {
         .cloned().collect()
 }
 
-async fn run(
-    state: AgentServiceState,
-    model: String,
-    task: String,
-    mut wake: mpsc::Receiver<()>,
-    scope: watch::Receiver<Value>,
-    stop: CancellationToken,
-    model_gate: std::sync::Arc<Semaphore>,
-) {
-    let root = state.workspace.root();
-    let mut attempted = BTreeSet::new();
-    let mut rescan = true;
-    loop {
-        if !rescan {
-            tokio::select! {biased;_=stop.cancelled()=>break,_=wake.recv()=>{}}
-        }
-        rescan = false;
-        if stop.is_cancelled() {
-            break;
-        }
-        let current = scope.borrow().clone();
-        if current.is_null() || current["finished"] == true {
-            continue;
-        }
-        let rows = match records(root.to_path_buf(), task.clone()).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%task,%error,"could not load durable Observer boundaries");
-                rescan = true;
-                tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
-                continue;
-            }
-        };
-        let mut pending = Vec::new();
-        for (input, status, _result) in &rows {
-            if !matches!(status.as_str(), "pending" | "unassessed" | "reviewing")
-                || attempted.contains(&observation_version_key(input))
-            {
-                continue;
-            }
-            if !applies(&input["identity"], &current) {
-                let _ = save(
-                    root,
-                    &task,
-                    input,
-                    "superseded",
-                    json!({"assessment":"uncertain"}),
-                )
-                .await;
-                continue;
-            }
-            if input["stage"] == "assignment" {
-                let _ = save(root,&task,input,"merged",json!({"reason":"assignment is included in execution messages"})).await;
-                continue;
-            }
-            pending.push(input.clone());
-        }
-        pending.sort_by_key(|v|v["source_event_seq"].as_i64().unwrap_or(i64::MAX));
-        rescan = pending.len() > 1;
-        let input = pending.first().cloned();
-        let Some(mut input) = input else {
-            continue;
-        };
-        let attempt_key=observation_version_key(&input);
-        if !attempted.insert(attempt_key.clone()) {
-            continue;
-        }
-        if stop.is_cancelled() {
-            break;
-        }
-        let process = match crate::session_history::task_process(root,&task,current["request_id"].as_u64().unwrap_or(1) as usize).await {
-            Ok(process)=>process,
-            Err(error)=> { let _=save(root,&task,&input,"failed",json!({"message":format!("{error:#}")})).await; continue; }
-        };
-        // Message boundaries belong to execution, not to when an asynchronous
-        // review happened to finish. A delayed review cannot absorb a later
-        // iteration or replay an earlier one.
-        let through_seq=input["source_event_seq"].as_i64().unwrap_or(i64::MAX);
-        let after_seq=rows.iter().filter(|(previous,_,_)|previous["stage"]!="assignment"
-            && previous["identity"]["request_id"]==input["identity"]["request_id"])
-            .filter_map(|(previous,_,_)|previous["source_event_seq"].as_i64())
-            .filter(|seq|*seq<through_seq).max().unwrap_or(-1);
-        let trace=iteration_records(&process,after_seq,through_seq);
-        input["activity_since_seq"]=json!(after_seq);
-        input["activity_through_seq"]=json!(through_seq);
-        input["recent_activity"]=json!(trace);
-        let reviewed_through_seq=through_seq;
-        if stop.is_cancelled() {
-            break;
-        }
-        if !applies(&input["identity"], &scope.borrow().clone()) {
-            let _ = save(
-                root,
-                &task,
-                &input,
-                "superseded",
-                json!({"assessment":"uncertain"}),
-            )
-            .await;
-            continue;
-        }
-        let _ = save(root, &task, &input, "reviewing", Value::Null).await;
-        let started = Instant::now();
-        let mut metadata = input["identity"].clone();
-        metadata["nodeId"] = input["identity"]["node_id"].clone();
-        metadata["workId"] = input["identity"]["work_id"].clone();
-        for field in [
-            "review_id",
-            "source_event_id",
-            "source_event_seq",
-            "organizer_decision_id",
-            "stage",
-            "turn",
-            "step",
-        ] {
-            metadata[field] = input[field].clone();
-        }
-        let result = tokio::select! {biased;_=stop.cancelled()=>{
-        let _=save(root,&task,&input,"unassessed",json!({"assessment":"uncertain","reason":"observation stopped"})).await;break;},
-        result=async {
-            let _permit=model_gate.acquire().await?;
-            anyhow::ensure!(!stop.is_cancelled() && applies(&input["identity"],&scope.borrow().clone()),"observation no longer applies");
-            let packed=pack(input.clone(),&[],&[]);
-            let raw=agent_service::observer_json_response(&state,&model,include_str!("../prompts/observer_system.md"),packed,1400,&task,metadata).await?;
-            Ok::<_,anyhow::Error>((raw,input.clone()))
-        }=>result};
-        match result {
-            Ok((raw,input)) => match serde_json::from_str::<Value>(
-                raw.trim()
-                    .trim_start_matches("```json")
-                    .trim_end_matches("```")
-                    .trim(),
-            ) {
-                Ok(raw) => {
-                    let review = normalize(raw, &input, started.elapsed().as_millis());
-                    let mut review = review;
-                    review["lessons_recorded"] = Value::Null;
-                    review["reviewed_through_seq"]=json!(reviewed_through_seq);
-                    let _ = save(root, &task, &input, "completed", review).await;
-                }
-                Err(error) => {
-                    let _ = save(
-                        root,
-                        &task,
-                        &input,
-                        "failed",
-                        json!({"assessment":"uncertain","message":error.to_string(),"observer_return":raw}),
-                    )
-                    .await;
-                }
-            },
-            Err(error) => {
-                let visual_failure=error.downcast_ref::<crate::visual_probe::VisualModelFailure>();
-                let visual_request=visual_failure.map(|failure|failure.manifest.clone()).unwrap_or(Value::Null);
-                let result=json!({"assessment":"uncertain","message":format!("{error:#}"),"visual_request":visual_request,
-                    "visual_check_result":visual_failure.map(|failure|json!({"assessment":"unavailable","actor":"observer",
-                        "identity":failure.manifest["identity"],"model_route":failure.manifest["model_route"],"input_mode":"request_failed",
-                        "artifact_ids":failure.manifest["selected_artifact_ids"],"visual_request":failure.manifest,"limitations":[format!("{error:#}")]}))});
-                let _ = save(
-                    root,
-                    &task,
-                    &input,
-                    if error.is::<tokio::time::error::Elapsed>() {"timeout"}else{"failed"},
-                    result,
-                )
-                .await;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn disabled_cancelled_interrupted_and_dropped_sessions_never_review() {
+        let root=std::env::temp_dir().join(format!("observer-no-background-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn=agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();drop(conn);
+        let mut state=agent_service::tests::flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
+        for (enabled,outcome) in [(false,"completed"),(true,"cancelled"),(true,"interrupted")] {
+            state.observer_enabled=enabled;
+            let mut observer=ObserverSession::start(state.clone(),"fake".into(),"task".into(),&CancellationToken::new());
+            observer.set_scope(&scheduler,"goal");observer.finish(outcome).await.unwrap();
+        }
+        drop(ObserverSession::start(state.clone(),"fake".into(),"task".into(),&CancellationToken::new()));
+        tokio::task::yield_now().await;
+        let conn=agent_service::open_db(&root).unwrap();
+        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='agent_request_contexts')",[],|row|row.get(0)).unwrap();
+        let requests:i64=if exists {conn.query_row("SELECT count(*) FROM agent_request_contexts",[],|row|row.get(0)).unwrap()}else{0};
+        assert_eq!(requests,0);
+        let reviews:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind LIKE 'observer/%'",[],|row|row.get(0)).unwrap();
+        assert_eq!(reviews,0);
+        drop(conn);std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn ongoing_context_contains_new_activity_without_repeated_history() {
         let failure=json!({"capability":"unknown","image_input_unavailable":{"reason":"model has no configured image input"}});
@@ -663,10 +304,9 @@ mod tests {
             "node_facts":{"operations":[{"outcome":"old history".repeat(20_000)}]},
             "activity_summary":{"tools":[{"outcome":"old history".repeat(20_000)}]},
             "recent_activity":recent,"activity_since_seq":400,
-            "plan_overview":[{"work_id":"earlier","status":"done"},{"work_id":"current","status":"running"}],
-            "visual_requests":[failure]}),&[json!({"delivery":"old original return".repeat(20_000)})],&[]);
+            "plan_overview":[{"work_id":"earlier","status":"done"},{"work_id":"current","status":"running"}]}),&[json!({"delivery":"old original return".repeat(20_000)})],&[]);
         assert_eq!(packed["recent_activity"],recent);
-        assert_eq!(packed["visual_requests"][0],failure);
+        assert_eq!(packed["recent_activity"][1]["dispatch"],failure);
         assert_eq!(packed["plan_overview"].as_array().unwrap().len(),2);
         assert_eq!(packed["activity_summary"]["tools"][0]["outcome"],"old history".repeat(20_000));
         assert!(packed.get("node_operations").is_none());
@@ -798,57 +438,6 @@ mod tests {
         assert_eq!(iteration_records(&process,2,5),vec![process["records"][1].clone(),process["records"][3].clone()]);
     }
 
-    #[tokio::test]
-    async fn queued_iterations_are_observed_once_in_order_with_temporary_context() {
-        use axum::{Json,routing::post};
-        use std::sync::{Arc,Mutex};
-        let root=std::env::temp_dir().join(format!("observer-temporary-{}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&root).unwrap();
-        agent_service::open_db(&root).unwrap().execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','goal','fake','running',0,0)",[]).unwrap();
-        let captured=Arc::new(Mutex::new(Vec::<Value>::new()));let received=captured.clone();
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
-        let server=tokio::spawn(async move {
-            axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
-                let received=received.clone();async move {
-                    received.lock().unwrap().push(body);
-                    Json(json!({"choices":[{"message":{"role":"assistant","content":"{\"assessment\":\"on_track\",\"summary\":\"PREVIOUS_OBSERVER_REPLY\"}"}}]}))
-                }
-            }))).await.unwrap();
-        });
-        let mut state=agent_service::tests::flow_test_state(&root,address);state.observer_enabled=true;state.observer_provider_url=state.provider_url.clone();
-        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
-        scheduler.apply(&json!({"action":"work","reason":"inspect","orders":[{"id":"w","node_id":"w","goal":"goal","done_when":"return","completion":"output"}]}),false,false).unwrap();
-        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&CancellationToken::new());
-        // Queue all rounds before setting the scope, simulating a slow Observer.
-        let assignment=observation("task",&scheduler,"w",1,1,"assignment","goal",&json!({}),Value::Null,Value::Null,Value::Null);
-        commit(&root,"task",json!({"commit_id":"assignment"}),vec![assignment]).await.unwrap();
-        for (step,marker,stage) in [(2,"FIRST_FAILURE","progress"),(3,"SECOND_RECOVERY","progress"),(4,"THIRD_RETURN","handoff")] {
-            let call=format!("call_{step}");
-            agent_service::emit(&root,"task","tool/call",json!({"turn":1,"step":step,"callId":call,"name":"workspace_info","arguments":"{}"})).await.unwrap();
-            agent_service::emit(&root,"task","tool/result",json!({"turn":1,"step":step,"message":{"toolCallId":call,"isError":step==2},"meta":{"result":{"marker":marker}}})).await.unwrap();
-            let input=observation("task",&scheduler,"w",1,step,stage,"goal",&json!({}),Value::Null,Value::Null,Value::Null);
-            let data=json!({"commit_id":format!("round-{step}")});
-            commit(&root,"task",data.clone(),vec![input.clone()]).await.unwrap();
-            commit(&root,"task",data,vec![input]).await.unwrap();
-        }
-        observer.set_scope(&scheduler,"goal");
-        tokio::time::timeout(Duration::from_secs(5),async {
-            loop {
-                if records(root.clone(),"task".into()).await.unwrap().iter().filter(|(_,status,_)|status=="completed").count()==3 {break;}
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
-        for _ in 0..10 {observer.notify();}
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let requests=captured.lock().unwrap().clone();assert_eq!(requests.len(),3,"assignment, replay and wakeups are not new rounds");
-        for (index,marker) in ["FIRST_FAILURE","SECOND_RECOVERY","THIRD_RETURN"].iter().enumerate() {
-            let text=requests[index]["messages"].to_string();assert!(text.contains(marker));
-            for other in ["FIRST_FAILURE","SECOND_RECOVERY","THIRD_RETURN"] {if other!=*marker {assert!(!text.contains(other),"each round gets only its original messages");}}
-            assert!(!text.contains("PREVIOUS_OBSERVER_REPLY"));
-            assert_eq!(requests[index]["messages"].as_array().unwrap().len(),4,"context does not accumulate prior reviews");
-        }
-        observer.finish("interrupted").await.unwrap();drop(observer);server.abort();std::fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn advice_dates_are_transmitted_without_host_applicability_judgment() {

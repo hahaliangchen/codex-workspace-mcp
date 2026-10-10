@@ -456,6 +456,9 @@ impl WorkState {
     pub fn defer_coordination(&self) -> bool { self.coordination_only_steps>=2 || self.investigation_streak>=12 || self.repeated_streak>=3 }
 }
 
+#[cfg(test)]
+mod legacy_observer_inbox {
+use super::*;
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ObserverInbox { items: BTreeMap<String, Value>, counter: usize, request_id: usize, scope: Value, observations: Vec<Value> }
@@ -467,7 +470,7 @@ fn advice_content(review:&Value)->Value {
     let mut findings=review["findings"].as_array().into_iter().flatten().map(|item|text(item.get("reason").unwrap_or(item))).collect::<Vec<_>>();
     findings.sort();findings.dedup();
     json!({"summary":text(&review["summary"]),"suggestions":suggestions,"findings":findings,"target":text(&review["target"]),
-        "observer_return":review["observer_return"],"visual_check_result":review["visual_check_result"],"visual_request":review["visual_request"],"review_status":review["review_status"]})
+        "observer_return":review["observer_return"],"original_message":review["original_message"],"visual_check_result":review["visual_check_result"],"visual_request":review["visual_request"],"review_status":review["review_status"]})
 }
 
 fn same_advice_issue(item:&Value,review:&Value,request_id:usize)->bool {
@@ -504,20 +507,12 @@ impl ObserverInbox {
         }
     }
     pub fn unhandled(&self)->Vec<Value> {self.pending().into_iter().filter(|item|item["disposition"]=="unread"&&item["organizer_consumption"].is_null()).collect()}
-    /// The same original messages go to Worker and Organizer. Archival and
+    /// Original Observer messages go only to Organizer. Archival and
     /// receipt metadata label history; they do not delete the sender's words.
     pub fn messages(&self)->Vec<Value> {
         let mut messages=self.items.values().filter(|item|item["request_id"]==self.request_id).cloned().collect::<Vec<_>>();
         messages.sort_by_key(|item|item["id"].as_str().and_then(|id|id.strip_prefix("advice_")).and_then(|id|id.parse::<usize>().ok()).unwrap_or(0));
         messages
-    }
-    pub fn message_cursor(&self)->usize {self.counter}
-    pub fn messages_since(&self,cursor:usize)->Vec<Value> {
-        let number=|item:&Value|item["id"].as_str().and_then(|id|id.strip_prefix("advice_"))
-            .and_then(|id|id.parse::<usize>().ok()).unwrap_or(0);
-        let mut messages=self.items.values().filter(|item|item["request_id"]==self.request_id&&number(item)>cursor)
-            .cloned().collect::<Vec<_>>();
-        messages.sort_by_key(number);messages
     }
     pub fn historical(&self)->Vec<Value> {
         self.items.values().filter(|item|item["request_id"]==self.request_id && item["archived"]==true).rev().take(4).cloned().collect()
@@ -636,7 +631,7 @@ impl ObserverInbox {
             "observed_at":review["observed_at"],"execution_revision":review["execution_revision"],
             "archived":request_id != self.request_id || (!review["identity"].is_null() && !self.scope.is_null() && !crate::observer_service::applies(&review["identity"],&self.scope)),
             "category":category,"review_status":review["review_status"],"visual_artifacts":review["visual_artifacts"],"visual_check_result":review["visual_check_result"],"visual_request":review["visual_request"],
-            "observer_return":review["observer_return"],
+            "observer_return":review["observer_return"],"original_message":review["original_message"],
             "summary":review["summary"],"suggestions":review["suggestions"],"findings":review["findings"],"target":review["target"],"supersedes_advice_id":previous,
             "origin_step":review["step"],"latest_step":review["step"],"node_id":review["node_id"],
             "delivered":false,"disposition":"unread","reason":""}));
@@ -644,11 +639,16 @@ impl ObserverInbox {
 
     pub fn deliver(&mut self) -> Vec<Value> {
         let mut newly = Vec::new();
-        for item in self.items.values_mut().filter(|item|item["request_id"] == self.request_id && item["archived"] != true && item["disposition"] == "unread").take(8) {
-            if item["delivered"] != true {
-                item["delivered"] = json!(true);
-                newly.push(item.clone());
-            }
+        // Limit new deliveries, not previously delivered history. Keep the
+        // insertion order already represented by the existing advice IDs.
+        let mut ids=self.items.iter().filter(|(_,item)|item["request_id"] == self.request_id
+            && item["archived"] != true && item["disposition"] == "unread" && item["delivered"] != true)
+            .map(|(id,_)|id.clone()).collect::<Vec<_>>();
+        ids.sort_by_key(|id|id.strip_prefix("advice_").and_then(|id|id.parse::<usize>().ok()).unwrap_or(0));
+        for id in ids.into_iter().take(8) {
+            let item=self.items.get_mut(&id).unwrap();
+            item["delivered"] = json!(true);
+            newly.push(item.clone());
         }
         newly
     }
@@ -710,6 +710,10 @@ impl ObserverInbox {
     }
 }
 
+}
+#[cfg(test)]
+pub use legacy_observer_inbox::ObserverInbox;
+
 #[cfg(test)]
 mod observer_request_tests {
     use super::*;
@@ -763,6 +767,32 @@ mod observer_request_tests {
         assert!(inbox.unhandled().is_empty());
         assert!(inbox.all_unread().is_empty());
         assert_eq!(inbox.snapshot()["items"][ids[0].as_str()]["summary"],"Pass the service URL to the font check");
+    }
+
+    #[test]
+    fn restored_delivered_history_does_not_starve_new_advice_or_reorder_it() {
+        let mut inbox=ObserverInbox::default();inbox.start_request(2);
+        for index in 0..8 {
+            let mut old=review(2,&format!("old_{index}"),"old observation");old["category"]=json!("planning");
+            inbox.insert(&old);
+        }
+        let delivered=inbox.deliver();assert_eq!(delivered.len(),8);
+        let ids=delivered.iter().map(|item|item["id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        inbox.record_organizer_consumption(&ids,&json!({"action":"work","decision_id":"old_decision"}),4,1);
+        let mut restored:ObserverInbox=serde_json::from_value(inbox.snapshot()).unwrap();
+        let original="  {\"summary\":\"给 Organizer 的原始建议\"}\n";
+        for index in 0..9 {
+            let mut next=review(2,&format!("new_{index}"),"new observation");
+            next["category"]=json!("planning");
+            next["original_message"]=json!({"role":"assistant","content":original});
+            restored.insert(&next);
+        }
+        let first=restored.deliver();assert_eq!(first.len(),8);
+        assert_eq!(first.iter().map(|item|item["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            (9..17).map(|index|format!("advice_{index}")).collect::<Vec<_>>());
+        assert!(first.iter().all(|item|item["original_message"]["content"]==original));
+        let last=restored.deliver();assert_eq!(last.len(),1);assert_eq!(last[0]["id"],"advice_17");
+        assert!(restored.deliver().is_empty(),"each new message is delivered once");
     }
 
     #[test]

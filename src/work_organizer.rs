@@ -65,6 +65,7 @@ fn organizer_tools(input:&Value)->Vec<Value> {
         "parameters":{"type":"object","properties":{
             "goal":{"type":"string","minLength":1,"maxLength":2400},"return_when":{"type":"string","minLength":1,"maxLength":1200},
             "reason":{"type":"string","minLength":1,"maxLength":1200},
+            "context":{"type":"object","description":"Necessary facts, source references and instructions you selected for Worker. Worker cannot read shared conversation history or receive Observer advice directly; supply needed information here or through exact upstream inputs."},
             "completion":{"type":"string","enum":["output","write","check","write_check"],"description":"Optional legacy metadata; does not constrain task contents or imply success."},
             "checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000},"description":"Optional host-observed check identifiers. Supported identifiers: npm:, npm-start:, npm-install:, program:, http-probe:."},
             "inputs":{"type":"array","maxItems":16,"description":"Exact upstream work/node references and fields from available_dependency_deliveries.","items":{"type":"object","properties":{
@@ -83,7 +84,7 @@ fn organizer_tools(input:&Value)->Vec<Value> {
     let resume=json!({"type":"function","function":{"name":"resume_task",
         "description":"Continue an existing unfinished node without creating another node or replacing its task contract. Use a work_id and revision from process.resumable_tasks when the user continues the same goal.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"revision":{"type":"integer","minimum":1},
-            "reason":{"type":"string","minLength":1},"request_action":request_action_schema(input)},"required":["work_id","revision","reason"]}}});
+            "reason":{"type":"string","minLength":1},"context":{"type":"object","description":"Updated necessary information selected for this unfinished Worker. Replaces its prior provided context when present."},"request_action":request_action_schema(input)},"required":["work_id","revision","reason"]}}});
     let read=json!({"type":"function","function":{"name":"read_task_result",
         "description":"Read exact selected fields from any completed task instance by work_id, including historical/deprecated revisions. The response labels whether it is historical and dependency-eligible. Raw source and operation materials remain in the notebook.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"node_id":{"type":"string"},
@@ -121,7 +122,15 @@ fn organizer_tools(input:&Value)->Vec<Value> {
             "reason":{"type":"string","minLength":1},"repair_goal":{"type":"string","maxLength":2400},
             "replacement_checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000}},
             "request_action":request_action_schema(input)},"required":["target_node_id","reason"]}}});
-    vec![schedule,resume,read,flow,crate::session_history::tool(),work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit]
+    let mut tools=vec![schedule,resume,read,flow,crate::session_history::tool(),work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit];
+    if input.pointer("/process/handoff/intent").and_then(Value::as_str)==Some("session_continuation") {
+        for tool in &mut tools {
+            if tool.pointer("/function/parameters/properties/request_action").is_some() {
+                tool["function"]["parameters"]["required"].as_array_mut().unwrap().push(json!("request_action"));
+            }
+        }
+    }
+    tools
 }
 
 fn host_work_id(task_id:&str,turn:usize,step:usize)->String {
@@ -143,6 +152,9 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             let goal=args["goal"].as_str().unwrap().trim();
             let return_when=args["return_when"].as_str().unwrap().trim();
             let reason=args["reason"].as_str().unwrap().trim();
+            if args.get("context").is_some_and(|value|!value.is_object()) {
+                return Err(contract_error("INVALID_WORK_CONTEXT","context",args.get("context"),"context must be an object selected by Organizer"));
+            }
             if args.get("completion").is_some_and(|value|!matches!(value.as_str(),Some("output"|"write"|"check"|"write_check"))) {
                 return Err(contract_error("INVALID_COMPLETION","completion",args.get("completion"),"completion must be output, write, check, or write_check"));
             }
@@ -154,6 +166,7 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
             let order=json!({"id":id,"node_id":format!("work_{id}"),"goal":goal,"done_when":return_when,
                 "completion":args.get("completion").cloned().unwrap_or(json!("output")),"checks":args.get("checks").cloned().unwrap_or_else(||json!([])),
                 "constraints":args.get("constraints").cloned().unwrap_or_else(||json!([])),
+                "context":args.get("context").cloned().unwrap_or_else(||json!({})),"original_command":args.to_string(),
                 "dependency_inputs":args.get("inputs").cloned().unwrap_or_else(||json!([])),
                 "edit_targets":scope.get("edit_targets").cloned().unwrap_or_else(||json!([])),
                 "browser_document_path":scope.get("browser_document_path"),"visual_goal":scope.get("visual_goal"),
@@ -174,6 +187,10 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
                 contract_error("RESUME_REVISION_REQUIRED","revision",args.get("revision"),"provide the existing node revision"))?;
             if args["reason"].as_str().is_none_or(|reason|reason.trim().is_empty()) {return Err(contract_error("RESUME_REASON_REQUIRED","reason",args.get("reason"),"state why this existing task continues"));}
             let mut decision=json!({"action":"select","task_id":work_id,"target_revision":revision,"reason":args["reason"]});
+            if let Some(context)=args.get("context") {
+                if !context.is_object() {return Err(contract_error("INVALID_WORK_CONTEXT","context",Some(context),"context must be an object selected by Organizer"));}
+                decision["context"]=context.clone();
+            }
             if let Some(action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=action.clone();}
             Ok(decision)
         },
@@ -276,7 +293,10 @@ fn decision_from_message(message:&Value,task_id:&str,turn:usize,step:usize)->Res
         .ok_or_else(||contract_error("ARGUMENTS_REQUIRED","arguments",Some(&calls[0]),"Organizer method arguments are missing"))?;
     if raw.len()>MAX_METHOD_ARGUMENT_BYTES {return Err(contract_error("ARGUMENTS_TOO_LARGE","arguments",Some(&json!(raw.len())),"Organizer method arguments exceed contract size"));}
     let args:Value=serde_json::from_str(raw).map_err(|error|contract_error("INVALID_ARGUMENTS","arguments",Some(&json!(raw)),error.to_string()))?;
-    normalize_decision(name,args,task_id,turn,step)
+    let mut decision=normalize_decision(name,args,task_id,turn,step)?;
+    if name=="schedule_task" {decision["orders"][0]["original_command"]=json!(raw);}
+    if matches!(name,"resume_task"|"revisit_task") {decision["original_command"]=json!(raw);}
+    Ok(decision)
 }
 
 /// A completed response is accepted only after the provider signalled its end.
@@ -354,18 +374,25 @@ pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usi
     cancel:&CancellationToken, timeout:Duration) -> Result<Value> {
     let construction_started=Instant::now();
     let tools=organizer_tools(&input);
-    let mut messages=vec![json!({"role":"system","content":include_str!("../prompts/organizer_system.md")})];
-    messages.extend(crate::session_history::organizer_messages(state.workspace.root(),task_id,&input).await?);
+    let mut view=crate::session_history::organizer_view(state.workspace.root(),task_id,&input,false).await?;
+    view.prepend(json!({"role":"system","content":include_str!("../prompts/organizer_system.md")}));
+    let messages=view.messages.clone();
     let mut body=json!({"model":model,"stream":true,"messages":messages,"tools":tools,"tool_choice":"auto"});
     if let Some(effort)=state.reasoning_effort.as_deref(){body["reasoning_effort"]=json!(effort);}
     if state.fast_mode {body["service_tier"]=json!("fast");}
-    let context_window=crate::context_window::prepare(&mut body,2)?;
+    let scope=format!("request:{}",input["process"]["request_id"].as_u64().unwrap_or(1));
+    let context_window=crate::context_rebuild::prepare(state,model,"organizer",task_id,&scope,&input,&mut body,view,
+        json!({"turn":turn,"step":step,"nodeId":node,"request_id":input["process"]["request_id"]}),cancel,timeout).await?;
+    let visual_context=crate::visual_artifacts::VisualContext {turn:Some(turn),identity:json!({"task_id":task_id,
+        "request_id":input["process"]["request_id"].as_u64().unwrap_or(1),"node_id":node}),..Default::default()};
+    let visual_dispatch=crate::visual_artifacts::prepare_request(state,"organizer",model,&visual_context,&[],input["human_request"].as_str().unwrap_or("review current task"),&mut body).await?;
+    crate::context_window::prepare(&mut body,2)?;
     let request_construction_ms=construction_started.elapsed().as_millis() as u64;
     let request_bytes=body.to_string().len();
     let metadata=json!({"actor":"organizer","stage":"organization","turn":turn,"step":step,"nodeId":node,
         "request_id":input["process"]["request_id"],"workId":input["process"]["current_work"]["id"],"revision":input["process"]["current_revision"],
         "plan_revision":input["process"]["plan_revision"],"request_construction_ms":request_construction_ms,"request_bytes":request_bytes,
-        "context_window":context_window});
+        "context_window":context_window,"visual_dispatch":visual_dispatch});
     let trace=crate::request_context::record(state.workspace.root(),task_id,metadata.clone(),&body).await;
     let progress=Progress{state,task_id,turn,step,node};
     let request_started=Instant::now();
@@ -382,7 +409,7 @@ pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usi
             Ok(completed)=>{
                 stats=completed.stats.clone();
                 crate::agent_service::emit(state.workspace.root(),task_id,"organizer/method_message",
-                    json!({"turn":turn,"step":step,"message":completed.message})).await?;
+                    json!({"turn":turn,"step":step,"actor":"organizer","identity":{"task_id":task_id,"request_id":input["process"]["request_id"]},"message":completed.message})).await?;
                 (completed_decision(completed,task_id,turn,step),None)
             },
             Err(error)=>(Err(error),None),
@@ -419,6 +446,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continuation_schema_requires_the_same_request_action_as_runtime() {
+        for continuation in [false,true] {
+            let input=if continuation {json!({"process":{"handoff":{"intent":"session_continuation"}},"capabilities":{"allowed_request_actions":["continue","subtask","replace"]}})} else {json!({})};
+            for tool in organizer_tools(&input) {
+                if tool.pointer("/function/parameters/properties/request_action").is_some() {
+                    assert_eq!(tool["function"]["parameters"]["required"].as_array().unwrap().contains(&json!("request_action")),continuation);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn independent_read_methods_share_one_completed_response() {
         let calls=[("read_task_result",json!({"work_id":"upload","fields":["worker_return"]})),
             ("read_session_history",json!({"event_seq":42}))].into_iter().enumerate().map(|(index,(name,args))|
@@ -443,6 +482,32 @@ mod tests {
         let details=contract_details(&finish).unwrap();
         assert_eq!(details["field_path"],"summary");
         assert_eq!(details["rule_id"],"FINISH_SUMMARY_REQUIRED");
+    }
+
+    #[test]
+    fn organizer_context_is_preserved_in_schedule_and_resume_and_rejects_nonobjects() {
+        let context=json!({"fact":"collision","source_event_seq":42,"instruction":"check driving"});
+        let scheduled=normalize_decision("schedule_task",json!({"goal":"check driving","return_when":"report","reason":"observed collision","context":context}),"task",1,1).unwrap();
+        assert_eq!(scheduled["orders"][0]["context"],context);
+        let resumed=normalize_decision("resume_task",json!({"work_id":"w","revision":1,"reason":"new facts","context":context}),"task",1,1).unwrap();
+        assert_eq!(resumed["context"],context);
+        for (tool,args) in [
+            ("schedule_task",json!({"goal":"check","return_when":"report","reason":"fact","context":"wrong"})),
+            ("resume_task",json!({"work_id":"w","revision":1,"reason":"fact","context":[]}))
+        ] {assert_eq!(contract_details(&normalize_decision(tool,args,"task",1,1).unwrap_err()).unwrap()["rule_id"],"INVALID_WORK_CONTEXT");}
+    }
+
+    #[test]
+    fn original_schedule_and_resume_arguments_retain_exact_bytes() {
+        for (name,raw) in [
+            ("schedule_task"," {\n \"goal\":\"执行任务\", \"return_when\":\"返回\", \"reason\":\"用户要求\" } "),
+            ("resume_task"," { \"work_id\":\"w\", \"revision\":1, \"reason\":\"改用新信息\", \"context\":{\"fact\":\"原文\"} } ")
+        ] {
+            let message=json!({"tool_calls":[{"id":"call","function":{"name":name,"arguments":raw}}]});
+            let decision=decision_from_message(&message,"task",1,1).unwrap();
+            let command=if name=="schedule_task" {&decision["orders"][0]["original_command"]} else {&decision["original_command"]};
+            assert_eq!(command,raw);
+        }
     }
 
     #[test]

@@ -6,6 +6,11 @@ import { foldImageData } from '../visual.ts'
 
 function text(value: unknown): string { return typeof value === 'string' ? value : JSON.stringify(value, null, 2) ?? '' }
 function messageLabel(message: Record<string, unknown>): string {
+  const name = String(message.name ?? '')
+  if (name === 'organizer') return 'Organizer 原始命令'
+  if (name === 'observer_retrospective') return 'Observer 原始复盘'
+  if (name.startsWith('observer_')) return 'Observer 历史消息'
+  if (name.startsWith('worker_return_')) return 'Worker 原始返回'
   const content = text(message.content)
   if (content.startsWith('Current work packet')) return '当前工作入参 · 目标、上游结果、HTTP 观测、完成条件'
   if (content.startsWith('Current task-tree node')) return '当前节点 · 祖先目标与子问题结果'
@@ -142,7 +147,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
 
   return <section className={css.panel}>
     <h3>实际模型请求上下文</h3>
-    <p className={css.hint}>开启调试后，从下一次请求开始记录。这里按请求发起时的节点归属展示；规划前请求及复盘可在「全部请求」查看。字节和字符数不是 token 数。</p>
+    <p className={css.hint}>规划、执行和观察的每次完整请求自动记录，任务结束后保留。Worker 是 Organizer 专注任务的执行分身，接收任务及必要信息并返回结果；Observer 只在执行结束后复盘原始过程，结论显示在聊天中。这里展示各次请求实际收到的上下文；同一历史事实被多次引用不代表多次操作。规划前请求及复盘可在「全部请求」查看。</p>
     {error && <p role="alert" className={css.error}>{error}</p>}
     <select aria-label="选择模型请求" value={selected ?? ''} onChange={event => { setSelected(Number(event.target.value) || null); setCompare(false) }}>
       <option value="">选择请求（{visible.length} 条）</option>
@@ -150,7 +155,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
         const rev = (item as unknown as { revision?: number }).revision
         const revLabel = rev && rev > 1 ? ` (r${rev})` : ''
         const displayId = (item as unknown as { workId?: string }).workId || item.nodeId || '未分配节点'
-        return <option key={item.id} value={item.id}>{item.actor === 'worker' ? 'Worker' : item.actor === 'organizer' ? 'Organizer' : 'Observer'} · 第 {item.turn} 轮 / 步骤 {item.step} · {item.stage} · {displayId}{revLabel}{item.review_id ? ` · 复盘 ${item.review_id}` : ''} · {statuses[item.status] ?? item.status}</option>
+        return <option key={item.id} value={item.id}>{item.actor === 'worker' ? 'Worker · 执行调用' : item.actor === 'organizer' ? 'Organizer · 任务决策' : 'Observer · 结束复盘'} · 第 {item.turn} 轮 / 步骤 {item.step} · {item.stage} · {displayId}{revLabel}{item.review_id ? ` · 复盘 ${item.review_id}` : ''} · {statuses[item.status] ?? item.status}</option>
       })}
     </select>
     {!visible.length && <p className={css.hint}>尚无已记录的请求。旧请求无法补回；节点切换后下一次请求才使用新节点上下文。</p>}
@@ -162,18 +167,19 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
         <span>{statuses[active.status] ?? active.status}{active.elapsed_ms === undefined ? '' : ` · ${(active.elapsed_ms / 1000).toFixed(1)} 秒`}</span>
         <span>{active.tools.length} 个可用工具</span>
       </div>
-      <p className={css.hint}>耗时包括调试存储、连接及完整模型响应，不包括后续工具执行。请求正文未再次裁剪，不包含鉴权请求头。</p>
+      <p className={css.hint}>耗时包括日志存储、连接及完整模型响应，不包括后续工具执行。请求正文未再次裁剪，不包含鉴权请求头。字节和字符数不是 token 数。</p>
+      <JsonDetails title="共享历史池与本次上下文的会话引用" value={{ context_access: (context.metadata as unknown as Record<string, unknown>).context_access, history_pool: (context.metadata as unknown as Record<string, unknown>).history_pool, history_reference: (context.metadata as unknown as Record<string, unknown>).history_reference }} />
       {active.compaction?.request_sizes && <p className={css.hint}>
         消息正文 {active.compaction.request_sizes.message_chars.toLocaleString()} 字符
         {' · '}其中系统消息 {active.compaction.request_sizes.system_chars.toLocaleString()}
         {' · '}工作记录 {active.compaction.request_sizes.work_state_chars.toLocaleString()}
         {' · '}工具定义另计 {active.compaction.request_sizes.tool_schema_chars.toLocaleString()} 字符（非 token 数）
       </p>}
-      {active.compaction?.work_projection && <p className={css.hint}>结论按本轮任务与相关文件筛选；完整历史仍保存在记事本。</p>}
+      {active.compaction?.work_projection && <p className={css.hint}>以下是宿主筛选元数据；实际模型输入以原始消息为准。完整历史仍保存在记事本。</p>}
       {active.work && <p>此前工具调用 {active.work.tool_calls} 次 · 写入成功 {active.work.successful_file_writes} 次 · 重复读取 {active.work.repeated_read_calls} 次</p>}
       {active.permission_mode && <p>本轮权限：{active.permission_mode}{active.final_step ? ' · 步数上限已到，工具因预算被移除' : ''}</p>}
       {active.compaction && <JsonDetails title={`历史裁剪：移除 ${active.compaction.omitted_raw_message_count} 条原始消息，截短 ${active.compaction.shortened_messages.length} 条`} value={active.compaction} />}
-      {predecessor && <label className={css.compare}><input type="checkbox" checked={compare} onChange={event => setCompare(event.target.checked)} />与上一条同角色请求比较（轮 {predecessor.turn} / 步骤 {predecessor.step}）</label>}
+      {predecessor && <label className={css.compare}><input type="checkbox" checked={compare} onChange={event => setCompare(event.target.checked)} />与上一条同来源请求比较（轮 {predecessor.turn} / 步骤 {predecessor.step}）</label>}
       {changes && <p>新增或变更消息 {changes.added.filter(Boolean).length} 条 · 上一请求中移除或被替换的消息 {changes.removed} 条。按完整消息匹配，摘要更新也算变更。</p>}
       {streamTimings(context.metadata.outcome) && <p className={css.hint}>{streamTimings(context.metadata.outcome)}</p>}
       <div className={css.actions}>

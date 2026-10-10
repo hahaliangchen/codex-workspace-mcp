@@ -18,7 +18,11 @@ fn scheduler_context(task:&str,scheduler:&crate::work_scheduler::WorkScheduler,w
         related_source_versions:json!(&frame.versions),current_page:frame.browser_page.clone(),host_current_artifact_ids:frame.current_visual_artifact_ids.clone(),..Default::default()}
 }
 fn images(body:&Value)->Vec<Vec<u8>> {body["messages"].as_array().into_iter().flatten().flat_map(|message|message["content"].as_array().into_iter().flatten()).filter_map(|block|block["image_url"]["url"].as_str()).map(|url|STANDARD.decode(url.strip_prefix("data:image/png;base64,").unwrap()).unwrap()).collect()}
-fn manifest(body:&Value)->Value {body["messages"].as_array().into_iter().flatten().filter_map(|message|message["content"].as_str()).find_map(|text|text.strip_prefix("Host visual dispatch: ")).map(|text|serde_json::Deserializer::from_str(text).into_iter::<Value>().next().unwrap().unwrap()).unwrap_or(Value::Null)}
+fn manifest(body:&Value)->Value {body["messages"].as_array().into_iter().flatten().rev().find_map(|message| {
+    let content=&message["content"];
+    let text=content.as_str().or_else(||content.as_array()?.iter().find_map(|block|block["text"].as_str()))?;
+    text.strip_prefix("Host visual dispatch: ").map(|text|serde_json::Deserializer::from_str(text).into_iter::<Value>().next().unwrap().unwrap())
+}).unwrap_or(Value::Null)}
 fn check(dispatch:&Value)->Value {
     let selected=dispatch["images"].as_array().into_iter().flatten().collect::<Vec<_>>();
     let current=selected.last();
@@ -32,6 +36,141 @@ fn fallback_check(dispatch:&Value)->Value {
     json!({"artifact_ids":service["artifact_ids"],"checked_goal":service["checked_goal"],"expected_visible_result":service["expected_visible_result"],
         "request_trace_id":dispatch["request_trace_id"],"assessment":service["assessment"],"observed_facts":service["observed_facts"],"issues":service["issues"],
         "limitations":service["limitations"],"visual_service_result_id":dispatch["visual_service_result_id"]})
+}
+
+#[tokio::test]
+async fn original_image_messages_reach_all_roles_and_paged_history_without_flattening() {
+    let root=TestRoot::new();task(&root.0,"task");let owner=context("task");
+    let first=png(80,60);let second=png(90,70);
+    let ids=[first.clone(),second.clone()].iter().map(|bytes|visual::save(&root.0,&owner,json!({}),bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+    let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
+    let mut worker=json!({"messages":[]});let dispatch=visual::prepare_request(&state,"worker","fake-model",&owner,&ids,"inspect two pages",&mut worker).await.unwrap();
+    let process=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
+    let original=&process["records"][0]["payload"]["content"];
+    let observer=crate::session_history::process_messages(&process);
+    let organizer=crate::session_history::organizer_messages(&root.0,"task",&json!({"process":{"request_id":1}})).await.unwrap();
+    let exact=crate::session_history::read(&root.0,"task",&json!({"event_seq":process["records"][0]["seq"],"max_chars":256})).await.unwrap();
+    assert!(exact["records"][0]["omitted_chars"].as_u64().unwrap()>0);
+    let historical=crate::session_history::history_image_messages(&exact);
+    let reader=visual::VisualContext {identity:json!({"task_id":"task","request_id":1,"node_id":"request"}),..Default::default()};
+    for (role,messages) in [("observer",observer),("organizer",organizer),("worker",historical)] {
+        let references=messages.iter().flat_map(|message|message["content"].as_array().into_iter().flatten()).filter(|block|block["type"]=="image_ref").collect::<Vec<_>>();
+        assert_eq!(references.len(),2,"{role} lost an image reference");
+        assert_eq!(references[0],&original[2]);assert_eq!(references[1],&original[4]);
+        let mut body=json!({"messages":messages});let delivered=visual::prepare_request(&state,role,"fake-model",&reader,&[],"review original messages",&mut body).await.unwrap();
+        assert_eq!(images(&body),vec![first.clone(),second.clone()],"{role} must receive the same immutable pixels");
+        assert_eq!(delivered["selected_artifact_ids"],json!([]));assert_eq!(delivered["retained_artifact_ids"],json!(ids));
+        assert!(!body.to_string().contains("source_identity\":"),"local routing metadata must not reach the provider as an extra message field");
+        assert!(!body["messages"].as_array().unwrap().iter().any(|message|message.get("source_identity").is_some()));
+        if role!="worker" {assert!(body.to_string().contains(dispatch["request_trace_id"].as_str().unwrap()),"the original Worker dispatch stays in history");}
+    }
+    let mut wrong=reader.clone();wrong.identity["request_id"]=json!(2);
+    let mut body=json!({"messages":crate::session_history::process_messages(&process)});
+    let historical=visual::prepare_request(&state,"observer","fake-model",&wrong,&[],"read earlier request",&mut body).await.unwrap();
+    assert_eq!(images(&body),vec![first,second]);assert_eq!(historical["identity"]["request_id"],2);
+    assert!(historical["images"].as_array().unwrap().iter().all(|image|image["identity"]["request_id"]==1),"historical image ownership is not rewritten to the new request");
+    let validated=visual::validate_check(&root.0,&wrong,&check(&historical),&[historical],"worker").unwrap();
+    assert!(validated["artifacts"].as_array().unwrap().iter().all(|artifact|artifact["identity"]["request_id"]==1),"a delivered historical image is valid evidence with its original provenance");
+    let unavailable=visual::prepare_request(&state,"observer","fake-model",&wrong,&ids,"direct selection without historical routing",&mut json!({"messages":[]})).await.unwrap();
+    assert_eq!(unavailable["unavailable"].as_array().unwrap().len(),2);
+}
+
+#[tokio::test]
+async fn observer_history_tool_loop_restores_images_in_each_subsequent_request() {
+    let root=TestRoot::new();task(&root.0,"task");let owner=context("task");
+    let bytes=[png(80,60),png(90,70)];
+    let requests=Arc::new(Mutex::new(Vec::<Value>::new()));let captured=requests.clone();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move {axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>| {
+        let requests=captured.clone();async move {
+            let mut calls=requests.lock().unwrap();let round=calls.len();calls.push(body);
+            let message=if round<2 {json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("history-{round}"),"type":"function","function":{"name":"read_session_history","arguments":json!({"event_seq":round,"max_chars":256}).to_string()}}]})}
+                else {json!({"role":"assistant","content":json!({"summary":"Both original images received","assessment":"on_track","recommendations":[]}).to_string()})};
+            Json(json!({"choices":[{"message":message}]}))
+        }
+    }))).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root.0,address);state.observer_provider_url=state.provider_url.clone();supported(&mut state);
+    for pixels in &bytes {
+        let id=visual::save(&root.0,&owner,json!({}),pixels).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+        visual::prepare_request(&state,"worker","fake-model",&owner,&[id],"inspect page",&mut json!({"messages":[]})).await.unwrap();
+    }
+    let input=json!({"identity":{"task_id":"task","request_id":1,"node_id":"request"},"request":{"goal":"review image delivery"}});
+    agent::observer_json_response(&state,"fake-model","Review the original record",input,1000,"task",json!({})).await.unwrap();
+    let requests=requests.lock().unwrap();assert_eq!(requests.len(),3);
+    assert!(images(&requests[0]).is_empty());assert_eq!(images(&requests[1]),vec![bytes[0].clone()]);assert_eq!(images(&requests[2]),bytes.to_vec());
+    assert_eq!(manifest(&requests[2])["selected_artifact_ids"],json!([]));assert_eq!(manifest(&requests[2])["actor"],"observer");
+    assert!(!requests[2].to_string().contains("\"type\":\"image_ref\""));server.abort();
+}
+
+#[tokio::test]
+async fn organizer_and_retrospective_http_preserve_the_same_original_images() {
+    let root=TestRoot::new();task(&root.0,"task");let owner=context("task");let bytes=png(80,60);
+    let requests=Arc::new(Mutex::new(Vec::<Value>::new()));let captured=requests.clone();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move {axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>| {
+        let requests=captured.clone();async move {
+            let organizer=body["tools"].as_array().unwrap().iter().any(|tool|tool["function"]["name"]=="finish_request");
+            requests.lock().unwrap().push(body);
+            let message=if organizer {json!({"role":"assistant","content":null,"tool_calls":[{"id":"finish","type":"function","function":{"name":"finish_request","arguments":json!({"summary":"Image received","achieved":true}).to_string()}}]})}
+                else {json!({"role":"assistant","content":json!({"summary":"Image received","path_review":"one original image"}).to_string()})};
+            Json(json!({"choices":[{"message":message}]}))
+        }
+    }))).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root.0,address);state.observer_provider_url=state.provider_url.clone();supported(&mut state);
+    let id=visual::save(&root.0,&owner,json!({}),&bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    visual::prepare_request(&state,"worker","fake-model",&owner,&[id],"inspect page",&mut json!({"messages":[]})).await.unwrap();
+    crate::work_organizer::decide(&state,"fake-model","task",1,2,"request",json!({"human_request":"inspect page","process":{"request_id":1}}),&CancellationToken::new(),Duration::from_secs(5)).await.unwrap();
+    let history=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
+    let input=json!({"stage":"retrospective","identity":{"task_id":"task","request_id":1,"node_id":"request"},"task_history":history,"request":{"goal":"inspect page"}});
+    agent::observer_json_response(&state,"fake-model","Review the original record",input,1000,"task",json!({})).await.unwrap();
+    let calls=requests.lock().unwrap();assert_eq!(calls.len(),2);
+    for call in calls.iter() {assert_eq!(images(call),vec![bytes.clone()]);assert!(!call["messages"].as_array().unwrap().iter().any(|message|message.get("source_identity").is_some()));}
+    assert_eq!(manifest(&calls[0])["actor"],"organizer");assert_eq!(manifest(&calls[1])["actor"],"observer");server.abort();
+}
+
+#[tokio::test]
+#[ignore = "real configured Observer replay; requires OBSERVER_REPLAY_AUDIT and OBSERVER_REPLAY_ROOT"]
+async fn real_observer_original_multimodal_history_recheck() -> anyhow::Result<()> {
+    let audit=PathBuf::from(std::env::var("OBSERVER_REPLAY_AUDIT")?);
+    let original_root=PathBuf::from(std::env::var("OBSERVER_REPLAY_ROOT")?);
+    let out=audit.parent().unwrap().join(format!("shared-image-retrospective-recheck-{}",visual::new_id()));std::fs::create_dir_all(&out)?;
+    let source:Value=serde_json::from_slice(&std::fs::read(audit.join("request-contexts/607.json"))?)?;
+    let mut input=crate::session_history::parse_plain_context(source["body"]["messages"][1]["content"].as_str().unwrap());
+    let task_id=input["identity"]["task_id"].as_str().unwrap().to_owned();
+    let mut history=crate::session_history::task_process(&original_root,&task_id,input["identity"]["request_id"].as_u64().unwrap() as usize).await?;
+    let before=input["task_history"]["history_reference"]["before_seq"].as_i64().unwrap();
+    history["records"].as_array_mut().unwrap().retain(|record|record["seq"].as_i64().unwrap()<before);
+    history["total_records"]=json!(history["records"].as_array().unwrap().len());history["history_reference"]=input["task_history"]["history_reference"].clone();
+    input["task_history"]=history.clone();
+    // Isolate test event writes while preserving original IDs, metadata and bytes.
+    task(&out,&task_id);let original=agent::open_db(&original_root)?;let target=agent::open_db(&out)?;
+    target.execute_batch("CREATE TABLE IF NOT EXISTS agent_visual_artifacts(artifact_id TEXT PRIMARY KEY,task_id TEXT NOT NULL,metadata TEXT NOT NULL)")?;
+    let mut stmt=original.prepare("SELECT artifact_id,metadata FROM agent_visual_artifacts WHERE task_id=?1")?;
+    let artifacts=stmt.query_map([&task_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+    for (id,raw) in &artifacts {
+        let item:Value=serde_json::from_str(raw)?;let path=item["workspace_relative_path"].as_str().unwrap();
+        let destination=out.join(path);std::fs::create_dir_all(destination.parent().unwrap())?;std::fs::copy(original_root.join(path),destination)?;
+        target.execute("INSERT INTO agent_visual_artifacts(artifact_id,task_id,metadata) VALUES (?1,?2,?3)",rusqlite::params![id,task_id,raw])?;
+    }
+    // Retain exact history reads if the model asks for an original event.
+    let mut events=original.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 AND seq<?2 ORDER BY seq")?;
+    let rows=events.query_map(rusqlite::params![task_id,before],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?.collect::<Result<Vec<_>,_>>()?;
+    for (seq,time,kind,data) in rows {target.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES (?1,?2,?3,?4,?5)",rusqlite::params![task_id,seq,time,kind,data])?;}
+    target.execute_batch("CREATE TABLE IF NOT EXISTS agent_context_debug(task_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0)")?;
+    target.execute("INSERT OR REPLACE INTO agent_context_debug(task_id,enabled) VALUES (?1,1)",[&task_id])?;
+    let mut state=agent::tests::flow_test_state(&out,"127.0.0.1:1".parse()?);
+    let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;crate::ai_proxy::apply_agent_config(&mut state,&config);
+    let model=source["body"]["model"].as_str().unwrap();
+    let started=std::time::Instant::now();
+    let result=agent::observer_json_response(&state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,&task_id,json!({"stage":"retrospective_recheck"})).await;
+    let mut requests=target.prepare("SELECT metadata,request_json FROM agent_request_contexts WHERE task_id=?1 ORDER BY id")?;
+    let requests=requests.query_map([&task_id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+    for (index,(_,body)) in requests.iter().enumerate() {std::fs::write(out.join(format!("request-{index}.json")),body)?;}
+    let raw=result.as_ref().cloned().unwrap_or_else(|error|format!("{error:#}"));std::fs::write(out.join("observer-response.txt"),&raw)?;
+    let pixel_inputs=requests.iter().map(|(_,body)|images(&serde_json::from_str::<Value>(body).unwrap()).iter().map(|bytes|json!({"bytes":bytes.len(),"hash":visual::hash(bytes)})).collect::<Vec<_>>()).collect::<Vec<_>>();
+    std::fs::write(out.join("report.json"),serde_json::to_vec_pretty(&json!({"model":model,"provider":state.observer_provider,"original_task":task_id,"through_seq_exclusive":before,"process_records":history["total_records"],"elapsed_ms":started.elapsed().as_millis(),"request_image_inputs":pixel_inputs,"succeeded":result.is_ok(),"response":raw,"original_task_modified":false,"new_captures":0}))?)?;
+    println!("Observer original multimodal recheck: {}",out.display());result?;
+    anyhow::ensure!(pixel_inputs.first().is_some_and(|images|images.len()==2),"the actual Observer request must receive both original images");Ok(())
 }
 
 #[test]
@@ -98,6 +237,58 @@ async fn visual_dispatch_capability_budget_restore_and_result_binding_are_explic
 }
 
 #[tokio::test]
+async fn visual_handoff_keeps_original_messages_without_host_request_aggregation() {
+    use crate::work_scheduler::{Completion,WorkOrder,WorkScheduler};
+    let root=TestRoot::new();task(&root.0,"task");
+    let mut scheduler=WorkScheduler::default();scheduler.request_started_turn=1;
+    scheduler.apply(&json!({"action":"work","orders":[{"id":"w","node_id":"n","goal":"check two pages","done_when":"report rendering","completion":"output"}]}),false,false).unwrap();
+    let ctx=scheduler_context("task",&scheduler,"w");
+    let id=visual::save(&root.0,&ctx,json!({}),&png(80,60)).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
+    let mut body=json!({"messages":[]});
+    let first=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id],"check two pages",&mut body).await.unwrap();
+    scheduler.visual_response_received(&first);
+    for _ in 0..3 {
+        let mut next=json!({"messages":[visual::conversation_message(&first)]});
+        let retained=visual::prepare_request(&state,"worker","fake-model",&ctx,&[],"check two pages",&mut next).await.unwrap();
+        assert_eq!(images(&next),images(&body));
+        assert_eq!(retained["selected_artifact_ids"],json!([]));
+        scheduler.visual_response_received(&retained);
+    }
+    let original=json!({"summary":"Original visual observation","limitations":["Original limitation"],"diagnostic":{"detail":"Full original result"}});
+    let output=scheduler.return_work(&original).unwrap();
+    assert!(output.get("visual_requests").is_none());
+    assert_eq!(output["worker_return"],original);
+    let organizer=scheduler.organizer_input();
+    assert!(organizer["current_result"].get("visual_requests").is_none());
+    assert_eq!(organizer["current_result"]["worker_return"],original);
+    let observer=crate::observer_service::observation("task",&scheduler,"w",1,4,"handoff","check two pages",&json!({}),json!({}),json!({"handoff":output}),json!([]));
+    assert!(!observer.to_string().contains("\"visual_requests\""));
+    // The model contexts do not need a second list to retain original delivery.
+    let history=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
+    assert_eq!(history["records"].as_array().unwrap().len(),4);
+    assert!(serde_json::to_string(&crate::session_history::process_messages(&history)).unwrap().contains(first["request_trace_id"].as_str().unwrap()));
+    for mode in 0..3 {
+        let mut next:WorkScheduler=serde_json::from_value(scheduler.snapshot()).unwrap();
+        if mode==2 {
+            let legacy=next.frames["w"].visual_requests.clone();
+            next.frames.get_mut("w").unwrap().output.as_mut().unwrap()["visual_requests"]=json!(legacy);
+            assert!(next.organizer_input()["current_result"].get("visual_requests").is_none());
+        }
+        next.enqueue(vec![WorkOrder{id:"next".into(),node_id:"next_node".into(),goal:"continue".into(),done_when:"report".into(),
+            dependency_inputs:if mode==0 {vec![json!({"work_id":"w"})]}else{vec![]},
+            upstream_ids:if mode==1 {vec!["w".into()]}else{vec![]},completion:Completion::Output,..Default::default()}],false,false).unwrap();
+        next.activate_next().unwrap();
+        let packet=next.worker_input("continue");
+        assert!(!packet.to_string().contains("\"visual_requests\""));
+        if mode==2 {assert_eq!(packet["upstream_outputs"],json!([]));assert!(packet.get("previous_step").is_none());continue;}
+        let delivered=&packet["upstream_outputs"][0];
+        assert_eq!(delivered["diagnostic"],original["diagnostic"]);
+        assert_eq!(delivered["limitations"],original["limitations"]);
+    }
+}
+
+#[tokio::test]
 async fn unavailable_visual_message_survives_worker_restore_and_observer_http() {
     let root=TestRoot::new();task(&root.0,"task");
     let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
@@ -138,7 +329,8 @@ async fn unavailable_visual_message_survives_worker_restore_and_observer_http() 
     let raw=agent::observer_json_response(&state,"fake-model","Review current result",observer_context,2000,"task",json!({})).await.unwrap();
     let result:Value=serde_json::from_str(&raw).unwrap();
     assert!(result.get("visual_request").is_none(),"Observer did not request image input");
-    assert_eq!(result["observer_return"]["diagnostic"]["original_reason"],"image capability unknown; no fallback");
+    assert_eq!(result["diagnostic"]["original_reason"],"image capability unknown; no fallback");
+    assert!(result.get("observer_return").is_none(),"host must not add fields to the original reply");
     server.abort();
 }
 
@@ -162,11 +354,13 @@ async fn worker_keeps_visual_unavailability_in_original_messages_across_work_rou
                 let stage=worker_calls.fetch_add(1,Ordering::Relaxed);
                 let operation=match stage {
                     0=>{
-                        let packet=body["messages"].as_array().unwrap().iter().filter_map(|message|message["content"].as_str())
-                            .find_map(|text|text.strip_prefix("Current work packet:\n")).map(crate::session_history::parse_plain_context).unwrap();
-                        let order=&packet["current_work"];
-                        let ctx=visual::VisualContext {identity:json!({"task_id":"task","request_id":packet["request_id"],"work_id":order["id"],
-                            "node_id":order["node_id"],"revision":order["revision"],"plan_revision":order["plan_revision"]}),..Default::default()};
+                        // Test fixture artifacts bind to the request's recorded transport
+                        // identity; the original Organizer command has no host-generated IDs.
+                        let conn=agent::open_db(&path).unwrap();
+                        let raw:String=conn.query_row("SELECT metadata FROM agent_request_contexts WHERE task_id='task' AND actor='worker' ORDER BY id DESC LIMIT 1",[],|row|row.get(0)).unwrap();
+                        let metadata:Value=serde_json::from_str(&raw).unwrap();
+                        let ctx=visual::VisualContext {identity:json!({"task_id":"task","request_id":metadata["request_id"],"work_id":metadata["workId"],
+                            "node_id":metadata["nodeId"],"revision":metadata["revision"],"plan_revision":metadata["plan_revision"]}),..Default::default()};
                         let artifact=visual::save(&path,&ctx,json!({}),&png(80,60)).unwrap();
                         tool("view","view_image",json!({"artifact_id":artifact["artifact_id"]}))
                     },
@@ -196,7 +390,8 @@ async fn worker_keeps_visual_unavailability_in_original_messages_across_work_rou
     assert!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().all(|schema|schema["function"]["name"]!="yield_work" && schema["function"]["name"]!="schedule_task")).any(|body|body["messages"].as_array().unwrap().iter().any(|message|message["content"].as_str().is_some_and(|content|content.contains(text)))),"Observer receives the same complete original limitation");
     let process=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
     assert_eq!(process["records"].as_array().unwrap().iter().filter(|record|record["kind"]=="visual/input_result").count(),1);
-    assert!(crate::session_history::process_messages(&process).iter().any(|message|message["content"].as_str().unwrap().contains(text)));
+    assert!(crate::session_history::process_messages(&process).iter().any(|message|message["content"].as_str().is_some_and(|content|content.contains(text))
+        || message["content"].as_array().into_iter().flatten().any(|block|block["text"].as_str().is_some_and(|content|content.contains(text)))));
     let history=crate::session_history::read(&root.0,"task",&json!({"event_seq":process["records"].as_array().unwrap().iter().find(|record|record["kind"]=="visual/input_result").unwrap()["seq"],"max_chars":12000})).await.unwrap();
     assert_eq!(history["records"][0]["content"],text);
     assert_eq!(calls.load(Ordering::Relaxed),3);server.abort();
@@ -321,7 +516,7 @@ async fn saved_visual_observation_survives_source_versions_change() {
 }
 
 #[derive(Default)]
-struct Script {requests:Mutex<Vec<Value>>,worker_calls:AtomicUsize,organizer_calls:AtomicUsize,url:String}
+struct Script {requests:Mutex<Vec<Value>>,worker_calls:AtomicUsize,organizer_calls:AtomicUsize,url:String,continue_after_image:bool}
 fn tool(id:&str,name:&str,args:Value)->Value {json!({"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}})}
 async fn chat(State(script):State<Arc<Script>>,Json(body):Json<Value>)->Json<Value> {
     let is_organizer=body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="schedule_task"||tool["function"]["name"]=="finish_request");
@@ -336,10 +531,11 @@ async fn chat(State(script):State<Arc<Script>>,Json(body):Json<Value>)->Json<Val
             0=>vec![tool("open","browser_open",json!({"url":script.url})),tool("shot","browser_screenshot",json!({}))],
             1=>{
                 let artifact=body["messages"].as_array().unwrap().iter().rev().filter(|message|message["role"]=="tool")
-                    .filter_map(|message|serde_json::from_str::<Value>(message["content"].as_str()?).ok())
+                    .filter_map(|message|serde_json::from_str::<Value>(crate::session_history::original_text(message["content"].as_str()?)).ok())
                     .find_map(|result|result["artifact_id"].as_str().map(str::to_owned)).unwrap();
                 vec![tool("view","view_image",json!({"artifact_id":artifact}))]
             },
+            2 if script.continue_after_image=>vec![tool("read","browser_read",json!({}))],
             _=>vec![tool("yield","yield_work",json!({"summary":"visual transport checked","visual_check_result":check(&dispatch)}))]
         };
         json!({"role":"assistant","content":null,"tool_calls":calls})
@@ -376,10 +572,82 @@ async fn visual_worker_runtime_sends_real_images_without_an_observer_or_extra_re
     let root=TestRoot::new();task(&root.0,"task");let script=Arc::new(Script {url:fixture(&root.0),..Default::default()});let (address,server)=server(script.clone()).await;
     let mut state=agent::tests::flow_test_state(&root.0,address);supported(&mut state);
     tokio::time::timeout(Duration::from_secs(20),agent::run_task(state,"task".into(),"fake-model".into(),"Inspect canvas rendering".into(),6,CancellationToken::new(),false,1,vec![],false,false)).await.unwrap().unwrap();
-    let requests=script.requests.lock().unwrap();let visual_requests=requests.iter().filter(|body|!images(body).is_empty()).collect::<Vec<_>>();assert_eq!(visual_requests.len(),1);
+    let requests=script.requests.lock().unwrap();let visual_requests=requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="worker").collect::<Vec<_>>();assert_eq!(visual_requests.len(),1);
+    assert_eq!(requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="organizer").count(),1,"the original image also reaches Organizer");
     let dispatch=manifest(visual_requests[0]);let id=dispatch["images"][0]["artifact_id"].as_str().unwrap();assert_eq!(visual::read(&root.0,"task",id).unwrap().1,images(visual_requests[0])[0]);
     assert_eq!(script.worker_calls.load(Ordering::Relaxed),3,"capture, explicit view_image, then visual return");
     assert_eq!(agent::open_db(&root.0).unwrap().query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='respond_observer'",[],|row|row.get::<_,i64>(0)).unwrap(),0);server.abort();
+}
+
+#[tokio::test]
+async fn conversation_image_references_restore_both_images_and_survive_a_text_only_step() {
+    let root=TestRoot::new();task(&root.0,"task");let ctx=context("task");
+    let first_bytes=png(80,60);let second_bytes=png(90,60);
+    let first=visual::save(&root.0,&ctx,json!({"page_epoch":1}),&first_bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    let second=visual::save(&root.0,&ctx,json!({"page_epoch":2}),&second_bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
+    let mut body=json!({"messages":[]});
+    let first_dispatch=visual::prepare_request(&state,"worker","fake-model",&ctx,&[first.clone()],"check slide",&mut body).await.unwrap();
+    let first_message=visual::conversation_message(&first_dispatch);
+    assert!(!first_message.to_string().contains("data:image"));
+    assert_eq!(first_message["content"][2]["type"],"image_ref");
+    let mut body=json!({"messages":[first_message.clone(),{"role":"assistant","content":"Going to slide 2"}]});
+    let second_dispatch=visual::prepare_request(&state,"worker","fake-model",&ctx,&[second.clone()],"check slide",&mut body).await.unwrap();
+    assert_eq!(images(&body),vec![first_bytes.clone(),second_bytes.clone()]);
+    assert_eq!(second_dispatch["retained_artifact_ids"],json!([first]));
+    assert_eq!(second_dispatch["images"].as_array().unwrap().len(),2);
+    assert!(visual::validate_check(&root.0,&ctx,&check(&second_dispatch),&[second_dispatch.clone()],"worker").is_ok());
+    let second_message=visual::conversation_message(&second_dispatch);
+    let mut body=json!({"messages":[first_message.clone(),second_message.clone(),{"role":"assistant","content":"Report the result"}]});
+    let continuation=visual::prepare_request(&state,"worker","fake-model",&ctx,&[],"check slide",&mut body).await.unwrap();
+    assert_eq!(images(&body),vec![first_bytes,second_bytes]);
+    assert_eq!(continuation["status"],"direct");
+    assert_eq!(continuation["selected_artifact_ids"],json!([]),"retained images are not new view calls");
+    assert!(!body.to_string().contains("\"type\":\"image_ref\""),"internal references never reach the provider");
+    let mut repeated=json!({"messages":[first_message.clone(),second_message,first_message]});
+    visual::prepare_request(&state,"worker","fake-model",&ctx,&[],"check slide",&mut repeated).await.unwrap();
+    assert_eq!(images(&repeated).len(),2,"multiple references to the same file share one pixel block");
+    let mut empty=json!({"messages":[]});
+    let not_selected=visual::prepare_request(&state,"worker","fake-model",&ctx,&[],"check slide",&mut empty).await.unwrap();
+    assert_eq!(not_selected["status"],"no_images","saved screenshots outside the window are not attached");
+    assert!(images(&empty).is_empty());
+}
+
+#[tokio::test]
+async fn worker_continuation_reuses_original_image_without_another_view_call() {
+    let root=TestRoot::new();task(&root.0,"task");
+    let script=Arc::new(Script {url:fixture(&root.0),continue_after_image:true,..Default::default()});
+    let (address,server)=server(script.clone()).await;
+    let mut state=agent::tests::flow_test_state(&root.0,address);supported(&mut state);
+    tokio::time::timeout(Duration::from_secs(20),agent::run_task(state,"task".into(),"fake-model".into(),"Inspect canvas rendering".into(),7,CancellationToken::new(),false,1,vec![],false,false)).await.unwrap().unwrap();
+    let requests=script.requests.lock().unwrap();
+    let visual_requests=requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="worker").collect::<Vec<_>>();
+    assert_eq!(visual_requests.len(),2,"pixels remain after a normal browser_read step");
+    assert_eq!(images(visual_requests[0]),images(visual_requests[1]));
+    assert_eq!(manifest(visual_requests[1])["selected_artifact_ids"],json!([]));
+    let conn=agent::open_db(&root.0).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='view_image'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    let records=conn.prepare("SELECT data FROM agent_task_events WHERE kind='visual/input_result'").unwrap()
+        .query_map([],|row|row.get::<_,String>(0)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+    assert!(records.iter().any(|record|record.contains("image_ref")));
+    assert!(records.iter().all(|record|!record.contains("data:image")),"history stores references, not base64");
+    server.abort();
+}
+
+#[tokio::test]
+async fn restoring_a_reference_reports_changed_bytes_without_sending_them() {
+    let root=TestRoot::new();task(&root.0,"task");let ctx=context("task");
+    let artifact=visual::save(&root.0,&ctx,json!({}),&png(80,60)).unwrap();
+    let id=artifact["artifact_id"].as_str().unwrap().to_owned();
+    let mut state=agent::tests::flow_test_state(&root.0,"127.0.0.1:1".parse().unwrap());supported(&mut state);
+    let dispatch=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id],"check slide",&mut json!({"messages":[]})).await.unwrap();
+    let reference=visual::conversation_message(&dispatch);
+    std::fs::write(root.0.join(artifact["workspace_relative_path"].as_str().unwrap()),png(90,60)).unwrap();
+    let mut body=json!({"messages":[reference]});
+    let restored=visual::prepare_request(&state,"worker","fake-model",&ctx,&[],"check slide",&mut body).await.unwrap();
+    assert!(images(&body).is_empty());
+    assert!(restored["unavailable"][0]["reason"].as_str().unwrap().contains("content_hash"));
+    assert!(body.to_string().contains("could not be delivered"));
 }
 
 #[test]
@@ -427,7 +695,11 @@ async fn visual_browser_pages_are_task_owned_and_observer_cannot_follow_replaced
     assert!(crate::browser_control::observe_page_snapshot(&root.0,&a,&first["page"]).await.is_ok(),"normal and canonical workspace paths refer to the same owned session");
     assert!(crate::browser_control::observe_page_snapshot(&root.0,&b,&first["page"]).await.is_err());
     let mut replacement=a.clone();replacement.identity["request_id"]=json!(2);replacement.identity["revision"]=json!(2);
-    assert!(crate::browser_control::execute_scoped(&workspace,&replacement,"browser_read",&json!({})).await.is_err());
+    let continued=crate::browser_control::execute_scoped(&workspace,&replacement,"browser_read",&json!({})).await.unwrap();
+    assert_eq!(continued["page"]["page_id"],first["page"]["page_id"],"a new request in the same conversation resumes the existing page");
+    assert_eq!(continued["page"]["url"],a_url,"continuing must not navigate the loaded page");
+    assert_eq!(continued["page"]["identity"],replacement.identity);
+    assert!(crate::browser_control::observe_page_snapshot(&root.0,&a,&first["page"]).await.is_err(),"an old Observer instance cannot act as the new caller");
     crate::browser_control::execute_scoped(&workspace,&replacement,"browser_open",&json!({"url":b_url})).await.unwrap();
     assert!(crate::browser_control::observe_page_snapshot(&root.0,&a,&first["page"]).await.is_err());
     assert_eq!(visual::read(&root.0,"a",shot["artifact_id"].as_str().unwrap()).unwrap().0["identity"],a.identity);
@@ -451,21 +723,19 @@ async fn observer_does_not_attach_or_capture_images_without_a_model_method_call(
             ctx=scheduler_context("task",&scheduler,"w");
             let shot=crate::browser_control::execute_scoped(&state.workspace,&ctx,"browser_screenshot",&json!({})).await.unwrap();scheduler.observe("browser_screenshot",&json!({}),&shot,false);
         }
-        let input=crate::observer_service::observation("task",&scheduler,"w",1,1,"handoff","check slide",&json!({}),Value::Null,json!({"summary":"canvas ready"}),Value::Null);
-        crate::observer_service::commit(&root.0,"task",json!({"commit_id":"visual_handoff"}),vec![input]).await.unwrap();
+        crate::observer_service::commit(&root.0,"task",json!({"commit_id":"visual_handoff"}),Vec::new()).await.unwrap();
         let mut observer=crate::observer_service::ObserverSession::start(state.clone(),"fake-model".into(),"task".into(),&CancellationToken::new());observer.set_scope(&scheduler,"check slide");
-        let reviews=tokio::time::timeout(Duration::from_secs(8),async {loop {let reviews=observer.reviews().await.unwrap();if !reviews.is_empty(){return reviews;}
-            tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
-        assert_eq!(reviews.len(),1,"an Observer result without recommendations is still delivered");
-        assert!(reviews[0]["suggestions"].as_array().unwrap().is_empty());
-        assert_eq!(reviews[0]["observer_return"]["summary"],"review");observer.finish("completed").await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(script.requests.lock().unwrap().is_empty(),"Observer must not call the model while execution is ongoing");
+        observer.finish("completed").await.unwrap();
+        observer.finish("completed").await.unwrap();
         let requests=script.requests.lock().unwrap();assert_eq!(requests.len(),1);assert!(images(&requests[0]).is_empty());
         let conn=agent::open_db(&root.0).unwrap();
         let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='agent_visual_artifacts')",[],|row|row.get(0)).unwrap();
         let count=if exists{conn.query_row("SELECT COUNT(*) FROM agent_visual_artifacts",[],|row|row.get::<_,i64>(0)).unwrap()}else{0};
         assert_eq!(count,if reuse {2}else{0},"Observer never captures on its own");
-        let result:String=conn.query_row("SELECT result FROM agent_observations",[],|row|row.get(0)).unwrap();let result:Value=serde_json::from_str(&result).unwrap();
-        assert!(result["visual_capture"].is_null());
+        let count:i64=conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='observer/retrospective'",[],|row|row.get(0)).unwrap();
+        assert_eq!(count,1,"finish is idempotent and only writes the final retrospective");
         crate::browser_control::cleanup(&root.0,"task").await;server.abort();
     }
 }
@@ -607,8 +877,13 @@ async fn visual_http_rejection_preserves_original_reason_in_every_role_context()
     assert_eq!(restored.frame().unwrap().visual_requests[0]["error"],REASON);
     assert_eq!(restored.frame().unwrap().visual_check_result["limitations"][0],REASON);
     let mut restored=restored;restored.return_work(&json!({"summary":"Screenshot exists but visual request failed","limitations":[REASON]})).unwrap();
-    assert_eq!(restored.organizer_input()["current_result"]["visual_requests"][0]["error"],REASON);
+    let organizer=restored.organizer_input();
+    assert!(organizer["current_result"].get("visual_requests").is_none(),"handoff must not replay host image-request history");
+    assert_eq!(organizer["current_result"]["worker_return"]["limitations"][0],REASON);
     assert!(!agent::load_observer_work_trace(&root.0,"task").unwrap().iter().any(|item|item["type"]=="visual/model_failed"),"Observer made no image request to mislabel as a visual failure");
+    agent::emit(&root.0,"task","visual/model_failed",json!({"turn":1,"step":1,"actor":"worker","manifest":dispatch,"error":REASON})).await.unwrap();
+    let history=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
+    assert!(serde_json::to_string(&crate::session_history::process_messages(&history)).unwrap().contains(REASON),"the original failure remains available without an aggregate");
     state.visual.capabilities.entry(String::new()).or_default().insert("fake-model".into(),visual::ImageCapability::Unsupported);
     state.visual.fallback=Some(visual::VisualRoute{provider:"vision".into(),model:"m".into(),url:state.provider_url.clone(),api_key:String::new()});
     let failed=visual::prepare_request(&state,"worker","fake-model",&ctx,&[id],"check slide",&mut json!({"messages":[]})).await.unwrap();
@@ -635,7 +910,7 @@ async fn visual_worker_image_rejection_returns_to_organizer_without_automatic_re
         }else if script.worker.fetch_add(1,Ordering::Relaxed)==0 {vec![tool("open","browser_open",json!({"url":script.url})),tool("shot","browser_screenshot",json!({}))]}
         else {
             let artifact=body["messages"].as_array().unwrap().iter().rev().filter(|message|message["role"]=="tool")
-                .filter_map(|message|serde_json::from_str::<Value>(message["content"].as_str()?).ok())
+                .filter_map(|message|serde_json::from_str::<Value>(crate::session_history::original_text(message["content"].as_str()?)).ok())
                 .find_map(|result|result["artifact_id"].as_str().map(str::to_owned)).unwrap();
             vec![tool("view","view_image",json!({"artifact_id":artifact}))]
         };

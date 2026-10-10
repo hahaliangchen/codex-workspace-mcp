@@ -22,6 +22,10 @@ pub struct WorkOrder {
     pub goal: String,
     pub done_when: String,
     pub constraints: Vec<String>,
+    /// Necessary information explicitly selected and supplied by Organizer.
+    pub context: Value,
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub original_command: Option<String>,
     pub upstream_ids: Vec<String>,
     pub dependency_inputs: Vec<Value>,
     pub finding_ids: Vec<String>,
@@ -54,6 +58,9 @@ pub struct WorkFrame {
     pub http_check_samples: BTreeMap<String, String>,
     pub check_errors: BTreeMap<String, Value>,
     pub operations: Vec<Value>,
+    /// Source IDs actually read by this invocation, independent of the bounded operation summary.
+    #[serde(default)]
+    pub read_material_ids: BTreeSet<i64>,
     pub sequence: usize,
     pub rounds: usize,
     pub rounds_without_change: usize,
@@ -68,11 +75,15 @@ pub struct WorkFrame {
     pub expectation_met: Option<bool>,
     pub source_selection: Value,
     pub organizer_guidance: Value,
+    #[serde(default)]
+    pub organizer_commands: Vec<String>,
     pub visual_artifact_ids:Vec<String>,
     /// Latest captured screenshot IDs. These references do not expire prior images.
     pub current_visual_artifact_ids:Vec<String>,
     pub visual_original_artifact_ids:Vec<String>,
     pub seen_visual_artifact_ids:Vec<String>,
+    /// Internal request bindings for restoration and image references. Delivery
+    /// belongs to the original conversation messages, never a handoff replay.
     pub visual_requests:Vec<Value>,
     pub visual_check_result:Value,
     pub browser_page:Value,
@@ -862,6 +873,8 @@ impl WorkScheduler {
 
             ensure!(!o.id.is_empty() && o.id.len() <= 80 && o.id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')), "work needs a stable short id");
             ensure!(!o.node_id.is_empty() && !o.goal.trim().is_empty() && !o.done_when.trim().is_empty(), "work needs node_id, goal and done_when");
+            if o.context.is_null() { o.context = json!({}); }
+            ensure!(o.context.is_object(), "Organizer context must be an object");
             ensure!(o.goal.chars().count() <= 2400 && o.done_when.chars().count() <= 1200 && o.constraints.len() <= 12 && o.constraints.iter().all(|s| s.chars().count() <= 700), "work contract is too large");
             if let Some(value)=o.browser_document_path.as_deref().filter(|value|value.contains("://")) {
                 anyhow::bail!("field_path=orders[{index}].browser_document_path: this field is the workspace-relative .pptx file path, but '{}' is a page URL; put the editor page URL in goal or constraints and the PPTX file path here",limited(value,300));
@@ -909,6 +922,10 @@ impl WorkScheduler {
                 ensure!(old.invalidated_by_plan_revision.is_none(), "invalidated work is sealed; assign a new work id");
                 ensure!(old.status != WorkStatus::Done, "completed work is sealed; assign a new problem");
                 ensure!(old.order.node_id == o.node_id && old.order.goal == o.goal && old.order.done_when == o.done_when && old.order.completion == o.completion && old.order.checks == o.checks && old.order.edit_targets == o.edit_targets && old.order.visual_goal == o.visual_goal && old.order.browser_document_path == o.browser_document_path && old.order.constraints.contains(&"requires_visual".to_owned()) == o.constraints.contains(&"requires_visual".to_owned()) && old.order.constraints.contains(&"requires_pptx".to_owned()) == o.constraints.contains(&"requires_pptx".to_owned()), "resume preserves the existing work contract");
+                if let Some(command)=&o.original_command {
+                    if old.organizer_commands.is_empty() {old.organizer_commands.push(old.order.original_command.clone().unwrap_or_else(||serde_json::to_string(&old.order).unwrap()));}
+                    if old.organizer_commands.last()!=Some(command) {old.organizer_commands.push(command.clone());}
+                }
                 old.order = o.clone();
                 old.status = WorkStatus::Ready;
                 old.output = None;
@@ -994,7 +1011,6 @@ impl WorkScheduler {
         // the generic source/log compactor, including legacy nested reasons.
         compacted["reason"]=worker_result_field(output,"reason").cloned().unwrap_or(Value::Null);
         compacted["visual_check_result"]=output["visual_check_result"].clone();
-        compacted["visual_requests"]=output["visual_requests"].clone();
         let mut omissions=Vec::new();let mut omitted_total=0;
         organizer_omissions(&compact,"current_result",0,&mut omissions,&mut omitted_total);
         if omitted_total>0 {
@@ -1041,7 +1057,7 @@ impl WorkScheduler {
                 "plan_revision": output["plan_revision"],
                 "goal": output["goal"],
                 "visual_artifact_ids":output["visual_artifact_ids"],"visual_check_result":output["visual_check_result"],
-                "worker_return":output["worker_return"],"visual_requests":output["visual_requests"],
+                "worker_return":output["worker_return"],
                 "done": output["done"],
                 "summary": output["summary"],
             });
@@ -1130,7 +1146,7 @@ impl WorkScheduler {
                 let mut deliverable = json!({
                     "id": output["id"],
                     "visual_artifact_ids":output["visual_artifact_ids"],"visual_check_result":output["visual_check_result"],
-                    "worker_return":output["worker_return"],"visual_requests":output["visual_requests"],
+                    "worker_return":output["worker_return"],
                     "node_id": output["node_id"],
                     "revision": output["revision"],
                     "plan_revision": output["plan_revision"],
@@ -1301,7 +1317,7 @@ impl WorkScheduler {
                 order.node_id = current.node_id.clone();
             }
             ensure!(order.id == current.id, "continue must address the current work id");
-            changed_inputs = order.constraints != current.constraints || order.material_ids != current.material_ids || order.finding_ids != current.finding_ids || order.material_ranges != current.material_ranges || order.final_answer != current.final_answer;
+            changed_inputs = order.context != current.context || order.constraints != current.constraints || order.material_ids != current.material_ids || order.finding_ids != current.finding_ids || order.material_ranges != current.material_ranges || order.final_answer != current.final_answer;
             ensure!(order.upstream_ids.iter().all(|id| self.frames.get(id).is_some_and(|f| f.status == WorkStatus::Done && f.invalidated_by_plan_revision.is_none())), "continued work needs finished upstream outputs");
             if let Err(err) = self.validate_dependency_inputs(&order) {
                 anyhow::bail!("continued work has unmet dependency inputs: {err}");
@@ -1863,6 +1879,9 @@ impl WorkScheduler {
         }
         let outcome = result.get("error").or_else(|| result.get("stderr").filter(|value| value.as_str().is_some_and(|s| !s.trim().is_empty())))
             .or_else(|| result.get("stdout")).map(|value| value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string())).unwrap_or_default();
+        if !failed {
+            if let Some(id) = result["notebook_material"]["id"].as_i64() { f.read_material_ids.insert(id); }
+        }
         f.operations.push(json!({
             "tool": name,
             "artifact_id":result["artifact_id"],
@@ -2008,12 +2027,18 @@ impl WorkScheduler {
             "checks": f.checked.keys().collect::<Vec<_>>(),
             "versions": f.versions,
             "operations": f.operations,
-            "visual_artifact_ids":f.visual_artifact_ids,"visual_check_result":f.visual_check_result,"visual_requests":f.visual_requests,
+            "visual_artifact_ids":f.visual_artifact_ids,"visual_check_result":f.visual_check_result,
             "resource_availability": exported_data.get("browser_upload_availability")
         });
         self.frames.get_mut(&frame_id).unwrap().output = Some(output.clone());
         self.handoff = Some(output.clone());
         Ok(output)
+    }
+
+    /// Keep the model's original text/arguments separate from host result metadata.
+    pub fn retain_original_return(&mut self, raw:&str) {
+        if let Some(output)=self.frame_mut().and_then(|frame|frame.output.as_mut()) {output["original_return"]=json!(raw);}
+        if let Some(handoff)=self.handoff.as_mut() {handoff["original_return"]=json!(raw);}
     }
 
     pub fn visual_response_received(&mut self,manifest:&Value) {
@@ -2102,43 +2127,14 @@ impl WorkScheduler {
         if !self.finished { self.handoff = Some(output.clone()); }
     }
 
-    /// Carry the immediately preceding invocation's result and material index,
-    /// even when the Organizer didn't declare a dependency. This is context,
-    /// not a success receipt or an implicit import of another node's source.
-    fn previous_step(&self,upstream:&[Value])->Option<Value> {
-        let ordered=self.execution_order();
-        let position=ordered.iter().position(|frame|frame.order.id==self.current)?;
-        let previous=ordered[..position].iter().rev().find(|frame|frame.status!=WorkStatus::Ready)?;
-        let already_delivered=upstream.iter().any(|delivery|delivery["id"]==previous.order.id);
-        let result=previous.output.as_ref().filter(|_|!already_delivered).map(|output| {
-            let mut result=output.clone();
-            // The completed invocation's tool ledger stays in saved history;
-            // its actual returned result is the next invocation's handoff.
-            result.as_object_mut().unwrap().remove("operations");
-            worker_delivery(result)
-        });
-        Some(json!({"work_id":previous.order.id,"node_id":previous.order.node_id,"revision":previous.order.revision,
-            "goal":previous.order.goal,"status":self.path_status(previous),"returned":previous.output.is_some(),
-            "historical":previous.invalidated_by_plan_revision.is_some(),"result":result,
-            "latest_report":if already_delivered {None}else{previous.progress.last()},"material_directory":previous.source_selection["materials"],
-            "delivery_location":if already_delivered {"upstream_outputs"}else{"previous_step.result"},
-            "result_reference":{"method":"read_task_result","work_id":previous.order.id},
-            "note":"A report is intent, not a returned result. Material references require version-checked notebook recall; historical results do not establish current resource availability."}))
-    }
-
-    pub fn worker_input(&self, human_request: &str) -> Value {
+    pub fn worker_input(&self, _human_request: &str) -> Value {
         let upstream = self.order()
             .and_then(|o| self.resolve_dependency_deliveries(o).ok())
             .unwrap_or_default().into_iter().map(worker_delivery).collect::<Vec<_>>();
-        let previous=self.previous_step(&upstream);
         json!({
-            "human_request": human_request,
             "request_id":self.request_started_turn,
-            "goal_boundary": self.goal_boundary,
-            "main_task_goal":self.request_goal,
             "current_work": self.order(),
             "upstream_outputs": upstream,
-            "previous_step": previous,
             "http_observations":self.worker_http_observations(),
             "done": self.done(),
             "organizer_handoff": self.frame().map(|f| &f.organizer_guidance),
@@ -2470,7 +2466,7 @@ impl WorkScheduler {
         let handoff=self.handoff.as_ref().filter(|handoff|current_output.is_none_or(|output|!handoff_matches_current_output(handoff,output)))
             .map(organizer_handoff);
         let current_work=self.order().map(|order|json!({"id":order.id,"node_id":order.node_id,"revision":order.revision,
-            "goal":order.goal,"return_when":order.done_when,"completion":order.completion,"constraints":order.constraints,
+            "goal":order.goal,"return_when":order.done_when,"completion":order.completion,"constraints":order.constraints,"context":order.context,
             "material_directory":self.frame().map(|frame|&frame.source_selection["materials"])}));
         json!({
             "schema_version":WORK_SCHEDULER_SCHEMA_VERSION,
@@ -2846,6 +2842,17 @@ impl WorkScheduler {
             "select" => {
                 let target = decision["task_id"].as_str().or_else(|| decision["node_id"].as_str());
                 self.select_task(target)?;
+                if let Some(context) = decision.get("context") {
+                    anyhow::ensure!(context.is_object(), "context must be an object selected by Organizer");
+                    self.frame_mut().unwrap().order.context = context.clone();
+                }
+                let frame=self.frame_mut().unwrap();
+                if frame.organizer_commands.is_empty() {
+                    frame.organizer_commands.push(frame.order.original_command.clone().unwrap_or_else(||serde_json::to_string(&frame.order).unwrap()));
+                }
+                frame.organizer_commands.push(decision["original_command"].as_str().map(str::to_owned).unwrap_or_else(||decision.to_string()));
+                self.frame_mut().unwrap().organizer_guidance = json!({"reason":decision["reason"]});
+                self.frame_mut().unwrap().reviewed_without_change = 0;
                 Ok(())
             },
             "revisit" => {
@@ -2858,6 +2865,9 @@ impl WorkScheduler {
                 let replacement_checks=decision.get("replacement_checks").and_then(Value::as_array)
                     .map(|checks|checks.iter().filter_map(Value::as_str).map(str::to_owned).collect::<Vec<_>>());
                 self.revisit(target_node, target_revision, reason, repair_goal, replacement_checks.as_deref(), can_write, can_check)?;
+                let frame=self.frame_mut().unwrap();
+                if frame.organizer_commands.is_empty() {frame.organizer_commands.push(frame.order.original_command.clone().unwrap_or_else(||serde_json::to_string(&frame.order).unwrap()));}
+                frame.organizer_commands.push(decision["original_command"].as_str().map(str::to_owned).unwrap_or_else(||decision.to_string()));
                 Ok(())
             },
             "continue" => {
@@ -2937,8 +2947,8 @@ mod tests {
         let submitted=json!({"summary":"Actual Worker conclusion","diagnostic":diagnostic,
             "limitations":(0..24).map(|index|format!("Original limitation {index}")).collect::<Vec<_>>()});
         let output=scheduler.return_work(&submitted).unwrap();assert_eq!(output["worker_return"],submitted);
-        scheduler.enqueue(vec![WorkOrder{id:"next".into(),node_id:"next_node".into(),goal:"continue".into(),done_when:"return".into(),completion:Completion::Output,..Default::default()}],false,false).unwrap();
-        scheduler.activate_next().unwrap();let packet=scheduler.worker_input("continue");let returned=&packet["previous_step"]["result"];
+        scheduler.enqueue(vec![WorkOrder{id:"next".into(),node_id:"next_node".into(),goal:"continue".into(),done_when:"return".into(),dependency_inputs:vec![json!({"work_id":"start","fields":[]})],completion:Completion::Output,..Default::default()}],false,false).unwrap();
+        scheduler.activate_next().unwrap();let packet=scheduler.worker_input("continue");let returned=&packet["upstream_outputs"][0];
         assert_eq!(returned["diagnostic"],diagnostic);assert_eq!(returned["limitations"],submitted["limitations"]);
         assert_eq!(packet.to_string().matches("ORIGINAL_DIAGNOSTIC_TAIL").count(),1);
     }
@@ -2968,16 +2978,14 @@ mod tests {
         assert_eq!(upstream["exported_data"]["extra"],"preserved-original-export");
         assert!(upstream.get("worker_return").is_none());
         assert!(upstream.get("operations").is_none());
-        assert!(input["previous_step"]["result"].is_null());
-        assert_eq!(input["previous_step"]["delivery_location"],"upstream_outputs");
-        assert_eq!(input["previous_step"]["work_id"],"start");
+        assert!(input.get("previous_step").is_none());
         assert_eq!(input.to_string().matches("upload-return-only-once").count(),1);
         assert_eq!(scheduler.frames["start"].operations.len(),1);
         assert_eq!(scheduler.frames["start"].output.as_ref().unwrap()["worker_return"]["diagnostic"]["message"],diagnostic);
     }
 
     #[test]
-    fn undeclared_previous_handoff_preserves_long_original_fields_once() {
+    fn undeclared_previous_handoff_stays_in_history_outside_worker_view() {
         let mut scheduler=WorkScheduler::default();
         scheduler.enqueue(vec![output_order()],false,false).unwrap();
         scheduler.activate_next().unwrap();
@@ -2989,15 +2997,30 @@ mod tests {
             completion:Completion::Output,..WorkOrder::default()}],false,false).unwrap();
         scheduler.activate_next().unwrap();
         let input=scheduler.worker_input("handle the limitation");
-        let previous=&input["previous_step"]["result"];
         assert_eq!(input["upstream_outputs"],json!([]));
-        assert_eq!(input["previous_step"]["delivery_location"],"previous_step.result");
-        assert_eq!(previous["reason"],original);
-        assert_eq!(previous["limitations"][0],original);
-        assert_eq!(previous["provider_diagnostic"]["detail"],original);
-        assert!(previous.get("worker_return").is_none());
-        assert!(previous.get("operations").is_none());
-        assert_eq!(input.to_string().matches("previous-return-only-once").count(),1);
+        assert!(input.get("previous_step").is_none());
+        assert!(!input.to_string().contains("previous-return-only-once"));
+        assert!(!input.to_string().contains(&original));
+        assert_eq!(scheduler.frames["start"].output.as_ref().unwrap()["worker_return"]["provider_diagnostic"]["detail"],original);
+
+    }
+
+    #[test]
+    fn organizer_supplies_worker_view_and_resume_replaces_only_selected_context() {
+        let mut scheduler=WorkScheduler::default();
+        let mut order=output_order();order.context=json!({"fact":"shared-collision","source_event_seq":42,"instruction":"check driving"});
+        scheduler.enqueue(vec![order],false,false).unwrap();scheduler.activate_next().unwrap();
+        let input=scheduler.worker_input("FULL_HUMAN_REQUEST_SHOULD_STAY_WITH_ORGANIZER");
+        assert_eq!(input["current_work"]["context"]["fact"],"shared-collision");
+        for field in ["human_request","main_task_goal","goal_boundary","previous_step"] {assert!(input.get(field).is_none());}
+        assert!(!input.to_string().contains("FULL_HUMAN_REQUEST_SHOULD_STAY_WITH_ORGANIZER"));
+        scheduler.apply(&json!({"action":"select","task_id":"start","reason":"use the corrected instruction",
+            "context":{"fact":"shared-collision","source_event_seq":42,"instruction":"check brakes"}}),false,false).unwrap();
+        let resumed=scheduler.worker_input("global request");
+        assert_eq!(resumed["current_work"]["context"]["instruction"],"check brakes");
+        assert_eq!(resumed["organizer_handoff"]["reason"],"use the corrected instruction");
+        scheduler.apply(&json!({"action":"select","task_id":"start","reason":"keep supplied facts"}),false,false).unwrap();
+        assert_eq!(scheduler.worker_input("")["current_work"]["context"]["source_event_seq"],42);
     }
 
     #[test]

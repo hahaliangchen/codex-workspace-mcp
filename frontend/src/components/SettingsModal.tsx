@@ -918,9 +918,9 @@ export function SettingsModal({
 
             {activeTab === 'observer' && draft !== null && (
               <div className={modelsCss.section}>
-                <h2 className={modelsCss.title}>Observer 全局观察</h2>
+                <h2 className={modelsCss.title}>Observer 结束复盘</h2>
                 <p className={modelsCss.intro}>
-                  Observer 使用独立上下文并持续掌握 Worker 的计划与进度：计划形成或路径推进到关键阶段时，给出非阻断的方向建议；Worker 也可以主动询问历史决策，避免重复回头查找。任务结束后，Observer 复盘完整路径、总结可缩短之处，并把有复用价值的工作信息、相关性和后续关注点写入工程记忆。计划、操作和技术判断仍由 Worker 自己负责。
+                  Observer 只在执行结束后读取本任务的原始过程，复盘完成情况、失败恢复、重复操作和汇总是否准确，提出下次更直接的做法。需要核对时可读取 Worker、Organizer 当时实际收到的完整上下文。复盘显示在聊天中，不参与运行中的调度，也不自动写入记忆。
                 </p>
 
                 <div className={modelsCss.rowCard}>
@@ -938,7 +938,7 @@ export function SettingsModal({
                     </div>
                   </div>
                   <p className={modelsCss.advancedHint}>
-                    Observer 只观察工作方向与过程效率，不检查语法、编译错误或普通工具报错，也不会批准、中断或接管工作。它暂时不可用时，Worker 照常继续；任务结束复盘会增加一次 Observer 模型调用。
+                    启用后，执行结束时启动一次复盘；需要补充证据时，复盘可按需读取历史。复盘失败不会改变执行结果。取消或中断不会启动新的复盘请求。
                   </p>
                 </div>
 

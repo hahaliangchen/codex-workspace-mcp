@@ -1011,7 +1011,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
                 finding: text,
                 relevance: stringOf(finding.relevance) ?? '',
                 watchFor: stringOf(finding.watch_for) ?? '',
-                sourceRefs: observerStringList(finding.sourceRefs),
+                sourceRefs: observerStringList(finding.source_refs ?? finding.sourceRefs),
                 certainty: finding.certainty === 'confirmed' ? 'confirmed' as const : 'uncertain' as const,
               }] : []
             })
