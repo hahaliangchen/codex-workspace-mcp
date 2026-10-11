@@ -1,5 +1,6 @@
 //! Protocol and ownership regressions use actual PNGs, HTTP and the task runtime.
 use crate::{agent_service as agent,visual_artifacts as visual};
+use anyhow::Context;
 use axum::{Json,extract::State,routing::post};
 use base64::{Engine,engine::general_purpose::STANDARD};
 use serde_json::{Value,json};
@@ -73,6 +74,34 @@ async fn original_image_messages_reach_all_roles_and_paged_history_without_flatt
     assert!(validated["artifacts"].as_array().unwrap().iter().all(|artifact|artifact["identity"]["request_id"]==1),"a delivered historical image is valid evidence with its original provenance");
     let unavailable=visual::prepare_request(&state,"observer","fake-model",&wrong,&ids,"direct selection without historical routing",&mut json!({"messages":[]})).await.unwrap();
     assert_eq!(unavailable["unavailable"].as_array().unwrap().len(),2);
+}
+
+#[tokio::test]
+async fn acceptance_view_image_reads_completed_node_pixels_without_recapturing() {
+    let root=TestRoot::new();task(&root.0,"task");task(&root.0,"other");
+    let pixels=png(80,60);let owner=context("task");
+    let id=visual::save(&root.0,&owner,json!({}),&pixels).unwrap()["artifact_id"].as_str().unwrap().to_owned();
+    let mut previous=owner.clone();previous.identity["request_id"]=json!(2);
+    visual::save(&root.0,&previous,json!({}),&pixels).unwrap();
+    visual::save(&root.0,&context("other"),json!({}),&pixels).unwrap();
+    assert_eq!(visual::request_artifact_ids(&root.0,"task",1).unwrap(),vec![id.clone()]);
+    let requests=Arc::new(Mutex::new(Vec::<Value>::new()));let captured=requests.clone();let selected=id.clone();
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move {axum::serve(listener,axum::Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>| {
+        let requests=captured.clone();let id=selected.clone();async move {
+            let mut calls=requests.lock().unwrap();let round=calls.len();calls.push(body);
+            let message=if round==0 {json!({"role":"assistant","tool_calls":[{"id":"inspect","type":"function","function":{"name":"view_image","arguments":json!({"artifact_id":id}).to_string()}}]})}
+                else {json!({"role":"assistant","content":json!({"action":"deliver","summary":"Received completed node's actual image"}).to_string()})};
+            Json(json!({"choices":[{"message":message}]}))
+        }
+    }))).await.unwrap()});
+    let mut state=agent::tests::flow_test_state(&root.0,address);state.observer_provider_url=state.provider_url.clone();supported(&mut state);
+    agent::observer_json_response(&state,"fake-model","Accept the delivery",json!({"identity":{"task_id":"task","request_id":1,"node_id":"request"},"request":{"goal":"check slide"}}),1000,"task",json!({})).await.unwrap();
+    let calls=requests.lock().unwrap();assert_eq!(calls.len(),2);assert!(images(&calls[0]).is_empty());
+    assert_eq!(images(&calls[1]),vec![pixels]);
+    assert_eq!(manifest(&calls[1])["retained_artifact_ids"],json!([id]));
+    assert_eq!(manifest(&calls[1])["images"][0]["identity"],owner.identity);
+    server.abort();
 }
 
 #[tokio::test]
@@ -187,6 +216,42 @@ fn visual_artifacts_are_immutable_and_require_task_request_and_explicit_upstream
     std::fs::write(root.0.join(first["workspace_relative_path"].as_str().unwrap()),png(121,90)).unwrap();
     let error=visual::read(&root.0,"a",id).unwrap_err().to_string();
     assert!(error.contains("content_hash"),"tampered bytes must fail the content hash check: {error}");
+}
+
+/// Rerun only acceptance against a completed real task. Browser/project
+/// operations are not repeated; writes are acceptance events and request logs.
+#[tokio::test]
+#[ignore = "real configured acceptance; requires OBSERVER_ACCEPTANCE_ROOT and OBSERVER_ACCEPTANCE_TASK"]
+async fn real_completed_task_acceptance_recheck() -> anyhow::Result<()> {
+    let root=PathBuf::from(std::env::var("OBSERVER_ACCEPTANCE_ROOT")?);
+    let task=std::env::var("OBSERVER_ACCEPTANCE_TASK")?;
+    let out=PathBuf::from(std::env::var("OBSERVER_ACCEPTANCE_OUTPUT")?);std::fs::create_dir_all(&out)?;
+    let conn=agent::open_db(&root)?;
+    // Completed tasks intentionally discard runtime snapshots. Acceptance can
+    // still read their retained human request and original final decision.
+    let raw:String=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='organizer/decision' ORDER BY seq DESC LIMIT 1",[&task],|row|row.get(0))?;
+    let saved:Value=serde_json::from_str(&raw)?;
+    let mut scheduler=crate::work_scheduler::WorkScheduler::default();
+    scheduler.request_goal=conn.query_row("SELECT prompt FROM agent_tasks WHERE id=?1",[&task],|row|row.get(0))?;
+    scheduler.request_started_turn=saved["turn"].as_u64().context("missing original turn")? as usize;
+    scheduler.final_result=saved["decision"].to_string();scheduler.request_completed=saved["decision"]["achieved"].as_bool();
+    drop(conn);
+    let mut state=agent::tests::flow_test_state(&root,"127.0.0.1:1".parse()?);
+    let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;crate::ai_proxy::apply_agent_config(&mut state,&config);
+    state.permission_mode=agent::PermissionMode::FullAccess;
+    anyhow::ensure!(state.observer_enabled,"Observer is not enabled in current configuration");
+    let model=if state.observer_model.is_empty(){state.default_model.clone()}else{state.observer_model.clone()};
+    let cancel=CancellationToken::new();let start=std::time::Instant::now();
+    let mut observer=crate::observer_service::ObserverSession::start(state,model,task.clone(),&cancel);
+    observer.set_scope(&scheduler,&scheduler.request_goal);observer.finish("completed").await?;
+    let conn=agent::open_db(&root)?;
+    let raw:String=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='observer/retrospective' ORDER BY seq DESC LIMIT 1",[&task],|row|row.get(0))?;
+    let result:Value=serde_json::from_str(&raw)?;
+    std::fs::write(out.join("acceptance-recheck.json"),serde_json::to_vec_pretty(&json!({"task_id":task,"elapsed_ms":start.elapsed().as_millis(),"new_browser_operations":0,"result":result}))?)?;
+    println!("Acceptance result: {}",out.join("acceptance-recheck.json").display());
+    anyhow::ensure!(result["status"]=="completed","acceptance unavailable: {}",result["message"]);
+    anyhow::ensure!(result["observer_return"]["action"]=="deliver","acceptance requested further work: {}",result["observer_return"]);
+    Ok(())
 }
 
 #[test]

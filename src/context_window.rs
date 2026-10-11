@@ -34,9 +34,13 @@ pub fn estimate(value: &Value) -> usize {
     }
 }
 
-/// Capacity guard only. The receiving role selects necessary history through
-/// context_rebuild before this guard; role names never decide what is removed.
+/// Restore chronological history order, then guard capacity. The receiving role
+/// selects necessary history through context_rebuild; roles never decide what
+/// original content is removed.
 pub fn prepare(body:&mut Value,_protected_prefix:usize)->Result<Value> {
+    if let Some(Value::Array(messages))=body.get_mut("messages") {
+        crate::session_history::order_context_messages(messages);
+    }
     let output=body["max_tokens"].as_u64().unwrap_or(8192) as usize;
     let input=estimate(body);let limit=MAX_TOKENS.saturating_sub(output);
     anyhow::ensure!(input<=limit,"Context exceeds the 256k capacity (estimated {input} input tokens, {output} reserved output tokens); task-directed history selection is required; no original message was truncated");

@@ -173,7 +173,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
       }
       case 'assistant/message': {
         const content = messageOf(event).content
-        const text = textOf(content)
+        const text = (event.data.acceptance_pending === true ? '本轮执行结果（提交 Observer 验收）\n\n' : '') + textOf(content)
         const reasoning = textOf(content, 'reasoning')
         const turn = numberOf(event.data.turn) ?? 0
         const step = numberOf(event.data.step) ?? 0
@@ -212,7 +212,16 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
       case 'observer/retrospective': {
         const original = event.data.observer_return
         const report = original && typeof original === 'object' ? original as Record<string, unknown> : event.data
-        const text = [stringOf(report.summary) ?? stringOf(event.data.summary),
+        const acceptance = report.acceptance && typeof report.acceptance === 'object' ? report.acceptance as Record<string, unknown> : undefined
+        const labels: Record<string, string> = { passed: '要求已满足', needs_work: '需要补齐', blocked: '受限，存在未完成项', uncertain: '尚未确认' }
+        const requirements = Array.isArray(acceptance?.requirements) ? acceptance.requirements.flatMap(value => {
+          if (!value || typeof value !== 'object') return []
+          const item = value as Record<string, unknown>
+          return [`- ${String(item.requirement ?? '')}：${String(item.result ?? '')}${item.explanation ? `；${String(item.explanation)}` : ''}`]
+        }) : []
+        const text = [acceptance ? `验收：${labels[String(acceptance.assessment)] ?? String(acceptance.assessment ?? '尚未确认')}` : undefined,
+          ...requirements, report.action === 'continue' ? 'Observer 请求将具体缺口交回 Organizer，继续补齐。' : undefined,
+          stringOf(report.summary) ?? stringOf(event.data.summary),
           stringOf(report.path_review) ?? stringOf(event.data.pathReview),
           ...observerStringList(report.shortening_opportunities ?? event.data.shorteningOpportunities).map(item => `- 下次可改进：${item}`),
           event.data.status === 'unavailable' ? `复盘未完成：${stringOf(event.data.message) ?? '未返回结果'}` : undefined]
@@ -515,7 +524,9 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         }
       }
       case 'observer/retrospective_start':
-        return { ...base, name: '复盘中', detail: 'Worker 已结束，Observer 正在回看完整工作路径。' }
+        return { ...base, name: '验收中', detail: '本轮执行结束，Observer 正在核对当前用户要求及实际成果。' }
+      case 'observer/followup':
+        return { ...base, name: '补齐中', detail: JSON.stringify(data.observer_return) }
       case 'observer/retrospective': {
         const shortening = observerStringList(data.shorteningOpportunities)
         const findings = Array.isArray(data.workFindings) ? data.workFindings.map(item => {

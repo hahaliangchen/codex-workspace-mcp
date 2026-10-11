@@ -225,9 +225,15 @@ impl TaskTree {
             .and_then(|result|result["goal_achieved"].as_bool())
     }
     pub fn resume_unachieved_request(&mut self) {
+        if self.goal_assessment()==Some(true) {return;}
+        self.continue_request();
+    }
+    /// An explicit acceptance return asks for more work on this request.
+    /// Reopen its grouping root; completed child invocations stay sealed.
+    pub fn continue_request(&mut self) {
         let Some(root_id)=self.nodes.values().find(|node|node.parent_id.is_none()).map(|node|node.id.clone()) else {return;};
         let Some(root)=self.nodes.get_mut(&root_id) else {return;};
-        if root.status=="done" && root.result.as_ref().and_then(|result|result["goal_achieved"].as_bool())!=Some(true) {
+        if root.status=="done" {
             if let Some(result)=root.result.take() {root.history_results.push(result);}
             root.status="running".into();
             self.active=root_id;

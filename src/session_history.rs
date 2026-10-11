@@ -141,7 +141,8 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
     let task = task.to_owned();
     let request = input["process"]["request_id"].as_i64().unwrap_or(1);
     let initial_context = json!({"capabilities":input["capabilities"],"request_id":request,
-        "resumable_tasks":input["process"]["resumable_tasks"],"turn":input["turn"]});
+        "resumable_tasks":input["process"]["resumable_tasks"],"turn":input["turn"],
+        "execution_phase":if input["process"]["handoff"]["intent"]=="observer_followup" {"Complete the specific gaps in the preceding original Observer return; preserve the same human goal and reuse completed work."}else{"execution"}});
     let human_request=input["human_request"].clone();
     tokio::task::spawn_blocking(move || -> Result<crate::context_window::HistoryView> {
         let conn = crate::agent_service::open_db(&root)?;
@@ -162,13 +163,20 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
             let before=messages.len();
             (|| -> Result<()> {
             let data: Value = serde_json::from_str(&raw)?;
+            // Ordinary Organizer input is the invocation's public handoff,
+            // not the Worker's implementation trace. The complete pool remains
+            // readable on demand and available for explicit context selection.
+            if !all_history && (matches!(kind.as_str(),"tool/call"|"tool/result"|"worker/progress")
+                || kind=="visual/input_result" && data["actor"]!="organizer"
+                || kind=="assistant/message" && data["actor"]!="organizer") {return Ok(());}
             if !all_history && kind=="observer/advice_delivered" && data["advice"]["identity"]["request_id"].as_i64()
                 .or_else(||data["advice"]["request_id"].as_i64()).is_some_and(|id|id!=request) {return Ok(());}
             if kind=="user/message" {
                 let content=data["model_content"].as_str().map(str::to_owned).unwrap_or_else(||message_text(&data["message"]));
-                messages.push(json!({"role":"user","content":content}));
+                let source=source_record(&task,seq,time,&kind,&data);
+                messages.push(with_source(json!({"role":"user","content":content}),&source));
                 if let Some(images)=image_message(&data["message"]) {
-                    messages.push(routed_message("user","user",&images,&data["identity"]));
+                    messages.push(with_source(routed_message("user","user",&images,&data["identity"]),&source));
                 }
                 return Ok(());
             }
@@ -294,6 +302,85 @@ pub fn history_image_messages(result:&Value)->Vec<Value> {
         Some(with_source(routed_message("user",record["role"].as_str().unwrap_or("history"),original,&record["source_identity"]),&record["source"]))
     }).collect()
 }
+
+/// A history lookup is a new read, not a new occurrence of its old messages.
+/// Move excerpt bodies into source-labelled messages and leave references in
+/// the lookup receipt. Stored events and tool results are never changed.
+fn project_history_read(value:&mut Value, originals:&mut Vec<Value>) {
+    if matches!(value["scope"].as_str(),Some("conversation"|"project")) {
+        if let Some(records)=value["records"].as_array_mut() {
+            for record in records {
+                let Some(text)=record["content"].as_str().map(str::to_owned) else {continue;};
+                let Some(seq)=record["seq"].as_i64() else {continue;};
+                let mut source=record["source"].clone();
+                if !source.is_object() {continue;}
+                source["seq"]=json!(seq);
+                for field in ["char_offset","payload_path","total_chars","returned_chars","omitted_chars"] {
+                    source[field]=record[field].clone();
+                }
+                originals.push(with_source(raw_message("retrieved_history",&json!(text)),&source));
+                let fields=record.as_object_mut().unwrap();
+                fields.remove("content");fields.remove("image_message");
+                fields.insert("content_location".into(),json!("Original excerpt is supplied in source order as a retrieved_history message; use seq and char_offset to locate it."));
+            }
+            return;
+        }
+    }
+    // Existing receipts use result wrappers; native tool receipts serialize
+    // the same result in content. Do not search arbitrary business fields.
+    if let Some(result)=value.get_mut("result") {project_history_read(result,originals);}
+    if let Some(Value::String(content))=value.get_mut("content") {
+        if let Ok(mut result)=serde_json::from_str::<Value>(content) {
+            let before=originals.len();project_history_read(&mut result,originals);
+            if originals.len()!=before {*content=result.to_string();}
+        }
+    }
+}
+
+fn source_position(message:&Value)->Option<(String,i64,u64)> {
+    // The current Worker command is a function input, not historical replay.
+    // Native assistant/tool exchanges retain their protocol order too.
+    if message["role"]!="user"||message["name"]=="organizer" {return None;}
+    let text=message["content"].as_str().or_else(||message["content"].as_array()?.iter()
+        .find_map(|part|part["text"].as_str().filter(|text|text.starts_with("Source: "))))?;
+    let header=text.strip_prefix("Source: ")?.split('\n').next()?;
+    let source:Value=serde_json::from_str(header).ok()?;
+    let task=source["history_reference"]["task_id"].as_str()
+        .or_else(||source["identity"]["task_id"].as_str())?;
+    Some((task.to_owned(),source["seq"].as_i64()?,source["char_offset"].as_u64().unwrap_or(0)))
+}
+
+/// Merge all retrieved history into its original conversation order, even
+/// across lookup batches/pages. Unrelated conversations have separate arrays;
+/// never compare their local sequence numbers. Non-history messages stay put.
+pub fn order_context_messages(messages:&mut Vec<Value>) {
+    let mut originals=Vec::new();
+    for message in messages.iter_mut() {
+        // Only read/result envelopes can contain retrieved history. Source
+        // bodies such as Worker returns are forwarded without interpretation.
+        let replay_read=matches!(message["name"].as_str(),Some("organizer_result"|"worker_tool_result"|"observer_history_read"));
+        if message["role"]!="tool"&&!replay_read {continue;}
+        let Some(content)=message["content"].as_str() else {continue;};
+        let (prefix,body)=if content.starts_with("Source: ") {
+            let Some((header,body))=content.split_once("\n\n") else {continue;};
+            (format!("{header}\n\n"),body)
+        }else{(String::new(),content)};
+        let Ok(mut value)=serde_json::from_str::<Value>(body) else {continue;};
+        let before=originals.len();project_history_read(&mut value,&mut originals);
+        if originals.len()!=before {message["content"]=json!(format!("{prefix}{value}"));}
+    }
+    messages.extend(originals);
+    let mut conversations=std::collections::HashMap::<String,usize>::new();
+    let mut positions=Vec::new();let mut ordered=Vec::new();
+    for (index,message) in messages.iter().enumerate() {
+        let Some((task,seq,offset))=source_position(message) else {continue;};
+        let next=conversations.len();let group=*conversations.entry(task).or_insert(next);
+        positions.push(index);ordered.push(((group,seq,offset),message.clone()));
+    }
+    ordered.sort_by_key(|(position,_)|*position);
+    for (index,(_,message)) in positions.into_iter().zip(ordered) {messages[index]=message;}
+}
+
 fn image_message(message:&Value)->Option<Value> {
     let images=message["content"].as_array()?.iter().filter(|block|matches!(block["type"].as_str(),Some("image_ref"|"image_url"))).cloned().collect::<Vec<_>>();
     (!images.is_empty()).then(||json!({"content":images}))
@@ -645,6 +732,7 @@ mod tests {
         let advice=messages.iter().filter(|message|message["name"].as_str().is_some_and(|name|name.starts_with("observer_"))).collect::<Vec<_>>();
         assert_eq!(advice.len(),2,"one reply is not repeated for each extracted recommendation; distinct replies stay distinct");
         for message in advice {assert_eq!(original_text(message["content"].as_str().unwrap()),raw);}
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
 

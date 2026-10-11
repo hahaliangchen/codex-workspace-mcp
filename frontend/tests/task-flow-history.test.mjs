@@ -7,6 +7,17 @@ const { outputText } = ts.transpileModule(source, { compilerOptions: { module: t
 const { flowState, chatItems, trajectoryRows } = await import('data:text/javascript;base64,' + Buffer.from(outputText).toString('base64'))
 const event = (type, data) => ({ type, time: 0, data })
 
+test('execution result is pending acceptance and the original specific gap is visible', () => {
+  const events = [event('assistant/message', { acceptance_pending: true, message: { content: [{ type: 'text', text: '执行结果' }] } }),
+    event('observer/retrospective', { status: 'completed', observer_return: { action: 'continue', summary: '缺少第 2 页截图',
+      acceptance: { assessment: 'needs_work', requirements: [{ requirement: '保存第 2 页截图', result: 'unmet', explanation: '只有第 1 页图片' }] } } })]
+  const items = chatItems(events)
+  assert.match(items[0].text, /提交 Observer 验收/)
+  assert.match(items[1].text, /需要补齐/)
+  assert.match(items[1].text, /只有第 1 页图片/)
+  assert.match(items[1].text, /交回 Organizer/)
+})
+
 test('ended runs retain the Organizer assessment without claiming goal completion', () => {
   const events = [event('turn/start', { turn: 1 }),
     event('organizer/decision', { turn: 1, decision: { action: 'blocked', achieved: false, unresolved: ['视觉验收未完成'] } }),

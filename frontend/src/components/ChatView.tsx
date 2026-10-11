@@ -309,6 +309,9 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
   }, [events])
   const durationInfo = useTaskDuration(events, task, running)
   const thinking = running && awaitingModel(events)
+  const acceptanceEvent = events.findLast(event => ['turn/start', 'observer/retrospective_start', 'observer/retrospective', 'observer/followup'].includes(event.type))
+  const acceptancePhase = running && acceptanceEvent?.type === 'observer/retrospective_start' ? 'Observer 正在验收本轮结果…'
+    : running && acceptanceEvent?.type === 'observer/followup' ? '正在补齐 Observer 指出的具体缺口…' : undefined
 
   const closedBefore = useMemo(() => {
     let lastEnd = -1
@@ -403,6 +406,7 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
       <div className={chatCss.root}>
         <div className={chatCss.scroll}>
           <div className={chatCss.column}>
+            {acceptancePhase && <div className={chatCss.hint} role="status">{acceptancePhase}</div>}
             {items.length === 0 && !thinking && <div className={chatCss.hint}>{t('app.waiting')}</div>}
 
             {nodes.map((node) => {

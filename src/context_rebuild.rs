@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{collections::BTreeSet, time::Duration};
 use tokio_util::sync::CancellationToken;
 
-const SELECTION_SYSTEM:&str="You are rebuilding your own context window for the current task. This is a context-selection phase, not task execution. Search the shared conversation using read_session_history: inspect the latest changes, then retrieve earlier instructions, results, corrections or advice necessary for your current task. Select existing event references with select_context. Keep necessary dependencies and superseding instructions; do not select old receipts as new executions. The host will recover whole original messages and put them in original history order. Do not summarize or rewrite them. Select only what is necessary, leave space for continued execution, and do not try to fill the window. No project operations, Worker dispatch or messages to other roles are allowed in this phase.";
+const SELECTION_SYSTEM:&str="You are rebuilding your own context window for the current task. This is a context-selection phase, not task execution. Search the shared conversation using read_session_history: inspect the latest changes, then retrieve earlier instructions, results, corrections or advice necessary for your current task. Ordinary source records contain actual operations and returns. include_context=true reads saved model-input views: use it for a specific debug/context_request reference when investigating what a role received; listing request copies does not retrieve actual execution results. Select existing event references with select_context. Keep necessary dependencies and superseding instructions; do not select old receipts as new executions. The host will recover whole original messages and put them in original history order. Do not summarize or rewrite them. Select only what is necessary, leave space for continued execution, and do not try to fill the window. No project operations, Worker dispatch or messages to other roles are allowed in this phase.";
 
 #[derive(Clone, Default)]
 struct Window {
@@ -277,6 +277,9 @@ async fn prepare_at_limit(
     let select = async {
         let mut looked_up = false;
         loop {
+            if let Some(Value::Array(messages))=selection_body.get_mut("messages") {
+                crate::session_history::order_context_messages(messages);
+            }
             ensure!(
                 estimate(&selection_body) <= MAX_TOKENS.saturating_sub(8192),
                 "Context-selection search exceeded its capacity; no original was silently dropped"
@@ -330,7 +333,10 @@ async fn prepare_at_limit(
                 )?;
                 let result = match name {
                     "read_session_history" => {
-                        ensure!(args["scope"].as_str().is_none_or(|s|s=="conversation") && args["task_id"].as_str().is_none_or(|s|s==task) && args["include_context"]!=true,"Context selection reads only this shared conversation, not model-request copies");
+                        // Exact role inputs belong to this conversation too.
+                        // Reading them helps choose evidence; it neither runs
+                        // the old invocation again nor selects its entire body.
+                        ensure!(args["scope"].as_str().is_none_or(|s|s=="conversation") && args["task_id"].as_str().is_none_or(|s|s==task),"Context selection reads only this shared conversation");
                         let mut bounded = args.clone();
                         if input["target_role"] == "worker" {
                             bounded["node_id"] = metadata["nodeId"].clone();
@@ -593,7 +599,7 @@ mod tests {
                             let message = if seen.len() == 1 {
                                 call(
                                     "read_session_history",
-                                    json!({"query":"必要的旧信息","limit":2}),
+                                    json!({"query":"必要的旧信息","limit":2,"include_context":true}),
                                 )
                             } else {
                                 call("select_context", json!({"event_seqs":[11,3]}))
@@ -835,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_256k_rebuilds_before_actual_organizer_and_observer_requests() {
+    async fn over_256k_preserves_original_returns_with_role_specific_history_routing() {
         use axum::response::IntoResponse;
         for actor in ["organizer", "observer"] {
             let root = root();
@@ -906,11 +912,20 @@ mod tests {
                 let raw=crate::agent_service::observer_json_response(&state,"fake","review",json!({"stage":"retrospective","identity":{"request_id":1},"request":{"goal":"check existing upload"},"task_history":history}),1000,"task",json!({"turn":1})).await.unwrap();
                 assert_eq!(raw, "reviewed original receipt");
             }
-            assert_eq!(
-                captured.lock().unwrap().len(),
-                3,
-                "two selection requests then exactly one normal role request"
-            );
+            let expected_requests = if actor == "organizer" { 3 } else { 1 };
+            let expected_selections = if actor == "organizer" { 2 } else { 0 };
+            let seen = captured.lock().unwrap();
+            assert_eq!(seen.len(), expected_requests);
+            if actor == "observer" {
+                let header = crate::session_history::parse_plain_context(seen[0]["messages"][1]["content"].as_str().unwrap());
+                let history = &header["task_history"];
+                assert_eq!(history["coverage"], "selected_role_messages");
+                assert_eq!(history["omitted_event_refs"], json!([5]));
+                assert_eq!(history["history_reference"]["task_id"], "task");
+                let omitted = crate::session_history::read(&root, "task", &json!({"scope":"conversation","task_id":"task","event_seq":5})).await.unwrap();
+                assert!(omitted.to_string().contains("UNRELATED_FILLER"), "omitted originals remain readable rather than being discarded");
+            }
+            drop(seen);
             let conn = crate::agent_service::open_db(&root).unwrap();
             let requests: i64 = conn
                 .query_row(
@@ -919,9 +934,9 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(requests, 3);
+            assert_eq!(requests, expected_requests as i64);
             let selections:i64=conn.query_row("SELECT COUNT(*) FROM agent_request_contexts WHERE json_extract(metadata,'$.stage')='context_selection'",[],|r|r.get(0)).unwrap();
-            assert_eq!(selections, 2);
+            assert_eq!(selections, expected_selections);
             drop(conn);
             server.abort();
             std::fs::remove_dir_all(root).unwrap();

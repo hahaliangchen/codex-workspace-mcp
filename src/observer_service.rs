@@ -1,5 +1,6 @@
 //! End-of-execution retrospectives over the shared original conversation.
-//! Observer has no running review, advisory queue or scheduling authority.
+//! Observer checks delivery after execution and can return a gap to Organizer.
+//! It never assigns Worker tasks or mutates project files.
 use crate::agent_service::{self, AgentServiceState};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
@@ -211,17 +212,27 @@ pub struct ObserverSession {
     task: String,
     scope: Value,
     finished: bool,
+    cancel: CancellationToken,
+    review: Option<Value>,
 }
 impl ObserverSession {
-    pub fn start(state:AgentServiceState,model:String,task:String,_cancel:&CancellationToken)->Self {
-        Self {enabled:state.observer_enabled,root:state.workspace.root().to_path_buf(),state,model,task,scope:Value::Null,finished:false}
+    pub fn start(state:AgentServiceState,model:String,task:String,cancel:&CancellationToken)->Self {
+        Self {enabled:state.observer_enabled,root:state.workspace.root().to_path_buf(),state,model,task,scope:Value::Null,finished:false,cancel:cancel.clone(),review:None}
     }
     pub fn set_scope(&mut self,scheduler:&crate::work_scheduler::WorkScheduler,prompt:&str) {
-        self.scope=json!({"request_id":scheduler.request_started_turn,"goal":prompt,
+        self.scope=json!({"request_id":scheduler.request_started_turn,"goal":if scheduler.request_goal.is_empty(){prompt}else{&scheduler.request_goal},
             "final_result":scheduler.final_result,"request_completed":scheduler.request_completed});
     }
+    /// Only an explicit successful Observer return requests another execution.
+    /// A missing action, read failure or timeout never implies a business defect.
+    pub fn followup(&self)->Option<Value> {
+        self.review.as_ref().filter(|review|review["status"]=="completed"
+            && review["observer_return"]["action"]=="continue" && !self.cancel.is_cancelled()).cloned()
+    }
+    pub fn next_execution(&mut self) {self.finished=false;self.review=None;}
+    pub fn cancelled(&self)->bool {self.cancel.is_cancelled()}
     pub async fn finish(&mut self,outcome:&str)->Result<()> {
-        if !self.enabled || self.finished {return Ok(());}
+        if !self.enabled || self.finished || self.cancel.is_cancelled() {return Ok(());}
         self.finished=true;
         // A user cancellation or dropped execution must not start another model request.
         if !matches!(outcome,"completed"|"failed"|"max_steps") {return Ok(());}
@@ -229,21 +240,22 @@ impl ObserverSession {
         let turn=history["records"].as_array().into_iter().flatten().filter_map(|record|record["turn"].as_u64()).max().unwrap_or(1);
         agent_service::emit(&self.root,&self.task,"observer/retrospective_start",
             json!({"outcome":outcome,"request_id":self.scope["request_id"],"turn":turn})).await?;
-        let result=match retrospective(&self.state,&self.model,&self.task,&self.scope,outcome,history,turn).await {
+        let result=match retrospective(&self.state,&self.model,&self.task,&self.scope,outcome,history,turn,&self.cancel).await {
             Ok(review)=>review,
             Err(error)=>json!({"status":"unavailable","outcome":outcome,"message":format!("{error:#}"),"memoryRecorded":false,"turn":turn,"request_id":self.scope["request_id"]}),
         };
-        agent_service::emit(&self.root,&self.task,"observer/retrospective",result).await
+        agent_service::emit(&self.root,&self.task,"observer/retrospective",result.clone()).await?;
+        self.review=Some(result);Ok(())
     }
 }
 
-async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str,task_history:Value,turn:u64)->Result<Value> {
+async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str,task_history:Value,turn:u64,cancel:&CancellationToken)->Result<Value> {
     let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
         "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
         "final_result":scope["final_result"],"task_history":task_history,
         "history":{"tool":"read_session_history","scope":"Read original process records, or include_context=true to inspect the exact saved Worker/Organizer model inputs referenced by debug/context_request. Input views are not additional executions."}});
-    let raw=agent_service::observer_json_response(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
-        json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]})).await?;
+    let raw=agent_service::observer_json_response_cancelled(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
+        json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]}),cancel).await?;
     let report:Value=match serde_json::from_str::<Value>(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim()) {
         Ok(report) if report.is_object()=>report,
         parsed=>return Ok(json!({"status":"unavailable","turn":turn,"request_id":scope["request_id"],
@@ -254,10 +266,45 @@ async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Valu
     // memory tools available, but do not turn a task review into a memory write.
     let original=report.get("observer_return").unwrap_or(&report);
     let mut result=json!({"status":"completed","summary":original["summary"],"pathReview":original["path_review"],
+        "action":original["action"],"acceptance":original["acceptance"],"request_id":scope["request_id"],
         "shorteningOpportunities":original["shortening_opportunities"],"workFindings":original["work_findings"],
         "routeShortcuts":original["route_shortcuts"].as_array().into_iter().flatten().map(|item|{let mut item=item.clone();item["lookFirst"]=item["look_first"].clone();item}).collect::<Vec<_>>(),"memoryRecorded":false,"stored":false,"observer_return":original});
     result["turn"]=json!(turn);
     Ok(result)
+}
+
+/// Share existing read tools and their workspace boundaries. No new shell,
+/// editing, browser navigation, upload, screenshot or automatic memory path.
+pub fn tools(state:&AgentServiceState)->Vec<Value> {
+    let mut tools=agent_service::local_tools(&state.workspace,state.tool_catalog.as_deref(),true).into_iter()
+        .filter(|tool|tool["function"]["name"].as_str().is_some_and(|name|read_tool(name)&&state.permission_mode.allows(name))).collect::<Vec<_>>();
+    tools.push(crate::session_history::tool());tools
+}
+pub fn read_tool(name:&str)->bool {
+    matches!(name,"workspace_info"|"list_dir"|"read_file"|"read_file_lines"|"search_text"|"search_code_map"|"view_image"
+        |"search_symbol_business_context"|"list_symbol_business_context"|"browser_read"|"browser_diagnostics")
+        || ["go","rust","ts","python"].iter().any(|language|
+            name==format!("search_{language}_symbols")||name==format!("list_{language}_symbols")||name==format!("read_{language}_symbol"))
+}
+
+/// A large acceptance starts from original role deliveries, not copied source
+/// and every intermediate tool body. All omitted originals remain in history.
+/// This is message routing; it does not judge requirements or summarize facts.
+pub fn acceptance_history(history:&Value)->Value {
+    let mut selected=history.clone();let mut omitted=Vec::new();
+    if let Some(records)=selected["records"].as_array_mut() {
+        records.retain(|record| {
+            let keep=matches!(record["kind"].as_str(),Some("user/message"|"organizer/method_message"|"organizer/assignment"|"worker/yield"
+                |"worker/progress"|"worker/error"|"organizer/error"|"organizer/request_error"|"visual/input_result"|"observer/retrospective"|"turn/end"))
+                || record["kind"]=="assistant/message"&&record["actor"]=="organizer"
+                || record["kind"]=="tool/result"&&record["is_error"]==true;
+            if !keep {omitted.push(record["seq"].clone());}keep
+        });
+        let count=records.len();selected["supplied_records"]=json!(count);
+    }
+    selected["coverage"]=json!("selected_role_messages");selected["omitted_event_refs"]=json!(omitted);
+    selected["view_note"]=json!("These are original instructions, assignments, returns and image inputs. Intermediate tools and exact model requests are stored in the same history_reference; retrieve specific evidence to check actual delivery. This view does not prove a complete process review.");
+    selected
 }
 
 #[cfg(test)]
@@ -271,6 +318,82 @@ fn iteration_records(process:&Value,after_seq:i64,through_seq:i64)->Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuation_is_an_explicit_original_return_not_a_status_or_keyword_inference() {
+        let root=std::env::temp_dir();
+        let state=agent_service::tests::flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
+        let cancel=CancellationToken::new();
+        let mut observer=ObserverSession::start(state.clone(),"fake".into(),"task".into(),&cancel);
+        for report in [json!({"status":"unavailable","observer_return":{"action":"continue"}}),
+            json!({"status":"completed","observer_return":{"summary":"需要继续修改"}}),
+            json!({"status":"completed","observer_return":{"action":"deliver","acceptance":{"assessment":"blocked"}}})] {
+            observer.review=Some(report);assert!(observer.followup().is_none());
+        }
+        let report=json!({"status":"completed","observer_return":{"action":"continue","handoff":{"original":"reason\n尾部","extra":[1,null,false]}}});
+        observer.review=Some(report.clone());assert_eq!(observer.followup(),Some(report));
+        cancel.cancel();assert!(observer.followup().is_none());
+        for permission in [agent_service::PermissionMode::ReadOnly,agent_service::PermissionMode::FullAccess] {
+            let mut state=state.clone();state.permission_mode=permission;
+            let tools=tools(&state);
+            assert!(tools.iter().any(|tool|tool["function"]["name"]=="read_file"));
+            assert!(tools.iter().any(|tool|tool["function"]["name"]=="view_image"));
+            assert!(tools.iter().all(|tool|tool["function"]["name"]=="read_session_history"||read_tool(tool["function"]["name"].as_str().unwrap())));
+            assert!(!tools.iter().any(|tool|tool["function"]["name"]=="write_file"||tool["function"]["name"]=="browser_upload"));
+            assert_eq!(tools.iter().any(|tool|tool["function"]["name"]=="browser_read"),matches!(permission,agent_service::PermissionMode::FullAccess));
+        }
+    }
+
+    #[test]
+    fn acceptance_scope_uses_the_effective_human_goal_not_a_continue_message() {
+        let state=agent_service::tests::flow_test_state(&std::env::temp_dir(),"127.0.0.1:9".parse().unwrap());
+        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&CancellationToken::new());
+        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_goal="Current replacement requirement".into();
+        observer.set_scope(&scheduler,"continue");assert_eq!(observer.scope["goal"],scheduler.request_goal);
+    }
+    #[test]
+    fn large_acceptance_routes_original_returns_without_rewriting_or_claiming_full_coverage() {
+        let input=json!({"coverage":"complete","total_records":5,"history_reference":{"task_id":"t"},"records":[
+            {"seq":1,"kind":"user/message","payload":"original requirement"},
+            {"seq":2,"kind":"tool/result","payload":{"raw":"源代码".repeat(1000)}},
+            {"seq":3,"kind":"worker/yield","payload":{"reason":"原始原因", "extra":[false,null,1]}},
+            {"seq":4,"kind":"visual/input_result","payload":{"content":[{"type":"image_ref","artifact_id":"image"}]}},
+            {"seq":5,"kind":"tool/result","is_error":true,"payload":{"error":"原始失败原因", "diagnostics":[false,null,1]}}]});
+        let routed=acceptance_history(&input);
+        assert_eq!(routed["records"],json!([input["records"][0],input["records"][2],input["records"][3],input["records"][4]]));
+        assert_eq!(routed["omitted_event_refs"],json!([2]));assert_eq!(routed["total_records"],5);
+        assert_eq!(routed["history_reference"],input["history_reference"]);assert_eq!(routed["coverage"],"selected_role_messages");
+        assert_eq!(input["records"][1]["payload"]["raw"],"源代码".repeat(1000));
+    }
+    #[tokio::test]
+    async fn cancellation_during_acceptance_keeps_error_without_dispatching_more_work() {
+        let root=std::env::temp_dir().join(format!("observer-cancel-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn=agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();drop(conn);
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let notified=std::sync::Arc::new(tokio::sync::Notify::new());let arrived=notified.clone();
+        let app=axum::Router::new().route("/v1/chat/completions",axum::routing::post(move || {
+            let arrived=arrived.clone();async move {arrived.notify_one();std::future::pending::<String>().await}
+        }));
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        let cancel=CancellationToken::new();let cancellation=cancel.clone();
+        let abort=tokio::spawn(async move {notified.notified().await;cancellation.cancel();});
+        let mut state=agent_service::tests::flow_test_state(&root,address);state.observer_enabled=true;
+        state.observer_provider_url=state.provider_url.clone();
+        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&cancel);
+        observer.set_scope(&crate::work_scheduler::WorkScheduler::default(),"goal");
+        tokio::time::timeout(std::time::Duration::from_secs(5),observer.finish("completed")).await.unwrap().unwrap();
+        assert!(observer.followup().is_none());
+        let review=observer.review.as_ref().unwrap();assert_eq!(review["status"],"unavailable");
+        assert!(review["message"].as_str().unwrap().contains("cancelled by user"),"{review}");
+        abort.await.unwrap();server.abort();let _=server.await;
+        let conn=agent_service::open_db(&root).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_request_contexts WHERE json_extract(metadata,'$.status')='cancelled'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='observer/followup'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        drop(conn);std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn disabled_cancelled_interrupted_and_dropped_sessions_never_review() {
         let root=std::env::temp_dir().join(format!("observer-no-background-{}",crate::visual_artifacts::new_id()));

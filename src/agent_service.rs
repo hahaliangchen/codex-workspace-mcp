@@ -28,12 +28,17 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_MAX_STEPS: usize = 100;
 const ORGANIZER_REQUEST_RETRY_LIMIT: usize = 1;
 #[cfg(test)]
-const ORGANIZER_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+// Parallel Windows fixtures may spend over a second waiting on SQLite/HTTP.
+// Explicit timeout fixtures sleep past this same deadline; production stays 180s.
+const ORGANIZER_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(not(test))]
 const ORGANIZER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const SUBAGENT_MAX_STEPS: usize = 12;
 const MAX_STEP_LIMIT: usize = 100;
-const OBSERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+// Acceptance may include history, code and image reads before its return.
+// Use the same production window as an Organizer decision, not the former
+// short summary-only window. A deadline never implies a business defect.
+const OBSERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -44,7 +49,7 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
-    fn allows(self, name: &str) -> bool {
+    pub(crate) fn allows(self, name: &str) -> bool {
         match name {
             "write_file" | "replace_range" | "edit_file" => !matches!(self, Self::ReadOnly),
             // Process execution uses the host account without a filesystem
@@ -632,14 +637,20 @@ fn worker_visual_context(task:&str,scheduler:&crate::work_scheduler::WorkSchedul
 }
 
 
-pub(crate) async fn observer_json_response(
+#[cfg(test)]
+pub(crate) async fn observer_json_response(state:&AgentServiceState,model:&str,system:&str,context:Value,
+    max_tokens:usize,task_id:&str,trace_metadata:Value)->anyhow::Result<String> {
+    observer_json_response_cancelled(state,model,system,context,max_tokens,task_id,trace_metadata,&state.plugin_cancel).await
+}
+pub(crate) async fn observer_json_response_cancelled(
     state: &AgentServiceState,
     model: &str,
     system: &str,
-    context: Value,
+    mut context: Value,
     max_tokens: usize,
     task_id: &str,
     mut trace_metadata: Value,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<String> {
     let history_guidance=if context["stage"]=="retrospective" {
         "Review the current human goal's complete chronological task_history, including failures, recovery and earlier Observer messages. If coverage is partial, use read_session_history with the provided history_reference to read omitted process records before claiming a complete review. Report any unread scope explicitly."
@@ -666,12 +677,23 @@ pub(crate) async fn observer_json_response(
     }
     let mut request_body = json!({"model":model,"stream":false,"max_tokens":max_tokens,
         "messages":observer_view.messages,
-        "tools":[crate::session_history::tool()],"tool_choice":"auto"});
-    let visual_context=crate::visual_artifacts::VisualContext {turn:trace_metadata["turn"].as_u64().map(|turn|turn as usize),identity:context["identity"].clone(),execution_epoch:context["execution_epoch"].as_u64().unwrap_or(0) as usize,related_source_versions:context["related_source_versions"].clone(),current_page:context["task_page"].clone(),host_current_artifact_ids:context["host_current_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),allowed_artifact_ids:context["allowed_visual_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),..Default::default()};
+        "tools":crate::observer_service::tools(state),"tool_choice":"auto"});
+    if context["stage"]=="retrospective" && crate::context_window::estimate(&request_body)>
+        crate::context_window::MAX_TOKENS.saturating_sub(max_tokens+8192) {
+        context["task_history"]=crate::observer_service::acceptance_history(&context["task_history"]);
+        let mut header=context.clone();header["task_history"].as_object_mut().unwrap().remove("records");
+        observer_view.messages.truncate(1);observer_view.sources.truncate(1);
+        observer_view.messages.push(json!({"role":"user","content":crate::session_history::plain_context(&header)}));observer_view.sources.push(None);
+        let process=crate::session_history::process_view(&context["task_history"]);
+        observer_view.messages.extend(process.messages);observer_view.sources.extend(process.sources);
+        request_body["messages"]=json!(observer_view.messages);
+    }
+    let mut visual_context=crate::visual_artifacts::VisualContext {turn:trace_metadata["turn"].as_u64().map(|turn|turn as usize),identity:context["identity"].clone(),execution_epoch:context["execution_epoch"].as_u64().unwrap_or(0) as usize,related_source_versions:context["related_source_versions"].clone(),current_page:context["task_page"].clone(),host_current_artifact_ids:context["host_current_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),allowed_artifact_ids:context["allowed_visual_artifact_ids"].as_array().into_iter().flatten().filter_map(|id|id.as_str().map(str::to_owned)).collect(),..Default::default()};
+    visual_context.allowed_artifact_ids.extend(crate::visual_artifacts::request_artifact_ids(state.workspace.root(),task_id,context["identity"]["request_id"].as_u64().unwrap_or(1))?);
     // An observation never selects or captures images on the model's behalf.
     let ids:Vec<String>=Vec::new();
     let scope=format!("request:{}:node:{}",context["identity"]["request_id"].as_u64().unwrap_or(1),context["identity"]["node_id"].as_str().unwrap_or("request"));
-    trace_metadata["context_window"]=crate::context_rebuild::prepare(state,model,"observer",task_id,&scope,&context,&mut request_body,observer_view.clone(),trace_metadata.clone(),&state.plugin_cancel,OBSERVER_REQUEST_TIMEOUT).await?;
+    trace_metadata["context_window"]=crate::context_rebuild::prepare(state,model,"observer",task_id,&scope,&context,&mut request_body,observer_view.clone(),trace_metadata.clone(),cancel,OBSERVER_REQUEST_TIMEOUT).await?;
     let mut lookup_messages=Vec::<Value>::new();
     let mut wire_body=request_body.clone();
     let visual_dispatch=crate::visual_artifacts::prepare_request(state,"observer",model,&visual_context,&ids,context["request"]["goal"].as_str().unwrap_or("review current visual delivery"),&mut wire_body).await?;
@@ -686,7 +708,7 @@ pub(crate) async fn observer_json_response(
         loop {
             let followup_trace=if lookup_round>0 {
                 let mut view=observer_view.clone();view.sources.extend(std::iter::repeat_n(None,lookup_messages.len()));view.messages.extend(lookup_messages.clone());
-                trace_metadata["context_window"]=crate::context_rebuild::prepare(state,model,"observer",task_id,&scope,&context,&mut request_body,view,trace_metadata.clone(),&state.plugin_cancel,OBSERVER_REQUEST_TIMEOUT).await?;
+                trace_metadata["context_window"]=crate::context_rebuild::prepare(state,model,"observer",task_id,&scope,&context,&mut request_body,view,trace_metadata.clone(),cancel,OBSERVER_REQUEST_TIMEOUT).await?;
                 wire_body=request_body.clone();
                 let dispatch=crate::visual_artifacts::prepare_request(state,"observer",model,&visual_context,&ids,context["request"]["goal"].as_str().unwrap_or("review current visual delivery"),&mut wire_body).await?;
                 crate::context_window::prepare(&mut wire_body,2)?;
@@ -694,12 +716,14 @@ pub(crate) async fn observer_json_response(
                 metadata["visual_dispatch"]=dispatch;
                 crate::request_context::record(state.workspace.root(),task_id,metadata,&wire_body).await
             } else {trace.take()};
-            let response=async {
+            let response=tokio::select! { biased;
+                _=cancel.cancelled()=>Err(anyhow::anyhow!("Observer cancelled by user")),
+                response=async {
                 let response = state.client.post(format!("{}/chat/completions", state.observer_provider_url.trim_end_matches('/')))
                     .bearer_auth(&state.observer_api_key).header("x-codex-visual-dispatch","task-owned").json(&wire_body).send().await?;
                 crate::visual_probe::successful_response(response).await?.json::<Value>().await.map_err(anyhow::Error::from)
-            }.await;
-            crate::request_context::finish(followup_trace,if response.is_ok(){"completed"}else{"failed"},
+            }=>response };
+            crate::request_context::finish(followup_trace,if cancel.is_cancelled(){"cancelled"}else if response.is_ok(){"completed"}else{"failed"},
                 json!({"response":response.as_ref().ok(),"error":response.as_ref().err().map(|error|format!("{error:#}"))})).await;
             let body=response?;let message=&body["choices"][0]["message"];
             let calls=message["tool_calls"].as_array().filter(|calls|!calls.is_empty());
@@ -708,12 +732,17 @@ pub(crate) async fn observer_json_response(
                 lookup_messages.push(exchange.clone());request_body["messages"].as_array_mut().unwrap().push(exchange);
                 for call in calls {
                     let args=call["function"]["arguments"].as_str().unwrap_or("{}");
-                    let output=if call["function"]["name"]=="read_session_history" {
-                        match serde_json::from_str::<Value>(args) {
-                            Ok(args)=>crate::session_history::read(state.workspace.root(),task_id,&args).await,
-                            Err(error)=>Err(error.into()),
-                        }
-                    } else {Err(anyhow::anyhow!("Observer tool is not available: {}",call["function"]["name"]))};
+                    if cancel.is_cancelled() {anyhow::bail!("Observer cancelled by user");}
+                    let name=call["function"]["name"].as_str().unwrap_or("");
+                    let output=match serde_json::from_str::<Value>(args) {
+                        Ok(args) if name=="read_session_history"=>crate::session_history::read(state.workspace.root(),task_id,&args).await,
+                        Ok(args) if crate::observer_service::read_tool(name)&&request_body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]==name)=> {
+                            if matches!(name,"view_image"|"browser_read"|"browser_diagnostics") {crate::browser_control::execute_scoped(&state.workspace,&visual_context,name,&args).await}
+                            else {execute_tool(state.workspace.clone(),state.tool_catalog.as_deref(),name,args).await}
+                        },
+                        Ok(_)=>Err(anyhow::anyhow!("Observer tool is not available: {name}")),
+                        Err(error)=>Err(error.into()),
+                    };
                     let is_error=output.is_err();
                     let result=output.unwrap_or_else(|error|json!({"error":format!("{error:#}")}));
                     emit(state.workspace.root(),task_id,"observer/history_read",json!({"actor":"observer","turn":trace_metadata["turn"],"stage":"retrospective",
@@ -723,6 +752,11 @@ pub(crate) async fn observer_json_response(
                     lookup_messages.push(message.clone());request_body["messages"].as_array_mut().unwrap().push(message);
                     let images=crate::session_history::history_image_messages(&result);
                     lookup_messages.extend(images.clone());request_body["messages"].as_array_mut().unwrap().extend(images);
+                    if !is_error&&name=="view_image" {
+                        let image=json!({"role":"user","source_identity":result["visual_artifact"]["identity"],
+                            "content":[{"type":"image_ref","artifact_id":result["artifact_id"],"view_original":serde_json::from_str::<Value>(args)?["original"]==true}]});
+                        lookup_messages.push(image.clone());request_body["messages"].as_array_mut().unwrap().push(image);
+                    }
                 }
                 lookup_round+=1;
                 continue;
@@ -2844,16 +2878,29 @@ pub(crate) async fn run_task(
     let mut organizer_source_chars=0usize;
     let mut active_scope=String::new();
     let mut delivered_commands=HashMap::<String,usize>::new();
-    for step in 1..=max_steps {
+    let mut step=0usize;
+    let mut execution_start=0usize;
+    'executions: loop {
+        step+=1;
         if cancel.is_cancelled() {
             observer.finish("cancelled").await?;finish_cancelled_run(&state, &root, &task_id, turn, &active_flow_node).await?;
             return Ok(());
+        }
+        if step-execution_start>max_steps {
+            emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"error","error":{
+                "message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"}}})).await?;
+            observer.set_scope(&scheduler,&prompt);observer.finish("max_steps").await?;
+            if cancel.is_cancelled() {finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;return Ok(());}
+            if continue_from_acceptance(&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                execution_start=step;continue;
+            }
+            finish(&state,&task_id,"max_steps").await?;return Ok(());
         }
         scheduler.refresh_http_check_validity();
         emit(&root, &task_id, "step/start", json!({"turn":turn,"step":step})).await?;
 
         // Completed work hands off to Organizer to evaluate and choose next action; no automatic activate_next bypass.
-        if (scheduler.needs_organizer() || crate::work_executor::WorkExecutor::should_yield(&scheduler)) && (step<max_steps || scheduler.order().is_none()) {
+        if (scheduler.needs_organizer() || crate::work_executor::WorkExecutor::should_yield(&scheduler)) && (step-execution_start<max_steps || scheduler.order().is_none()) {
             scheduler.refresh_browser_upload_validity(&root,&task_id).await;
             scheduler.save_selection(source_working_set.snapshot());
             emit(&root,&task_id,"organizer/start",json!({"turn":turn,"step":step,"nodeId":scheduler.node()})).await?;
@@ -2911,7 +2958,11 @@ pub(crate) async fn run_task(
                                     fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
                                         "Organizer repeated the same invalid read reference; saved work can be resumed.".to_owned(),
                                         "ORGANIZER_CONTRACT_REPEATED","organizer_contract_validation").await?;
-                                    observer.finish("failed").await?;
+                                    if failed_execution_acceptance(&state,&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                                        execution_start=step;organizer_error=Value::Null;organizer_request_error=Value::Null;
+                                        organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                                        continue 'executions;
+                                    }
                                     return Ok(());
                                 }
                                 continue;
@@ -2934,7 +2985,11 @@ pub(crate) async fn run_task(
                             fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
                                 "Organizer repeated the same malformed method, rule, field and submitted value; saved work is resumable.".to_owned(),
                                 "ORGANIZER_CONTRACT_REPEATED","organizer_contract_validation").await?;
-                            observer.finish("failed").await?;
+                            if failed_execution_acceptance(&state,&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                                execution_start=step;organizer_error=Value::Null;organizer_request_error=Value::Null;
+                                organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                                continue 'executions;
+                            }
                             return Ok(());
                         }
                         continue;
@@ -2961,7 +3016,11 @@ pub(crate) async fn run_task(
                         fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
                             "Organizer request failed after a bounded retry; unfinished work is saved for continuation.".to_owned(),
                             "ORGANIZER_REQUEST_RETRY_EXHAUSTED","organizer_request").await?;
-                        observer.finish("failed").await?;
+                        if failed_execution_acceptance(&state,&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                            execution_start=step;organizer_error=Value::Null;organizer_request_error=Value::Null;
+                            organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                            continue 'executions;
+                        }
                         return Ok(());
                     }
                 }
@@ -3017,7 +3076,11 @@ pub(crate) async fn run_task(
                         fail_turn(&state,&root,&task_id,turn,step,&observer_model,&prompt,
                             format!("Organizer repeated the same invalid rule, field and submitted value: {}",feedback["error"].as_str().unwrap_or("unknown contract error")),
                             "ORGANIZER_CONTRACT_REPEATED","organizer_contract_validation").await?;
-                        observer.finish("failed").await?;
+                        if failed_execution_acceptance(&state,&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                            execution_start=step;organizer_error=Value::Null;organizer_request_error=Value::Null;
+                            organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                            continue 'executions;
+                        }
                         return Ok(());
                     }
                     emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await?;
@@ -3071,14 +3134,22 @@ pub(crate) async fn run_task(
         }
         if scheduler.finished {
             let answer=scheduler.final_result.clone();
-            emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,"actor":"organizer",
+            emit_surface(&root,&task_id,"assistant/message",json!({"turn":turn,"step":step,"actor":"organizer","acceptance_pending":state.observer_enabled,
                 "message":{"id":uuid_like(),"role":"assistant","content":[{"type":"text","text":answer}],
                     "source":{"kind":"model","provider":state.provider_url,"model":model}},"stream":[]}),Some("append")).await?;
             emit(&root,&task_id,"step/end",json!({"turn":turn,"step":step})).await?;
             emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":{"kind":"completed",
                 "goal_achieved":scheduler.request_completed,"unresolved":scheduler.request_unresolved}})).await?;
-            finish(&state,&task_id,"completed").await?;
+            observer.set_scope(&scheduler,&prompt);
             observer.finish("completed").await?;
+            if cancel.is_cancelled() {finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;return Ok(());}
+            if continue_from_acceptance(&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                execution_start=step;
+                organizer_error=Value::Null;organizer_request_error=Value::Null;
+                organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                continue;
+            }
+            finish(&state,&task_id,"completed").await?;
             return Ok(());
         }
         let mut tools = local_tools(&state.workspace, state.tool_catalog.as_deref(), ban_run_command);
@@ -3102,7 +3173,7 @@ pub(crate) async fn run_task(
         // Keep the ordinary capability description even when the final request
         // deliberately offers no tools so a budget limit is not a permission denial.
         let capability_tools = tools.clone();
-        let final_step = step == max_steps && max_steps > 1;
+        let final_step = step-execution_start == max_steps && max_steps > 1;
         if final_step || scheduler.finished {
             tools.clear();
         }
@@ -3605,7 +3676,11 @@ pub(crate) async fn run_task(
                 }
                 fail_turn(&state, &root, &task_id, turn, step, &observer_model, &prompt, message,
                     "WORKER_EXECUTION_FAILED","worker_execution").await?;
-                observer.finish("failed").await?;
+                if failed_execution_acceptance(&state,&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                    execution_start=step;organizer_error=Value::Null;organizer_request_error=Value::Null;
+                    organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                    continue 'executions;
+                }
                 return Ok(());
             }
         };
@@ -3637,8 +3712,15 @@ pub(crate) async fn run_task(
                     json!({"kind":"error","error":{"message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"}})
                 } else { json!({"kind":"completed"}) };
                 emit(&root,&task_id,"turn/end",json!({"turn":turn,"reason":reason})).await?;
-                finish(&state,&task_id,status).await?;
                 observer.finish(status).await?;
+                if cancel.is_cancelled() {finish_cancelled_run(&state,&root,&task_id,turn,&active_flow_node).await?;return Ok(());}
+                if continue_from_acceptance(&root,&task_id,turn,step,&mut scheduler,&mut task_tree,&mut observer).await? {
+                    execution_start=step;
+                    organizer_error=Value::Null;organizer_request_error=Value::Null;
+                    organizer_contract_fingerprints.clear();organizer_read_results.clear();organizer_source_chars=0;
+                    continue;
+                }
+                finish(&state,&task_id,status).await?;
                 return Ok(());
             },
             crate::work_executor::RoundDisposition::Cancelled => {
@@ -3651,14 +3733,24 @@ pub(crate) async fn run_task(
 
     }
 
-    emit(&root,&task_id,"turn/end",json!({
-        "turn":turn,"reason":{"kind":"error","error":{
-            "message":format!("reached max step limit ({max_steps})"),"code":"MAX_STEPS"
-        }}
-    })).await?;
-    finish(&state, &task_id, "max_steps").await?;
-    observer.finish("max_steps").await?;
-    Ok(())
+}
+
+/// Continue only because Observer explicitly requested it. Keep every sealed
+/// delivery, source selection and resource; Organizer chooses the actual repair.
+async fn continue_from_acceptance(root:&std::path::Path,task:&str,turn:usize,step:usize,
+    scheduler:&mut crate::work_scheduler::WorkScheduler,tree:&mut crate::flow_tree::TaskTree,
+    observer:&mut crate::observer_service::ObserverSession)->anyhow::Result<bool> {
+    let Some(review)=observer.followup() else{return Ok(false);};
+    tree.continue_request();
+    scheduler.finished=false;scheduler.request_completed=Some(false);
+    scheduler.handoff=Some(json!({"done":false,"intent":"observer_followup","observer_return":review["observer_return"],
+        "previous_handoff":scheduler.pending_handoff()}));
+    emit(root,task,"observer/followup",json!({"turn":turn,"step":step,"request_id":scheduler.request_started_turn,
+        "observer_return":review["observer_return"]})).await?;
+    let flow=scheduler.unified_flow_plan(tree.enabled().then_some(tree));
+    crate::observer_service::commit(root,task,json!({"commit_id":format!("{turn}:{step}:acceptance-followup"),
+        "turn":turn,"step":step,"scheduler":scheduler.snapshot(),"task_tree":tree.snapshot(),"flow_plan":flow}),Vec::new()).await?;
+    observer.next_execution();Ok(true)
 }
 async fn persist_organizer_failure(
     root:&std::path::Path,
@@ -3682,8 +3774,19 @@ async fn persist_organizer_failure(
     Ok(())
 }
 
+async fn failed_execution_acceptance(state:&AgentServiceState,root:&std::path::Path,task:&str,turn:usize,step:usize,
+    scheduler:&mut crate::work_scheduler::WorkScheduler,tree:&mut crate::flow_tree::TaskTree,
+    observer:&mut crate::observer_service::ObserverSession)->anyhow::Result<bool> {
+    observer.set_scope(scheduler,"");observer.finish("failed").await?;
+    if observer.cancelled() {
+        finish_cancelled_run(state,root,task,turn,scheduler.node()).await?;return Ok(false);
+    }
+    if continue_from_acceptance(root,task,turn,step,scheduler,tree,observer).await? {return Ok(true);}
+    finish(state,task,"failed").await?;Ok(false)
+}
+
 async fn fail_turn(
-    state: &AgentServiceState,
+    _state: &AgentServiceState,
     root: &std::path::Path,
     task_id: &str,
     turn: usize,
@@ -3702,7 +3805,8 @@ async fn fail_turn(
         json!({"turn":turn,"reason":{"kind":"error","error":{"message":message,"code":code,"stage":stage}}}),
     )
     .await?;
-    finish(state, task_id, "failed").await?;
+    // Keep the task running through acceptance; its explicit return determines
+    // continuation. An unavailable review leaves the execution failure intact.
     Ok(())
 }
 
@@ -3849,7 +3953,7 @@ fn run_subagent<'a>(
     })
 }
 
-fn local_tools(
+pub(crate) fn local_tools(
     _workspace: &crate::tools::Workspace,
     catalog: Option<&crate::plugin_builtin::ToolCatalog>,
     ban_run_command: bool,
@@ -4895,6 +4999,21 @@ pub(crate) mod tests {
         script.requests.lock().unwrap().push(body.clone());
         if !organizer && script.observer_gate.is_some() && body["stream"] == false {
             let input: Value = test_model_context(&body);
+            if input["request"]["goal"]=="Acceptance omitted input validation" {
+                if !body["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool") {
+                    return Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                        "id":"acceptance_source","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"validation.js\"}"}}]}}]})).into_response();
+                }
+                let repaired=body["messages"].as_array().unwrap().iter().filter(|message|message["role"]=="tool")
+                    .any(|message|message["content"].as_str().unwrap_or("").contains("REQUIRED_INPUT"));
+                let original=json!({"action":if repaired{"deliver"}else{"continue"},
+                    "acceptance":{"assessment":if repaired{"passed"}else{"needs_work"},
+                        "requirements":[{"requirement":"Reject empty input and return a clear error","result":if repaired{"satisfied"}else{"unmet"},"evidence":"acceptance_source"}]},
+                    "handoff":if repaired{Value::Null}else{json!({"requirement":"Clear validation error","reason":"The guard exists, but Error has no message.",
+                        "evidence":{"call_id":"acceptance_source","source":"validation.js"},"extra_diagnostic":{"original_reason":"不能丢失的原始原因"}})},
+                    "summary":if repaired{"Input validation and error implemented"}else{"Missing explicit validation error"}});
+                return Json(json!({"choices":[{"message":{"role":"assistant","content":original.to_string()}}]})).into_response();
+            }
             if input["stage"]=="retrospective" && input["request"]["goal"]=="Observer final route memory" {
                 if input["task_history"]["coverage"]=="partial" && !body["messages"].as_array().unwrap().iter().any(|message|message["role"]=="tool") {
                     return Json(json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
@@ -5443,6 +5562,40 @@ pub(crate) mod tests {
         for (index,(_,review)) in events.iter().enumerate().filter(|(_, (kind,_))|kind=="observer/retrospective_start") {
             assert!(events[..index].iter().any(|(kind,event)|kind=="turn/end" && event["turn"]==review["turn"]),"review starts after its execution ends");
         }
+    }
+
+    #[tokio::test]
+    async fn acceptance_reads_actual_code_and_returns_original_gap_then_accepts_repair() {
+        let call=|id:&str,content:&str|(false,json!({"role":"assistant","content":null,"tool_calls":[
+            {"id":id,"type":"function","function":{"name":"write_file","arguments":json!({"path":"validation.js","content":content}).to_string()}}]}));
+        let repair_handoff=json!({"requirement":"Clear validation error","reason":"The guard exists, but Error has no message.",
+            "evidence":{"call_id":"acceptance_source","source":"validation.js"},"extra_diagnostic":{"original_reason":"不能丢失的原始原因"}});
+        let schedule=|id:&str,context:Value|scheduling_reply(json!({"action":"work","orders":[{
+            "id":id,"node_id":"direct","goal":"Implement input validation with an explicit error","done_when":"Implementation written",
+            "context":context,"edit_targets":["validation.js"]}]}));
+        let (events,requests)=run_flow_script_with_observer(vec![
+            schedule("initial",json!({"requirements":["Reject empty input","Return a clear error"]})),
+            call("first","export function validate(v) { if (!v) throw new Error(); return v; }"),
+            yield_reply("completed","Initial guard implemented",json!({"file":"validation.js"})),finish_simple_reply("Initial implementation"),
+            schedule("repair",json!({"observer_handoff":repair_handoff})),
+            // The current file is refreshed; a focused edit preserves the initial guard.
+            (false,json!({"role":"assistant","content":null,"tool_calls":[{"id":"repair","type":"function","function":{"name":"edit_file",
+                "arguments":json!({"path":"validation.js","edits":[{"old_text":"new Error()","new_text":"new Error('REQUIRED_INPUT')"}]}).to_string()}}]})),
+            yield_reply("completed","Added REQUIRED_INPUT error",json!({"file":"validation.js"})),finish_simple_reply("Repaired implementation"),
+        ],&[("Acceptance omitted input validation",6)],true).await;
+        assert_eq!(requests.iter().filter(|body|body["stream"]==false).count(),4); // Two acceptances, each with one source read.
+        assert_eq!(events.iter().filter(|(kind,_)|kind=="observer/retrospective_start").count(),2);
+        assert!(!events.iter().any(|(kind,_)|kind=="observer/node_review"));
+        let reviews=events.iter().filter(|(kind,_)|kind=="observer/retrospective").map(|(_,data)|data).collect::<Vec<_>>();
+        assert_eq!(reviews.len(),2);assert_eq!(reviews[0]["action"],"continue");assert_eq!(reviews[1]["acceptance"]["assessment"],"passed");
+        let followups=events.iter().filter(|(kind,_)|kind=="observer/followup").collect::<Vec<_>>();assert_eq!(followups.len(),1);
+        assert_eq!(followups[0].1["observer_return"]["handoff"],repair_handoff);
+        let after_review=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|tool|tool["function"]["name"]=="schedule_task"))
+            .find(|body|body["messages"].to_string().contains("不能丢失的原始原因")).unwrap();
+        assert!(after_review["messages"].to_string().contains("Error has no message"));
+        assert_eq!(events.iter().filter(|(kind,_)|kind=="user/message").count(),1,"automatic repair adds no synthetic human instruction");
+        assert_eq!(committed_turn(&events,1)["scheduler"]["frames"].as_object().unwrap().len(),2,"same Flow retains both tasks");
+        assert_eq!(events.iter().filter(|(kind,data)|kind=="observer/history_read"&&data["name"]=="read_file"&&!data["is_error"].as_bool().unwrap()).count(),2);
     }
 
     #[tokio::test]

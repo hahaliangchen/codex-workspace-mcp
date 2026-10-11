@@ -150,6 +150,13 @@ pub fn view(root:&Path,context:&VisualContext,id:&str)->Result<Value> {
     let (artifact,_)=read(root,context.task_id(),id)?;authorize(&artifact,context)?;
     Ok(json!({"visual_artifact":artifact,"artifact_id":id,"captured":true,"visual_assessment":"not_evaluated","guidance":"This image is selected for the next normal model request if the route explicitly supports image input. Capture/view alone is not visual verification."}))
 }
+/// Observer can inspect images belonging to the accepted human goal, across
+/// its child work instances. Other tasks and replaced goals remain excluded.
+pub fn request_artifact_ids(root:&Path,task:&str,request:u64)->Result<Vec<String>> {
+    let conn=connection(root)?;
+    let mut stmt=conn.prepare("SELECT artifact_id FROM agent_visual_artifacts WHERE task_id=?1 AND json_extract(metadata,'$.request_id')=?2 ORDER BY rowid")?;
+    Ok(stmt.query_map(params![task,request],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
 /// Encode at dispatch, keeping persistent state and SSE free of base64 copies.
 pub fn image_block(root:&Path,context:&VisualContext,id:&str,original:bool)->Result<(Value,Value)> {
     let (artifact,mut bytes)=read(root,context.task_id(),id)?;authorize(&artifact,context)?;
