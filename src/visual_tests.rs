@@ -40,7 +40,7 @@ fn fallback_check(dispatch:&Value)->Value {
 }
 
 #[tokio::test]
-async fn original_image_messages_reach_all_roles_and_paged_history_without_flattening() {
+async fn original_image_messages_reach_observer_and_explicit_organizer_history_without_flattening() {
     let root=TestRoot::new();task(&root.0,"task");let owner=context("task");
     let first=png(80,60);let second=png(90,70);
     let ids=[first.clone(),second.clone()].iter().map(|bytes|visual::save(&root.0,&owner,json!({}),bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
@@ -50,6 +50,8 @@ async fn original_image_messages_reach_all_roles_and_paged_history_without_flatt
     let original=&process["records"][0]["payload"]["content"];
     let observer=crate::session_history::process_messages(&process);
     let organizer=crate::session_history::organizer_messages(&root.0,"task",&json!({"process":{"request_id":1}})).await.unwrap();
+    assert!(!organizer.iter().any(|message|message["content"].as_array().is_some()));
+    let organizer=crate::session_history::organizer_view(&root.0,"task",&json!({"process":{"request_id":1}}),true).await.unwrap().messages;
     let exact=crate::session_history::read(&root.0,"task",&json!({"event_seq":process["records"][0]["seq"],"max_chars":256})).await.unwrap();
     assert!(exact["records"][0]["omitted_chars"].as_u64().unwrap()>0);
     let historical=crate::session_history::history_image_messages(&exact);
@@ -132,7 +134,7 @@ async fn observer_history_tool_loop_restores_images_in_each_subsequent_request()
 }
 
 #[tokio::test]
-async fn organizer_and_retrospective_http_preserve_the_same_original_images() {
+async fn organizer_receives_worker_returns_and_retrospective_preserves_original_images() {
     let root=TestRoot::new();task(&root.0,"task");let owner=context("task");let bytes=png(80,60);
     let requests=Arc::new(Mutex::new(Vec::<Value>::new()));let captured=requests.clone();
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
@@ -149,12 +151,18 @@ async fn organizer_and_retrospective_http_preserve_the_same_original_images() {
     let id=visual::save(&root.0,&owner,json!({}),&bytes).unwrap()["artifact_id"].as_str().unwrap().to_owned();
     visual::prepare_request(&state,"worker","fake-model",&owner,&[id],"inspect page",&mut json!({"messages":[]})).await.unwrap();
     crate::work_organizer::decide(&state,"fake-model","task",1,2,"request",json!({"human_request":"inspect page","process":{"request_id":1}}),&CancellationToken::new(),Duration::from_secs(5)).await.unwrap();
+    let result=crate::session_history::read(&root.0,"task",&json!({"role":"worker","max_chars":256})).await.unwrap();
+    agent::emit(&root.0,"task","organizer/result_read",json!({"turn":1,"result":{"request":{"action":"read_session_history","role":"worker"},"result":result}})).await.unwrap();
+    crate::work_organizer::decide(&state,"fake-model","task",1,3,"request",json!({"human_request":"inspect page","process":{"request_id":1}}),&CancellationToken::new(),Duration::from_secs(5)).await.unwrap();
     let history=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
     let input=json!({"stage":"retrospective","identity":{"task_id":"task","request_id":1,"node_id":"request"},"task_history":history,"request":{"goal":"inspect page"}});
     agent::observer_json_response(&state,"fake-model","Review the original record",input,1000,"task",json!({})).await.unwrap();
-    let calls=requests.lock().unwrap();assert_eq!(calls.len(),2);
-    for call in calls.iter() {assert_eq!(images(call),vec![bytes.clone()]);assert!(!call["messages"].as_array().unwrap().iter().any(|message|message.get("source_identity").is_some()));}
-    assert_eq!(manifest(&calls[0])["actor"],"organizer");assert_eq!(manifest(&calls[1])["actor"],"observer");server.abort();
+    let calls=requests.lock().unwrap();assert_eq!(calls.len(),3);
+    assert!(images(&calls[0]).is_empty(),"Worker image delivery is not repeated in ordinary Organizer input");
+    assert_eq!(images(&calls[1]),vec![bytes.clone()],"Organizer's explicit history read restores the original pixels");
+    assert_eq!(images(&calls[2]),vec![bytes]);
+    for call in calls.iter() {assert!(!call["messages"].as_array().unwrap().iter().any(|message|message.get("source_identity").is_some()));}
+    assert_eq!(manifest(&calls[1])["actor"],"organizer");assert_eq!(manifest(&calls[2])["actor"],"observer");server.abort();
 }
 
 #[tokio::test]
@@ -451,7 +459,9 @@ async fn worker_keeps_visual_unavailability_in_original_messages_across_work_rou
     }
     let text=original["content"].as_str().unwrap();
     assert!(text.contains("image capability of this model is unknown and no fallback visual service is configured"));
-    assert!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|schema|schema["function"]["name"]=="schedule_task")).last().unwrap()["messages"].as_array().unwrap().iter().any(|message|message["content"].as_str().is_some_and(|content|content.contains(text))));
+    let organizer=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|schema|schema["function"]["name"]=="schedule_task")).last().unwrap();
+    assert!(!organizer["messages"].to_string().contains(text));
+    assert!(organizer["messages"].to_string().contains("Image capability unknown; no fallback"),"Organizer receives the limitation in the original Worker return");
     assert!(requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().all(|schema|schema["function"]["name"]!="yield_work" && schema["function"]["name"]!="schedule_task")).any(|body|body["messages"].as_array().unwrap().iter().any(|message|message["content"].as_str().is_some_and(|content|content.contains(text)))),"Observer receives the same complete original limitation");
     let process=crate::session_history::task_process(&root.0,"task",1).await.unwrap();
     assert_eq!(process["records"].as_array().unwrap().iter().filter(|record|record["kind"]=="visual/input_result").count(),1);
@@ -638,7 +648,9 @@ async fn visual_worker_runtime_sends_real_images_without_an_observer_or_extra_re
     let mut state=agent::tests::flow_test_state(&root.0,address);supported(&mut state);
     tokio::time::timeout(Duration::from_secs(20),agent::run_task(state,"task".into(),"fake-model".into(),"Inspect canvas rendering".into(),6,CancellationToken::new(),false,1,vec![],false,false)).await.unwrap().unwrap();
     let requests=script.requests.lock().unwrap();let visual_requests=requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="worker").collect::<Vec<_>>();assert_eq!(visual_requests.len(),1);
-    assert_eq!(requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="organizer").count(),1,"the original image also reaches Organizer");
+    assert_eq!(requests.iter().filter(|body|!images(body).is_empty() && manifest(body)["actor"]=="organizer").count(),0,"Organizer receives the original visual result without replaying the Worker image delivery");
+    let organizer=requests.iter().filter(|body|body["tools"].as_array().into_iter().flatten().any(|schema|schema["function"]["name"]=="schedule_task")).last().unwrap();
+    assert!(organizer["messages"].to_string().contains("visual_check_result"));
     let dispatch=manifest(visual_requests[0]);let id=dispatch["images"][0]["artifact_id"].as_str().unwrap();assert_eq!(visual::read(&root.0,"task",id).unwrap().1,images(visual_requests[0])[0]);
     assert_eq!(script.worker_calls.load(Ordering::Relaxed),3,"capture, explicit view_image, then visual return");
     assert_eq!(agent::open_db(&root.0).unwrap().query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='respond_observer'",[],|row|row.get::<_,i64>(0)).unwrap(),0);server.abort();

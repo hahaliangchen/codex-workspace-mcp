@@ -567,8 +567,8 @@ mod tests {
         insert(
             &root,
             5,
-            "tool/result",
-            json!({"turn":1,"meta":{"result":{"irrelevant":"noise ".repeat(10000)}}}),
+            "worker/yield",
+            json!({"turn":1,"output":{"id":"noise","original_return":{"irrelevant":"noise ".repeat(10000)}}}),
         );
         insert(
             &root,
@@ -912,8 +912,8 @@ mod tests {
                 let raw=crate::agent_service::observer_json_response(&state,"fake","review",json!({"stage":"retrospective","identity":{"request_id":1},"request":{"goal":"check existing upload"},"task_history":history}),1000,"task",json!({"turn":1})).await.unwrap();
                 assert_eq!(raw, "reviewed original receipt");
             }
-            let expected_requests = if actor == "organizer" { 3 } else { 1 };
-            let expected_selections = if actor == "organizer" { 2 } else { 0 };
+            let expected_requests = 1;
+            let expected_selections = 0;
             let seen = captured.lock().unwrap();
             assert_eq!(seen.len(), expected_requests);
             if actor == "observer" {

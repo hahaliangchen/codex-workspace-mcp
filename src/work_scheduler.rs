@@ -2852,7 +2852,8 @@ impl WorkScheduler {
                 }
                 frame.organizer_commands.push(decision["original_command"].as_str().map(str::to_owned).unwrap_or_else(||decision.to_string()));
                 self.frame_mut().unwrap().organizer_guidance = json!({"reason":decision["reason"]});
-                self.frame_mut().unwrap().reviewed_without_change = 0;
+                let frame = self.frame_mut().unwrap();
+                frame.reviewed_without_change = frame.rounds_without_change;
                 Ok(())
             },
             "revisit" => {
@@ -4113,6 +4114,34 @@ mod tests {
             "error_message":if status.is_none(){json!("connection refused")}else{Value::Null},
             "check_key":crate::http_probe::check_key(&json!({"url":url})),"check_passed":status.is_some_and(|code|(200..300).contains(&code)),
             "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS})
+    }
+
+    #[test]
+    fn selecting_unfinished_work_reviews_prior_rounds_without_restarting_each_tool() {
+        let mut scheduler=WorkScheduler::default();
+        scheduler.enqueue(vec![task("review","Inspect two pages")],false,false).unwrap();
+        scheduler.activate_next().unwrap();
+        for _ in 0..11 {scheduler.finish_round(1,0);}
+        scheduler.request_handoff("Worker response contained neither text nor a yield_work return.");
+        scheduler.finish_round(0,0);
+        assert!(scheduler.needs_organizer());
+        let failure=scheduler.pending_handoff().unwrap().clone();
+
+        scheduler.apply(&json!({"action":"select","task_id":"review","reason":"Return the existing page observations"}),false,false).unwrap();
+        assert!(!scheduler.needs_organizer());
+        for _ in 0..3 {
+            scheduler.finish_round(1,0);
+            assert!(!scheduler.needs_organizer(),"resumed tool rounds must not re-trigger the reviewed stall");
+        }
+        for _ in 0..9 {scheduler.finish_round(1,0);}
+        assert_eq!(scheduler.pending_handoff().unwrap()["stall"]["kind"],"no_change","new unreviewed rounds still trigger stall detection");
+        scheduler.apply(&json!({"action":"select","task_id":"review","reason":"Finish the observation return"}),false,false).unwrap();
+        scheduler.finish_round(1,0);
+        assert!(!scheduler.needs_organizer());
+        scheduler.return_work(&json!({"summary":"Both pages inspected","outcome":"completed"})).unwrap();
+        assert_eq!(scheduler.output().unwrap()["worker_return"]["summary"],"Both pages inspected");
+        assert_eq!(failure["done"],false);
+        assert_eq!(scheduler.frame().unwrap().rounds,25,"resuming preserves prior execution counts");
     }
 
     #[test]

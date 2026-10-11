@@ -246,6 +246,10 @@ cargo run
 
 打开 `http://127.0.0.1:3001/agent`。Rust 从 `frontend/dist` 读取页面（可用环境变量 `AGENT_WEB_DIR` 指向其他目录）；未构建时回退到内嵌的旧页面，旧页面也可在 `/agent/classic` 打开。前端开发时运行 `npm run dev`（`http://127.0.0.1:5173/agent/`），接口请求代理到 `127.0.0.1:3001`，可用 `AGENT_BACKEND` 改写。
 
+Agent 与设置页的监听地址可通过 `AGENT_BIND` 指定，默认 `127.0.0.1:3001`；辅助 MCP 监听地址仍由 `MCP_BIND` 指定。保留现有服务运行时，可为另一个宿主选择未占用端口。
+
+同一工作区切换任务宿主前，须等当前执行和 Observer 验收全部结束。启动恢复逻辑会将数据库中的运行任务视为上次宿主遗留任务；不同端口不代表支持同一工作区同时执行任务。旧宿主可继续保留已完成任务的浏览器与项目服务。
+
 页面可以新建对话（先 `POST /agent/sessions` 建空会话，再发送第一条消息），查看流式模型回复和工具步骤，切换轨迹表格与时间轴，停止运行中的任务，并在刷新后打开历史任务。选择已结束的主任务后，可以直接发送下一条消息；新轮次沿用该任务的用户消息、模型回复和工具结果，轨迹追加到同一个任务 ID。运行中的任务和子代理轨迹不接受跟进消息。输入框支持 `/` 技能建议和 `@` 工作区文件引用；提交时，Rust 会将被引用文件的有界内容快照附进模型上下文，旧轮次继续使用当时的快照。
 
 `frontend/src/dsh/` 从 DeepSeek Harness（commit `46a7f68`，MIT，见其中 `LICENSE` 与 `SOURCE.md`）复制了 Cordis 核心及其原许可证、`ui-slots` 和 `ui-renderer` 的浏览器端完整源码，以及 `ui-primitives`、`store`、`workspace-path`、主题样式、语言包、ui-chat / ui-tool / ui-conversation 的 CSS 模块和 `ReasoningRow`。Vite 从本地 Cordis 源码构建；TypeScript 使用固定版本 `@deepseek-ai/cordis@4.0.4` 的公开类型。`frontend/src/cordis/` 启动 Cordis 与原版 UI renderer，注册 Rust 任务 API 服务、页面 root，以及侧栏、聊天、轨迹、输入框子插槽。`frontend/src/components/` 是沿用 DSH 样式的 React 页面组件，数据经 HTTP/SSE 对接 Rust。DSH 的动态插件加载器、Remote RPC 和完整业务 UI 插件仍未移植。

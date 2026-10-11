@@ -8,8 +8,11 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, process::Command,
 pub const TOOLS: &[&str] = &["browser_open", "browser_read", "browser_wait", "browser_diagnostics", "browser_click", "browser_press_key", "browser_upload", "browser_screenshot", "browser_close", "view_image"];
 pub fn is_tool(name: &str) -> bool { TOOLS.contains(&name) }
 
-struct Session { ws: String, child: Option<tokio::process::Child>, profile:Option<std::path::PathBuf>, session_id:String, page_id:String, owner:Value, epoch:u64, capture_seq:u64, signature:Value, visible:bool }
-struct CdpConnection { stream: TcpStream, next_id: u64 }
+struct Session { ws: String, child: Option<tokio::process::Child>, profile:Option<std::path::PathBuf>, session_id:String, page_id:String, owner:Value, epoch:u64, capture_seq:u64, signature:Value, visible:bool,
+    dialog:std::sync::Arc<std::sync::Mutex<Option<Value>>>,dialog_commands:tokio::sync::mpsc::Sender<DialogCommand>,dialog_watch:tokio::task::JoinHandle<()> }
+type DialogCommand=(bool,tokio::sync::oneshot::Sender<Result<Value>>);
+impl Drop for Session {fn drop(&mut self){self.dialog_watch.abort();}}
+struct CdpConnection { stream: TcpStream, next_id: u64, dialog:Option<Value> }
 type Page=std::sync::Arc<tokio::sync::Mutex<Option<Session>>>;
 static SESSIONS:std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<String,Page>>>=std::sync::OnceLock::new();
 fn sessions()->&'static tokio::sync::Mutex<std::collections::HashMap<String,Page>> {SESSIONS.get_or_init(Default::default)}
@@ -20,7 +23,8 @@ fn session_key(root:&Path,task:&str)->String {
 
 fn connection_record(session:&Session)->Value {
     json!({"browser_session_id":session.session_id,"page_id":session.page_id,"websocket_url":session.ws,
-        "display_mode":if session.visible{"visible_window"}else{"headless"},"page_epoch":session.epoch,"capture_seq":session.capture_seq})
+        "display_mode":if session.visible{"visible_window"}else{"headless"},"page_epoch":session.epoch,"capture_seq":session.capture_seq,
+        "javascript_dialog":session.dialog.lock().unwrap().clone()})
 }
 
 /// Read the original tool return from this conversation, not a second session registry.
@@ -60,11 +64,49 @@ async fn reconnect(record:&Value)->Result<Session> {
     let url=reqwest::Url::parse(&ws).context("invalid browser websocket URL")?;
     ensure!(url.scheme()=="ws"&&matches!(url.host_str(),Some("127.0.0.1"|"localhost"|"[::1]")),"browser reconnection requires a local Chrome debugging endpoint");
     ensure!(url.path()==format!("/devtools/page/{page_id}"),"browser websocket URL does not name the recorded page ID");
-    let state=timeout(Duration::from_secs(5),page_state(&ws)).await.context("browser reconnection timed out")?
-        .context("the recorded browser page is unreachable")?;
+    let pending=record.get("javascript_dialog").filter(|value|value.is_object()).cloned();
+    let state=if let Some(dialog)=&pending {json!({"url":dialog["url"],"javascript_dialog":dialog,"dom_unavailable":true})}
+        else {timeout(Duration::from_secs(5),page_state(&ws)).await.context("browser reconnection timed out")?
+            .context("the recorded browser page is unreachable")?};
+    let (dialog,dialog_commands,dialog_watch)=watch_dialogs(&ws,pending).await?;
     Ok(Session{ws,child:None,profile,session_id:session_id.to_owned(),page_id:page_id.to_owned(),owner:Value::Null,
         epoch:record["page_epoch"].as_u64().unwrap_or(0),capture_seq:record["capture_seq"].as_u64().unwrap_or(0),signature:state,
-        visible:record["display_mode"]=="visible_window"})
+        visible:record["display_mode"]=="visible_window",dialog,dialog_commands,dialog_watch})
+}
+
+fn restore_connection_record(root:&Path,task:&str,record:&Value)->Result<Value> {
+    let mut restored=record.as_object().context("browser_connection must be an object")?.clone();
+    if let Some(saved)=saved_connection(root,task)? {
+        if saved["browser_session_id"]==record["browser_session_id"] && saved["page_id"]==record["page_id"] {
+            for (key,value) in saved.as_object().context("saved browser connection is invalid")? {
+                restored.entry(key.clone()).or_insert_with(||value.clone());
+            }
+        }
+    }
+    let conn=crate::agent_service::open_db(root)?;
+    let mut stmt=conn.prepare("SELECT json_extract(data,'$.meta.result.browser_connection') FROM agent_task_events
+        WHERE task_id=?1 AND kind='tool/result'
+          AND json_extract(data,'$.meta.result.browser_connection.browser_session_id')=?2
+          AND json_extract(data,'$.meta.result.browser_connection.page_id')=?3 ORDER BY seq")?;
+    let rows=stmt.query_map(rusqlite::params![task,record["browser_session_id"].as_str(),record["page_id"].as_str()],|row|row.get::<_,String>(0))?;
+    let mut original_mode=None;
+    for raw in rows {
+        let saved:Value=serde_json::from_str(&raw?)?;
+        if original_mode.is_none() && matches!(saved["display_mode"].as_str(),Some("visible_window"|"headless")) {
+            original_mode=Some(saved["display_mode"].clone());
+        }
+        if let Some(ws)=saved.get("websocket_url") {restored.entry("websocket_url".to_owned()).or_insert_with(||ws.clone());}
+        // These counters survive host reconnection and never go backwards.
+        for field in ["page_epoch","capture_seq"] {
+            if saved[field].as_u64().unwrap_or(0)>restored.get(field).and_then(Value::as_u64).unwrap_or(0) {
+                restored.insert(field.to_owned(),saved[field].clone());
+            }
+        }
+    }
+    if let Some(mode)=original_mode {restored.insert("display_mode".into(),mode);}
+    ensure!(matches!(restored.get("display_mode").and_then(Value::as_str),Some("visible_window"|"headless")),
+        "browser connection has no original display mode; supply the complete original connection record");
+    Ok(Value::Object(restored))
 }
 
 fn reconnection_failure(record:&Value,error:&anyhow::Error)->Value {
@@ -166,7 +208,7 @@ pub fn definitions() -> Vec<Value> {
         json!({"name":"browser_wait","description":"Wait up to timeout_ms for a selector, visible text, font loading state or an application-confirmed presentation load after the latest file change. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"document_loaded":{"type":"boolean","description":"Set true to wait for a confirmed upload change, a completed application loading cycle, a valid current/total page indicator, slides, and no explicit load error. A generic DOM snapshot without a correlated load cycle stays unconfirmed."},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
         json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, and the page's recorded requests since navigation: every fetch/XHR call (method, URL, status, time, duration, failure) plus font/resource timing entries. Filter with url_contains (e.g. /api/fonts) and category. request_coverage states what the record cannot see; an empty result means nothing matched in that scope, not that no request happened. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{"url_contains":{"type":"string"},"category":{"type":"string","enum":["all","fetch","xhr","font","resource"]}}}}),
         json!({"name":"browser_click","description":"Click a visible, enabled control. text matches the same label browser_read lists under controls (exact label preferred, then containing); selector is an exact CSS selector and takes precedence. times (1-5) repeats the same click, e.g. to step through slides, before you read the result.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"},"times":{"type":"integer","minimum":1,"maximum":5}}}}),
-        json!({"name":"browser_press_key","description":"Press a supported key in this task's focused browser page, e.g. Delete after selecting a slide element. This is an interaction, not proof of its visible result.","inputSchema":{"type":"object","required":["key"],"properties":{"key":{"type":"string","enum":["Delete","Backspace","Enter","Escape","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown"]}}}}),
+        json!({"name":"browser_press_key","description":"Press a supported key in this task's focused browser page, e.g. Delete after selecting a slide element. For a reported native JavaScript dialog, Enter accepts and Escape dismisses it; other keys do not dismiss it. Dialog text is preserved in the return. This is an interaction, not proof of its visible result.","inputSchema":{"type":"object","required":["key"],"properties":{"key":{"type":"string","enum":["Delete","Backspace","Enter","Escape","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown"]}}}}),
         json!({"name":"browser_upload","description":"Assign a workspace file to an input[type=file]. path is relative to the workspace.","inputSchema":{"type":"object","required":["path"],"properties":{"path":{"type":"string"},"selector":{"type":"string"}}}}),
         json!({"name":"browser_screenshot","description":"Capture an immutable visual artifact of this task's page and select it for the next normal Worker image request. Capture is not a visual pass. Default viewport; full_page is explicit.","inputSchema":{"type":"object","properties":{"full_page":{"type":"boolean"}}}}),
         json!({"name":"browser_close","description":"Explicitly close this task's controlled browser session. Completed visible sessions remain open until this is called or a replacement page is opened.","inputSchema":{"type":"object","properties":{}}}),
@@ -194,11 +236,15 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     let mut guard=page.lock().await;
     let explicit=args.get("browser_connection");
     let different_connection=explicit.is_some_and(|record|guard.as_ref().is_some_and(|session|
-        record["browser_session_id"]!=session.session_id||record["page_id"]!=session.page_id||record["websocket_url"]!=session.ws));
+        record.get("browser_session_id").is_some_and(|id|id!=&session.session_id)
+        ||record.get("page_id").is_some_and(|id|id!=&session.page_id)
+        ||record.get("websocket_url").is_some_and(|ws|ws!=&session.ws)));
     if guard.is_none()||different_connection {
         let record=if let Some(record)=explicit {Some(record.clone())}else if name!="browser_open" {saved_connection(workspace.root(),context.task_id())?}else{None};
         if let Some(record)=record {
-            match reconnect(&record).await {
+            let restored=restore_connection_record(workspace.root(),context.task_id(),&record);
+            let connection=match restored {Ok(restored)=>reconnect(&restored).await,Err(error)=>Err(error)};
+            match connection {
                 Ok(session)=>*guard=Some(session),
                 Err(error)=>return Ok(reconnection_failure(&record,&error)),
             }
@@ -220,6 +266,29 @@ pub async fn execute_scoped(workspace:&crate::tools::Workspace,context:&crate::v
     // Continuing this conversation rebinds the caller without navigating away
     // from the document left in the original browser.
     session.owner=context.identity.clone();
+    let pending=session.dialog.lock().unwrap().clone();
+    if let Some(dialog)=pending {
+        if name=="browser_press_key" && matches!(args["key"].as_str(),Some("Enter"|"Escape")) {
+            let accept=args["key"]=="Enter";
+            let (reply,received)=tokio::sync::oneshot::channel();
+            session.dialog_commands.send((accept,reply)).await.context("browser dialog connection ended")?;
+            let response=timeout(Duration::from_secs(20),received).await.context("browser dialog handling timed out")?
+                .context("browser dialog connection ended")??;
+            if let Some(error)=response.get("error") {
+                if error["code"]==-32602 && error["message"]=="No dialog is showing" {*session.dialog.lock().unwrap()=None;}
+                return Ok(json!({"ok":false,"error_code":"browser_dialog_unavailable","reason":error,
+                    "javascript_dialog":dialog,"browser_connection":connection_record(session),
+                    "needed":"The recorded dialog could not be handled. Read the live page again; this is not a successful confirmation."}));
+            }
+            *session.dialog.lock().unwrap()=None;
+            session.epoch+=1;
+            return Ok(json!({"ok":true,"pressed":args["key"],"dialog_handled":true,"accepted":accept,
+                "javascript_dialog":dialog,"browser_connection":connection_record(session)}));
+        }
+        return Ok(json!({"ok":false,"error_code":"browser_dialog_open","stage":"javascript_dialog",
+            "javascript_dialog":dialog,"browser_connection":connection_record(session),
+            "needed":"Read the original dialog text. If appropriate, explicitly accept with browser_press_key Enter or dismiss with Escape; no dialog has been handled automatically."}));
+    }
     if matches!(name,"browser_open"|"browser_click"|"browser_press_key"|"browser_upload") {session.epoch+=1;}
     let mut result=match name {
         "browser_open" => open(&session.ws,args["url"].as_str().context("url is required")?).await?,
@@ -715,8 +784,9 @@ async fn launch(visible:bool) -> Result<Session> {
     }).await??;
     let ws = page_socket(port).await?;
     call(&ws,"Emulation.setDeviceMetricsOverride",json!({"width":1280,"height":800,"deviceScaleFactor":1,"mobile":false})).await?;
+    let (dialog,dialog_commands,dialog_watch)=watch_dialogs(&ws,None).await?;
     let page_id=ws.rsplit('/').next().unwrap_or("").to_owned();
-    Ok(Session { ws, child:Some(child),profile:Some(dir),session_id,page_id,owner:Value::Null,epoch:0,capture_seq:0,signature:Value::Null,visible })
+    Ok(Session { ws, child:Some(child),profile:Some(dir),session_id,page_id,owner:Value::Null,epoch:0,capture_seq:0,signature:Value::Null,visible,dialog,dialog_commands,dialog_watch })
 }
 
 fn page_target(page: &Value) -> bool {
@@ -801,7 +871,12 @@ fn browser_candidates() -> Vec<std::path::PathBuf> {
 }
 
 async fn eval(ws: &str, expression: &str) -> Result<Value> {
-    let response = call(ws, "Runtime.evaluate", json!({"expression":expression,"returnByValue":true})).await?;
+    let mut cdp=connect_cdp(ws).await?;
+    evaluate(&mut cdp,expression).await
+}
+
+async fn evaluate(cdp:&mut CdpConnection,expression:&str)->Result<Value> {
+    let response = cdp.call("Runtime.evaluate", json!({"expression":expression,"returnByValue":true})).await?;
     ensure!(response.pointer("/result/exceptionDetails").is_none(), "page script failed: {}", response.pointer("/result/exceptionDetails/text").and_then(Value::as_str).unwrap_or("exception"));
     response.pointer("/result/result/value").cloned().context("page script returned no value")
 }
@@ -812,11 +887,61 @@ async fn call(ws: &str, method: &str, params: Value) -> Result<Value> {
 }
 
 async fn connect_cdp(ws:&str)->Result<CdpConnection> {
-    Ok(CdpConnection{stream:connect(ws).await?,next_id:1})
+    Ok(CdpConnection{stream:connect(ws).await?,next_id:1,dialog:None})
+}
+
+async fn watch_dialogs(ws:&str,pending:Option<Value>)->Result<(std::sync::Arc<std::sync::Mutex<Option<Value>>>,tokio::sync::mpsc::Sender<DialogCommand>,tokio::task::JoinHandle<()>)> {
+    let mut cdp=connect_cdp(ws).await?;
+    if pending.is_some() {
+        // Chrome may defer Page.enable until the existing modal is handled.
+        send(&mut cdp.stream,&json!({"id":cdp.next_id,"method":"Page.enable","params":{}}).to_string()).await?;
+        cdp.next_id+=1;
+    } else {cdp.call("Page.enable",json!({})).await?;}
+    let dialog=std::sync::Arc::new(std::sync::Mutex::new(cdp.dialog.take().or(pending)));
+    let observed=dialog.clone();
+    let (commands,mut incoming)=tokio::sync::mpsc::channel::<DialogCommand>(1);
+    let watch=tokio::spawn(async move {
+        // Keep Page events attached between model requests; a new short-lived
+        // Runtime connection cannot reliably rediscover an already-open dialog.
+        let (mut reader,mut writer)=cdp.stream.into_split();
+        let mut replies=std::collections::HashMap::new();
+        loop {
+            // Keep the frame read alive while writing commands: read_exact is
+            // not cancellation safe if a WebSocket frame is only partly read.
+            let message=recv(&mut reader);tokio::pin!(message);
+            loop {
+            tokio::select! {
+                message=&mut message=> {
+                    let Ok(message)=message else {return;};
+                    if let Ok(event)=serde_json::from_str::<Value>(&message) {
+                        if event["method"]=="Page.javascriptDialogOpening" {*observed.lock().unwrap()=Some(event["params"].clone());}
+                        if event["method"]=="Page.javascriptDialogClosed" {*observed.lock().unwrap()=None;}
+                        if let Some(reply)=event["id"].as_u64().and_then(|id|replies.remove(&id)) {
+                            if event.get("error").is_none() {*observed.lock().unwrap()=None;}
+                            let _=tokio::sync::oneshot::Sender::send(reply,Ok(event));
+                        }
+                    }
+                    break;
+                }
+                command=incoming.recv()=> {
+                    let Some((accept,reply))=command else {return;};
+                    let id=cdp.next_id;cdp.next_id+=1;
+                    match send(&mut writer,&json!({"id":id,"method":"Page.handleJavaScriptDialog","params":{"accept":accept}}).to_string()).await {
+                        Ok(())=>{replies.insert(id,reply);}
+                        Err(error)=>{let _=reply.send(Err(error));return;}
+                    }
+                }
+            }
+            }
+        }
+    });
+    Ok((dialog,commands,watch))
 }
 
 impl CdpConnection {
     async fn call(&mut self,method:&str,params:Value)->Result<Value> {
+        let allowed_with_dialog=matches!(method,"Page.enable"|"Page.handleJavaScriptDialog"|"Browser.close");
+        if !allowed_with_dialog && self.dialog.is_some() {anyhow::bail!("browser_dialog_open: {}",self.dialog.as_ref().unwrap());}
         let id=self.next_id;
         self.next_id=self.next_id.checked_add(1).context("browser command id space exhausted")?;
         send(&mut self.stream,&json!({"id":id,"method":method,"params":params}).to_string()).await?;
@@ -824,6 +949,11 @@ impl CdpConnection {
         loop {
             let message=timeout(deadline.saturating_duration_since(tokio::time::Instant::now()),recv(&mut self.stream)).await.context("browser command timed out")??;
             let value:Value=serde_json::from_str(&message)?;
+            if value["method"]=="Page.javascriptDialogOpening" {
+                self.dialog=Some(value["params"].clone());
+                if !allowed_with_dialog {anyhow::bail!("browser_dialog_open: {}",value["params"]);}
+            }
+            if value["method"]=="Page.javascriptDialogClosed" {self.dialog=None;}
             if value["id"].as_u64()==Some(id) {
                 if let Some(error)=value.get("error") {anyhow::bail!("{method} failed: {error}");}
                 return Ok(value);
@@ -852,7 +982,7 @@ async fn connect(ws_url: &str) -> Result<TcpStream> {
     Ok(stream)
 }
 
-async fn send(stream: &mut TcpStream, text: &str) -> Result<()> {
+async fn send(stream: &mut (impl tokio::io::AsyncWrite + Unpin), text: &str) -> Result<()> {
     let payload = text.as_bytes();
     ensure!(payload.len() < 1_000_000, "browser command is too large");
     let mut frame = vec![0x81];
@@ -866,7 +996,7 @@ async fn send(stream: &mut TcpStream, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn recv(stream: &mut TcpStream) -> Result<String> {
+async fn recv(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<String> {
     let mut message=Vec::new();
     loop {
     let mut header = [0u8; 2];
@@ -916,6 +1046,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_connection_keeps_original_mode_and_monotonic_counters() {
+        let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-metadata-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let context=crate::visual_artifacts::VisualContext::mcp(&root);
+        let original=json!({"browser_session_id":"original","page_id":"page","websocket_url":"ws://127.0.0.1:1234/devtools/page/page",
+            "display_mode":"visible_window","page_epoch":6,"capture_seq":2});
+        record_return(&root,&context,"browser_open",&json!({"browser_connection":original})).await;
+        let mut incomplete=original.clone();incomplete["display_mode"]=json!("headless");incomplete["page_epoch"]=json!(0);incomplete["capture_seq"]=json!(0);
+        record_return(&root,&context,"browser_read",&json!({"browser_connection":incomplete})).await;
+        let partial=json!({"browser_session_id":"original","page_id":"page"});
+        for input in [&partial,&incomplete] {
+            let restored=restore_connection_record(&root,context.task_id(),input).unwrap();
+            for field in ["display_mode","page_epoch","capture_seq","websocket_url"] {assert_eq!(restored[field],original[field]);}
+        }
+        assert!(restore_connection_record(&root,context.task_id(),&json!({"browser_session_id":"other","page_id":"page"})).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn resumes_original_chrome_from_conversation_without_navigation_or_upload() {
         if browser_path().is_none(){return;}
         let root=std::env::temp_dir().join(format!("browser-resume-{}",crate::visual_artifacts::new_id()));std::fs::create_dir_all(&root).unwrap();
@@ -944,8 +1093,15 @@ mod tests {
         assert!(serde_json::to_string(&crate::session_history::process_messages(&history)).unwrap().contains(opened["browser_connection"]["websocket_url"].as_str().unwrap()));
         // The same returned record also works explicitly without a live cache.
         forget_runtime(&root,context.task_id()).await;context.identity["request_id"]=json!(3);
-        let explicit=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":resumed["browser_connection"]})).await.unwrap();
+        let partial=json!({"browser_session_id":resumed["browser_connection"]["browser_session_id"],"page_id":resumed["browser_connection"]["page_id"]});
+        let explicit=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":partial})).await.unwrap();
         assert_eq!(explicit["page"]["page_id"],opened["page"]["page_id"]);
+        assert_eq!(explicit["browser_connection"]["display_mode"],opened["browser_connection"]["display_mode"]);
+        assert_eq!(explicit["browser_connection"]["page_epoch"],resumed["browser_connection"]["page_epoch"]);
+        let captured=execute_scoped(&workspace,&context,"browser_screenshot",&json!({"browser_connection":partial})).await.unwrap();
+        record_return(&root,&context,"browser_screenshot",&captured).await;
+        let read_again=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":partial})).await.unwrap();
+        assert_eq!(read_again["browser_connection"]["capture_seq"],captured["browser_connection"]["capture_seq"]);
         assert_eq!(inspect_test_page(&root,&context,expression).await.unwrap(),before);
         let closed=execute_scoped(&workspace,&context,"browser_close",&json!({})).await.unwrap();assert_eq!(closed["closed"],true,"{closed}");record_return(&root,&context,"browser_close",&closed).await;
         let after=execute_scoped(&workspace,&context,"browser_read",&json!({})).await.unwrap();assert_eq!(after["error_code"],"browser_session_missing","closing must not resurrect an older record");
@@ -979,7 +1135,7 @@ mod tests {
         assert_eq!(result["error_code"],"browser_reconnect_failed");assert_eq!(result["browser_connection"],record);
         assert!(result["reason"].as_str().unwrap().contains("unreachable"));
         assert!(sessions().lock().await.get(&session_key(&root,context.task_id())).unwrap().lock().await.is_none());
-        let wrong=json!({"browser_session_id":"recorded-session","page_id":"another-page","websocket_url":record["websocket_url"]});
+        let wrong=json!({"browser_session_id":"recorded-session","page_id":"another-page","websocket_url":record["websocket_url"],"display_mode":"visible_window"});
         let rejected=execute_scoped(&workspace,&context,"browser_read",&json!({"browser_connection":wrong})).await.unwrap();
         assert_eq!(rejected["error_code"],"browser_reconnect_failed");assert!(rejected["reason"].as_str().unwrap().contains("recorded page ID"));
         let _=close_session(&root,context.task_id()).await;std::fs::remove_dir_all(root).unwrap();
@@ -1034,6 +1190,50 @@ mod tests {
             assert_eq!(cdp_file_path(Path::new(r"\\?\D:\企业 项目\演示.pptx")).unwrap(),r"D:\企业 项目\演示.pptx");
             assert_eq!(cdp_file_path(Path::new(r"\\?\UNC\server\share\演示.pptx")).unwrap(),r"\\server\share\演示.pptx");
         }
+    }
+
+    #[tokio::test]
+    async fn native_dialog_is_reported_and_only_an_explicit_key_handles_it() {
+        if browser_path().is_none() {return;}
+        let root=Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("browser-dialog-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file=root.join("dialog.html");
+        std::fs::write(&file,"<html><body><button onclick=\"setTimeout(()=>alert('Original load failure: font service unavailable'),50)\">Load fixture</button><p>Existing page</p></body></html>").unwrap();
+        let workspace=crate::tools::Workspace::new(&root).unwrap();
+        let opened=execute(&workspace,"browser_open",&json!({"url":reqwest::Url::from_file_path(&file).unwrap().to_string()})).await.unwrap();
+        execute(&workspace,"browser_click",&json!({"text":"Load fixture"})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result=tokio::time::timeout(Duration::from_secs(5),execute(&workspace,"browser_read",&json!({}))).await.unwrap().unwrap();
+        assert_eq!(result["error_code"],"browser_dialog_open");
+        assert_eq!(result["javascript_dialog"]["message"],"Original load failure: font service unavailable");
+        let untouched=execute(&workspace,"browser_press_key",&json!({"key":"Tab"})).await.unwrap();
+        assert_eq!(untouched["error_code"],"browser_dialog_open");
+        let handled=execute(&workspace,"browser_press_key",&json!({"key":"Enter"})).await.unwrap();
+        assert_eq!(handled["dialog_handled"],true);assert_eq!(handled["javascript_dialog"],result["javascript_dialog"]);
+        execute(&workspace,"browser_click",&json!({"text":"Load fixture"})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result=execute(&workspace,"browser_read",&json!({})).await.unwrap();
+        // Restore an old receipt after the original connection has explicitly
+        // dismissed it; stale dialog evidence must not count as a new success.
+        let dismissed=execute(&workspace,"browser_press_key",&json!({"key":"Escape"})).await.unwrap();
+        assert_eq!(dismissed["dialog_handled"],true);assert_eq!(dismissed["accepted"],false);
+        let mut resumed=reconnect(&result["browser_connection"]).await.unwrap();
+        assert_eq!(resumed.signature["javascript_dialog"]["message"],result["javascript_dialog"]["message"]);
+        let task_id=crate::visual_artifacts::VisualContext::mcp(workspace.root()).task_id().to_owned();
+        let session=sessions().lock().await.get(&session_key(workspace.root(),&task_id)).cloned().unwrap();
+        {
+            let mut guard=session.lock().await;
+            resumed.child=guard.as_mut().unwrap().child.take();
+            *guard=Some(resumed);
+        }
+        let handled=execute(&workspace,"browser_press_key",&json!({"key":"Escape"})).await.unwrap();
+        assert_eq!(handled["error_code"],"browser_dialog_unavailable");
+        assert_eq!(handled["javascript_dialog"],result["javascript_dialog"]);
+        assert!(handled.get("dialog_handled").is_none());
+        let page=execute(&workspace,"browser_read",&json!({"expect_text":"Existing page"})).await.unwrap();
+        assert_eq!(page["matched"],true);assert_eq!(page["browser_connection"]["page_id"],opened["browser_connection"]["page_id"]);
+        cleanup(workspace.root(),&task_id).await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

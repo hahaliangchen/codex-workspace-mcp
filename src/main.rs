@@ -134,9 +134,10 @@ async fn main() -> anyhow::Result<()> {
         env::current_dir()?.join(ai_config_path)
     };
     {
-        match TcpListener::bind("127.0.0.1:3001").await {
+        let agent_bind = env::var("AGENT_BIND").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
+        match TcpListener::bind(&agent_bind).await {
             Ok(listener) => {
-                info!(path = %ai_config_path.display(), "AI proxy starting on port 3001");
+                info!(path = %ai_config_path.display(), bind = %agent_bind, "AI proxy starting");
                 let workspace_for_proxy = workspace.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
@@ -146,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 });
             }
-            Err(e) => warn!(%e, "could not start AI proxy on port 3001"),
+            Err(e) => warn!(%e, bind = %agent_bind, "could not start AI proxy"),
         }
     }
 

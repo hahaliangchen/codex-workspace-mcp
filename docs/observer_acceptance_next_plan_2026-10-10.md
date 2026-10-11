@@ -18,6 +18,8 @@
 
 以上为远端拉取时的基础状态。2026-10-10 已实现明确验收返回到 Organizer 的自动补齐，并运行本机 PPT 任务。实现、回归与真实运行记录见 [实施记录](observer_acceptance_implementation_result_2026-10-10.md)。
 
+2026-10-11 的历史路由回归、图片来源修复、浏览器弹窗处理和本机复验进度见 [复验记录](observer_acceptance_recheck_2026-10-11.md)。
+
 ## 下一步执行流程
 
 1. Organizer 执行用户任务，认为本轮工作已完成时，提交实际结果供 Observer 验收。
@@ -72,22 +74,22 @@ Observer 阅读当前任务的原始时间线。需要追查归因时，读取�
 
 相关实现入口：
 
-- Observer 生命周期与结束复盘：[observer_service.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/observer_service.rs)。
-- 执行结束、角色调用与续聊：[agent_service.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/agent_service.rs)。
-- Organizer 调用与任务状态：[work_organizer.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/work_organizer.rs)、[work_scheduler.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/work_scheduler.rs)。
-- 原始记录、实际请求和按需上下文：[session_history.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/session_history.rs)、[request_context.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/request_context.rs)、[context_rebuild.rs](/home/goodtime/Documents/project/codex-workspace-mcp/src/context_rebuild.rs)。
-- 验收提示词：[observer_retrospective.md](/home/goodtime/Documents/project/codex-workspace-mcp/prompts/observer_retrospective.md)。
+- Observer 生命周期与结束复盘：[observer_service.rs](../src/observer_service.rs)。
+- 执行结束、角色调用与续聊：[agent_service.rs](../src/agent_service.rs)。
+- Organizer 调用与任务状态：[work_organizer.rs](../src/work_organizer.rs)、[work_scheduler.rs](../src/work_scheduler.rs)。
+- 原始记录、实际请求和按需上下文：[session_history.rs](../src/session_history.rs)、[request_context.rs](../src/request_context.rs)、[context_rebuild.rs](../src/context_rebuild.rs)。
+- 验收提示词：[observer_retrospective.md](../prompts/observer_retrospective.md)。
 
 ## 可以直接发布给 Agent 的测试任务
 
-任务工作区：`/home/goodtime/project/pptx-editor-engine`。
+本机任务工作区：`D:\enterpriseProject\pptx-editor-engine`。Ubuntu 开发环境中的 `/home/goodtime/project/pptx-editor-engine` 是同一 PPT 编辑器项目，运行时使用所在系统的实际路径。
 
 当前本地 Agent 页面/API 使用 `http://127.0.0.1:3001/agent`，辅助 MCP 使用 3002；PPT 编辑器此前使用 3000。运行时确认服务及页面实际可用性，不能只凭历史端口记录判断。
 
 以下正文可直接复制给本地 Agent：
 
 ```text
-帮我运行 /home/goodtime/project/pptx-editor-engine 这个 PPT 编辑器，在可见的 Chrome 中加载项目里的“元景行业智能体方案-20260713(2) - 副本.pptx”。
+帮我运行 D:\enterpriseProject\pptx-editor-engine 这个 PPT 编辑器，在可见的 Chrome 中加载项目里的“元景行业智能体方案-20260713(2) - 副本.pptx”。
 
 如果服务和浏览器页面还能用，就继续使用。检查第 1 页，再翻到第 2 页，两页各保存一张截图，看看有没有明显的显示异常，并检查浏览器的控制台和请求情况。
 
@@ -97,7 +99,7 @@ Observer 阅读当前任务的原始时间线。需要追查归因时，读取�
 指定文件的完整路径为：
 
 ```text
-/home/goodtime/project/pptx-editor-engine/元景行业智能体方案-20260713(2) - 副本.pptx
+D:\enterpriseProject\pptx-editor-engine\元景行业智能体方案-20260713(2) - 副本.pptx
 ```
 
 2026-10-10 读取该 PPTX 文件的幻灯片条目确认共 8 页。运行中仍应实际读取页码和文档状态，不能用这个数量替代加载验证。

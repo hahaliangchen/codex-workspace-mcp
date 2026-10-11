@@ -161,6 +161,7 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
         let mut delivered_reviews=std::collections::HashSet::<String>::new();
         for (seq,time,kind,raw) in rows {
             let before=messages.len();
+            let mut retrieved_images=Vec::new();
             (|| -> Result<()> {
             let data: Value = serde_json::from_str(&raw)?;
             // Ordinary Organizer input is the invocation's public handoff,
@@ -195,7 +196,7 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
                 "tool/result" => {
                     messages.push(raw_message("worker_tool_result",&json!({"role":"tool",
                         "tool_call_id":data["message"]["toolCallId"],"content":plain_context(original_payload(&kind,&data))})));
-                    messages.extend(history_image_messages(original_payload(&kind,&data)));return Ok(());
+                    retrieved_images.extend(history_image_messages(original_payload(&kind,&data)));return Ok(());
                 },
                 "worker/progress" => ("worker",data.clone()),
                 "organizer/decision" => ("organizer_call",original_payload(&kind,&data).clone()),
@@ -213,7 +214,7 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
                     let result=&data["result"];
                     if !has_original {messages.push(raw_message("organizer_call",&result["request"]));}
                     messages.push(raw_message("organizer_result",&result["result"]));
-                    messages.extend(history_image_messages(&result["result"]));return Ok(());
+                    retrieved_images.extend(history_image_messages(&result["result"]));return Ok(());
                 },
                 "organizer/error" | "organizer/request_error" | "worker/error" | "visual/model_failed" | "organizer/material_unavailable" => ("runtime_error", data.clone()),
                 _ => return Ok(()),
@@ -225,6 +226,7 @@ pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:
             let data:Value=serde_json::from_str(&raw)?;
             let record=source_record(&task,seq,time,&kind,&data);
             for message in &mut messages[before..] {*message=with_source(message.clone(),&record);}
+            messages.extend(retrieved_images);
             sources.extend(std::iter::repeat_n(Some(seq),messages.len()-before));
         }
         Ok(crate::context_window::HistoryView {messages,sources})
@@ -396,7 +398,7 @@ pub fn process_messages(process: &Value) -> Vec<Value> {
             routed_message("user",&name,payload,&record["identity"])
         } else {raw_message(&name,payload)};
         let mut messages=vec![with_source(message,record)];
-        if kind=="tool/result" {messages.extend(history_image_messages(payload).into_iter().map(|message|with_source(message,record)));}
+        if kind=="tool/result" {messages.extend(history_image_messages(payload));}
         messages
     }).collect()
 }
@@ -587,6 +589,70 @@ mod tests {
         serde_json::from_str(text.split_once("\n\n").unwrap().0.strip_prefix("Source: ").unwrap()).unwrap()
     }
 
+    #[test]
+    fn paged_history_keeps_original_order_slices_and_native_tool_protocol() {
+        let source=|task:&str,seq:i64|json!({"seq":seq,"time":seq*100,"actor":"worker",
+            "history_reference":{"task_id":task,"event_seq":seq}});
+        let excerpt=|task:&str,seq:i64,offset:u64,text:&str|json!({"seq":seq,"char_offset":offset,
+            "content":text,"returned_chars":text.chars().count(),"source":source(task,seq)});
+        let lookup=|id:&str,records:Value|json!({"role":"tool","tool_call_id":id,
+            "content":json!({"scope":"conversation","records":records}).to_string()});
+        let command=with_source(raw_message("organizer",&json!("current assignment")),&source("a",100));
+        let calls=json!({"role":"assistant","tool_calls":[{"id":"read","type":"function",
+            "function":{"name":"read_session_history","arguments":"{}"}}]});
+        let receipt=lookup("read",json!([excerpt("a",7,40," second slice \n"),excerpt("a",3,0," earlier \n")]));
+        let stored_receipt=receipt.clone();
+        let mut messages=vec![json!({"role":"system","content":"instructions"}),command.clone(),
+            with_source(raw_message("worker_return",&json!("later return")),&source("a",9)),calls.clone(),receipt,
+            with_source(raw_message("worker_return",&json!("other conversation")),&source("b",1)),
+            lookup("page-2",json!([excerpt("a",7,0," first slice \n"),excerpt("b",0,0,"other earlier")]))];
+        order_context_messages(&mut messages);
+        assert_eq!(messages[0]["content"],"instructions");assert_eq!(messages[1],command);
+        assert_eq!(messages[3],calls);assert_eq!(messages[4]["tool_call_id"],"read");
+        assert!(!messages[4]["content"].as_str().unwrap().contains("second slice"));
+        assert!(stored_receipt["content"].as_str().unwrap().contains("second slice"),"saved lookup is intact");
+        let positions=messages.iter().filter_map(source_position).collect::<Vec<_>>();
+        assert_eq!(positions,vec![("a".into(),3,0),("a".into(),7,0),("a".into(),7,40),("a".into(),9,0),("b".into(),0,0),("b".into(),1,0)]);
+        let slices=messages.iter().filter(|message|message["name"]=="retrieved_history")
+            .map(|message|original_text(message["content"].as_str().unwrap())).collect::<Vec<_>>();
+        assert_eq!(slices,vec![" earlier \n"," first slice \n"," second slice \n","other earlier"]);
+        let ordered=messages.clone();order_context_messages(&mut messages);assert_eq!(messages,ordered);
+    }
+
+    #[tokio::test]
+    async fn retrieved_images_keep_their_original_source_after_organizer_and_observer_replay() {
+        let root=std::env::temp_dir().join(format!("retrieved-image-source-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn=crate::agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','check','fake','completed',0,0)",[]).unwrap();
+        let source=json!({"seq":3,"time":300,"kind":"visual/input_result","actor":"worker",
+            "identity":{"task_id":"task","request_id":1,"work_id":"completed"},
+            "history_reference":{"task_id":"task","event_seq":3}});
+        let image=json!({"role":"system","content":[{"type":"image_ref","artifact_id":"original-image"}]});
+        let result=json!({"scope":"conversation","records":[{"seq":3,"content":"original image delivery",
+            "source":source,"source_identity":source["identity"],"image_message":image}]});
+        for (seq,kind,data) in [(10,"tool/result",json!({"turn":1,"meta":{"result":result}})),
+            (11,"organizer/result_read",json!({"turn":1,"result":{"request":{"action":"read_session_history"},"result":result}}))] {
+            conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?1,?2,?3)",params![seq,kind,data.to_string()]).unwrap();
+        }
+        drop(conn);
+        let process=task_process(&root,"task",1).await.unwrap();
+        let organizer=organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap();
+        for mut messages in [process_messages(&process),organizer] {
+            order_context_messages(&mut messages);
+            let images=messages.iter().filter(|message|message["content"].as_array().is_some()).collect::<Vec<_>>();
+            assert!(!images.is_empty());
+            for message in images {
+                let blocks=message["content"].as_array().unwrap();
+                assert_eq!(blocks.len(),2,"one original source header and one unmodified image");
+                assert_eq!(blocks[0]["text"],format!("Source: {source}"));
+                assert_eq!(blocks[1],image["content"][0]);
+                assert_eq!(source_position(message),Some(("task".into(),3,0)));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn all_receivers_keep_original_body_actor_order_call_failure_and_review_status() {
         let root=std::env::temp_dir().join(format!("source-complete-{}",crate::visual_artifacts::new_id()));
@@ -609,15 +675,17 @@ mod tests {
         let process=task_process(&root,"task",1).await.unwrap();
         let messages=process_messages(&process);
         let organizer=organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap();
+        let complete=organizer_view(&root,"task",&json!({"process":{"request_id":1}}),true).await.unwrap().messages;
         let history=read(&root,"task",&json!({"limit":12,"max_chars":12000})).await.unwrap();
         for (record,message) in process["records"].as_array().unwrap().iter().zip(&messages) {
             let seq=record["seq"].as_i64().unwrap();
             let source=source_header(message);
             assert_eq!(source,source_metadata(record));
-            let forwarded=organizer.iter().find(|message|message["content"].as_str().is_some_and(|text|text.starts_with("Source: ")) && source_header(message)["seq"]==seq).unwrap();
+            let forwarded=complete.iter().find(|message|message["content"].as_str().is_some_and(|text|text.starts_with("Source: ")) && source_header(message)["seq"]==seq).unwrap();
             assert_eq!(source_header(forwarded),source);
             assert_eq!(history["records"].as_array().unwrap().iter().find(|item|item["seq"]==seq).unwrap()["source"],source);
         }
+        assert!(!organizer.iter().any(|message|matches!(message["name"].as_str(),Some("worker_tool_call"|"worker_tool_result"))));
         let failure=&messages[1];
         assert_eq!(source_header(failure)["identity"],identity);
         assert_eq!(source_header(failure)["actor"],"worker");
@@ -813,10 +881,11 @@ mod tests {
         let observer=serde_json::to_string(&process_messages(&process)).unwrap();
         let organizer=serde_json::to_string(&organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap()).unwrap();
         let history=read(&root,"task",&json!({"limit":12,"max_chars":12000})).await.unwrap().to_string();
-        for text in [&observer,&organizer,&history] {
+        for text in [&observer,&history] {
             for marker in ["LEGACY_PROGRESS","PRESERVE_EXTRA","UNKNOWN_NO_FALLBACK_TAIL"] {assert!(text.contains(marker),"missing {marker}");}
             assert!(!text.contains("DUPLICATE_TELEMETRY"));
         }
+        for marker in ["LEGACY_PROGRESS","PRESERVE_EXTRA","UNKNOWN_NO_FALLBACK_TAIL"] {assert!(!organizer.contains(marker));}
         let exact=read(&root,"task",&json!({"event_seq":1,"max_chars":12000})).await.unwrap();
         assert_eq!(exact["records"][0]["content"],reason);
         std::fs::remove_dir_all(root).unwrap();

@@ -5944,7 +5944,8 @@ pub(crate) mod tests {
         assert!(requests.iter().all(|body|body["tools"].as_array().into_iter().flatten()
             .all(|tool|tool.pointer("/function/name").and_then(Value::as_str)!=Some("report_progress"))));
         assert!(workers[1]["messages"].to_string().contains(narration));
-        assert!(requests.last().unwrap()["messages"].to_string().contains(narration));
+        assert!(!requests.last().unwrap()["messages"].to_string().contains(narration));
+        assert!(requests.last().unwrap()["messages"].to_string().contains("task_a delivered"));
         assert_eq!(events.iter().filter(|(kind,data)|kind=="assistant/message" && data["message"].to_string().contains(narration)).count(),1);
         assert!(!events.iter().any(|(kind,_)|kind=="worker/progress"));
         let frame=&committed_turn(&events,1)["scheduler"]["frames"]["task_a"];
@@ -6049,7 +6050,9 @@ pub(crate) mod tests {
         assert!(!initial.to_string().contains("HISTORY_ONLY_FACT"));
         let after_read:Value=test_model_context(&requests[4]);
         assert_eq!(after_read["read_task_results"][0]["action"],"read_session_history");
-        assert!(after_read["read_task_results"][0]["result"].to_string().contains("HISTORY_ONLY_FACT"));
+        assert!(!after_read["read_task_results"][0]["result"].to_string().contains("HISTORY_ONLY_FACT"));
+        assert!(requests[4]["messages"].as_array().unwrap().iter().any(|message|
+            message["name"]=="retrieved_history" && message["content"].as_str().is_some_and(|text|text.contains("HISTORY_ONLY_FACT"))));
         assert_eq!(committed_turn(&events,2)["scheduler"]["archived_requests"].as_array().unwrap().len(),1);
     }
 
