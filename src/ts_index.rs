@@ -1,7 +1,7 @@
 pub mod api;
-mod read_details;
 pub mod diagnostic;
 pub mod parser;
+mod read_details;
 pub mod resolve;
 pub mod types;
 pub mod utils;

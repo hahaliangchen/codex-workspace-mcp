@@ -1,4 +1,3 @@
-
 use reqwest::Client;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -60,8 +59,6 @@ pub fn emit_event(event: SurgeryEvent) {
         let _ = sender.try_send(event);
     }
 }
-
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RelatedCodeBlock {
@@ -163,7 +160,11 @@ fn load_expert_provider(request: &ExpertCodeSurgeryRequest) -> anyhow::Result<Ex
     }
 
     let route = crate::ai_proxy::selected_route(true)?;
-    Ok(ExpertProvider { url: route.url, api_key: route.api_key, model: route.model })
+    Ok(ExpertProvider {
+        url: route.url,
+        api_key: route.api_key,
+        model: route.model,
+    })
 }
 
 async fn call_expert_model(

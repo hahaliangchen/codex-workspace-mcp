@@ -3,7 +3,12 @@
 
 use std::path::PathBuf;
 
-use axum::{Json, extract::State, http::header, response::{Html, IntoResponse, Response}};
+use axum::{
+    Json,
+    extract::State,
+    http::header,
+    response::{Html, IntoResponse, Response},
+};
 use serde_json::json;
 
 use crate::agent_service::AgentServiceState;
@@ -84,14 +89,16 @@ pub async fn dsh_design_css() -> impl IntoResponse {
 
 pub async fn info(State(state): State<AgentServiceState>) -> impl IntoResponse {
     let state = state.with_latest_config().await;
-    let ready = !state.plugin_cancel.is_cancelled() && !state.provider_url.is_empty() && !state.default_model.is_empty();
+    let ready = !state.plugin_cancel.is_cancelled()
+        && !state.provider_url.is_empty()
+        && !state.default_model.is_empty();
     Json(json!({
-            "ready": ready,
-            "workspace": state.workspace.root().display().to_string(),
-            "model": state.default_model,
-            "subagent_enabled": state.enable_subagent,
-            "subagent_model": state.expert_model,
-        }))
+        "ready": ready,
+        "workspace": state.workspace.root().display().to_string(),
+        "model": state.default_model,
+        "subagent_enabled": state.enable_subagent,
+        "subagent_model": state.expert_model,
+    }))
 }
 
 pub async fn star_png() -> impl IntoResponse {
@@ -103,7 +110,11 @@ pub async fn star_png() -> impl IntoResponse {
     if let Ok(bytes) = tokio::fs::read(&alt).await {
         return ([(header::CONTENT_TYPE, "image/png")], bytes).into_response();
     }
-    ([(header::CONTENT_TYPE, "image/png")], include_bytes!("../frontend/src/assets/star.png").to_vec()).into_response()
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../frontend/src/assets/star.png").to_vec(),
+    )
+        .into_response()
 }
 
 pub async fn favicon_png() -> impl IntoResponse {

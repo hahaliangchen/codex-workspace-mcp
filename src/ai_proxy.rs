@@ -54,7 +54,7 @@ struct ModelCapabilities {
     #[serde(default)]
     fast_mode: bool,
     #[serde(default)]
-    image_input:crate::visual_artifacts::ImageCapability,
+    image_input: crate::visual_artifacts::ImageCapability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_probe: Option<Value>,
 }
@@ -63,11 +63,13 @@ fn built_in_capabilities(model: &str) -> ModelCapabilities {
     if model == "gpt-6-luna" {
         ModelCapabilities {
             reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
-                .into_iter().map(str::to_owned).collect(),
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             default_effort: Some("max".into()),
             fast_mode: true,
-            image_input:Default::default(),
-            image_probe:None,
+            image_input: Default::default(),
+            image_probe: None,
         }
     } else {
         ModelCapabilities::default()
@@ -105,11 +107,11 @@ pub(crate) struct AiProxyConfig {
     #[serde(default)]
     observer_model: Option<String>,
     #[serde(default)]
-    visual_fallback_enabled:bool,
+    visual_fallback_enabled: bool,
     #[serde(default)]
-    visual_provider:Option<String>,
+    visual_provider: Option<String>,
     #[serde(default)]
-    visual_model:Option<String>,
+    visual_model: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
     #[serde(flatten)]
@@ -122,7 +124,9 @@ fn observer_enabled_by_default() -> bool {
 
 impl AiProxyConfig {
     fn resolve_expert_provider(&self) -> Option<crate::expert_surgery::ExpertProvider> {
-        if !self.enable_subagent { return None; }
+        if !self.enable_subagent {
+            return None;
+        }
         // Legacy code-surgery routing is separate from the standalone task subagent.
         // Inheriting the task model must not silently expose another tool here.
         let provider_name = self.expert_provider.as_deref()?;
@@ -151,11 +155,20 @@ pub(crate) fn apply_agent_config(
         .get(main_name)
         .filter(|provider| provider.api_type == "openai-completions");
     state.provider_name = main.map(|_| main_name.to_owned()).unwrap_or_default();
-    state.provider_routes = config.providers.iter()
+    state.provider_routes = config
+        .providers
+        .iter()
         .filter(|(_, provider)| provider.api_type == "openai-completions")
-        .map(|(name, provider)| (name.clone(), crate::agent_service::AgentProviderRoute {
-            url: provider.url.clone(), api_key: provider.api_key.clone(), models: provider.model_map.clone(),
-        }))
+        .map(|(name, provider)| {
+            (
+                name.clone(),
+                crate::agent_service::AgentProviderRoute {
+                    url: provider.url.clone(),
+                    api_key: provider.api_key.clone(),
+                    models: provider.model_map.clone(),
+                },
+            )
+        })
         .collect();
     state.provider_url = main.map(|p| p.url.clone()).unwrap_or_default();
     state.api_key = main.map(|p| p.api_key.clone()).unwrap_or_default();
@@ -173,7 +186,10 @@ pub(crate) fn apply_agent_config(
         .and_then(|name| config.providers.get(name))
         .filter(|provider| provider.api_type == "openai-completions")
         .or(main);
-    state.expert_provider_name = config.expert_provider.clone().unwrap_or_else(|| main_name.to_owned());
+    state.expert_provider_name = config
+        .expert_provider
+        .clone()
+        .unwrap_or_else(|| main_name.to_owned());
     state.expert_provider_url = subagent.map(|p| p.url.clone()).unwrap_or_default();
     state.expert_api_key = subagent.map(|p| p.api_key.clone()).unwrap_or_default();
     state.expert_model = config
@@ -182,37 +198,82 @@ pub(crate) fn apply_agent_config(
         .or_else(|| config.orchestrator_model.clone())
         .or_else(|| subagent.and_then(|p| p.model_map.values().next().cloned()))
         .unwrap_or_default();
-    state.subagent_inherits_model = config.expert_provider.is_none() && config.expert_model.is_none();
-    state.enable_subagent = config.enable_subagent && main.is_some() && subagent.is_some() && !state.expert_model.is_empty();
+    state.subagent_inherits_model =
+        config.expert_provider.is_none() && config.expert_model.is_none();
+    state.enable_subagent = config.enable_subagent
+        && main.is_some()
+        && subagent.is_some()
+        && !state.expert_model.is_empty();
 
     let observer_name = config.observer_provider.as_deref().unwrap_or(main_name);
-    let observer = config.providers.get(observer_name)
+    let observer = config
+        .providers
+        .get(observer_name)
         .filter(|provider| provider.api_type == "openai-completions");
-    state.observer_provider = observer.map(|_| observer_name.to_owned()).unwrap_or_default();
+    state.observer_provider = observer
+        .map(|_| observer_name.to_owned())
+        .unwrap_or_default();
     state.observer_provider_url = observer.map(|p| p.url.clone()).unwrap_or_default();
     state.observer_api_key = observer.map(|p| p.api_key.clone()).unwrap_or_default();
     state.observer_model = config.observer_model.clone().unwrap_or_default();
-    state.observer_inherits_model = config.observer_provider.is_none() && config.observer_model.is_none();
+    state.observer_inherits_model =
+        config.observer_provider.is_none() && config.observer_model.is_none();
     state.observer_enabled = config.observer_enabled
         && observer.is_some()
         && (state.observer_inherits_model || !state.observer_model.is_empty());
-    state.visual.capabilities=config.model_capabilities.iter().map(|(provider,models)|(provider.clone(),models.iter().flat_map(|(model,cap)| {
-        let mapped=config.providers.get(provider).and_then(|p|p.model_map.get(model)).cloned().unwrap_or_else(||model.clone());
-        [(model.clone(),cap.image_input),(mapped,cap.image_input)]
-    }).collect())).collect();
-    state.visual.fallback=if config.visual_fallback_enabled {
-        config.visual_provider.as_ref().zip(config.visual_model.as_ref()).and_then(|(provider,model)| {
-            let route=config.providers.get(provider)?;
-            (route.api_type=="openai-completions" && state.visual.capability(provider,model)==crate::visual_artifacts::ImageCapability::Supported)
-                .then(||crate::visual_artifacts::VisualRoute {provider:provider.clone(),model:route.model_map.get(model).cloned().unwrap_or_else(||model.clone()),url:route.url.clone(),api_key:route.api_key.clone()})
+    state.visual.capabilities = config
+        .model_capabilities
+        .iter()
+        .map(|(provider, models)| {
+            (
+                provider.clone(),
+                models
+                    .iter()
+                    .flat_map(|(model, cap)| {
+                        let mapped = config
+                            .providers
+                            .get(provider)
+                            .and_then(|p| p.model_map.get(model))
+                            .cloned()
+                            .unwrap_or_else(|| model.clone());
+                        [(model.clone(), cap.image_input), (mapped, cap.image_input)]
+                    })
+                    .collect(),
+            )
         })
-    }else{None};
+        .collect();
+    state.visual.fallback = if config.visual_fallback_enabled {
+        config
+            .visual_provider
+            .as_ref()
+            .zip(config.visual_model.as_ref())
+            .and_then(|(provider, model)| {
+                let route = config.providers.get(provider)?;
+                (route.api_type == "openai-completions"
+                    && state.visual.capability(provider, model)
+                        == crate::visual_artifacts::ImageCapability::Supported)
+                    .then(|| crate::visual_artifacts::VisualRoute {
+                        provider: provider.clone(),
+                        model: route
+                            .model_map
+                            .get(model)
+                            .cloned()
+                            .unwrap_or_else(|| model.clone()),
+                        url: route.url.clone(),
+                        api_key: route.api_key.clone(),
+                    })
+            })
+    } else {
+        None
+    };
 }
 
 pub(crate) fn dsh_config_path() -> std::path::PathBuf {
     let home = std::env::var_os("DSH_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(|v| std::path::PathBuf::from(v).join(".dsh")))
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|v| std::path::PathBuf::from(v).join(".dsh"))
+        })
         .or_else(|| std::env::var_os("HOME").map(|v| std::path::PathBuf::from(v).join(".dsh")))
         .unwrap_or_else(|| std::path::PathBuf::from(".dsh"));
     let profile = std::env::var("DSH_PROFILE").unwrap_or_else(|_| "web".into());
@@ -220,8 +281,12 @@ pub(crate) fn dsh_config_path() -> std::path::PathBuf {
 }
 
 fn credentials_path(config_path: &Path) -> std::path::PathBuf {
-    config_path.parent().and_then(Path::parent).and_then(Path::parent)
-        .expect("DSH profile path has a home directory").join(".credentials.yaml")
+    config_path
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .expect("DSH profile path has a home directory")
+        .join(".credentials.yaml")
 }
 
 fn observer_settings_path(config_path: &Path) -> std::path::PathBuf {
@@ -241,13 +306,29 @@ fn read_yaml(path: &Path, fallback: Value) -> anyhow::Result<Value> {
 }
 
 fn write_yaml_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
-    let parent = path.parent().ok_or_else(|| anyhow::anyhow!("configuration path has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("configuration path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let suffix = format!("{}.{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
-    let temporary = parent.join(format!(".{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), suffix));
+    let suffix = format!(
+        "{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        suffix
+    ));
     let result = (|| -> anyhow::Result<()> {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-        #[cfg(unix)] {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
@@ -257,18 +338,31 @@ fn write_yaml_atomic(path: &Path, value: &Value) -> anyhow::Result<()> {
         std::fs::rename(&temporary, path)?;
         Ok(())
     })();
-    if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
     result
 }
 
 fn plugin_config<'a>(patch: &'a Value, id: &str) -> Option<&'a Value> {
-    patch.as_array()?.iter().find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?.get("config")
+    patch
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?
+        .get("config")
 }
 
 fn set_plugin_config(patch: &mut Value, id: &str, config: Value) -> anyhow::Result<()> {
-    let entries = patch.as_array_mut().ok_or_else(|| anyhow::anyhow!("DSH profile patch must be a YAML sequence"))?;
-    if let Some(entry) = entries.iter_mut().find(|entry| entry.get("id").and_then(Value::as_str) == Some(id)) {
-        entry.as_object_mut().ok_or_else(|| anyhow::anyhow!("DSH plugin entry is not a mapping"))?
+    let entries = patch
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("DSH profile patch must be a YAML sequence"))?;
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+    {
+        entry
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSH plugin entry is not a mapping"))?
             .insert("config".into(), config);
     } else {
         entries.push(json!({"id":id,"config":config}));
@@ -280,87 +374,197 @@ fn dotenv_value(path: &Path, reference: &str) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     for line in raw.lines() {
         let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
-        if line.starts_with('#') { continue; }
-        let Some((name, value)) = line.split_once('=') else { continue };
-        if name.trim() != reference { continue; }
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim() != reference {
+            continue;
+        }
         let value = value.trim();
-        let value = if value.len() >= 2 && ((value.starts_with('"') && value.ends_with('"')) || (value.starts_with('\'') && value.ends_with('\''))) {
-            &value[1..value.len()-1]
-        } else { value };
-        if !value.is_empty() { return Some(value.to_owned()); }
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
     }
     None
 }
 
 fn credential_value(credentials: &Value, config_path: &Path, reference: &str) -> String {
-    std::env::var(reference).ok().filter(|s| !s.is_empty())
-        .or_else(|| credentials.pointer(&format!("/refs/{reference}")).and_then(Value::as_str).map(str::to_owned))
-        .or_else(|| std::env::current_dir().ok().and_then(|dir| dotenv_value(&dir.join(".env"), reference)))
-        .or_else(|| dotenv_value(&credentials_path(config_path).with_file_name(".env"), reference))
+    std::env::var(reference)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            credentials
+                .pointer(&format!("/refs/{reference}"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|dir| dotenv_value(&dir.join(".env"), reference))
+        })
+        .or_else(|| {
+            dotenv_value(
+                &credentials_path(config_path).with_file_name(".env"),
+                reference,
+            )
+        })
         .unwrap_or_default()
 }
 
 pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
     let patch = read_yaml(config_path, json!([]))?;
-    anyhow::ensure!(patch.is_array(), "DSH profile patch must be a YAML sequence");
-    let credentials = read_yaml(&credentials_path(config_path), json!({"version":1,"refs":{},"records":{}}))?;
+    anyhow::ensure!(
+        patch.is_array(),
+        "DSH profile patch must be a YAML sequence"
+    );
+    let credentials = read_yaml(
+        &credentials_path(config_path),
+        json!({"version":1,"refs":{},"records":{}}),
+    )?;
     let mut config = AiProxyConfig::default();
-    if let Some(providers) = plugin_config(&patch, "llm-pi-ai").and_then(|v| v.get("providers")).and_then(Value::as_object) {
+    if let Some(providers) = plugin_config(&patch, "llm-pi-ai")
+        .and_then(|v| v.get("providers"))
+        .and_then(Value::as_object)
+    {
         for (id, entry) in providers {
-            let Some(url) = entry.get("baseURL").and_then(Value::as_str) else { continue };
-            let Some(models) = entry.get("models").and_then(Value::as_array) else { continue };
-            let model_map = models.iter().filter_map(|v| v.get("id").and_then(Value::as_str).map(|id| (id.to_owned(), id.to_owned()))).collect();
-            let reference = entry.get("apiKeyEnv").and_then(Value::as_str).map(str::to_owned);
-            let api_key = reference.as_deref().map(|r| credential_value(&credentials, config_path, r)).unwrap_or_default();
-            config.providers.insert(id.clone(), ProviderConfig {
-                url: url.to_owned(), api_key, api_key_ref: reference, model_map,
-                api_type: entry.get("api").and_then(Value::as_str).unwrap_or("openai-completions").to_owned(),
-                extra: entry.get("displayName").and_then(Value::as_str)
-                    .map(|name| HashMap::from([("displayName".to_owned(), json!(name))]))
-                    .unwrap_or_default(),
-            });
+            let Some(url) = entry.get("baseURL").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(models) = entry.get("models").and_then(Value::as_array) else {
+                continue;
+            };
+            let model_map = models
+                .iter()
+                .filter_map(|v| {
+                    v.get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| (id.to_owned(), id.to_owned()))
+                })
+                .collect();
+            let reference = entry
+                .get("apiKeyEnv")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let api_key = reference
+                .as_deref()
+                .map(|r| credential_value(&credentials, config_path, r))
+                .unwrap_or_default();
+            config.providers.insert(
+                id.clone(),
+                ProviderConfig {
+                    url: url.to_owned(),
+                    api_key,
+                    api_key_ref: reference,
+                    model_map,
+                    api_type: entry
+                        .get("api")
+                        .and_then(Value::as_str)
+                        .unwrap_or("openai-completions")
+                        .to_owned(),
+                    extra: entry
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .map(|name| HashMap::from([("displayName".to_owned(), json!(name))]))
+                        .unwrap_or_default(),
+                },
+            );
         }
     }
     if let Some(main) = plugin_config(&patch, "agent-default-model") {
-        config.orchestrator_provider = main.get("provider").and_then(Value::as_str).map(str::to_owned);
+        config.orchestrator_provider = main
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         config.orchestrator_model = main.get("model").and_then(Value::as_str).map(str::to_owned);
         config.default_provider = config.orchestrator_provider.clone();
     }
     if let Some(selection) = plugin_config(&patch, "subagent-model-selection-settings") {
-        config.enable_subagent = selection.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-        if let Some(route) = selection.get("allowedModels").and_then(Value::as_array).and_then(|a| a.first()) {
+        config.enable_subagent = selection
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(route) = selection
+            .get("allowedModels")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+        {
             let provider = route.get("provider").and_then(Value::as_str);
             let model = route.get("model").and_then(Value::as_str);
-            if provider != config.orchestrator_provider.as_deref() || model != config.orchestrator_model.as_deref() {
+            if provider != config.orchestrator_provider.as_deref()
+                || model != config.orchestrator_model.as_deref()
+            {
                 config.expert_provider = provider.map(str::to_owned);
                 config.expert_model = model.map(str::to_owned);
             }
         }
     }
     let observer = read_yaml(&observer_settings_path(config_path), json!({}))?;
-    config.observer_enabled = observer.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-    config.observer_provider = observer.get("provider").and_then(Value::as_str).map(str::to_owned);
-    config.observer_model = observer.get("model").and_then(Value::as_str).map(str::to_owned);
+    config.observer_enabled = observer
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    config.observer_provider = observer
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    config.observer_model = observer
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let generation = read_yaml(&generation_settings_path(config_path), json!({}))?;
-    config.reasoning_effort = generation.get("reasoning_effort").and_then(Value::as_str).map(str::to_owned);
-    config.fast_mode = generation.get("fast_mode").and_then(Value::as_bool).unwrap_or(false);
-    config.visual_fallback_enabled=generation["visual_fallback_enabled"].as_bool().unwrap_or(false);
-    config.visual_provider=generation["visual_provider"].as_str().map(str::to_owned);
-    config.visual_model=generation["visual_model"].as_str().map(str::to_owned);
-    config.model_capabilities = generation.get("model_capabilities")
-        .cloned().map(serde_json::from_value).transpose()?.unwrap_or_default();
+    config.reasoning_effort = generation
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    config.fast_mode = generation
+        .get("fast_mode")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    config.visual_fallback_enabled = generation["visual_fallback_enabled"]
+        .as_bool()
+        .unwrap_or(false);
+    config.visual_provider = generation["visual_provider"].as_str().map(str::to_owned);
+    config.visual_model = generation["visual_model"].as_str().map(str::to_owned);
+    config.model_capabilities = generation
+        .get("model_capabilities")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
     for (provider_id, provider) in &config.providers {
-        let models = config.model_capabilities.entry(provider_id.clone()).or_default();
+        let models = config
+            .model_capabilities
+            .entry(provider_id.clone())
+            .or_default();
         for model_id in provider.model_map.keys() {
-            models.entry(model_id.clone()).or_insert_with(|| built_in_capabilities(model_id));
+            models
+                .entry(model_id.clone())
+                .or_insert_with(|| built_in_capabilities(model_id));
         }
         for (model, capability) in models {
-            if capability.image_probe.as_ref().is_some_and(|probe| provider.api_type != "openai-completions"
-                || probe["route_fingerprint"] != crate::visual_probe::route_fingerprint(&provider.url,model)) {
+            if capability.image_probe.as_ref().is_some_and(|probe| {
+                provider.api_type != "openai-completions"
+                    || probe["route_fingerprint"]
+                        != crate::visual_probe::route_fingerprint(&provider.url, model)
+            }) {
                 capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
             }
             if capability.image_input == crate::visual_artifacts::ImageCapability::Supported
-                && (provider.api_type != "openai-completions" || !verified_image_support(capability, &provider.url, model)) {
+                && (provider.api_type != "openai-completions"
+                    || !verified_image_support(capability, &provider.url, model))
+            {
                 capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
             }
         }
@@ -377,7 +581,12 @@ pub(crate) struct DshRoute {
 
 pub(crate) fn selected_route(expert: bool) -> anyhow::Result<DshRoute> {
     let config = load_config(&dsh_config_path())?;
-    if expert { anyhow::ensure!(config.enable_subagent, "DSH subagent model selection is disabled"); }
+    if expert {
+        anyhow::ensure!(
+            config.enable_subagent,
+            "DSH subagent model selection is disabled"
+        );
+    }
     let (name, model) = if expert {
         (
             config.expert_provider.or(config.orchestrator_provider),
@@ -387,17 +596,30 @@ pub(crate) fn selected_route(expert: bool) -> anyhow::Result<DshRoute> {
         (config.orchestrator_provider, config.orchestrator_model)
     };
     let name = name.ok_or_else(|| anyhow::anyhow!("DSH model provider is not configured"))?;
-    let provider = config.providers.get(&name).ok_or_else(|| anyhow::anyhow!("DSH provider {name} is unavailable"))?;
-    anyhow::ensure!(provider.api_type == "openai-completions", "this Rust agent requires an OpenAI Chat Completions route");
+    let provider = config
+        .providers
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("DSH provider {name} is unavailable"))?;
+    anyhow::ensure!(
+        provider.api_type == "openai-completions",
+        "this Rust agent requires an OpenAI Chat Completions route"
+    );
     Ok(DshRoute {
-        name, url: provider.url.clone(), api_key: provider.api_key.clone(),
+        name,
+        url: provider.url.clone(),
+        api_key: provider.api_key.clone(),
         model: model.ok_or_else(|| anyhow::anyhow!("DSH model is not configured"))?,
     })
 }
 
 fn disk_revision(config_path: &Path) -> anyhow::Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for path in [config_path.to_path_buf(), credentials_path(config_path), observer_settings_path(config_path), generation_settings_path(config_path)] {
+    for path in [
+        config_path.to_path_buf(),
+        credentials_path(config_path),
+        observer_settings_path(config_path),
+        generation_settings_path(config_path),
+    ] {
         match std::fs::read(path) {
             Ok(bytes) => bytes.hash(&mut hasher),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0u8.hash(&mut hasher),
@@ -531,11 +753,11 @@ struct SettingsEdit {
     #[serde(default)]
     observer_model: Option<String>,
     #[serde(default)]
-    visual_fallback_enabled:Option<bool>,
+    visual_fallback_enabled: Option<bool>,
     #[serde(default)]
-    visual_provider:Option<String>,
+    visual_provider: Option<String>,
     #[serde(default)]
-    visual_model:Option<String>,
+    visual_model: Option<String>,
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
@@ -545,67 +767,137 @@ fn nonempty(value: Option<String>) -> Option<String> {
 }
 
 fn verified_image_support(capability: &ModelCapabilities, url: &str, model: &str) -> bool {
-    capability.image_probe.as_ref().is_some_and(|probe|
-        probe["status"] == "verified" && probe["capability"] == "supported"
-        && probe["request"]["contains_image_content"] == true
-        && probe["route_fingerprint"] == crate::visual_probe::route_fingerprint(url,model))
+    capability.image_probe.as_ref().is_some_and(|probe| {
+        probe["status"] == "verified"
+            && probe["capability"] == "supported"
+            && probe["request"]["contains_image_content"] == true
+            && probe["route_fingerprint"] == crate::visual_probe::route_fingerprint(url, model)
+    })
 }
 
-fn image_probe_route(config: &AiProxyConfig, provider: &str, model: &str) -> anyhow::Result<crate::visual_artifacts::VisualRoute> {
-    let route = config.providers.get(provider).ok_or_else(||anyhow::anyhow!("provider is not configured; save settings first"))?;
-    anyhow::ensure!(route.api_type == "openai-completions", "image probe currently requires an OpenAI Chat Completions route");
-    let model = route.model_map.get(model).ok_or_else(||anyhow::anyhow!("model is not configured; save settings first"))?;
-    Ok(crate::visual_artifacts::VisualRoute { provider:provider.into(),model:model.clone(),url:route.url.clone(),api_key:route.api_key.clone() })
+fn image_probe_route(
+    config: &AiProxyConfig,
+    provider: &str,
+    model: &str,
+) -> anyhow::Result<crate::visual_artifacts::VisualRoute> {
+    let route = config
+        .providers
+        .get(provider)
+        .ok_or_else(|| anyhow::anyhow!("provider is not configured; save settings first"))?;
+    anyhow::ensure!(
+        route.api_type == "openai-completions",
+        "image probe currently requires an OpenAI Chat Completions route"
+    );
+    let model = route
+        .model_map
+        .get(model)
+        .ok_or_else(|| anyhow::anyhow!("model is not configured; save settings first"))?;
+    Ok(crate::visual_artifacts::VisualRoute {
+        provider: provider.into(),
+        model: model.clone(),
+        url: route.url.clone(),
+        api_key: route.api_key.clone(),
+    })
 }
 
-fn persist_image_probe(path: &Path, revision: &str, provider: &str, model: &str, report: &Value) -> anyhow::Result<(AiProxyConfig,String)> {
-    anyhow::ensure!(disk_revision(path)? == revision, "settings changed during image verification; run it again on the saved route");
+fn persist_image_probe(
+    path: &Path,
+    revision: &str,
+    provider: &str,
+    model: &str,
+    report: &Value,
+) -> anyhow::Result<(AiProxyConfig, String)> {
+    anyhow::ensure!(
+        disk_revision(path)? == revision,
+        "settings changed during image verification; run it again on the saved route"
+    );
     let mut config = load_config(path)?;
-    let route = image_probe_route(&config,provider,model)?;
-    anyhow::ensure!(report["route_fingerprint"] == crate::visual_probe::route_fingerprint(&route.url,&route.model), "image probe route changed");
-    let capability = config.model_capabilities.entry(provider.into()).or_default().entry(model.into()).or_default();
+    let route = image_probe_route(&config, provider, model)?;
+    anyhow::ensure!(
+        report["route_fingerprint"]
+            == crate::visual_probe::route_fingerprint(&route.url, &route.model),
+        "image probe route changed"
+    );
+    let capability = config
+        .model_capabilities
+        .entry(provider.into())
+        .or_default()
+        .entry(model.into())
+        .or_default();
     capability.image_input = serde_json::from_value(report["capability"].clone())?;
     capability.image_probe = Some(report.clone());
     let generation_path = generation_settings_path(path);
-    let mut generation = read_yaml(&generation_path,json!({}))?;
+    let mut generation = read_yaml(&generation_path, json!({}))?;
     generation["model_capabilities"] = serde_json::to_value(&config.model_capabilities)?;
-    write_yaml_atomic(&generation_path,&generation)?;
-    Ok((config,disk_revision(path)?))
+    write_yaml_atomic(&generation_path, &generation)?;
+    Ok((config, disk_revision(path)?))
 }
 
 #[derive(Deserialize)]
-struct ImageProbeRequest { revision:String, provider:String, model:String }
+struct ImageProbeRequest {
+    revision: String,
+    provider: String,
+    model: String,
+}
 
-async fn probe_agent_image_input(State(state): State<AiProxyState>, headers: HeaderMap, Json(input): Json<ImageProbeRequest>) -> Response {
+async fn probe_agent_image_input(
+    State(state): State<AiProxyState>,
+    headers: HeaderMap,
+    Json(input): Json<ImageProbeRequest>,
+) -> Response {
     if !trusted_settings_request(&headers) {
-        return (StatusCode::FORBIDDEN,Json(json!({"error":"settings are only available to the local page"}))).into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"settings are only available to the local page"})),
+        )
+            .into_response();
     }
     let result = async {
         let config = load_config(&state.config_path)?;
-        anyhow::ensure!(disk_revision(&state.config_path)? == input.revision, "settings changed; reload before image verification");
-        let route = image_probe_route(&config,&input.provider,&input.model)?;
-        let report = crate::visual_probe::probe(&state.client,&route).await?;
+        anyhow::ensure!(
+            disk_revision(&state.config_path)? == input.revision,
+            "settings changed; reload before image verification"
+        );
+        let route = image_probe_route(&config, &input.provider, &input.model)?;
+        let report = crate::visual_probe::probe(&state.client, &route).await?;
         let _guard = state.settings_write.lock().await;
-        let (config,revision) = persist_image_probe(&state.config_path,&input.revision,&input.provider,&input.model,&report)?;
-        let view = settings_view(&config,revision);
+        let (config, revision) = persist_image_probe(
+            &state.config_path,
+            &input.revision,
+            &input.provider,
+            &input.model,
+            &report,
+        )?;
+        let view = settings_view(&config, revision);
         *state.config.write().await = config;
-        Ok::<_,anyhow::Error>(json!({"probe":report,"settings":view}))
-    }.await;
+        Ok::<_, anyhow::Error>(json!({"probe":report,"settings":view}))
+    }
+    .await;
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST,Json(json!({"error":format!("{error:#}")}))).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
     }
 }
 
 pub(crate) async fn probe_default_image_input(path: &Path) -> anyhow::Result<Value> {
     let revision = disk_revision(path)?;
     let config = load_config(path)?;
-    let provider = config.orchestrator_provider.as_deref().ok_or_else(||anyhow::anyhow!("main provider is not configured"))?;
-    let model = config.orchestrator_model.as_deref().ok_or_else(||anyhow::anyhow!("main model is not configured"))?;
-    let route = image_probe_route(&config,provider,model)?;
-    let report = crate::visual_probe::probe(&Client::new(),&route).await?;
+    let provider = config
+        .orchestrator_provider
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("main provider is not configured"))?;
+    let model = config
+        .orchestrator_model
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("main model is not configured"))?;
+    let route = image_probe_route(&config, provider, model)?;
+    let report = crate::visual_probe::probe(&Client::new(), &route).await?;
     // Store evidence without touching profile routing, credentials, or fallback settings.
-    persist_image_probe(path,&revision,provider,model,&report)?;
+    persist_image_probe(path, &revision, provider, model, &report)?;
     Ok(report)
 }
 
@@ -649,46 +941,94 @@ fn save_settings(
             "provider {id} URL must not include credentials, query, or fragment"
         );
         anyhow::ensure!(
-            matches!(draft.api_type.as_str(), "openai-completions" | "openai-responses" | "anthropic-messages"),
+            matches!(
+                draft.api_type.as_str(),
+                "openai-completions" | "openai-responses" | "anthropic-messages"
+            ),
             "provider {id} has unsupported protocol"
         );
         anyhow::ensure!(
-            !draft.models.is_empty()
-                && draft.models.iter().all(|model| !model.trim().is_empty()),
+            !draft.models.is_empty() && draft.models.iter().all(|model| !model.trim().is_empty()),
             "provider {id} needs at least one model"
         );
-        anyhow::ensure!(draft.models.iter().collect::<std::collections::HashSet<_>>().len() == draft.models.len(), "provider {id} has duplicate model IDs");
-        let configured = draft.model_capabilities.unwrap_or_else(|| config.model_capabilities.get(&id).cloned().unwrap_or_default());
+        anyhow::ensure!(
+            draft
+                .models
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == draft.models.len(),
+            "provider {id} has duplicate model IDs"
+        );
+        let configured = draft.model_capabilities.unwrap_or_else(|| {
+            config
+                .model_capabilities
+                .get(&id)
+                .cloned()
+                .unwrap_or_default()
+        });
         let mut capabilities = HashMap::new();
         for model in &draft.models {
-            let mut capability = configured.get(model).cloned().unwrap_or_else(|| built_in_capabilities(model));
+            let mut capability = configured
+                .get(model)
+                .cloned()
+                .unwrap_or_else(|| built_in_capabilities(model));
             // A settings payload cannot manufacture successful probe evidence.
-            capability.image_probe = config.model_capabilities.get(&id).and_then(|models|models.get(model))
-                .and_then(|previous|previous.image_probe.clone());
-            if capability.image_probe.as_ref().is_some_and(|probe| draft.api_type != "openai-completions"
-                || probe["route_fingerprint"] != crate::visual_probe::route_fingerprint(url.as_str(),model)) {
+            capability.image_probe = config
+                .model_capabilities
+                .get(&id)
+                .and_then(|models| models.get(model))
+                .and_then(|previous| previous.image_probe.clone());
+            if capability.image_probe.as_ref().is_some_and(|probe| {
+                draft.api_type != "openai-completions"
+                    || probe["route_fingerprint"]
+                        != crate::visual_probe::route_fingerprint(url.as_str(), model)
+            }) {
                 capability.image_input = crate::visual_artifacts::ImageCapability::Unknown;
             }
-            anyhow::ensure!(capability.image_input != crate::visual_artifacts::ImageCapability::Supported
-                || (draft.api_type == "openai-completions" && verified_image_support(&capability, url.as_str(), model)),
-                "provider {id} model {model}: verify image input on the saved route before marking it supported");
-            anyhow::ensure!(capability.reasoning_efforts.iter().all(|effort| matches!(effort.as_str(), "none" | "low" | "medium" | "high" | "xhigh" | "max")), "provider {id} model {model} has an unsupported reasoning effort");
-            anyhow::ensure!(capability.reasoning_efforts.iter().collect::<std::collections::HashSet<_>>().len() == capability.reasoning_efforts.len(), "provider {id} model {model} has duplicate reasoning efforts");
-            anyhow::ensure!(capability.default_effort.as_ref().is_none_or(|effort| capability.reasoning_efforts.contains(effort)), "provider {id} model {model} default effort is not in its supported levels");
+            anyhow::ensure!(
+                capability.image_input != crate::visual_artifacts::ImageCapability::Supported
+                    || (draft.api_type == "openai-completions"
+                        && verified_image_support(&capability, url.as_str(), model)),
+                "provider {id} model {model}: verify image input on the saved route before marking it supported"
+            );
+            anyhow::ensure!(
+                capability.reasoning_efforts.iter().all(|effort| matches!(
+                    effort.as_str(),
+                    "none" | "low" | "medium" | "high" | "xhigh" | "max"
+                )),
+                "provider {id} model {model} has an unsupported reasoning effort"
+            );
+            anyhow::ensure!(
+                capability
+                    .reasoning_efforts
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == capability.reasoning_efforts.len(),
+                "provider {id} model {model} has duplicate reasoning efforts"
+            );
+            anyhow::ensure!(
+                capability
+                    .default_effort
+                    .as_ref()
+                    .is_none_or(|effort| capability.reasoning_efforts.contains(effort)),
+                "provider {id} model {model} default effort is not in its supported levels"
+            );
             capabilities.insert(model.clone(), capability);
         }
         model_capabilities.insert(id.clone(), capabilities);
         let previous = config.providers.get(&id);
         let requested_key = draft.api_key.filter(|v| !v.is_empty());
-        if draft.clear_api_key { key_actions.insert(id.clone(), None); }
-        else if let Some(value) = &requested_key { key_actions.insert(id.clone(), Some(value.clone())); }
+        if draft.clear_api_key {
+            key_actions.insert(id.clone(), None);
+        } else if let Some(value) = &requested_key {
+            key_actions.insert(id.clone(), Some(value.clone()));
+        }
         let key = if draft.clear_api_key {
             String::new()
         } else if let Some(value) = requested_key {
-            anyhow::ensure!(
-                value.len() <= 8192,
-                "provider {id} has an invalid API key"
-            );
+            anyhow::ensure!(value.len() <= 8192, "provider {id} has an invalid API key");
             value
         } else {
             previous.map(|p| p.api_key.clone()).unwrap_or_default()
@@ -703,11 +1043,19 @@ fn save_settings(
         });
         provider.url = url.as_str().trim_end_matches('/').to_owned();
         provider.api_key = key;
-        provider.model_map = draft.models.into_iter().map(|model| (model.clone(), model)).collect();
+        provider.model_map = draft
+            .models
+            .into_iter()
+            .map(|model| (model.clone(), model))
+            .collect();
         provider.api_type = draft.api_type;
         match nonempty(draft.display_name) {
-            Some(name) => { provider.extra.insert("displayName".into(), json!(name)); }
-            None => { provider.extra.remove("displayName"); }
+            Some(name) => {
+                provider.extra.insert("displayName".into(), json!(name));
+            }
+            None => {
+                provider.extra.remove("displayName");
+            }
         }
         providers.insert(id, provider);
     }
@@ -723,25 +1071,64 @@ fn save_settings(
     }
     config.observer_provider = nonempty(request.observer_provider);
     config.observer_model = nonempty(request.observer_model);
-    if let Some(enabled)=request.visual_fallback_enabled {config.visual_fallback_enabled=enabled;config.visual_provider=nonempty(request.visual_provider);config.visual_model=nonempty(request.visual_model);}
+    if let Some(enabled) = request.visual_fallback_enabled {
+        config.visual_fallback_enabled = enabled;
+        config.visual_provider = nonempty(request.visual_provider);
+        config.visual_model = nonempty(request.visual_model);
+    }
     config.default_provider = config.orchestrator_provider.clone();
     if let Some(effort) = request.reasoning_effort {
         let effort = effort.trim();
-        anyhow::ensure!(effort.is_empty() || matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max"),
-            "unsupported reasoning effort");
+        anyhow::ensure!(
+            effort.is_empty()
+                || matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max"),
+            "unsupported reasoning effort"
+        );
         config.reasoning_effort = (!effort.is_empty()).then(|| effort.to_owned());
     }
-    if let Some(fast_mode) = request.fast_mode { config.fast_mode = fast_mode; }
-    if config.visual_fallback_enabled {
-        let capability=config.visual_provider.as_ref().and_then(|provider|config.model_capabilities.get(provider)).and_then(|models|config.visual_model.as_ref().and_then(|model|models.get(model)));
-        anyhow::ensure!(capability.is_some_and(|cap|cap.image_input==crate::visual_artifacts::ImageCapability::Supported),"visual fallback requires an explicitly configured image-supported route");
+    if let Some(fast_mode) = request.fast_mode {
+        config.fast_mode = fast_mode;
     }
-    let selected_capability = config.orchestrator_provider.as_ref()
+    if config.visual_fallback_enabled {
+        let capability = config
+            .visual_provider
+            .as_ref()
+            .and_then(|provider| config.model_capabilities.get(provider))
+            .and_then(|models| {
+                config
+                    .visual_model
+                    .as_ref()
+                    .and_then(|model| models.get(model))
+            });
+        anyhow::ensure!(
+            capability.is_some_and(
+                |cap| cap.image_input == crate::visual_artifacts::ImageCapability::Supported
+            ),
+            "visual fallback requires an explicitly configured image-supported route"
+        );
+    }
+    let selected_capability = config
+        .orchestrator_provider
+        .as_ref()
         .and_then(|provider| config.model_capabilities.get(provider))
-        .and_then(|models| config.orchestrator_model.as_ref().and_then(|model| models.get(model)));
+        .and_then(|models| {
+            config
+                .orchestrator_model
+                .as_ref()
+                .and_then(|model| models.get(model))
+        });
     if let Some(capability) = selected_capability {
-        anyhow::ensure!(config.reasoning_effort.as_ref().is_none_or(|effort| capability.reasoning_efforts.contains(effort)), "selected model does not support this reasoning effort");
-        anyhow::ensure!(!config.fast_mode || capability.fast_mode, "selected model does not support fast mode");
+        anyhow::ensure!(
+            config
+                .reasoning_effort
+                .as_ref()
+                .is_none_or(|effort| capability.reasoning_efforts.contains(effort)),
+            "selected model does not support this reasoning effort"
+        );
+        anyhow::ensure!(
+            !config.fast_mode || capability.fast_mode,
+            "selected model does not support fast mode"
+        );
     } else {
         config.reasoning_effort = None;
         config.fast_mode = false;
@@ -759,16 +1146,28 @@ fn save_settings(
             "selected provider {name} does not exist"
         );
     }
-    anyhow::ensure!(config.orchestrator_provider.is_some() == config.orchestrator_model.is_some(), "choose both a main-agent provider and model");
-    anyhow::ensure!(config.expert_provider.is_some() == config.expert_model.is_some(), "choose both a subagent provider and model");
-    anyhow::ensure!(config.observer_provider.is_some() == config.observer_model.is_some(), "choose both an observer provider and model");
+    anyhow::ensure!(
+        config.orchestrator_provider.is_some() == config.orchestrator_model.is_some(),
+        "choose both a main-agent provider and model"
+    );
+    anyhow::ensure!(
+        config.expert_provider.is_some() == config.expert_model.is_some(),
+        "choose both a subagent provider and model"
+    );
+    anyhow::ensure!(
+        config.observer_provider.is_some() == config.observer_model.is_some(),
+        "choose both an observer provider and model"
+    );
     for (provider, model) in [
         (&config.orchestrator_provider, &config.orchestrator_model),
         (&config.expert_provider, &config.expert_model),
         (&config.observer_provider, &config.observer_model),
     ] {
         if let (Some(provider), Some(model)) = (provider, model) {
-            anyhow::ensure!(config.providers[provider].model_map.contains_key(model), "model {model} is not in provider {provider}'s catalog");
+            anyhow::ensure!(
+                config.providers[provider].model_map.contains_key(model),
+                "model {model} is not in provider {provider}'s catalog"
+            );
         }
     }
     if config.enable_subagent {
@@ -777,9 +1176,13 @@ fn save_settings(
             "configure the main model before enabling subagent"
         );
     }
-    for name in [&config.orchestrator_provider, &config.expert_provider, &config.observer_provider]
-        .into_iter()
-        .flatten()
+    for name in [
+        &config.orchestrator_provider,
+        &config.expert_provider,
+        &config.observer_provider,
+    ]
+    .into_iter()
+    .flatten()
     {
         anyhow::ensure!(
             config.providers[name].api_type == "openai-completions",
@@ -788,43 +1191,82 @@ fn save_settings(
     }
     let mut patch = read_yaml(config_path, json!([]))?;
     let original_patch = patch.clone();
-    let mut credentials = read_yaml(&credentials_path(config_path), json!({"version":1,"refs":{},"records":{}}))?;
-    anyhow::ensure!(patch.is_array(), "DSH profile patch must be a YAML sequence");
-    anyhow::ensure!(credentials.get("version").and_then(Value::as_u64) == Some(1), "unsupported DSH credentials version");
-    let refs = credentials.get_mut("refs").and_then(Value::as_object_mut)
+    let mut credentials = read_yaml(
+        &credentials_path(config_path),
+        json!({"version":1,"refs":{},"records":{}}),
+    )?;
+    anyhow::ensure!(
+        patch.is_array(),
+        "DSH profile patch must be a YAML sequence"
+    );
+    anyhow::ensure!(
+        credentials.get("version").and_then(Value::as_u64) == Some(1),
+        "unsupported DSH credentials version"
+    );
+    let refs = credentials
+        .get_mut("refs")
+        .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow::anyhow!("DSH credentials refs must be a mapping"))?;
     let old_providers = plugin_config(&patch, "llm-pi-ai")
-        .and_then(|v| v.get("providers")).and_then(Value::as_object).cloned().unwrap_or_default();
+        .and_then(|v| v.get("providers"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let mut dsh_providers = old_providers.clone();
     for id in old_providers.keys() {
-        if config.providers.contains_key(id) || old_providers[id].get("models").is_none() || old_providers[id].get("baseURL").is_none() { continue }
+        if config.providers.contains_key(id)
+            || old_providers[id].get("models").is_none()
+            || old_providers[id].get("baseURL").is_none()
+        {
+            continue;
+        }
         dsh_providers.remove(id);
     }
     for (id, provider) in &config.providers {
         let mut entry = old_providers.get(id).cloned().unwrap_or_else(|| json!({}));
-        let item = entry.as_object_mut().ok_or_else(|| anyhow::anyhow!("provider {id} is not a mapping"))?;
+        let item = entry
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("provider {id} is not a mapping"))?;
         item.insert("baseURL".into(), json!(provider.url));
         item.insert("api".into(), json!(provider.api_type));
-        if let Some(name) = provider.extra.get("displayName") { item.insert("displayName".into(), name.clone()); }
-        else { item.remove("displayName"); }
+        if let Some(name) = provider.extra.get("displayName") {
+            item.insert("displayName".into(), name.clone());
+        } else {
+            item.remove("displayName");
+        }
         let mut models = Vec::new();
         for model in provider.model_map.values() {
-            let previous = old_providers.get(id).and_then(|v| v.get("models")).and_then(Value::as_array)
-                .and_then(|a| a.iter().find(|v| v.get("id").and_then(Value::as_str) == Some(model)));
+            let previous = old_providers
+                .get(id)
+                .and_then(|v| v.get("models"))
+                .and_then(Value::as_array)
+                .and_then(|a| {
+                    a.iter()
+                        .find(|v| v.get("id").and_then(Value::as_str) == Some(model))
+                });
             models.push(previous.cloned().unwrap_or_else(|| json!({"id":model})));
         }
-        models.sort_by(|a,b| a["id"].as_str().cmp(&b["id"].as_str()));
-        models.dedup_by(|a,b| a["id"] == b["id"]);
+        models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        models.dedup_by(|a, b| a["id"] == b["id"]);
         item.insert("models".into(), json!(models));
-        let reference = provider.api_key_ref.clone().unwrap_or_else(|| format!("{}_API_KEY", id.to_ascii_uppercase().replace('-', "_")));
+        let reference = provider
+            .api_key_ref
+            .clone()
+            .unwrap_or_else(|| format!("{}_API_KEY", id.to_ascii_uppercase().replace('-', "_")));
         match key_actions.get(id) {
             Some(None) => {
-                anyhow::ensure!(std::env::var_os(&reference).is_none(), "{reference} is supplied by the environment and cannot be cleared here");
+                anyhow::ensure!(
+                    std::env::var_os(&reference).is_none(),
+                    "{reference} is supplied by the environment and cannot be cleared here"
+                );
                 item.remove("apiKeyEnv");
                 refs.remove(&reference);
             }
             Some(Some(key)) => {
-                anyhow::ensure!(std::env::var_os(&reference).is_none(), "{reference} is supplied by the environment and cannot be replaced here");
+                anyhow::ensure!(
+                    std::env::var_os(&reference).is_none(),
+                    "{reference} is supplied by the environment and cannot be replaced here"
+                );
                 item.insert("apiKeyEnv".into(), json!(reference));
                 refs.insert(reference, json!(key));
             }
@@ -832,33 +1274,57 @@ fn save_settings(
         }
         dsh_providers.insert(id.clone(), entry);
     }
-    let mut llm = plugin_config(&patch, "llm-pi-ai").cloned().unwrap_or_else(|| json!({}));
-    llm.as_object_mut().ok_or_else(|| anyhow::anyhow!("llm-pi-ai config is not a mapping"))?
+    let mut llm = plugin_config(&patch, "llm-pi-ai")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    llm.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("llm-pi-ai config is not a mapping"))?
         .insert("providers".into(), Value::Object(dsh_providers));
     set_plugin_config(&mut patch, "llm-pi-ai", llm)?;
-    if let (Some(provider), Some(model)) = (&config.orchestrator_provider, &config.orchestrator_model) {
-        let mut default_model = plugin_config(&patch, "agent-default-model").cloned().unwrap_or_else(|| json!({}));
-        let item = default_model.as_object_mut().ok_or_else(|| anyhow::anyhow!("agent-default-model config is not a mapping"))?;
+    if let (Some(provider), Some(model)) =
+        (&config.orchestrator_provider, &config.orchestrator_model)
+    {
+        let mut default_model = plugin_config(&patch, "agent-default-model")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let item = default_model
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("agent-default-model config is not a mapping"))?;
         item.insert("provider".into(), json!(provider));
         item.insert("model".into(), json!(model));
         set_plugin_config(&mut patch, "agent-default-model", default_model)?;
     } else if let Some(entries) = patch.as_array_mut() {
-        entries.retain(|entry| entry.get("id").and_then(Value::as_str) != Some("agent-default-model"));
+        entries
+            .retain(|entry| entry.get("id").and_then(Value::as_str) != Some("agent-default-model"));
     }
-    let mut subagent = plugin_config(&patch, "subagent").cloned().unwrap_or_else(|| json!({}));
-    let item = subagent.as_object_mut().ok_or_else(|| anyhow::anyhow!("subagent config is not a mapping"))?;
+    let mut subagent = plugin_config(&patch, "subagent")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let item = subagent
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("subagent config is not a mapping"))?;
     item.insert("maxDepth".into(), json!(1));
     item.insert("maxActiveSubagents".into(), json!(1));
     set_plugin_config(&mut patch, "subagent", subagent)?;
     let allowed = match (
-        config.expert_provider.as_ref().or(config.orchestrator_provider.as_ref()),
-        config.expert_model.as_ref().or(config.orchestrator_model.as_ref()),
+        config
+            .expert_provider
+            .as_ref()
+            .or(config.orchestrator_provider.as_ref()),
+        config
+            .expert_model
+            .as_ref()
+            .or(config.orchestrator_model.as_ref()),
     ) {
         (Some(provider), Some(model)) => json!([{"provider":provider,"model":model}]),
         _ => json!([]),
     };
-    let mut selection = plugin_config(&patch, "subagent-model-selection-settings").cloned().unwrap_or_else(|| json!({}));
-    let item = selection.as_object_mut().ok_or_else(|| anyhow::anyhow!("subagent model selection config is not a mapping"))?;
+    let mut selection = plugin_config(&patch, "subagent-model-selection-settings")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let item = selection
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("subagent model selection config is not a mapping"))?;
     item.insert("enabled".into(), json!(config.enable_subagent));
     item.insert("allowedModels".into(), allowed);
     set_plugin_config(&mut patch, "subagent-model-selection-settings", selection)?;
@@ -879,19 +1345,33 @@ fn save_settings(
         "visual_fallback_enabled":config.visual_fallback_enabled,"visual_provider":config.visual_provider,"visual_model":config.visual_model,
     });
     if disk_revision(config_path)? != request.revision {
-        return Ok(Err("settings changed while saving; reload before retrying".into()));
+        return Ok(Err(
+            "settings changed while saving; reload before retrying".into()
+        ));
     }
-    if let Some(parent) = secret_path.parent() { std::fs::create_dir_all(parent)?; }
-    if let Some(parent) = config_path.parent() { std::fs::create_dir_all(parent)?; }
-    if !key_actions.is_empty() { write_yaml_atomic(&secret_path, &credentials)?; }
+    if let Some(parent) = secret_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !key_actions.is_empty() {
+        write_yaml_atomic(&secret_path, &credentials)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600))?;
     }
-    if patch != original_patch { write_yaml_atomic(config_path, &patch)?; }
-    if observer_settings != original_observer { write_yaml_atomic(&observer_path, &observer_settings)?; }
-    if generation_settings != original_generation { write_yaml_atomic(&generation_path, &generation_settings)?; }
+    if patch != original_patch {
+        write_yaml_atomic(config_path, &patch)?;
+    }
+    if observer_settings != original_observer {
+        write_yaml_atomic(&observer_path, &observer_settings)?;
+    }
+    if generation_settings != original_generation {
+        write_yaml_atomic(&generation_path, &generation_settings)?;
+    }
     let revision = disk_revision(config_path)?;
     Ok(Ok((config, revision)))
 }
@@ -1052,8 +1532,11 @@ struct AiProxyState {
 }
 
 async fn plugin_tree(State(state): State<AiProxyState>) -> Json<Value> {
-    let events = state.runtime.service::<plugin_builtin::LifecycleLog>(plugin_runtime::ROOT, "plugin-events")
-        .map(|log| log.snapshot()).unwrap_or_default();
+    let events = state
+        .runtime
+        .service::<plugin_builtin::LifecycleLog>(plugin_runtime::ROOT, "plugin-events")
+        .map(|log| log.snapshot())
+        .unwrap_or_default();
     Json(json!({"plugins":state.runtime.snapshot(),"events":events}))
 }
 
@@ -1192,7 +1675,7 @@ async fn list_models(State(state): State<AiProxyState>) -> impl IntoResponse {
 /// POST /v1/chat/completions — OpenAI-compatible endpoint.
 async fn chat_completions(
     State(state): State<AiProxyState>,
-    headers:HeaderMap,
+    headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
     let config = current_config(&state).await;
@@ -1207,11 +1690,18 @@ async fn chat_completions(
         }
     };
 
-    let task_visual=headers.get("x-codex-visual-dispatch").and_then(|value|value.to_str().ok())==Some("task-owned");
-    if !task_visual {crate::vision_preprocess::set_visible_images_from_body(&body);}
+    let task_visual = headers
+        .get("x-codex-visual-dispatch")
+        .and_then(|value| value.to_str().ok())
+        == Some("task-owned");
+    if !task_visual {
+        crate::vision_preprocess::set_visible_images_from_body(&body);
+    }
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    if !task_visual {crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;}
+    if !task_visual {
+        crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
+    }
 
     info!("=== /v1/chat/completions  model={}", client_model);
 
@@ -1273,13 +1763,24 @@ async fn chat_completions(
 }
 
 /// POST /v1/messages — Anthropic Messages API endpoint.
-async fn messages(State(state): State<AiProxyState>,headers:HeaderMap, Json(mut body): Json<Value>) -> Response {
+async fn messages(
+    State(state): State<AiProxyState>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
     let config = current_config(&state).await;
-    let task_visual=headers.get("x-codex-visual-dispatch").and_then(|value|value.to_str().ok())==Some("task-owned");
-    if !task_visual {crate::vision_preprocess::set_visible_images_from_body(&body);}
+    let task_visual = headers
+        .get("x-codex-visual-dispatch")
+        .and_then(|value| value.to_str().ok())
+        == Some("task-owned");
+    if !task_visual {
+        crate::vision_preprocess::set_visible_images_from_body(&body);
+    }
     let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
     let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    if !task_visual {crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;}
+    if !task_visual {
+        crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
+    }
     let raw_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
 
     info!("=== /v1/messages  model={}", raw_model);
@@ -1461,12 +1962,24 @@ pub async fn run(
 
     let runtime = Arc::new(plugin_runtime::PluginRuntime::new());
     runtime.mount(plugin_runtime::ROOT, plugin_builtin::DiagnosticsPlugin)?;
-    runtime.mount(plugin_runtime::ROOT, plugin_builtin::WorkspacePlugin(workspace.clone()))?;
-    runtime.mount(plugin_runtime::ROOT, plugin_builtin::ModelSettingsPlugin(Arc::new(plugin_builtin::ModelSettings {
-        path: config_path.to_path_buf(), config: config.clone(),
-    })))?;
-    let tools_scope = runtime.mount(plugin_runtime::ROOT, plugin_builtin::ToolCatalogPlugin(client.clone()))?;
-    let agent_state = (*runtime.service::<crate::agent_service::AgentServiceState>(tools_scope, "agent-tasks")?).clone();
+    runtime.mount(
+        plugin_runtime::ROOT,
+        plugin_builtin::WorkspacePlugin(workspace.clone()),
+    )?;
+    runtime.mount(
+        plugin_runtime::ROOT,
+        plugin_builtin::ModelSettingsPlugin(Arc::new(plugin_builtin::ModelSettings {
+            path: config_path.to_path_buf(),
+            config: config.clone(),
+        })),
+    )?;
+    let tools_scope = runtime.mount(
+        plugin_runtime::ROOT,
+        plugin_builtin::ToolCatalogPlugin(client.clone()),
+    )?;
+    let agent_state = (*runtime
+        .service::<crate::agent_service::AgentServiceState>(tools_scope, "agent-tasks")?)
+    .clone();
     let agent_routes = Router::new()
         .route("/agent", get(crate::agent_web::page))
         .route("/agent/", get(crate::agent_web::page))
@@ -1481,7 +1994,10 @@ pub async fn run(
         .route("/agent/classic", get(crate::agent_web::classic_page))
         .route("/agent/app.css", get(crate::agent_web::app_css))
         .route("/agent/app.js", get(crate::agent_web::app_js))
-        .route("/agent/browser-runtime.js", get(crate::agent_web::browser_runtime_js))
+        .route(
+            "/agent/browser-runtime.js",
+            get(crate::agent_web::browser_runtime_js),
+        )
         .route("/agent/settings", get(crate::agent_web::settings_page))
         .route("/agent/settings.css", get(crate::agent_web::settings_css))
         .route("/agent/settings.js", get(crate::agent_web::settings_js))
@@ -1491,7 +2007,10 @@ pub async fn run(
             get(crate::agent_web::dsh_design_css),
         )
         .route("/agent/info", get(crate::agent_web::info))
-        .route("/agent/workspace/files", get(crate::agent_service::workspace_files))
+        .route(
+            "/agent/workspace/files",
+            get(crate::agent_service::workspace_files),
+        )
         .route("/agent/commands", get(crate::agent_service::slash_commands))
         .route(
             "/agent/tasks",
@@ -1511,16 +2030,46 @@ pub async fn run(
             "/agent/tasks/{task_id}/events",
             get(crate::agent_service::get_events),
         )
-        .route("/agent/tasks/{task_id}/changes/{turn}", get(crate::workspace_changes::get_summary))
-        .route("/agent/tasks/{task_id}/changes/{turn}/files/{index}", get(crate::workspace_changes::get_diff))
-        .route("/agent/tasks/{task_id}/changes/{turn}/undo", post(crate::workspace_changes::undo_turn))
-        .route("/agent/tasks/{task_id}/context-debug", get(crate::request_context::setting).put(crate::request_context::set_setting))
-        .route("/agent/tasks/{task_id}/request-contexts", get(crate::request_context::list))
-        .route("/agent/tasks/{task_id}/request-contexts/{id}", get(crate::request_context::get))
-        .route("/agent/tasks/{task_id}/notebook", get(crate::task_notebook::list))
-        .route("/agent/tasks/{task_id}/visual-artifacts/{id}/image", get(crate::visual_artifacts::image_route))
-        .route("/agent/tasks/{task_id}/notebook/history", get(crate::task_notebook::history))
-        .route("/agent/tasks/{task_id}/notebook/materials/{id}", get(crate::task_notebook::get))
+        .route(
+            "/agent/tasks/{task_id}/changes/{turn}",
+            get(crate::workspace_changes::get_summary),
+        )
+        .route(
+            "/agent/tasks/{task_id}/changes/{turn}/files/{index}",
+            get(crate::workspace_changes::get_diff),
+        )
+        .route(
+            "/agent/tasks/{task_id}/changes/{turn}/undo",
+            post(crate::workspace_changes::undo_turn),
+        )
+        .route(
+            "/agent/tasks/{task_id}/context-debug",
+            get(crate::request_context::setting).put(crate::request_context::set_setting),
+        )
+        .route(
+            "/agent/tasks/{task_id}/request-contexts",
+            get(crate::request_context::list),
+        )
+        .route(
+            "/agent/tasks/{task_id}/request-contexts/{id}",
+            get(crate::request_context::get),
+        )
+        .route(
+            "/agent/tasks/{task_id}/notebook",
+            get(crate::task_notebook::list),
+        )
+        .route(
+            "/agent/tasks/{task_id}/visual-artifacts/{id}/image",
+            get(crate::visual_artifacts::image_route),
+        )
+        .route(
+            "/agent/tasks/{task_id}/notebook/history",
+            get(crate::task_notebook::history),
+        )
+        .route(
+            "/agent/tasks/{task_id}/notebook/materials/{id}",
+            get(crate::task_notebook::get),
+        )
         .route(
             "/agent/tasks/{task_id}/flow/nodes/{node_id}/interrupt",
             post(crate::agent_service::interrupt_flow_node),
@@ -1618,7 +2167,9 @@ mod tests {
             observer_enabled: false,
             observer_provider: None,
             observer_model: None,
-            visual_fallback_enabled:false,visual_provider:None,visual_model:None,
+            visual_fallback_enabled: false,
+            visual_provider: None,
+            visual_model: None,
             providers: [(
                 "default".to_string(),
                 provider(
@@ -1652,7 +2203,9 @@ mod tests {
             observer_enabled: false,
             observer_provider: None,
             observer_model: None,
-            visual_fallback_enabled:false,visual_provider:None,visual_model:None,
+            visual_fallback_enabled: false,
+            visual_provider: None,
+            visual_model: None,
             providers: [
                 (
                     "default".to_string(),
@@ -1682,31 +2235,60 @@ mod tests {
 
     #[test]
     fn image_probe_evidence_is_persisted_and_bound_to_the_saved_route() {
-        let root=std::env::temp_dir().join(format!("codex-image-config-{}",crate::visual_artifacts::new_id()));
-        let path=root.join("profiles/web/cordis.patch.yml");std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut patch=json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"https://first.example/v1","api":"openai-completions","models":[{"id":"m"}]}}}},
+        let root = std::env::temp_dir().join(format!(
+            "codex-image-config-{}",
+            crate::visual_artifacts::new_id()
+        ));
+        let path = root.join("profiles/web/cordis.patch.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut patch = json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"https://first.example/v1","api":"openai-completions","models":[{"id":"m"}]}}}},
             {"id":"agent-default-model","config":{"provider":"test","model":"m"}}]);
-        write_yaml_atomic(&path,&patch).unwrap();
-        let generation=generation_settings_path(&path);
-        write_yaml_atomic(&generation,&json!({"custom_setting":"retain me"})).unwrap();
-        let report=json!({"status":"verified","capability":"supported","request":{"contains_image_content":true},
+        write_yaml_atomic(&path, &patch).unwrap();
+        let generation = generation_settings_path(&path);
+        write_yaml_atomic(&generation, &json!({"custom_setting":"retain me"})).unwrap();
+        let report = json!({"status":"verified","capability":"supported","request":{"contains_image_content":true},
             "route_fingerprint":crate::visual_probe::route_fingerprint("https://first.example/v1","m"),"response_body":"image-only challenge passed"});
-        let original=disk_revision(&path).unwrap();
-        let (_,revision)=persist_image_probe(&path,&original,"test","m",&report).unwrap();
-        assert_ne!(revision,original);
-        assert_eq!(read_yaml(&generation,json!({})).unwrap()["custom_setting"],"retain me");
-        let config=load_config(&path).unwrap();let capability=&config.model_capabilities["test"]["m"];
-        assert_eq!(capability.image_input,crate::visual_artifacts::ImageCapability::Supported);
-        assert_eq!(capability.image_probe.as_ref().unwrap(),&report);
-        assert!(persist_image_probe(&path,&original,"test","m",&report).is_err(),"stale revisions cannot overwrite settings");
-        patch[0]["config"]["providers"]["test"]["api"]=json!("anthropic-messages");write_yaml_atomic(&path,&patch).unwrap();
-        assert_eq!(load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,crate::visual_artifacts::ImageCapability::Unknown,"a Chat Completions probe cannot verify another protocol");
-        patch[0]["config"]["providers"]["test"]["api"]=json!("openai-completions");
-        patch[0]["config"]["providers"]["test"]["baseURL"]=json!("https://second.example/v1");write_yaml_atomic(&path,&patch).unwrap();
-        assert_eq!(load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,crate::visual_artifacts::ImageCapability::Unknown);
+        let original = disk_revision(&path).unwrap();
+        let (_, revision) = persist_image_probe(&path, &original, "test", "m", &report).unwrap();
+        assert_ne!(revision, original);
+        assert_eq!(
+            read_yaml(&generation, json!({})).unwrap()["custom_setting"],
+            "retain me"
+        );
+        let config = load_config(&path).unwrap();
+        let capability = &config.model_capabilities["test"]["m"];
+        assert_eq!(
+            capability.image_input,
+            crate::visual_artifacts::ImageCapability::Supported
+        );
+        assert_eq!(capability.image_probe.as_ref().unwrap(), &report);
+        assert!(
+            persist_image_probe(&path, &original, "test", "m", &report).is_err(),
+            "stale revisions cannot overwrite settings"
+        );
+        patch[0]["config"]["providers"]["test"]["api"] = json!("anthropic-messages");
+        write_yaml_atomic(&path, &patch).unwrap();
+        assert_eq!(
+            load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,
+            crate::visual_artifacts::ImageCapability::Unknown,
+            "a Chat Completions probe cannot verify another protocol"
+        );
+        patch[0]["config"]["providers"]["test"]["api"] = json!("openai-completions");
+        patch[0]["config"]["providers"]["test"]["baseURL"] = json!("https://second.example/v1");
+        write_yaml_atomic(&path, &patch).unwrap();
+        assert_eq!(
+            load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,
+            crate::visual_artifacts::ImageCapability::Unknown
+        );
         let edit:SettingsEdit=serde_json::from_value(json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"https://second.example/v1","api_type":"openai-completions","models":["other"],
             "model_capabilities":{"other":{"image_input":"supported","image_probe":report}}}]})).unwrap();
-        assert!(save_settings(&path,edit).unwrap_err().to_string().contains("verify image input"),"UI payloads cannot manufacture support evidence");
-        let _=std::fs::remove_dir_all(root);
+        assert!(
+            save_settings(&path, edit)
+                .unwrap_err()
+                .to_string()
+                .contains("verify image input"),
+            "UI payloads cannot manufacture support evidence"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

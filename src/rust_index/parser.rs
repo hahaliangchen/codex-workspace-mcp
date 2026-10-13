@@ -299,15 +299,25 @@ pub fn maybe_reindex_after_write(
     if crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "rust").is_none() {
         return Ok(None);
     }
-    let (files_indexed,symbols_indexed)=build_index_scope(root,Some(changed_path))?;
-    Ok(Some(IndexRustWorkspaceResponse { index:crate::symbol_index_state::health(root,"rust","rust_symbols")?, index_path:"SQLite".into(), files_indexed,symbols_indexed, generated_at_unix:crate::rust_index::now_unix() }))
+    let (files_indexed, symbols_indexed) = build_index_scope(root, Some(changed_path))?;
+    Ok(Some(IndexRustWorkspaceResponse {
+        index: crate::symbol_index_state::health(root, "rust", "rust_symbols")?,
+        index_path: "SQLite".into(),
+        files_indexed,
+        symbols_indexed,
+        generated_at_unix: crate::rust_index::now_unix(),
+    }))
 }
 
 pub fn list_symbols(
     root: &Path,
     request: ListRustSymbolsRequest,
 ) -> Result<ListRustSymbolsResponse> {
-    ensure_query_index(root,request.file_path.as_deref(),request.options.directory.as_deref())?;
+    ensure_query_index(
+        root,
+        request.file_path.as_deref(),
+        request.options.directory.as_deref(),
+    )?;
     let kind = request
         .kind
         .as_ref()
@@ -326,7 +336,14 @@ pub fn list_symbols(
     let page = crate::symbol_query::page(total, request.options.offset, request.options.limit);
     selection.pagination = Some((page.offset, page.limit));
     let symbols = load_selected_symbols(root, &selection)?;
-    let catalog = crate::symbol_description::Catalog::load_for_files(root, "rust", &symbols.iter().map(|symbol|symbol.file_path.as_str()).collect::<Vec<_>>())?;
+    let catalog = crate::symbol_description::Catalog::load_for_files(
+        root,
+        "rust",
+        &symbols
+            .iter()
+            .map(|symbol| symbol.file_path.as_str())
+            .collect::<Vec<_>>(),
+    )?;
     let symbols = symbols
         .iter()
         .map(|symbol| {
@@ -377,7 +394,11 @@ pub fn search_symbols(
     if terms.is_empty() {
         return Err(std::io::Error::other("query must contain at least one search term").into());
     }
-    ensure_query_index(root,request.options.file_path.as_deref(),request.options.directory.as_deref())?;
+    ensure_query_index(
+        root,
+        request.options.file_path.as_deref(),
+        request.options.directory.as_deref(),
+    )?;
     let selection = crate::symbol_query::Selection {
         file_path: request.options.file_path.as_deref(),
         directory: request.options.directory.as_deref(),
@@ -389,7 +410,14 @@ pub fn search_symbols(
         ..Default::default()
     };
     let symbols = load_selected_symbols(root, &selection)?;
-    let catalog = crate::symbol_description::Catalog::load_for_files(root, "rust", &symbols.iter().map(|symbol|symbol.file_path.as_str()).collect::<Vec<_>>())?;
+    let catalog = crate::symbol_description::Catalog::load_for_files(
+        root,
+        "rust",
+        &symbols
+            .iter()
+            .map(|symbol| symbol.file_path.as_str())
+            .collect::<Vec<_>>(),
+    )?;
     let mut ranked: Vec<_> = symbols
         .iter()
         .filter_map(|symbol| {
@@ -414,13 +442,18 @@ pub fn search_symbols(
             .map(|(score, matched)| (score, symbol, matched, description))
         })
         .collect();
-    let page = crate::symbol_query::rank_page(&mut ranked, request.options.offset, request.limit, |(a_score, a, _, _), (b_score, b, _, _)| {
-        b_score
-            .cmp(a_score)
-            .then(a.file_path.cmp(&b.file_path))
-            .then(a.start_line.cmp(&b.start_line))
-            .then(a.id.cmp(&b.id))
-    });
+    let page = crate::symbol_query::rank_page(
+        &mut ranked,
+        request.options.offset,
+        request.limit,
+        |(a_score, a, _, _), (b_score, b, _, _)| {
+            b_score
+                .cmp(a_score)
+                .then(a.file_path.cmp(&b.file_path))
+                .then(a.start_line.cmp(&b.start_line))
+                .then(a.id.cmp(&b.id))
+        },
+    );
     let matches = ranked
         .iter()
         .skip(page.offset)
@@ -444,10 +477,14 @@ pub fn search_symbols(
 }
 
 pub fn read_symbol(root: &Path, request: ReadRustSymbolRequest) -> Result<ReadRustSymbolResponse> {
-    read_symbol_snapshot(root,&request,true)
+    read_symbol_snapshot(root, &request, true)
 }
 
-fn read_symbol_snapshot(root: &Path, request: &ReadRustSymbolRequest, retry:bool) -> Result<ReadRustSymbolResponse> {
+fn read_symbol_snapshot(
+    root: &Path,
+    request: &ReadRustSymbolRequest,
+    retry: bool,
+) -> Result<ReadRustSymbolResponse> {
     if request.symbol_id.is_empty()
         && (request
             .options
@@ -461,11 +498,16 @@ fn read_symbol_snapshot(root: &Path, request: &ReadRustSymbolRequest, retry:bool
         )
         .into());
     }
-    let initialized=crate::database::init_db(root).ok().is_some_and(|conn|crate::database::get_index_generated_at(&conn,&root.to_string_lossy(),"rust").is_some());
-    if !initialized {build_index(root)?;}
-    else if request.symbol_id.is_empty() {
-        if let Some(file)=request.options.file_path.as_deref() {
-            if crate::source_read::needs_index_refresh(root,"rust",file) {maybe_reindex_after_write(root,&root.join(file))?;}
+    let initialized = crate::database::init_db(root).ok().is_some_and(|conn| {
+        crate::database::get_index_generated_at(&conn, &root.to_string_lossy(), "rust").is_some()
+    });
+    if !initialized {
+        build_index(root)?;
+    } else if request.symbol_id.is_empty() {
+        if let Some(file) = request.options.file_path.as_deref() {
+            if crate::source_read::needs_index_refresh(root, "rust", file) {
+                maybe_reindex_after_write(root, &root.join(file))?;
+            }
         }
     }
     let by_id = !request.symbol_id.is_empty();
@@ -531,21 +573,33 @@ fn read_symbol_snapshot(root: &Path, request: &ReadRustSymbolRequest, retry:bool
             )
         })
     })?;
-    let snapshot=crate::source_read::read(&root.join(&symbol.file_path),crate::source_read::FILE_LIMIT)?;
-    if crate::source_read::indexed_hash(root,"rust",&symbol.file_path).as_deref()!=Some(snapshot.hash.as_str()) {
-        if !retry {return Err(std::io::Error::other("source_version_conflict: indexed symbol and source versions differ; no source returned").into());}
-        maybe_reindex_after_write(root,&root.join(&symbol.file_path))?;
-        return read_symbol_snapshot(root,request,false);
+    let snapshot = crate::source_read::read(
+        &root.join(&symbol.file_path),
+        crate::source_read::FILE_LIMIT,
+    )?;
+    if crate::source_read::indexed_hash(root, "rust", &symbol.file_path).as_deref()
+        != Some(snapshot.hash.as_str())
+    {
+        if !retry {
+            return Err(std::io::Error::other("source_version_conflict: indexed symbol and source versions differ; no source returned").into());
+        }
+        maybe_reindex_after_write(root, &root.join(&symbol.file_path))?;
+        return read_symbol_snapshot(root, request, false);
     }
-    let source_code_hash=snapshot.hash.clone();
-    let content = crate::symbol_query::source_range(&snapshot.content, symbol.start_line, symbol.end_line)?;
+    let source_code_hash = snapshot.hash.clone();
+    let content =
+        crate::symbol_query::source_range(&snapshot.content, symbol.start_line, symbol.end_line)?;
     let (callers, callees, suggested_reads) = if request.include_context {
         let index_symbols = load_all_symbols(root)?;
         build_context(&index_symbols, &symbol)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
     };
-    let catalog = crate::symbol_description::Catalog::load_for_files(root, "rust", &[symbol.file_path.as_str()])?;
+    let catalog = crate::symbol_description::Catalog::load_for_files(
+        root,
+        "rust",
+        &[symbol.file_path.as_str()],
+    )?;
     let mut description = describe_symbol(&catalog, &symbol);
     if description.code_hash != source_code_hash && description.status == "current" {
         description.status = "stale";
@@ -564,20 +618,30 @@ fn read_symbol_snapshot(root: &Path, request: &ReadRustSymbolRequest, retry:bool
 }
 
 fn build_index(root: &Path) -> Result<(usize, usize)> {
-    build_index_scope(root,None)
+    build_index_scope(root, None)
 }
 
 fn build_index_scope(root: &Path, changed_path: Option<&Path>) -> Result<(usize, usize)> {
-    build_index_scoped(root,changed_path,false)
+    build_index_scoped(root, changed_path, false)
 }
 
-fn build_index_scoped(root: &Path, changed_path: Option<&Path>, directory: bool) -> Result<(usize, usize)> {
+fn build_index_scoped(
+    root: &Path,
+    changed_path: Option<&Path>,
+    directory: bool,
+) -> Result<(usize, usize)> {
     let refresh_lock = crate::symbol_index_state::lock(root, "rust");
     let _guard = refresh_lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut conn = crate::database::init_db(root)?;
-    let plan = match changed_path { Some(path) if directory=>crate::symbol_index_state::RefreshPlan::for_directory(root,"rust",&conn,path)?, Some(path)=>crate::symbol_index_state::RefreshPlan::for_file(root,"rust",&conn,path)?, None=>crate::symbol_index_state::RefreshPlan::new(root,"rust",&conn)? };
+    let plan = match changed_path {
+        Some(path) if directory => {
+            crate::symbol_index_state::RefreshPlan::for_directory(root, "rust", &conn, path)?
+        }
+        Some(path) => crate::symbol_index_state::RefreshPlan::for_file(root, "rust", &conn, path)?,
+        None => crate::symbol_index_state::RefreshPlan::new(root, "rust", &conn)?,
+    };
     if !plan.needs_update() {
         plan.record_check(&conn, root, "rust")?;
         return Ok(crate::symbol_index_state::counts(
@@ -1354,6 +1418,16 @@ impl From<&RustSymbol> for RustSymbolSummary {
     }
 }
 
-pub(crate) fn ensure_query_index(root: &Path, file: Option<&str>, directory: Option<&str>) -> Result<()> {
-    crate::symbol_index_state::ensure_query_index(root,"rust",file,directory,|path,is_directory|build_index_scoped(root,path,is_directory).map(|_|()))
+pub(crate) fn ensure_query_index(
+    root: &Path,
+    file: Option<&str>,
+    directory: Option<&str>,
+) -> Result<()> {
+    crate::symbol_index_state::ensure_query_index(
+        root,
+        "rust",
+        file,
+        directory,
+        |path, is_directory| build_index_scoped(root, path, is_directory).map(|_| ()),
+    )
 }

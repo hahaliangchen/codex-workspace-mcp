@@ -1399,7 +1399,9 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           node.kind = stringOf(rawNode.kind) ?? node.kind
           node.description = stringOf(rawNode.description) ?? node.description
           node.status = flowStatus(rawNode.status ?? node.status)
+          treeFields(node, rawNode, turn)
           nodeMap.set(id, node)
+          if (node.status === 'running') activeNodeId = id
         }
         for (const raw of Array.isArray(data.edges) ? data.edges : []) {
           if (!raw || typeof raw !== 'object') continue
@@ -1439,6 +1441,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         }
         break
       }
+      case 'context/tool_call':
       case 'tool/call': {
         currentTurn = Math.max(currentTurn, turn)
         const callId = stringOf(data.callId) ?? ''
@@ -1459,6 +1462,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         activeNodeId = targetId
         break
       }
+      case 'context/tool_result':
       case 'tool/result': {
         const callId = callIdOfResult(event) ?? ''
         const targetId = callsToNode.get(callId) ?? activeNodeId

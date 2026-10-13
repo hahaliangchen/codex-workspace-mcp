@@ -8,7 +8,11 @@ struct SubagentProvider {
 
 fn get_subagent_provider() -> anyhow::Result<SubagentProvider> {
     let route = crate::ai_proxy::selected_route(false)?;
-    Ok(SubagentProvider { url: route.url, api_key: route.api_key, model: route.model })
+    Ok(SubagentProvider {
+        url: route.url,
+        api_key: route.api_key,
+        model: route.model,
+    })
 }
 
 pub async fn analyze_image_via_vision_agent(

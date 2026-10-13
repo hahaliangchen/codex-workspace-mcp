@@ -1,129 +1,379 @@
 //! Read the existing conversation/event log on demand; no second history store.
-use anyhow::{Result, ensure};
-use rusqlite::{params,OptionalExtension};
+use anyhow::{Context, Result, ensure};
+use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::path::Path;
 
 /// Forward text unchanged; serialize original structured values without interpretation.
 /// Values are never summarized, shortened or interpreted here.
 pub fn plain_context(value: &Value) -> String {
-    value.as_str().map(str::to_owned).unwrap_or_else(||value.to_string())
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 #[cfg(test)]
-pub fn original_text(text:&str)->&str {
-    if text.starts_with("Source: ") {text.split_once("\n\n").map(|(_,body)|body).unwrap_or(text)}else{text}
+pub fn original_text(text: &str) -> &str {
+    if text.starts_with("Source: ") {
+        text.split_once("\n\n")
+            .map(|(_, body)| body)
+            .unwrap_or(text)
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
 pub fn parse_plain_context(text: &str) -> Value {
-    let text=original_text(text);
-    if let Ok(value) = serde_json::from_str(text) { return value; }
+    let text = original_text(text);
+    if let Ok(value) = serde_json::from_str(text) {
+        return value;
+    }
     let mut fields = serde_json::Map::new();
     let mut name = None;
     let mut content = Vec::new();
-    let save = |name: Option<String>, content: &mut Vec<&str>, fields: &mut serde_json::Map<String,Value>| {
+    let save = |name: Option<String>,
+                content: &mut Vec<&str>,
+                fields: &mut serde_json::Map<String, Value>| {
         if let Some(name) = name {
             let text = content.join("\n").trim_end().to_owned();
-            fields.insert(name, serde_json::from_str(&text).unwrap_or(Value::String(text)));
+            fields.insert(
+                name,
+                serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            );
         }
         content.clear();
     };
     for line in text.lines() {
-        if line.starts_with('[') && line.ends_with(']') && line.len()>2
-            && line[1..line.len()-1].bytes().all(|b|b.is_ascii_alphanumeric() || b==b'_') {
+        if line.starts_with('[')
+            && line.ends_with(']')
+            && line.len() > 2
+            && line[1..line.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
             save(name.take(), &mut content, &mut fields);
-            name = Some(line[1..line.len()-1].to_owned());
-        } else { content.push(line); }
+            name = Some(line[1..line.len() - 1].to_owned());
+        } else {
+            content.push(line);
+        }
     }
     save(name, &mut content, &mut fields);
     Value::Object(fields)
 }
 
-fn original_payload<'a>(kind:&str,data:&'a Value)->&'a Value {
-    let paths:&[&str]=match kind {
-        "user/message"|"assistant/message"|"organizer/method_message"|"visual/input_result"=>&["/message"],
-        "worker/yield"=>&["/output/original_return","/output/worker_return","/output"],
-        "observer/node_review"=>&["/result/original_message","/result/observer_return","/result"],
-        "tool/result"=>&["/meta/result","/message/content"],
-        "organizer/decision"=>&["/decision"],
-        "organizer/assignment"=>&["/order"],
-        "organizer/result_read"=>&["/result"],
-        "observer/advice_delivered"=>&["/advice"],"observer/retrospective"=>&["/observer_return"],_=>&[]
+/// The single extraction point for content persisted in history events.
+/// Display wrappers are never treated as original content. Known persisted
+/// fields are selected mechanically; absent authoritative fields are errors.
+pub fn saved_history_payload<'a>(kind: &str, data: &'a Value) -> Result<&'a Value> {
+    let paths: &[&str] = match kind {
+        "user/message"
+        | "assistant/message"
+        | "organizer/method_message"
+        | "organizer/continuation_plan"
+        | "organizer/context_note"
+        | "visual/input_result" => &["/message"],
+        "tool/result" => &["/meta/result"],
+        "worker/yield" => &[
+            "/output/original_return",
+            "/output/worker_return",
+            "/output",
+        ],
+        "observer/node_review" => &[
+            "/result/original_message",
+            "/result/observer_return",
+            "/result",
+        ],
+        "organizer/decision" => &["/decision"],
+        "organizer/assignment" => &["/order"],
+        "organizer/result_read" => &["/result"],
+        "observer/advice_delivered" => &["/advice"],
+        // A completed retrospective has an authoritative raw model return.
+        // Unavailable/failed records may only contain status and message;
+        // preserve that full record instead of making it unreadable.
+        "observer/retrospective" => &["/observer_return", ""],
+        _ => &[],
     };
-    paths.iter().find_map(|path|data.pointer(path).filter(|value|!value.is_null())).unwrap_or(data)
+    paths
+        .iter()
+        .find_map(|path| data.pointer(path).filter(|value| !value.is_null()))
+        .or_else(|| {
+            if kind == "tool/result" {
+                data.pointer("/meta/result")
+            } else {
+                None
+            }
+        })
+        .or_else(|| if paths.is_empty() { Some(data) } else { None })
+        .with_context(|| format!("{kind} event is missing its saved original payload field"))
 }
 
-fn source_record(task:&str,seq:i64,time:i64,kind:&str,data:&Value)->Value {
-    json!({"seq":seq,"time":time,"kind":kind,"turn":data["turn"],"step":data["step"],
+/// Return a complete message exactly as persisted inside the history event.
+pub fn saved_history_message(kind: &str, data: &Value) -> Result<Value> {
+    let message = saved_history_payload(kind, data)?;
+    message
+        .as_object()
+        .context("saved history message is not an object")
+        .map(|_| message.clone())
+}
+
+/// Restore a stored tool return as the matching native protocol message.
+pub fn replay_tool_result(data: &Value, source: &Value) -> Result<Value> {
+    let result = saved_history_payload("tool/result", data)?;
+    let call_id = tool_result_call_id(data)?;
+    Ok(replay_tool_result_payload(result, call_id, source))
+}
+
+pub fn tool_result_call_id(data: &Value) -> Result<&str> {
+    data.get("callId")
+        .or_else(|| data.pointer("/message/toolCallId"))
+        .or_else(|| data.pointer("/message/source/callId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("tool/result event is missing its original message.toolCallId")
+}
+
+fn replay_tool_result_payload(result: &Value, call_id: &str, source: &Value) -> Value {
+    with_source(
+        json!({"role":"tool","tool_call_id":call_id,"content":result.to_string()}),
+        source,
+    )
+}
+
+fn source_record(task: &str, seq: i64, time: i64, kind: &str, data: &Value) -> Value {
+    let mut record = json!({"seq":seq,"time":time,"kind":kind,"turn":data["turn"],"step":data["step"],
         "identity":data.get("identity").or_else(||data.pointer("/advice/identity")),"actor":data.get("actor").cloned().unwrap_or_else(||json!(source_actor(kind))),
         "node_id":data.get("nodeId").or_else(||data.get("flowNodeId")).or_else(||data.pointer("/identity/node_id")),
-        "call_id":data.get("callId").or_else(||data.pointer("/message/toolCallId")),
+        "call_id":data.get("callId").or_else(||data.pointer("/message/toolCallId")).or_else(||data.pointer("/message/source/callId")),
         "work_id":data.get("workId").or_else(||data.get("work_id")).or_else(||data.pointer("/output/id")).or_else(||data.pointer("/order/id")).or_else(||data.pointer("/identity/work_id")),
         "duration_ms":data.pointer("/meta/durationMs"),"stage":data["stage"],"failure_stage":data["failure_stage"],
         "review_id":data.get("review_id").or_else(||data.pointer("/advice/review_id")),
         "is_error":data.pointer("/message/isError").or_else(||data.get("is_error")),"review_status":data.get("status").or_else(||data.pointer("/advice/review_status")),
-        "payload":original_payload(kind,data),
-        "history_reference":{"scope":"conversation","task_id":task,"event_seq":seq,"include_event":true}})
-}
-
-fn source_metadata(record:&Value)->Value {
-    let mut source=record.clone();source.as_object_mut().unwrap().remove("payload");source
-}
-
-pub(crate) fn event_source(task:&str,seq:i64,time:i64,kind:&str,data:&Value)->Value {
-    source_metadata(&source_record(task,seq,time,kind,data))
-}
-
-/// Keep provenance visible in the provider-supported content envelope. This
-/// adds no interpretation and never changes the original text or image blocks.
-pub(crate) fn with_source(mut message:Value,record:&Value)->Value {
-    if !record.is_object() {return message;}
-    let header=format!("Source: {}",source_metadata(record));
-    match message.get_mut("content") {
-        Some(Value::String(text))=>*text=format!("{header}\n\n{text}"),
-        Some(Value::Array(blocks))=>blocks.insert(0,json!({"type":"text","text":header})),
-        _=>{},
+        "payload":saved_history_payload(kind,data).unwrap_or(data),
+        "history_reference":{"scope":"conversation","task_id":task,"event_seq":seq,"include_event":true}});
+    if let Some(sources) = data.get("source_event_seqs") {
+        record["derived_from_event_seqs"] = sources.clone();
     }
+    record
+}
+
+/// Save an Organizer-authored context note as a new shared-history event.
+/// The original events remain untouched and are linked through provenance.
+pub async fn record_context_note(
+    root: &Path,
+    task: &str,
+    content: &str,
+    source_event_seqs: &[Value],
+) -> Result<Value> {
+    ensure!(!content.trim().is_empty(), "context note content must not be empty");
+    ensure!(!source_event_seqs.is_empty(), "context note must cite at least one source event");
+    ensure!(source_event_seqs.len() <= 64, "context note may cite at most 64 source events");
+    let refs = source_event_seqs
+        .iter()
+        .map(|value| value.as_i64().context("context note source references must be event sequence numbers"))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    ensure!(refs.iter().all(|seq| *seq >= 0), "context note source references must be non-negative");
+    let root = root.to_path_buf();
+    let task = task.to_owned();
+    let content = content.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let mut conn = crate::agent_service::open_db(&root)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for seq in &refs {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_task_events WHERE task_id=?1 AND seq=?2)",
+                params![task, seq],
+                |row| row.get(0),
+            )?;
+            ensure!(exists, "context note source event {seq} does not exist in this conversation");
+        }
+        let message = json!({"role":"user","name":"organizer_context_note","content":content});
+        let seq = crate::agent_service::append_event_tx(
+            &tx,
+            &task,
+            "organizer/context_note",
+            &json!({"actor":"organizer","message":message,"source_event_seqs":refs}),
+            None,
+        )?;
+        tx.commit()?;
+        Ok(json!({"stored":true,"event_seq":seq,"source_event_seqs":refs,"message":message}))
+    }).await?
+}
+
+fn observer_process_message(kind: &str, payload: &Value, source: &Value) -> Result<Value> {
+    match kind {
+        "observer/advice_delivered" => {
+            if let Some(original) = payload
+                .pointer("/advice/original_message")
+                .or_else(|| payload.pointer("/original_message"))
+                .filter(|message| message.is_object())
+            {
+                replay_history_message(kind, original, source)
+            } else {
+                let advice = payload.get("advice").unwrap_or(payload);
+                Ok(with_source(raw_message("observer_history", advice), source))
+            }
+        }
+        "observer/node_review" => {
+            let original = payload
+                .pointer("/result/original_message")
+                .or_else(|| payload.pointer("/result/observer_return"))
+                .or_else(|| payload.pointer("/result"))
+                .unwrap_or(payload);
+            if original.get("role").is_some() {
+                replay_history_message(kind, original, source)
+            } else if original.get("content").is_some() {
+                Ok(with_source(
+                    routed_message(
+                        "user",
+                        &kind.replace('/', "_"),
+                        original,
+                        &source["identity"],
+                    ),
+                    source,
+                ))
+            } else {
+                Ok(with_source(
+                    raw_message("observer_node_review", original),
+                    source,
+                ))
+            }
+        }
+        "observer/retrospective" => {
+            let original = payload.pointer("/observer_return").unwrap_or(payload);
+            Ok(with_source(
+                raw_message("observer_retrospective", original),
+                source,
+            ))
+        }
+        _ => anyhow::bail!("unsupported observer history event: {kind}"),
+    }
+}
+
+fn source_metadata(record: &Value) -> Value {
+    let mut source = record.clone();
+    source.as_object_mut().unwrap().remove("payload");
+    source
+}
+
+pub(crate) fn event_source(task: &str, seq: i64, time: i64, kind: &str, data: &Value) -> Value {
+    source_metadata(&source_record(task, seq, time, kind, data))
+}
+
+/// Keep provenance as an independent internal field. Never rewrite the body.
+pub(crate) fn with_source(mut message: Value, record: &Value) -> Value {
+    if !record.is_object() {
+        return message;
+    }
+    message["source"] = source_metadata(record);
     message
+}
+
+/// Restore saved assistant calls to native protocol fields while preserving
+/// their original call IDs, argument strings and text blocks.
+pub fn replay_history_message(kind: &str, message: &Value, source: &Value) -> Result<Value> {
+    let historical_call = kind == "organizer/method_message"
+        || (kind == "assistant/message"
+            && (message["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+                || message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| block["type"] == "tool-call")
+                })));
+    if historical_call {
+        let mut native = message.clone();
+        if let Some(fields) = native.as_object_mut() {
+            fields.remove("id");
+            fields.remove("source");
+        }
+        native["role"] = json!("assistant");
+        if message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            native["tool_calls"] = message["tool_calls"].clone();
+            if message.get("content").is_none() {
+                native["content"] = Value::Null;
+            }
+        } else {
+            let blocks = message["content"]
+                .as_array()
+                .context("saved assistant tool call content is not an array")?;
+            let mut calls = Vec::new();
+            let mut content = Vec::new();
+            for block in blocks {
+                if block["type"] == "tool-call" {
+                    let id = block["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .context("saved tool call is missing its id")?;
+                    let name = block["name"]
+                        .as_str()
+                        .filter(|name| !name.is_empty())
+                        .context("saved tool call is missing its name")?;
+                    let arguments = block["arguments"]
+                        .as_str()
+                        .context("saved tool call is missing its original arguments")?;
+                    calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}));
+                } else {
+                    content.push(block.clone());
+                }
+            }
+            anyhow::ensure!(
+                !calls.is_empty(),
+                "saved assistant call message contains no tool calls"
+            );
+            native["content"] = if content.is_empty() {
+                Value::Null
+            } else {
+                json!(content)
+            };
+            native["tool_calls"] = json!(calls);
+        }
+        Ok(with_source(native, source))
+    } else {
+        Ok(with_source(message.clone(), source))
+    }
+}
+
+pub fn replay_tool_call_ids(message: &Value) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for call in message["tool_calls"].as_array().into_iter().flatten() {
+        let id = call["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("saved assistant tool call is missing its id")?
+            .to_owned();
+        anyhow::ensure!(
+            !ids.contains(&id),
+            "saved assistant tool call contains duplicate id {id}"
+        );
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Whole original messages and tool results for the current human goal, in
 /// chronological order. Transport copies, deltas and repeated Flow snapshots
 /// are not separate actions. Large originals remain readable by event sequence.
-pub async fn task_process(root:&Path,task:&str,started_turn:usize)->Result<Value> {
-    let root=root.to_path_buf();let task=task.to_owned();
+pub async fn task_process(root: &Path, task: &str, started_turn: usize) -> Result<Value> {
+    let root = root.to_path_buf();
+    let task = task.to_owned();
     tokio::task::spawn_blocking(move ||->Result<Value>{
         let conn=crate::agent_service::open_db(&root)?;
-        let mut stmt=conn.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events
-            WHERE task_id=?1 AND COALESCE(json_extract(data,'$.turn'),json_extract(data,'$.identity.request_id'),0)>=?2
-            AND (?2=0 OR json_extract(data,'$.identity.request_id') IS NULL OR json_extract(data,'$.identity.request_id')=?2)
-            ORDER BY seq")?;
-        let rows=stmt.query_map(params![task,started_turn],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
+        let mut stmt=conn.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
+        let rows=stmt.query_map(params![task],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
             row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let original_decisions=rows.iter().filter(|(_,_,kind,_)|kind=="organizer/method_message")
-            .filter_map(|(_,_,_,raw)|serde_json::from_str::<Value>(raw).ok()).map(|data|(data["turn"].clone(),data["step"].clone())).collect::<Vec<_>>();
-        let visual_deliveries=rows.iter().filter(|(_,_,kind,_)|kind=="visual/input_result")
-            .filter_map(|(_,_,_,raw)|serde_json::from_str::<Value>(raw).ok())
-            .filter_map(|data|data["request_trace_id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
         let mut records=Vec::new();
         for (seq,time,kind,raw) in rows {
-            if !matches!(kind.as_str(),"user/message"|"assistant/message"|"worker/yield"
-                |"organizer/assignment"|"organizer/decision"|"observer/node_review"|"observer/consult_reply"|"observer/advice_delivered"
-                |"tool/call"|"tool/result"|"turn/end"|"worker/error"|"organizer/error"
-                |"organizer/request_error"|"organizer/result_read"|"organizer/method_message"|"organizer/request_metrics"|"observer/history_read"|"visual/service_result"
-                |"observer/retrospective"|"observer/retrospective_start"
-                |"visual/input_result"|"worker/progress"|"visual/model_received"|"visual/model_failed"|"visual/check_result"|"debug/context_request") {continue;}
             let data:Value=serde_json::from_str(&raw)?;
-            if matches!(kind.as_str(),"visual/model_received"|"visual/service_result") && data["manifest"]["request_trace_id"].as_str().is_some_and(|id|visual_deliveries.iter().any(|saved|saved==id)) {continue;}
-            if kind=="organizer/decision" && original_decisions.contains(&(data["turn"].clone(),data["step"].clone())) {continue;}
-            if kind=="assistant/message" && message_text(&data["message"]).is_empty()
-                && !data["message"]["content"].as_array().is_some_and(|blocks|blocks.iter().any(|block|matches!(block["type"].as_str(),Some("image_ref"|"image_url")))) {continue;}
-            if kind=="observer/node_review" && !matches!(data["status"].as_str(),Some("completed"|"failed"|"timeout"|"cancelled")) {continue;}
+            saved_history_payload(&kind,&data)?;
+            if kind=="tool/result" {tool_result_call_id(&data)?;}
             records.push(source_record(&task,seq,time,&kind,&data));
         }
         Ok(json!({"request_id":started_turn,"coverage":"complete","total_records":records.len(),
-            "history_reference":{"scope":"conversation","task_id":task,"request_id":started_turn,
+            "history_reference":{"scope":"conversation","task_id":task,
                 "after_seq":records.first().map(|record|record["seq"].as_i64().unwrap()-1),
                 "before_seq":records.last().map(|record|record["seq"].as_i64().unwrap()+1),"include_event":true},
             "records":records}))
@@ -132,127 +382,365 @@ pub async fn task_process(root:&Path,task:&str,started_turn:usize)->Result<Value
 
 /// Replay only messages addressed to Organizer, in their original order.
 /// This is routing, not a summary of Worker operations or a rebuilt task state.
-pub async fn organizer_messages(root:&Path,task:&str,input:&Value)->Result<Vec<Value>> {
-    Ok(organizer_view(root,task,input,false).await?.messages)
+pub async fn organizer_messages(root: &Path, task: &str, input: &Value) -> Result<Vec<Value>> {
+    Ok(organizer_view(root, task, input, false).await?.messages)
 }
 
-pub async fn organizer_view(root: &Path, task: &str, input: &Value, all_history:bool) -> Result<crate::context_window::HistoryView> {
+pub async fn organizer_view(
+    root: &Path,
+    task: &str,
+    input: &Value,
+    _all_history: bool,
+) -> Result<crate::context_window::HistoryView> {
     let root = root.to_path_buf();
     let task = task.to_owned();
     let request = input["process"]["request_id"].as_i64().unwrap_or(1);
     let initial_context = json!({"capabilities":input["capabilities"],"request_id":request,
-        "resumable_tasks":input["process"]["resumable_tasks"],"turn":input["turn"],
-        "execution_phase":if input["process"]["handoff"]["intent"]=="observer_followup" {"Complete the specific gaps in the preceding original Observer return; preserve the same human goal and reuse completed work."}else{"execution"}});
-    let human_request=input["human_request"].clone();
+        "human_request":input["human_request"],"resumable_tasks":input["process"]["resumable_tasks"],"turn":input["turn"]});
     tokio::task::spawn_blocking(move || -> Result<crate::context_window::HistoryView> {
         let conn = crate::agent_service::open_db(&root)?;
-        let mut stmt = conn.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1
-            AND (?3 OR COALESCE(json_extract(data,'$.turn'),json_extract(data,'$.identity.request_id'),0)>=?2)
-            AND (?3 OR json_extract(data,'$.identity.request_id') IS NULL OR json_extract(data,'$.identity.request_id')=?2)
-            ORDER BY seq")?;
-        let rows = stmt.query_map(params![task,request,all_history], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
-            row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let original_decisions=rows.iter().filter(|(_,_,kind,_)|kind=="organizer/method_message")
-            .filter_map(|(_,_,_,raw)|serde_json::from_str::<Value>(raw).ok()).map(|data|(data["turn"].clone(),data["step"].clone())).collect::<Vec<_>>();
-        let has_user=rows.iter().any(|(_,_,kind,_)|kind=="user/message");
-        let mut messages=vec![json!({"role":"system","name":"runtime","content":plain_context(&initial_context)})];
-        if !has_user {messages.push(json!({"role":"user","content":plain_context(&human_request)}));}
-        let mut sources=vec![None;messages.len()];
-        let mut delivered_reviews=std::collections::HashSet::<String>::new();
-        for (seq,time,kind,raw) in rows {
-            let before=messages.len();
-            let mut retrieved_images=Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![task], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut messages = vec![
+            json!({"role":"system","name":"runtime","content":plain_context(&initial_context)}),
+        ];
+        let mut sources = vec![None; messages.len()];
+        let mut pending_tool_calls = Vec::<String>::new();
+        let mut pending_tool_sources = std::collections::HashMap::<String, i64>::new();
+        let mut deferred_images = Vec::<Value>::new();
+        let mut deferred_observer_messages = Vec::<Value>::new();
+        for (seq, time, kind, raw) in rows {
+            // Request snapshots and context-selection reads are audit/control
+            // records. A read result can contain the full raw context page; it
+            // is available on demand through read_session_history and must not
+            // be injected as an unsolicited Organizer message on the next turn.
+            if matches!(
+                kind.as_str(),
+                "debug/context_request"
+                    | "debug/context_end"
+                    | "context/selection_read"
+                    | "context/rebuilt"
+            ) {
+                continue;
+            }
+            // These records are runtime snapshots used for recovery and task
+            // state inspection. Keep them in the event store, but do not turn
+            // them into ordinary Organizer/Worker conversation messages.
+            if matches!(
+                kind.as_str(),
+                "execution/commit"
+                    | "scheduler/state"
+                    | "flow/plan"
+                    | "flow/tree_state"
+            ) {
+                continue;
+            }
+            let before = messages.len();
+            let mut retrieved_images = Vec::new();
+            let mut selection_source = seq;
             (|| -> Result<()> {
-            let data: Value = serde_json::from_str(&raw)?;
-            // Ordinary Organizer input is the invocation's public handoff,
-            // not the Worker's implementation trace. The complete pool remains
-            // readable on demand and available for explicit context selection.
-            if !all_history && (matches!(kind.as_str(),"tool/call"|"tool/result"|"worker/progress")
-                || kind=="visual/input_result" && data["actor"]!="organizer"
-                || kind=="assistant/message" && data["actor"]!="organizer") {return Ok(());}
-            if !all_history && kind=="observer/advice_delivered" && data["advice"]["identity"]["request_id"].as_i64()
-                .or_else(||data["advice"]["request_id"].as_i64()).is_some_and(|id|id!=request) {return Ok(());}
-            if kind=="user/message" {
-                let content=data["model_content"].as_str().map(str::to_owned).unwrap_or_else(||message_text(&data["message"]));
-                let source=source_record(&task,seq,time,&kind,&data);
-                messages.push(with_source(json!({"role":"user","content":content}),&source));
-                if let Some(images)=image_message(&data["message"]) {
-                    messages.push(with_source(routed_message("user","user",&images,&data["identity"]),&source));
-                }
-                return Ok(());
-            }
-            let has_original=original_decisions.contains(&(data["turn"].clone(),data["step"].clone()));
-            if kind=="organizer/decision" && has_original {return Ok(());}
-            if kind=="organizer/method_message" {
-                messages.push(raw_message("organizer_call",&data["message"])); return Ok(());
-            }
-            let (sender, payload) = match kind.as_str() {
-                "assistant/message"|"visual/input_result" => {
-                    if kind=="assistant/message" && message_text(&data["message"]).is_empty() && image_message(&data["message"]).is_none() {return Ok(());}
-                    messages.push(routed_message("user",data["actor"].as_str().unwrap_or("worker"),original_payload(&kind,&data),&data["identity"]));
-                    return Ok(());
-                },
-                "tool/call" => ("worker_tool_call", data.clone()),
-                "tool/result" => {
-                    messages.push(raw_message("worker_tool_result",&json!({"role":"tool",
-                        "tool_call_id":data["message"]["toolCallId"],"content":plain_context(original_payload(&kind,&data))})));
-                    retrieved_images.extend(history_image_messages(original_payload(&kind,&data)));return Ok(());
-                },
-                "worker/progress" => ("worker",data.clone()),
-                "organizer/decision" => ("organizer_call",original_payload(&kind,&data).clone()),
-                "organizer/assignment" => ("organizer_assignment",original_payload(&kind,&data).clone()),
-                "worker/yield" => ("worker_return",original_payload(&kind,&data).clone()),
-                "observer/retrospective" => ("observer_retrospective",original_payload(&kind,&data).clone()),
-                "observer/advice_delivered" => {
-                    if let Some(review)=data["advice"]["review_id"].as_str().filter(|id|!id.is_empty()) {
-                        if !delivered_reviews.insert(review.to_owned()) {return Ok(());}
+                let data: Value = serde_json::from_str(&raw)?;
+                if !pending_tool_calls.is_empty()
+                    && !matches!(kind.as_str(), "tool/call" | "tool/result")
+                {
+                    if matches!(
+                        kind.as_str(),
+                        "user/message"
+                            | "visual/input_result"
+                            | "assistant/message"
+                            | "organizer/method_message"
+                            | "organizer/continuation_plan"
+                    ) {
+                        anyhow::bail!(
+                            "saved tool exchange is incomplete before {kind}: {:?}",
+                            pending_tool_calls
+                        );
                     }
-                    let original=observer_message(&data["advice"]);
-                    messages.push(routed_message("user",&format!("observer_{}",data["advice"]["id"].as_str().unwrap_or("advice")),&original,&data["advice"]["identity"]));return Ok(());
-                },
-                "organizer/result_read" => {
-                    let result=&data["result"];
-                    if !has_original {messages.push(raw_message("organizer_call",&result["request"]));}
-                    messages.push(raw_message("organizer_result",&result["result"]));
-                    retrieved_images.extend(history_image_messages(&result["result"]));return Ok(());
-                },
-                "organizer/error" | "organizer/request_error" | "worker/error" | "visual/model_failed" | "organizer/material_unavailable" => ("runtime_error", data.clone()),
-                _ => return Ok(()),
-            };
-            let name=if sender=="worker_return" {format!("worker_return_{}",data["output"]["id"].as_str().unwrap_or("").chars().take(50).collect::<String>())}else{sender.to_owned()};
-            messages.push(raw_message(&name,&payload));
-            Ok(())
+                    if matches!(
+                        kind.as_str(),
+                        "observer/advice_delivered"
+                            | "observer/node_review"
+                            | "observer/retrospective"
+                    ) {
+                        let source = source_record(&task, seq, time, &kind, &data);
+                        deferred_observer_messages
+                            .push(observer_process_message(&kind, &data, &source)?);
+                        return Ok(());
+                    }
+                    if kind == "organizer/context_note" {
+                        let source = source_record(&task, seq, time, &kind, &data);
+                        deferred_observer_messages.push(replay_history_message(
+                            &kind,
+                            saved_history_payload(&kind, &data)?,
+                            &source,
+                        )?);
+                        return Ok(());
+                    }
+                    // Do not turn telemetry, scheduler records, or other host
+                    // events into messages between an assistant call and its tool
+                    // result. They remain queryable in the event store.
+                    return Ok(());
+                }
+                if kind == "user/message" {
+                    ensure!(
+                        pending_tool_calls.is_empty(),
+                        "saved tool exchange is incomplete before user/message: {:?}",
+                        pending_tool_calls
+                    );
+                    let source = source_record(&task, seq, time, &kind, &data);
+                    let message = saved_history_message(&kind, &data)?;
+                    messages.push(replay_history_message(&kind, &message, &source)?);
+                    return Ok(());
+                }
+                if kind == "organizer/method_message" {
+                    ensure!(
+                        pending_tool_calls.is_empty(),
+                        "saved tool exchange is incomplete before organizer/method_message: {:?}",
+                        pending_tool_calls
+                    );
+                    let message = saved_history_message(&kind, &data)?;
+                    let replayed = replay_history_message(
+                        &kind,
+                        &message,
+                        &source_record(&task, seq, time, &kind, &data),
+                    )?;
+                    pending_tool_calls = replay_tool_call_ids(&replayed)?;
+                    for id in &pending_tool_calls {
+                        pending_tool_sources.insert(id.clone(), seq);
+                    }
+                    messages.push(replayed);
+                    return Ok(());
+                }
+                if matches!(kind.as_str(), "organizer/continuation_plan" | "organizer/context_note") {
+                    ensure!(
+                        pending_tool_calls.is_empty(),
+                        "saved tool exchange is incomplete before {kind}: {:?}",
+                        pending_tool_calls
+                    );
+                    let message = saved_history_message(&kind, &data)?;
+                    messages.push(replay_history_message(
+                        &kind,
+                        &message,
+                        &source_record(&task, seq, time, &kind, &data),
+                    )?);
+                    return Ok(());
+                }
+                let (sender, payload) = match kind.as_str() {
+                    "assistant/message" => {
+                        ensure!(
+                            pending_tool_calls.is_empty(),
+                            "saved tool exchange is incomplete before assistant/message: {:?}",
+                            pending_tool_calls
+                        );
+                        let source = source_record(&task, seq, time, &kind, &data);
+                        let message = saved_history_message(&kind, &data)?;
+                        let replayed = replay_history_message(&kind, &message, &source)?;
+                        pending_tool_calls = replay_tool_call_ids(&replayed)?;
+                        for id in &pending_tool_calls {
+                            pending_tool_sources.insert(id.clone(), seq);
+                        }
+                        messages.push(replayed);
+                        return Ok(());
+                    }
+                    "visual/input_result" => {
+                        ensure!(
+                            pending_tool_calls.is_empty(),
+                            "saved tool exchange is incomplete before visual/input_result: {:?}",
+                            pending_tool_calls
+                        );
+                        let source = source_record(&task, seq, time, &kind, &data);
+                        let message = saved_history_message(&kind, &data)?;
+                        messages.push(replay_history_message(&kind, &message, &source)?);
+                        return Ok(());
+                    }
+                    "tool/call" => {
+                        let call_id = data["callId"]
+                            .as_str()
+                            .context("saved tool/call event is missing callId")?;
+                        ensure!(
+                            pending_tool_calls.iter().any(|id| id == call_id),
+                            "saved tool/call {call_id} has no matching assistant call"
+                        );
+                        return Ok(());
+                    }
+                    "tool/result" => {
+                        let source = source_record(&task, seq, time, &kind, &data);
+                        let result_message = replay_tool_result(&data, &source)?;
+                        let call_id = result_message["tool_call_id"].as_str().unwrap_or("");
+                        let Some(index) = pending_tool_calls.iter().position(|id| id == call_id)
+                        else {
+                            anyhow::bail!(
+                                "saved tool result {call_id} has no matching assistant call"
+                            );
+                        };
+                        selection_source = *pending_tool_sources
+                            .get(call_id)
+                            .context("saved tool exchange lost its source index")?;
+                        pending_tool_sources.remove(call_id);
+                        pending_tool_calls.remove(index);
+                        messages.push(result_message);
+                        for mut image in history_image_messages(saved_history_payload(&kind, &data)?) {
+                            // A selected image is part of the completed view_image
+                            // exchange. Group it with the call event so context
+                            // selection cannot keep the pixels while dropping the call.
+                            if image.get("source").is_none() {
+                                image["source"] = json!({"seq":selection_source});
+                            }
+                            deferred_images.push(image);
+                        }
+                        if pending_tool_calls.is_empty() {
+                            messages.append(&mut deferred_observer_messages);
+                        }
+                        return Ok(());
+                    }
+                    "worker/progress" => ("worker", data.clone()),
+                    "organizer/decision" => (
+                        "organizer_call",
+                        saved_history_payload(&kind, &data)?.clone(),
+                    ),
+                    "organizer/assignment" => (
+                        "organizer_assignment",
+                        saved_history_payload(&kind, &data)?.clone(),
+                    ),
+                    "worker/yield" => (
+                        "worker_return",
+                        saved_history_payload(&kind, &data)?.clone(),
+                    ),
+                    "observer/retrospective" => (
+                        "observer_retrospective",
+                        saved_history_payload(&kind, &data)?.clone(),
+                    ),
+                    "observer/advice_delivered" => {
+                        if let Some(original) = data
+                            .pointer("/advice/original_message")
+                            .filter(|message| message.is_object())
+                        {
+                            messages.push(replay_history_message(
+                                &kind,
+                                original,
+                                &source_record(&task, seq, time, &kind, &data),
+                            )?);
+                        } else {
+                            messages.push(raw_message("observer_history", &data["advice"]));
+                        }
+                        return Ok(());
+                    }
+                    "organizer/result_read" => {
+                        let result = &data["result"];
+                        messages.push(raw_message("organizer_call", &result["request"]));
+                        messages.push(raw_message("organizer_result", &result["result"]));
+                        retrieved_images.extend(history_image_messages(&result["result"]));
+                        return Ok(());
+                    }
+                    "organizer/error"
+                    | "organizer/request_error"
+                    | "worker/error"
+                    | "visual/model_failed"
+                    | "organizer/material_unavailable" => ("runtime_error", data.clone()),
+                    _ => ("event", data.clone()),
+                };
+                let name = if sender == "worker_return" {
+                    format!(
+                        "worker_return_{}",
+                        data["output"]["id"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(50)
+                            .collect::<String>()
+                    )
+                } else {
+                    sender.to_owned()
+                };
+                messages.push(raw_message(&name, &payload));
+                Ok(())
             })()?;
-            let data:Value=serde_json::from_str(&raw)?;
-            let record=source_record(&task,seq,time,&kind,&data);
-            for message in &mut messages[before..] {*message=with_source(message.clone(),&record);}
+            let data: Value = serde_json::from_str(&raw)?;
+            let record = source_record(&task, seq, time, &kind, &data);
+            for message in &mut messages[before..] {
+                if message.get("source").is_none() {
+                    *message = with_source(message.clone(), &record);
+                }
+            }
             messages.extend(retrieved_images);
-            sources.extend(std::iter::repeat_n(Some(seq),messages.len()-before));
+            sources.extend(messages[before..].iter().map(|message| {
+                if message["source"]["kind"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("observer/"))
+                {
+                    message["source"]["seq"].as_i64()
+                } else {
+                    Some(selection_source)
+                }
+            }));
         }
-        Ok(crate::context_window::HistoryView {messages,sources})
-    }).await?
+        ensure!(
+            pending_tool_calls.is_empty(),
+            "saved tool exchange is missing results for {:?}",
+            pending_tool_calls
+        );
+        for image in deferred_images {
+            sources.push(image["source"]["seq"].as_i64());
+            messages.push(image);
+        }
+        Ok(crate::context_window::HistoryView { messages, sources })
+    })
+    .await?
 }
 
-
-fn message_text(message:&Value)->String {
-    let content=&message["content"];
-    if let Some(text)=content.as_str() {return text.to_owned();}
-    content.as_array().into_iter().flatten().filter_map(|block|block["text"].as_str()).collect::<Vec<_>>().join("\n")
+fn message_text(message: &Value) -> String {
+    let content = &message["content"];
+    if let Some(text) = content.as_str() {
+        return text.to_owned();
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
-fn source_actor(kind:&str)->&str {
-    match kind {"assistant/message"|"worker/yield"|"worker/progress"=>"worker", "user/message"=>"user",
-        kind if kind.starts_with("organizer/")=>"organizer",kind if kind.starts_with("observer/")=>"observer",
-        kind if kind.starts_with("tool/")=>"worker",_=>"unknown"}
+fn source_actor(kind: &str) -> &str {
+    match kind {
+        "assistant/message" | "worker/yield" | "worker/progress" => "worker",
+        "user/message" => "user",
+        kind if kind.starts_with("organizer/") => "organizer",
+        kind if kind.starts_with("observer/") => "observer",
+        kind if kind.starts_with("tool/") => "worker",
+        _ => "unknown",
+    }
 }
 
 /// Wrap an original body without rewriting it; callers add source metadata separately.
-pub fn raw_message(name:&str,payload:&Value)->Value {
+pub fn raw_message(name: &str, payload: &Value) -> Value {
     json!({"role":"user","name":name,"content":plain_context(payload)})
 }
 /// Reuse the exact source event of a command or an upstream return. Provenance
 /// is attached to the original body, never reconstructed from a summary.
-pub async fn handoff_message(root:&Path,task:&str,name:&str,original:&Value)->Result<Value> {
-    let (root,task,name,original)=(root.to_path_buf(),task.to_owned(),name.to_owned(),original.clone());
+pub async fn handoff_message(
+    root: &Path,
+    task: &str,
+    name: &str,
+    original: &Value,
+) -> Result<Value> {
+    let (root, task, name, original) = (
+        root.to_path_buf(),
+        task.to_owned(),
+        name.to_owned(),
+        original.clone(),
+    );
     tokio::task::spawn_blocking(move ||->Result<Value> {
         let conn=crate::agent_service::open_db(&root)?;
         let kind=if name=="organizer" {"organizer/method_message"}else{"worker/yield"};
@@ -262,7 +750,7 @@ pub async fn handoff_message(root:&Path,task:&str,name:&str,original:&Value)->Re
             let (seq,time,text)=row?;let data:Value=serde_json::from_str(&text)?;
             let matching_call=if name=="organizer" {data["message"]["tool_calls"].as_array().into_iter().flatten()
                 .find(|call|call["function"]["arguments"]==original)}else{None};
-            if matching_call.is_some() || (name!="organizer" && name==format!("worker_return_{}",data["output"]["id"].as_str().unwrap_or("").chars().take(50).collect::<String>()) && original_payload(kind,&data)==&original) {
+            if matching_call.is_some() || (name!="organizer" && name==format!("worker_return_{}",data["output"]["id"].as_str().unwrap_or("").chars().take(50).collect::<String>()) && saved_history_payload(kind,&data)?==&original) {
                 let mut source=source_record(&task,seq,time,kind,&data);
                 if let Some(call)=matching_call {source["call_id"]=call["id"].clone();}
                 return Ok(with_source(raw_message(&name,&original),&source));
@@ -274,11 +762,16 @@ pub async fn handoff_message(root:&Path,task:&str,name:&str,original:&Value)->Re
     }).await?
 }
 
-pub async fn sourced_tool_result(root:&Path,task:&str,message:Value,call_id:&str)->Result<Value> {
-    let (root,task,call_id)=(root.to_path_buf(),task.to_owned(),call_id.to_owned());
+pub async fn sourced_tool_result(
+    root: &Path,
+    task: &str,
+    message: Value,
+    call_id: &str,
+) -> Result<Value> {
+    let (root, task, call_id) = (root.to_path_buf(), task.to_owned(), call_id.to_owned());
     tokio::task::spawn_blocking(move ||->Result<Value> {
         let conn=crate::agent_service::open_db(&root)?;
-        let source=conn.query_row("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.message.toolCallId')=?2 ORDER BY seq DESC LIMIT 1",
+        let source=conn.query_row("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND COALESCE(json_extract(data,'$.callId'),json_extract(data,'$.message.toolCallId'),json_extract(data,'$.message.source.callId'))=?2 ORDER BY seq DESC LIMIT 1",
             params![task,call_id],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?))).optional()?;
         if let Some((seq,time,text))=source {
             return Ok(with_source(message,&source_record(&task,seq,time,"tool/result",&serde_json::from_str(&text)?)));
@@ -287,42 +780,92 @@ pub async fn sourced_tool_result(root:&Path,task:&str,message:Value,call_id:&str
     }).await?
 }
 
-fn routed_message(role:&str,name:&str,message:&Value,identity:&Value)->Value {
-    let content=if message["content"].is_string() {message["content"].clone()}
-        else if let Some(blocks)=message["content"].as_array() {
-            json!(blocks.iter().filter(|block|block["type"]!="tool-call").cloned().collect::<Vec<_>>())
-        } else {json!(plain_context(message))};
-    let mut routed=json!({"role":role,"name":name,"content":content});
-    if identity.is_object() {routed["source_identity"]=identity.clone();}
+fn routed_message(role: &str, name: &str, message: &Value, identity: &Value) -> Value {
+    let content = if message["content"].is_string() {
+        message["content"].clone()
+    } else if let Some(blocks) = message["content"].as_array() {
+        json!(
+            blocks
+                .iter()
+                .filter(|block| block["type"] != "tool-call")
+                .cloned()
+                .collect::<Vec<_>>()
+        )
+    } else {
+        json!(plain_context(message))
+    };
+    let mut routed = json!({"role":role,"name":name,"content":content});
+    if identity.is_object() {
+        routed["source_identity"] = identity.clone();
+    }
     routed
 }
 
 /// Keep original image blocks typed, without host-authored captions.
-pub fn history_image_messages(result:&Value)->Vec<Value> {
-    result["records"].as_array().into_iter().flatten().filter_map(|record| {
-        let original=record.get("image_message")?;
-        Some(with_source(routed_message("user",record["role"].as_str().unwrap_or("history"),original,&record["source_identity"]),&record["source"]))
-    }).collect()
+pub fn history_image_messages(result: &Value) -> Vec<Value> {
+    if result["artifact_id"].as_str().is_some()
+        && result["visual_artifact"]["identity"].is_object()
+    {
+        return vec![json!({
+            "role":"user",
+            "name":"organizer_view_image",
+            "source_identity":result["visual_artifact"]["identity"],
+            "content":[{"type":"image_ref","artifact_id":result["artifact_id"],"view_original":result["view_original"]==true}]
+        })];
+    }
+    result["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|record| {
+            let original = record.get("image_message")?;
+            Some(with_source(
+                routed_message(
+                    "user",
+                    record["role"].as_str().unwrap_or("history"),
+                    original,
+                    &record["source_identity"],
+                ),
+                &record["source"],
+            ))
+        })
+        .collect()
 }
 
 /// A history lookup is a new read, not a new occurrence of its old messages.
 /// Move excerpt bodies into source-labelled messages and leave references in
 /// the lookup receipt. Stored events and tool results are never changed.
-fn project_history_read(value:&mut Value, originals:&mut Vec<Value>) {
-    if matches!(value["scope"].as_str(),Some("conversation"|"project")) {
-        if let Some(records)=value["records"].as_array_mut() {
+fn project_history_read(value: &mut Value, originals: &mut Vec<Value>) {
+    if matches!(value["scope"].as_str(), Some("conversation" | "project")) {
+        if let Some(records) = value["records"].as_array_mut() {
             for record in records {
-                let Some(text)=record["content"].as_str().map(str::to_owned) else {continue;};
-                let Some(seq)=record["seq"].as_i64() else {continue;};
-                let mut source=record["source"].clone();
-                if !source.is_object() {continue;}
-                source["seq"]=json!(seq);
-                for field in ["char_offset","payload_path","total_chars","returned_chars","omitted_chars"] {
-                    source[field]=record[field].clone();
+                let Some(text) = record["content"].as_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(seq) = record["seq"].as_i64() else {
+                    continue;
+                };
+                let mut source = record["source"].clone();
+                if !source.is_object() {
+                    continue;
                 }
-                originals.push(with_source(raw_message("retrieved_history",&json!(text)),&source));
-                let fields=record.as_object_mut().unwrap();
-                fields.remove("content");fields.remove("image_message");
+                source["seq"] = json!(seq);
+                for field in [
+                    "char_offset",
+                    "payload_path",
+                    "total_chars",
+                    "returned_chars",
+                    "omitted_chars",
+                ] {
+                    source[field] = record[field].clone();
+                }
+                originals.push(with_source(
+                    raw_message("retrieved_history", &json!(text)),
+                    &source,
+                ));
+                let fields = record.as_object_mut().unwrap();
+                fields.remove("content");
+                fields.remove("image_message");
                 fields.insert("content_location".into(),json!("Original excerpt is supplied in source order as a retrieved_history message; use seq and char_offset to locate it."));
             }
             return;
@@ -330,140 +873,336 @@ fn project_history_read(value:&mut Value, originals:&mut Vec<Value>) {
     }
     // Existing receipts use result wrappers; native tool receipts serialize
     // the same result in content. Do not search arbitrary business fields.
-    if let Some(result)=value.get_mut("result") {project_history_read(result,originals);}
-    if let Some(Value::String(content))=value.get_mut("content") {
-        if let Ok(mut result)=serde_json::from_str::<Value>(content) {
-            let before=originals.len();project_history_read(&mut result,originals);
-            if originals.len()!=before {*content=result.to_string();}
+    if let Some(result) = value.get_mut("result") {
+        project_history_read(result, originals);
+    }
+    if let Some(Value::String(content)) = value.get_mut("content") {
+        if let Ok(mut result) = serde_json::from_str::<Value>(content) {
+            let before = originals.len();
+            project_history_read(&mut result, originals);
+            if originals.len() != before {
+                *content = result.to_string();
+            }
         }
     }
 }
 
-fn source_position(message:&Value)->Option<(String,i64,u64)> {
+fn source_position(message: &Value) -> Option<(String, i64, u64)> {
     // The current Worker command is a function input, not historical replay.
     // Native assistant/tool exchanges retain their protocol order too.
-    if message["role"]!="user"||message["name"]=="organizer" {return None;}
-    let text=message["content"].as_str().or_else(||message["content"].as_array()?.iter()
-        .find_map(|part|part["text"].as_str().filter(|text|text.starts_with("Source: "))))?;
-    let header=text.strip_prefix("Source: ")?.split('\n').next()?;
-    let source:Value=serde_json::from_str(header).ok()?;
-    let task=source["history_reference"]["task_id"].as_str()
-        .or_else(||source["identity"]["task_id"].as_str())?;
-    Some((task.to_owned(),source["seq"].as_i64()?,source["char_offset"].as_u64().unwrap_or(0)))
+    if message["role"] != "user" || message["name"] == "organizer" {
+        return None;
+    }
+    let source = &message["source"];
+    let task = source["history_reference"]["task_id"]
+        .as_str()
+        .or_else(|| source["identity"]["task_id"].as_str())?;
+    Some((
+        task.to_owned(),
+        source["seq"].as_i64()?,
+        source["char_offset"].as_u64().unwrap_or(0),
+    ))
 }
 
 /// Merge all retrieved history into its original conversation order, even
 /// across lookup batches/pages. Unrelated conversations have separate arrays;
 /// never compare their local sequence numbers. Non-history messages stay put.
-pub fn order_context_messages(messages:&mut Vec<Value>) {
-    let mut originals=Vec::new();
+pub fn order_context_messages(messages: &mut Vec<Value>) {
+    let mut originals = Vec::new();
     for message in messages.iter_mut() {
         // Only read/result envelopes can contain retrieved history. Source
         // bodies such as Worker returns are forwarded without interpretation.
-        let replay_read=matches!(message["name"].as_str(),Some("organizer_result"|"worker_tool_result"|"observer_history_read"));
-        if message["role"]!="tool"&&!replay_read {continue;}
-        let Some(content)=message["content"].as_str() else {continue;};
-        let (prefix,body)=if content.starts_with("Source: ") {
-            let Some((header,body))=content.split_once("\n\n") else {continue;};
-            (format!("{header}\n\n"),body)
-        }else{(String::new(),content)};
-        let Ok(mut value)=serde_json::from_str::<Value>(body) else {continue;};
-        let before=originals.len();project_history_read(&mut value,&mut originals);
-        if originals.len()!=before {message["content"]=json!(format!("{prefix}{value}"));}
+        let replay_read = matches!(
+            message["name"].as_str(),
+            Some("organizer_result" | "worker_tool_result" | "observer_history_read")
+        );
+        if message["role"] != "tool" && !replay_read {
+            continue;
+        }
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        let Ok(mut value) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let before = originals.len();
+        project_history_read(&mut value, &mut originals);
+        if originals.len() != before {
+            message["content"] = json!(value.to_string());
+        }
     }
     messages.extend(originals);
-    let mut conversations=std::collections::HashMap::<String,usize>::new();
-    let mut positions=Vec::new();let mut ordered=Vec::new();
-    for (index,message) in messages.iter().enumerate() {
-        let Some((task,seq,offset))=source_position(message) else {continue;};
-        let next=conversations.len();let group=*conversations.entry(task).or_insert(next);
-        positions.push(index);ordered.push(((group,seq,offset),message.clone()));
+    let mut conversations = std::collections::HashMap::<String, usize>::new();
+    let mut positions = Vec::new();
+    let mut ordered = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some((task, seq, offset)) = source_position(message) else {
+            continue;
+        };
+        let next = conversations.len();
+        let group = *conversations.entry(task).or_insert(next);
+        positions.push(index);
+        ordered.push(((group, seq, offset), message.clone()));
     }
-    ordered.sort_by_key(|(position,_)|*position);
-    for (index,(_,message)) in positions.into_iter().zip(ordered) {messages[index]=message;}
+    ordered.sort_by_key(|(position, _)| *position);
+    for (index, (_, message)) in positions.into_iter().zip(ordered) {
+        messages[index] = message;
+    }
 }
 
-fn image_message(message:&Value)->Option<Value> {
-    let images=message["content"].as_array()?.iter().filter(|block|matches!(block["type"].as_str(),Some("image_ref"|"image_url"))).cloned().collect::<Vec<_>>();
-    (!images.is_empty()).then(||json!({"content":images}))
+fn image_message(message: &Value) -> Option<Value> {
+    let images = message["content"]
+        .as_array()?
+        .iter()
+        .filter(|block| matches!(block["type"].as_str(), Some("image_ref" | "image_url")))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!images.is_empty()).then(|| json!({"content":images}))
 }
 /// Forward original process messages and their provenance in source order.
-pub fn process_messages(process: &Value) -> Vec<Value> {
-    process["records"].as_array().into_iter().flatten().flat_map(|record| {
-        let kind=record["kind"].as_str().unwrap_or("message");
-        let payload=&record["payload"];
-        let name=kind.replace('/',"_");
-        let message=if matches!(kind,"assistant/message"|"user/message"|"visual/input_result")
-            || (kind=="observer/node_review" && payload.get("content").is_some()) {
-            routed_message("user",&name,payload,&record["identity"])
-        } else {raw_message(&name,payload)};
-        let mut messages=vec![with_source(message,record)];
-        if kind=="tool/result" {messages.extend(history_image_messages(payload));}
-        messages
-    }).collect()
+pub fn process_messages(process: &Value) -> Result<Vec<Value>> {
+    let mut messages = Vec::new();
+    let mut pending = Vec::<String>::new();
+    let mut deferred_observer_messages = Vec::<Value>::new();
+    for record in process["records"].as_array().into_iter().flatten() {
+        let kind = record["kind"].as_str().unwrap_or("message");
+        let payload = &record["payload"];
+        // These are audit/control records, not conversation turns. In
+        // particular, a history read can contain a large raw context page;
+        // it must remain available through read_session_history without being
+        // silently injected into the next Organizer request.
+        if matches!(
+            kind,
+            "debug/context_request"
+                | "debug/context_end"
+                | "context/selection_read"
+                | "context/rebuilt"
+        ) {
+            continue;
+        }
+        let name = kind.replace('/', "_");
+        if matches!(
+            kind,
+            "assistant/message" | "organizer/method_message" | "organizer/continuation_plan" | "organizer/context_note"
+        ) {
+            if !pending.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "saved tool exchange is incomplete before another assistant message: {:?}",
+                    pending
+                ));
+            }
+            let message = match replay_history_message(kind, payload, record) {
+                Ok(message) => message,
+                Err(error) => return Err(error),
+            };
+            pending = match replay_tool_call_ids(&message) {
+                Ok(ids) => ids,
+                Err(error) => return Err(error),
+            };
+            messages.push(message);
+            continue;
+        }
+        if kind == "tool/call" {
+            let Some(call_id) = record["call_id"].as_str() else {
+                return Err(anyhow::anyhow!(
+                    "saved tool/call record is missing its call id"
+                ));
+            };
+            if !pending.iter().any(|id| id == call_id) {
+                return Err(anyhow::anyhow!(
+                    "saved tool/call {call_id} has no matching assistant call"
+                ));
+            }
+            continue;
+        }
+        if kind == "tool/result" {
+            let Some(call_id) = record["call_id"].as_str() else {
+                return Err(anyhow::anyhow!(
+                    "saved tool/result record is missing its call id"
+                ));
+            };
+            let Some(index) = pending.iter().position(|id| id == call_id) else {
+                return Err(anyhow::anyhow!(
+                    "saved tool result {call_id} has no matching assistant call"
+                ));
+            };
+            pending.remove(index);
+            messages.push(replay_tool_result_payload(payload, call_id, record));
+            if pending.is_empty() {
+                messages.extend(history_image_messages(payload));
+                messages.append(&mut deferred_observer_messages);
+            }
+            continue;
+        }
+        if !pending.is_empty() {
+            if matches!(
+                kind,
+                "user/message"
+                    | "visual/input_result"
+                    | "assistant/message"
+                    | "organizer/method_message"
+                    | "organizer/continuation_plan"
+            ) {
+                return Err(anyhow::anyhow!(
+                    "saved tool exchange is incomplete before {kind}; missing results for {:?}",
+                    pending
+                ));
+            }
+            if matches!(
+                kind,
+                "observer/advice_delivered" | "observer/node_review" | "observer/retrospective"
+            ) {
+                deferred_observer_messages.push(observer_process_message(kind, payload, record)?);
+                continue;
+            }
+            if kind == "organizer/context_note" {
+                deferred_observer_messages.push(replay_history_message(kind, payload, record)?);
+                continue;
+            }
+            // Technical events remain in the event log for history queries, but
+            // they are not conversation messages and cannot split a native
+            // assistant/tool exchange during protocol assembly.
+            continue;
+        }
+        let message = if matches!(
+            kind,
+            "user/message" | "visual/input_result" | "organizer/continuation_plan" | "organizer/context_note"
+        ) {
+            replay_history_message(kind, payload, record)?
+        } else if matches!(
+            kind,
+            "observer/advice_delivered" | "observer/node_review" | "observer/retrospective"
+        ) {
+            observer_process_message(kind, payload, record)?
+        } else {
+            raw_message(&name, payload)
+        };
+        messages.push(if message.get("source").is_some() {
+            message
+        } else {
+            with_source(message, record)
+        });
+    }
+    if !pending.is_empty() {
+        return Err(anyhow::anyhow!(
+            "saved tool exchange is missing results for {:?}",
+            pending
+        ));
+    }
+    Ok(messages)
 }
 
-pub fn process_view(process:&Value)->crate::context_window::HistoryView {
-    let mut view=crate::context_window::HistoryView::default();
-    for record in process["records"].as_array().into_iter().flatten() {
-        let messages=process_messages(&json!({"records":[record]}));
-        view.sources.extend(std::iter::repeat_n(record["seq"].as_i64(),messages.len()));
-        view.messages.extend(messages);
+pub fn process_view(process: &Value) -> Result<crate::context_window::HistoryView> {
+    let messages = process_messages(process)?;
+    let mut groups = std::collections::HashMap::<String, i64>::new();
+    let mut sources = Vec::with_capacity(messages.len());
+    for message in &messages {
+        let source = message["source"]["seq"].as_i64();
+        if message["role"] == "assistant" {
+            if let Some(seq) = source {
+                for id in replay_tool_call_ids(message)? {
+                    groups.insert(id, seq);
+                }
+            }
+            sources.push(source);
+        } else if message["role"] == "tool" {
+            sources.push(
+                message["tool_call_id"]
+                    .as_str()
+                    .and_then(|id| groups.get(id).copied())
+                    .or(source),
+            );
+        } else {
+            sources.push(source);
+        }
     }
-    view
+    Ok(crate::context_window::HistoryView { messages, sources })
 }
 
 pub fn tool() -> Value {
     json!({"type":"function","function":{"name":"read_session_history",
-        "description":"Read saved conversation history only when current inputs lack needed information. Default scope=conversation reads the current conversation or a returned task_id. scope=project searches conversations in this workspace, returning one dated matching excerpt and a read_reference per conversation. Filter by keyword, role, node or turn. Conversation records are chronological; before_seq pages toward older events, event_seq/char_offset retrieve exact text. Project results page with project_offset. Historical records do not prove current resource availability. This read does not create a Flow node or change execution.",
-        "parameters":{"type":"object","properties":{
-            "scope":{"type":"string","enum":["conversation","project"]},
-            "task_id":{"type":"string","description":"Conversation returned by project search; defaults to the current conversation. Only conversations saved in this workspace can be read."},
-            "project_offset":{"type":"integer","minimum":0,"description":"Offset for project search; use the returned next_search."},
-            "query":{"type":"string","maxLength":1000},
-            "role":{"type":"string","enum":["all","user","worker","organizer","observer","tool"]},
-            "node_id":{"type":"string"},"turn":{"type":"integer","minimum":1},
-            "request_id":{"type":"integer","minimum":1,"description":"Human goal ID from task history_reference; excludes late Observer records from a replaced goal."},
-            "before_seq":{"type":"integer","minimum":0},"after_seq":{"type":"integer","minimum":-1,"description":"Exclusive lower bound from task history_reference; retain when paging within that human goal."},"event_seq":{"type":"integer","minimum":0},
-            "limit":{"type":"integer","minimum":1,"maximum":12},
-            "char_offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":256,"maximum":12000},
-            "include_event":{"type":"boolean","description":"Return the original event envelope instead of just the sender's message/return or tool output; useful for inspecting provenance."},
-            "include_context":{"type":"boolean","description":"Include recorded model input views for audit, filterable by the receiving role. Default false. An exact event_seq also resolves a context reference. These views cite the shared history; they are not new actions or independent facts."}
-        }}}})
+    "description":"Read saved conversation history only when current inputs lack needed information. Default scope=conversation reads the current conversation or a returned task_id. scope=project searches conversations in this workspace, returning one dated matching excerpt and a read_reference per conversation. Filter by keyword, role, node or turn. Conversation records are chronological; before_seq pages toward older events, event_seq/char_offset retrieve exact text. Project results page with project_offset. Historical records do not prove current resource availability. This read does not create a Flow node or change execution.",
+    "parameters":{"type":"object","properties":{
+        "scope":{"type":"string","enum":["conversation","project"]},
+        "task_id":{"type":"string","description":"Conversation returned by project search; defaults to the current conversation. Only conversations saved in this workspace can be read."},
+        "project_offset":{"type":"integer","minimum":0,"description":"Offset for project search; use the returned next_search."},
+        "query":{"type":"string","maxLength":1000},
+        "role":{"type":"string","enum":["all","user","agent","context_agent","worker","organizer","observer","tool"]},
+        "node_id":{"type":"string"},"turn":{"type":"integer","minimum":1},
+        "request_id":{"type":"integer","minimum":1,"description":"Human goal ID from task history_reference; excludes late Observer records from a replaced goal."},
+        "before_seq":{"type":"integer","minimum":0},"after_seq":{"type":"integer","minimum":-1,"description":"Exclusive lower bound from task history_reference; retain when paging within that human goal."},"event_seq":{"type":"integer","minimum":0},
+        "limit":{"type":"integer","minimum":1,"maximum":12},
+        "char_offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":256,"maximum":12000},
+        "include_event":{"type":"boolean","description":"Return the original event envelope instead of just the sender's message/return or tool output; useful for inspecting provenance."},
+        "include_context":{"type":"boolean","description":"Include recorded model input views for audit, filterable by the receiving role. Default false. An exact event_seq also resolves a context reference. These views cite the shared history; they are not new actions or independent facts."}
+    }}}})
 }
 
-pub async fn read(root:&Path, task:&str, args:&Value) -> Result<Value> {
-    let root=root.to_path_buf();let task=task.to_owned();let args=args.clone();
-    tokio::task::spawn_blocking(move || read_saved(&root,&task,&args)).await?
+pub async fn read(root: &Path, task: &str, args: &Value) -> Result<Value> {
+    let root = root.to_path_buf();
+    let task = task.to_owned();
+    let args = args.clone();
+    tokio::task::spawn_blocking(move || read_saved(&root, &task, &args)).await?
 }
 
-fn read_saved(root:&Path, task:&str, args:&Value) -> Result<Value> {
-    let scope=args["scope"].as_str().unwrap_or("conversation");
-    ensure!(matches!(scope,"conversation"|"project"),"invalid history scope");
-    let project=scope=="project";
-    let target=args["task_id"].as_str().unwrap_or(task);
-    let role=args["role"].as_str().unwrap_or("all");
-    ensure!(matches!(role,"all"|"user"|"worker"|"organizer"|"observer"|"tool"),"invalid history role");
-    let query=args["query"].as_str().unwrap_or("").trim().to_lowercase();
-    let node=args["node_id"].as_str().unwrap_or("");
-    let turn=args["turn"].as_i64();let exact=args["event_seq"].as_i64();
-    let before=args["before_seq"].as_i64();let after=args["after_seq"].as_i64();let request=args["request_id"].as_i64();
-    let limit=if exact.is_some(){1}else{args["limit"].as_u64().unwrap_or(4).clamp(1,12) as usize};
-    let max_chars=args["max_chars"].as_u64().unwrap_or(6000).clamp(256,12000) as usize;
-    let offset=args["char_offset"].as_u64().unwrap_or(0) as usize;
-    ensure!(offset==0||exact.is_some(),"char_offset requires event_seq");
-    ensure!(!project||(exact.is_none()&&before.is_none()&&after.is_none()&&args["task_id"].is_null()),
-        "Project search returns conversation references; use scope=conversation with task_id for exact events or before_seq.");
-    let conn=crate::agent_service::open_db(root)?;
+fn read_saved(root: &Path, task: &str, args: &Value) -> Result<Value> {
+    let scope = args["scope"].as_str().unwrap_or("conversation");
+    ensure!(
+        matches!(scope, "conversation" | "project"),
+        "invalid history scope"
+    );
+    let project = scope == "project";
+    let target = args["task_id"].as_str().unwrap_or(task);
+    let role = args["role"].as_str().unwrap_or("all");
+    ensure!(
+        matches!(
+            role,
+            "all" | "user" | "agent" | "context_agent" | "worker" | "organizer" | "observer" | "tool"
+        ),
+        "invalid history role"
+    );
+    let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();
+    let node = args["node_id"].as_str().unwrap_or("");
+    let turn = args["turn"].as_i64();
+    let exact = args["event_seq"].as_i64();
+    let before = args["before_seq"].as_i64();
+    let after = args["after_seq"].as_i64();
+    let request = args["request_id"].as_i64();
+    let limit = if exact.is_some() {
+        1
+    } else {
+        args["limit"].as_u64().unwrap_or(4).clamp(1, 12) as usize
+    };
+    let max_chars = args["max_chars"].as_u64().unwrap_or(6000).clamp(256, 12000) as usize;
+    let offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
+    ensure!(
+        offset == 0 || exact.is_some(),
+        "char_offset requires event_seq"
+    );
+    ensure!(
+        !project
+            || (exact.is_none()
+                && before.is_none()
+                && after.is_none()
+                && args["task_id"].is_null()),
+        "Project search returns conversation references; use scope=conversation with task_id for exact events or before_seq."
+    );
+    let conn = crate::agent_service::open_db(root)?;
     let has_contexts:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_request_contexts')",[],|row|row.get(0))?;
-    let context_search=if has_contexts {
+    let context_search = if has_contexts {
         "OR (kind='debug/context_request' AND instr(lower(COALESCE((SELECT request_json FROM agent_request_contexts c WHERE c.task_id=history.task_id AND c.id=json_extract(history.data,'$.id')),'')),?3)>0)"
-    }else{""};
+    } else {
+        ""
+    };
     if !project {
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_tasks WHERE id=?1)",params![target],|row|row.get(0))?;
-        ensure!(exists,"Conversation not found in this workspace: {target}");
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_tasks WHERE id=?1)",
+            params![target],
+            |row| row.get(0),
+        )?;
+        ensure!(exists, "Conversation not found in this workspace: {target}");
     }
-    let project_offset=args["project_offset"].as_i64().unwrap_or(0).max(0);
+    let project_offset = args["project_offset"].as_i64().unwrap_or(0).max(0);
     let base=format!("WITH history AS (
         SELECT e.task_id,e.seq,e.timestamp,e.kind,e.data,
             CASE WHEN e.kind LIKE 'tool/%' THEN 'tool'
@@ -479,175 +1218,357 @@ fn read_saved(root:&Path, task:&str, args:&Value) -> Result<Value> {
                 (SELECT json_extract(c.data,'$.flowNodeId') FROM agent_task_events c
                  WHERE c.task_id=e.task_id AND c.kind='tool/call'
                    AND json_extract(c.data,'$.callId')=json_extract(e.data,'$.message.toolCallId') ORDER BY c.seq DESC LIMIT 1)) AS node_id
-        FROM agent_task_events e WHERE (?1 IS NULL OR e.task_id=?1) AND e.kind IN
-          ('user/message','assistant/message','worker/yield','organizer/assignment',
-           'organizer/decision','observer/node_review','observer/consult_reply','observer/advice_delivered','observer/retrospective','tool/call','tool/result',
-           'turn/end','worker/error','organizer/error','organizer/request_error','organizer/result_read','organizer/method_message','organizer/request_metrics','visual/service_result',
-           'observer/history_read','observer/retrospective_start','visual/input_result','worker/progress','visual/model_received','visual/model_failed','visual/check_result','debug/context_request')
+        FROM agent_task_events e WHERE (?1 IS NULL OR e.task_id=?1)
           AND (e.kind!='debug/context_request' OR ?6 IS NOT NULL OR ?12)
-          AND (e.kind NOT IN ('visual/model_received','visual/service_result') OR NOT EXISTS (
-              SELECT 1 FROM agent_task_events v WHERE v.task_id=e.task_id AND v.kind='visual/input_result'
-                AND json_extract(v.data,'$.request_trace_id')=json_extract(e.data,'$.manifest.request_trace_id')))
-          AND (e.kind!='observer/node_review' OR json_extract(e.data,'$.status') IN ('completed','failed','timeout','cancelled'))
-          AND (?6 IS NOT NULL OR e.kind!='tool/call' OR json_extract(e.data,'$.name')!='read_session_history')
-          AND (?6 IS NOT NULL OR e.kind!='tool/result' OR NOT EXISTS (
-              SELECT 1 FROM agent_task_events c WHERE c.task_id=e.task_id AND c.kind='tool/call'
-                AND json_extract(c.data,'$.callId')=json_extract(e.data,'$.message.toolCallId')
-                AND json_extract(c.data,'$.name')='read_session_history'))
     ), filtered AS (SELECT * FROM history
       WHERE (?2='all' OR role=?2) AND (?3='' OR instr(lower(data),?3)>0 {context_search})
         AND (?4='' OR node_id=?4) AND (?5 IS NULL OR json_extract(data,'$.turn')=?5)
         AND (?6 IS NULL OR seq=?6) AND (?7 IS NULL OR seq<?7) AND (?10 IS NULL OR seq>?10)
         AND (?11 IS NULL OR json_extract(data,'$.identity.request_id') IS NULL OR json_extract(data,'$.identity.request_id')=?11)
     )");
-    let select=if project {
+    let select = if project {
         ", ranked AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY seq DESC) AS rank,
            COUNT(*) OVER(PARTITION BY task_id) AS matched_events FROM filtered)
          SELECT r.seq,r.timestamp,r.kind,r.data,r.role,r.node_id,r.task_id,t.prompt,t.status,r.matched_events
          FROM ranked r JOIN agent_tasks t ON t.id=r.task_id WHERE r.rank=1
          ORDER BY t.updated_at DESC,t.id DESC LIMIT ?8 OFFSET ?9"
-    }else{
+    } else {
         " SELECT seq,timestamp,kind,data,role,node_id,task_id,NULL,NULL,NULL FROM filtered
           ORDER BY seq DESC LIMIT ?8 OFFSET ?9"
     };
-    let mut stmt=conn.prepare(&format!("{base}{select}"))?;
-    let rows=stmt.query_map(params![if project{None}else{Some(target)},role,query,node,turn,exact,before,
-        (limit+1) as i64,if project{project_offset}else{0},after,request,args["include_context"]==true],|row|Ok((
-        row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,
-        row.get::<_,String>(4)?,row.get::<_,Option<String>>(5)?,row.get::<_,String>(6)?,
-        row.get::<_,Option<String>>(7)?,row.get::<_,Option<String>>(8)?,row.get::<_,Option<i64>>(9)?
-    )))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let more=rows.len()>limit;let mut records=Vec::new();let mut remaining=max_chars;
+    let mut stmt = conn.prepare(&format!("{base}{select}"))?;
+    let rows = stmt
+        .query_map(
+            params![
+                if project { None } else { Some(target) },
+                role,
+                query,
+                node,
+                turn,
+                exact,
+                before,
+                (limit + 1) as i64,
+                if project { project_offset } else { 0 },
+                after,
+                request,
+                args["include_context"] == true
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = rows.len() > limit;
+    let mut records = Vec::new();
+    let mut remaining = max_chars;
     // Allocate the shared excerpt budget across the selected records so an
     // oversized newest result cannot silently hide all the other matches.
-    let per_record=(max_chars/rows.len().min(limit).max(1)).max(1);
-    for (seq,time,kind,raw,actor,node_id,record_task,prompt,status,matched_events) in rows.into_iter().take(limit) {
-        let mut data:Value=serde_json::from_str(&raw)?;
-        if kind=="debug/context_request" {
-            data["request_context"]=if let Some(id)=data["id"].as_i64() {
+    let per_record = (max_chars / rows.len().min(limit).max(1)).max(1);
+    for (seq, time, kind, raw, actor, node_id, record_task, prompt, status, matched_events) in
+        rows.into_iter().take(limit)
+    {
+        let mut data: Value = serde_json::from_str(&raw)?;
+        saved_history_payload(&kind, &data)?;
+        if kind == "debug/context_request" {
+            data["request_context"] = if let Some(id) = data["id"].as_i64() {
                 crate::request_context::saved_context(&conn,&record_task,id)?
                     .unwrap_or_else(||json!({"record_kind":"model_input","unavailable":true,"reason":"This older request body was not retained."}))
-            }else{json!({"record_kind":"model_input","unavailable":true})};
+            } else {
+                json!({"record_kind":"model_input","unavailable":true})
+            };
         }
-        let paths:&[&str]=if args["include_event"]==true {&[""]}else{match kind.as_str() {
-            "user/message"|"assistant/message"|"visual/input_result"=>&["/message/content"],
-            "worker/yield"=>&["/output/original_return","/output/worker_return","/output"],
-            "observer/node_review"=>&["/result/original_message","/result/observer_return","/result"],
-            "tool/result"=>&["/meta/result","/message/content"],
-            "organizer/decision"=>&["/decision"],"debug/context_request"=>&["/request_context"],_=>&[""]
-        }};
-        let (payload,pointer)=paths.iter().find_map(|pointer|data.pointer(pointer).filter(|value|!value.is_null())
-            .map(|value|(value,*pointer))).unwrap_or((&data,""));
-        let text=if let Some(text)=payload.as_str(){text.to_owned()}else{payload.to_string()};
-        let record_offset=if args["char_offset"].is_null()&&!query.is_empty() {
-            text.to_lowercase().find(&query).map(|index|text.to_lowercase()[..index].chars().count().saturating_sub(120)).unwrap_or(offset)
-        } else {offset};
-        let total=text.chars().count();let slice=text.chars().skip(record_offset).take(per_record.min(remaining)).collect::<String>();
-        let returned=slice.chars().count();remaining=remaining.saturating_sub(returned);
-        let next=record_offset.saturating_add(returned);
-        let mut record=json!({"task_id":record_task,"seq":seq,"sampled_at":chrono::DateTime::from_timestamp_millis(time).map(|date|date.to_rfc3339()),
+        let (payload, pointer) = if kind == "tool/result" && args["include_event"] != true {
+            (saved_history_payload(&kind, &data)?, "/meta/result")
+        } else {
+            let paths: &[&str] = if args["include_event"] == true {
+                &[""]
+            } else {
+                match kind.as_str() {
+                    "user/message" | "assistant/message" | "visual/input_result" => {
+                        &["/message/content"]
+                    }
+                    "organizer/context_note" | "organizer/continuation_plan" => & ["/message/content"],
+                    "worker/yield" => &[
+                        "/output/original_return",
+                        "/output/worker_return",
+                        "/output",
+                    ],
+                    "observer/node_review" => &[
+                        "/result/original_message",
+                        "/result/observer_return",
+                        "/result",
+                    ],
+                    "tool/result" => &["/meta/result"],
+                    "organizer/decision" => &["/decision"],
+                    "debug/context_request" => &["/request_context"],
+                    _ => &[""],
+                }
+            };
+            let (payload, pointer) = paths
+                .iter()
+                .find_map(|pointer| {
+                    data.pointer(pointer)
+                        .filter(|value| !value.is_null())
+                        .map(|value| (value, *pointer))
+                })
+                .unwrap_or((&data, ""));
+            (payload, pointer)
+        };
+        let text = if let Some(text) = payload.as_str() {
+            text.to_owned()
+        } else {
+            payload.to_string()
+        };
+        let record_offset = if args["char_offset"].is_null() && !query.is_empty() {
+            text.to_lowercase()
+                .find(&query)
+                .map(|index| {
+                    text.to_lowercase()[..index]
+                        .chars()
+                        .count()
+                        .saturating_sub(120)
+                })
+                .unwrap_or(offset)
+        } else {
+            offset
+        };
+        let total = text.chars().count();
+        let slice = text
+            .chars()
+            .skip(record_offset)
+            .take(per_record.min(remaining))
+            .collect::<String>();
+        let returned = slice.chars().count();
+        remaining = remaining.saturating_sub(returned);
+        let next = record_offset.saturating_add(returned);
+        let mut record = json!({"task_id":record_task,"seq":seq,"sampled_at":chrono::DateTime::from_timestamp_millis(time).map(|date|date.to_rfc3339()),
             "role":actor,"kind":kind,"node_id":node_id,"turn":data["turn"],"source":source_metadata(&source_record(&record_task,seq,time,&kind,&data)),"payload_path":pointer,
             "content":slice,"content_format":if payload.is_string(){"text"}else{"json"},
             "total_chars":total,"char_offset":record_offset,"returned_chars":returned,"omitted_chars":total.saturating_sub(returned),
             "next_char_offset":if next<total{Some(next)}else{None},
             "read_reference":{"scope":"conversation","task_id":record_task,"event_seq":seq,"include_event":args["include_event"]==true},
             "next_read":if next<total{json!({"task_id":record_task,"event_seq":seq,"char_offset":next,"include_event":args["include_event"]==true})}else{Value::Null}});
-        if let Some(images)=image_message(&data["message"]) {
-            record["image_message"]=images;record["source_identity"]=data["identity"].clone();
+        if let Some(images) = image_message(&data["message"]) {
+            record["image_message"] = images;
+            record["source_identity"] = data["identity"].clone();
         }
         if project {
-            record["conversation"]=json!({"prompt_excerpt":prompt.unwrap_or_default().chars().take(320).collect::<String>(),
+            record["conversation"] = json!({"prompt_excerpt":prompt.unwrap_or_default().chars().take(320).collect::<String>(),
                 "status":status,"matched_events":matched_events});
         }
         records.push(record);
     }
-    let next_before=if more&&!project {records.last().and_then(|record|record["seq"].as_i64())}else{None};
-    if !project {records.reverse();}
-    let next_search=if project&&more {
+    let next_before = if more && !project {
+        records.last().and_then(|record| record["seq"].as_i64())
+    } else {
+        None
+    };
+    if !project {
+        records.reverse();
+    }
+    let next_search = if project && more {
         json!({"scope":"project","query":args["query"],"role":role,"node_id":args["node_id"],"turn":turn,
                 "project_offset":project_offset+limit as i64,"limit":limit,"max_chars":max_chars,"include_event":args["include_event"]==true,"include_context":args["include_context"]==true})
-    }else{Value::Null};
-    Ok(json!({"records":records,"has_more":more,"next_before_seq":next_before,"next_search":next_search,
+    } else {
+        Value::Null
+    };
+    Ok(
+        json!({"records":records,"has_more":more,"next_before_seq":next_before,"next_search":next_search,
         "scope":scope,"task_id":if project{None}else{Some(target)},
         "history_note":"Saved records in this workspace, not assertions about present resource availability. Project search returns the latest matching event per conversation, ordered by conversation update time; use read_reference to read that event or task_id with query/before_seq to read other records. Conversation records are chronological. Excerpts preserve original content; event_seq/char_offset retrieve omitted text. Project pagination can shift if conversations change during a search.",
-        "returned_chars":max_chars-remaining,"max_chars":max_chars}))
+        "returned_chars":max_chars-remaining,"max_chars":max_chars}),
+    )
 }
 
 /// Observer speaks to Organizer in its original words. Inbox disposition,
 /// normalized recommendations and history references are internal metadata.
-pub fn observer_message(item:&Value) -> Value {
-    if item["original_message"].is_object() {return item["original_message"].clone();}
-    let original=item.get("observer_return").filter(|value|!value.is_null()).unwrap_or(item);
+pub fn observer_message(item: &Value) -> Value {
+    if item["original_message"].is_object() {
+        return item["original_message"].clone();
+    }
+    let original = item
+        .get("observer_return")
+        .filter(|value| !value.is_null())
+        .unwrap_or(item);
     json!({"role":"assistant","content":plain_context(original)})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn source_header(message:&Value)->Value {
-        let text=message["content"].as_str().unwrap();
-        serde_json::from_str(text.split_once("\n\n").unwrap().0.strip_prefix("Source: ").unwrap()).unwrap()
+    fn source_header(message: &Value) -> Value {
+        message["source"].clone()
     }
 
     #[test]
     fn paged_history_keeps_original_order_slices_and_native_tool_protocol() {
-        let source=|task:&str,seq:i64|json!({"seq":seq,"time":seq*100,"actor":"worker",
-            "history_reference":{"task_id":task,"event_seq":seq}});
-        let excerpt=|task:&str,seq:i64,offset:u64,text:&str|json!({"seq":seq,"char_offset":offset,
-            "content":text,"returned_chars":text.chars().count(),"source":source(task,seq)});
-        let lookup=|id:&str,records:Value|json!({"role":"tool","tool_call_id":id,
-            "content":json!({"scope":"conversation","records":records}).to_string()});
-        let command=with_source(raw_message("organizer",&json!("current assignment")),&source("a",100));
-        let calls=json!({"role":"assistant","tool_calls":[{"id":"read","type":"function",
+        let source = |task: &str, seq: i64| {
+            json!({"seq":seq,"time":seq*100,"actor":"worker",
+            "history_reference":{"task_id":task,"event_seq":seq}})
+        };
+        let excerpt = |task: &str, seq: i64, offset: u64, text: &str| {
+            json!({"seq":seq,"char_offset":offset,
+            "content":text,"returned_chars":text.chars().count(),"source":source(task,seq)})
+        };
+        let lookup = |id: &str, records: Value| {
+            json!({"role":"tool","tool_call_id":id,
+            "content":json!({"scope":"conversation","records":records}).to_string()})
+        };
+        let command = with_source(
+            raw_message("organizer", &json!("current assignment")),
+            &source("a", 100),
+        );
+        let calls = json!({"role":"assistant","tool_calls":[{"id":"read","type":"function",
             "function":{"name":"read_session_history","arguments":"{}"}}]});
-        let receipt=lookup("read",json!([excerpt("a",7,40," second slice \n"),excerpt("a",3,0," earlier \n")]));
-        let stored_receipt=receipt.clone();
-        let mut messages=vec![json!({"role":"system","content":"instructions"}),command.clone(),
-            with_source(raw_message("worker_return",&json!("later return")),&source("a",9)),calls.clone(),receipt,
-            with_source(raw_message("worker_return",&json!("other conversation")),&source("b",1)),
-            lookup("page-2",json!([excerpt("a",7,0," first slice \n"),excerpt("b",0,0,"other earlier")]))];
+        let receipt = lookup(
+            "read",
+            json!([
+                excerpt("a", 7, 40, " second slice \n"),
+                excerpt("a", 3, 0, " earlier \n")
+            ]),
+        );
+        let stored_receipt = receipt.clone();
+        let mut messages = vec![
+            json!({"role":"system","content":"instructions"}),
+            command.clone(),
+            with_source(
+                raw_message("worker_return", &json!("later return")),
+                &source("a", 9),
+            ),
+            calls.clone(),
+            receipt,
+            with_source(
+                raw_message("worker_return", &json!("other conversation")),
+                &source("b", 1),
+            ),
+            lookup(
+                "page-2",
+                json!([
+                    excerpt("a", 7, 0, " first slice \n"),
+                    excerpt("b", 0, 0, "other earlier")
+                ]),
+            ),
+        ];
         order_context_messages(&mut messages);
-        assert_eq!(messages[0]["content"],"instructions");assert_eq!(messages[1],command);
-        assert_eq!(messages[3],calls);assert_eq!(messages[4]["tool_call_id"],"read");
-        assert!(!messages[4]["content"].as_str().unwrap().contains("second slice"));
-        assert!(stored_receipt["content"].as_str().unwrap().contains("second slice"),"saved lookup is intact");
-        let positions=messages.iter().filter_map(source_position).collect::<Vec<_>>();
-        assert_eq!(positions,vec![("a".into(),3,0),("a".into(),7,0),("a".into(),7,40),("a".into(),9,0),("b".into(),0,0),("b".into(),1,0)]);
-        let slices=messages.iter().filter(|message|message["name"]=="retrieved_history")
-            .map(|message|original_text(message["content"].as_str().unwrap())).collect::<Vec<_>>();
-        assert_eq!(slices,vec![" earlier \n"," first slice \n"," second slice \n","other earlier"]);
-        let ordered=messages.clone();order_context_messages(&mut messages);assert_eq!(messages,ordered);
+        assert_eq!(messages[0]["content"], "instructions");
+        assert_eq!(messages[1], command);
+        assert_eq!(messages[3], calls);
+        assert_eq!(messages[4]["tool_call_id"], "read");
+        assert!(
+            !messages[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("second slice")
+        );
+        assert!(
+            stored_receipt["content"]
+                .as_str()
+                .unwrap()
+                .contains("second slice"),
+            "saved lookup is intact"
+        );
+        let positions = messages
+            .iter()
+            .filter_map(source_position)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            vec![
+                ("a".into(), 3, 0),
+                ("a".into(), 7, 0),
+                ("a".into(), 7, 40),
+                ("a".into(), 9, 0),
+                ("b".into(), 0, 0),
+                ("b".into(), 1, 0)
+            ]
+        );
+        let slices = messages
+            .iter()
+            .filter(|message| message["name"] == "retrieved_history")
+            .map(|message| original_text(message["content"].as_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slices,
+            vec![
+                " earlier \n",
+                " first slice \n",
+                " second slice \n",
+                "other earlier"
+            ]
+        );
+        let ordered = messages.clone();
+        order_context_messages(&mut messages);
+        assert_eq!(messages, ordered);
     }
 
     #[tokio::test]
     async fn retrieved_images_keep_their_original_source_after_organizer_and_observer_replay() {
-        let root=std::env::temp_dir().join(format!("retrieved-image-source-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "retrieved-image-source-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','check','fake','completed',0,0)",[]).unwrap();
-        let source=json!({"seq":3,"time":300,"kind":"visual/input_result","actor":"worker",
+        let source = json!({"seq":3,"time":300,"kind":"visual/input_result","actor":"worker",
             "identity":{"task_id":"task","request_id":1,"work_id":"completed"},
             "history_reference":{"task_id":"task","event_seq":3}});
-        let image=json!({"role":"system","content":[{"type":"image_ref","artifact_id":"original-image"}]});
-        let result=json!({"scope":"conversation","records":[{"seq":3,"content":"original image delivery",
+        let image = json!({"role":"system","content":[{"type":"image_ref","artifact_id":"original-image"}]});
+        let result = json!({"scope":"conversation","records":[{"seq":3,"content":"original image delivery",
             "source":source,"source_identity":source["identity"],"image_message":image}]});
-        for (seq,kind,data) in [(10,"tool/result",json!({"turn":1,"meta":{"result":result}})),
-            (11,"organizer/result_read",json!({"turn":1,"result":{"request":{"action":"read_session_history"},"result":result}}))] {
+        for (seq, kind, data) in [
+            (
+                9,
+                "assistant/message",
+                json!({"turn":1,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"read-history","type":"function","function":{"name":"read_session_history","arguments":"{}"}}]}}),
+            ),
+            (
+                10,
+                "tool/call",
+                json!({"turn":1,"callId":"read-history","name":"read_session_history","arguments":"{}"}),
+            ),
+            (
+                11,
+                "tool/result",
+                json!({"turn":1,"message":{"toolCallId":"read-history"},"meta":{"result":result}}),
+            ),
+            (
+                12,
+                "organizer/result_read",
+                json!({"turn":1,"result":{"request":{"action":"read_session_history"},"result":result}}),
+            ),
+        ] {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?1,?2,?3)",params![seq,kind,data.to_string()]).unwrap();
         }
         drop(conn);
-        let process=task_process(&root,"task",1).await.unwrap();
-        let organizer=organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap();
-        for mut messages in [process_messages(&process),organizer] {
+        let process = task_process(&root, "task", 1).await.unwrap();
+        let organizer = organizer_messages(&root, "task", &json!({"process":{"request_id":1}}))
+            .await
+            .unwrap();
+        for mut messages in [process_messages(&process).unwrap(), organizer] {
             order_context_messages(&mut messages);
-            let images=messages.iter().filter(|message|message["content"].as_array().is_some()).collect::<Vec<_>>();
+            let images = messages
+                .iter()
+                .filter(|message| message["content"].as_array().is_some())
+                .collect::<Vec<_>>();
             assert!(!images.is_empty());
             for message in images {
-                let blocks=message["content"].as_array().unwrap();
-                assert_eq!(blocks.len(),2,"one original source header and one unmodified image");
-                assert_eq!(blocks[0]["text"],format!("Source: {source}"));
-                assert_eq!(blocks[1],image["content"][0]);
-                assert_eq!(source_position(message),Some(("task".into(),3,0)));
+                let blocks = message["content"].as_array().unwrap();
+                assert_eq!(blocks.len(), 1, "one unmodified image block");
+                assert_eq!(blocks[0], image["content"][0]);
+                assert_eq!(message["source"], source);
+                assert_eq!(source_position(message), Some(("task".into(), 3, 0)));
             }
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -655,258 +1576,534 @@ mod tests {
 
     #[tokio::test]
     async fn all_receivers_keep_original_body_actor_order_call_failure_and_review_status() {
-        let root=std::env::temp_dir().join(format!("source-complete-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "source-complete-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','check','fake','completed',0,0)",[]).unwrap();
-        let identity=json!({"task_id":"task","request_id":1,"work_id":"upload","node_id":"upload","revision":2});
-        let original=" \n模型不支持视觉，完整失败原因。".repeat(1200)+"\n原始结尾 ";
-        let result=json!({"reason":original,"nested":{"untouched":[1,true,null]}});
-        let entries=vec![
-            ("tool/call",json!({"turn":2,"step":3,"actor":"worker","identity":identity,"callId":"read1","name":"view_image","arguments":"{}"})),
-            ("tool/result",json!({"turn":2,"step":3,"actor":"worker","identity":identity,"message":{"toolCallId":"read1","isError":true},"meta":{"result":result}})),
-            ("observer/advice_delivered",json!({"turn":2,"advice":{"id":"legacy","identity":identity,"review_status":"failed","observer_return":{"summary":original}}})),
-            ("assistant/message",json!({"turn":2,"actor":"organizer","message":{"content":"最终说明"}})),
+        let identity = json!({"task_id":"task","request_id":1,"work_id":"upload","node_id":"upload","revision":2});
+        let original = " \n模型不支持视觉，完整失败原因。".repeat(1200) + "\n原始结尾 ";
+        let result = json!({"reason":original,"nested":{"untouched":[1,true,null]}});
+        let entries = vec![
+            (
+                "assistant/message",
+                json!({"turn":2,"actor":"worker","identity":identity,"message":{"role":"assistant","content":[{"type":"tool-call","id":"read1","name":"view_image","arguments":"{}"}]}}),
+            ),
+            (
+                "tool/call",
+                json!({"turn":2,"step":3,"actor":"worker","identity":identity,"callId":"read1","name":"view_image","arguments":"{}"}),
+            ),
+            (
+                "tool/result",
+                json!({"turn":2,"step":3,"actor":"worker","identity":identity,"message":{"toolCallId":"read1","isError":true},"meta":{"result":result}}),
+            ),
+            (
+                "observer/advice_delivered",
+                json!({"turn":2,"advice":{"id":"legacy","identity":identity,"review_status":"failed","observer_return":{"summary":original}}}),
+            ),
+            (
+                "assistant/message",
+                json!({"turn":2,"actor":"organizer","message":{"content":"最终说明"}}),
+            ),
         ];
-        for (seq,(kind,data)) in entries.iter().enumerate() {
+        for (seq, (kind, data)) in entries.iter().enumerate() {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?2,?3,?4)",params![seq,1000+seq,kind,data.to_string()]).unwrap();
         }
         drop(conn);
-        let process=task_process(&root,"task",1).await.unwrap();
-        let messages=process_messages(&process);
-        let organizer=organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap();
-        let complete=organizer_view(&root,"task",&json!({"process":{"request_id":1}}),true).await.unwrap().messages;
-        let history=read(&root,"task",&json!({"limit":12,"max_chars":12000})).await.unwrap();
-        for (record,message) in process["records"].as_array().unwrap().iter().zip(&messages) {
-            let seq=record["seq"].as_i64().unwrap();
-            let source=source_header(message);
-            assert_eq!(source,source_metadata(record));
-            let forwarded=complete.iter().find(|message|message["content"].as_str().is_some_and(|text|text.starts_with("Source: ")) && source_header(message)["seq"]==seq).unwrap();
-            assert_eq!(source_header(forwarded),source);
-            assert_eq!(history["records"].as_array().unwrap().iter().find(|item|item["seq"]==seq).unwrap()["source"],source);
+        let process = task_process(&root, "task", 1).await.unwrap();
+        let messages = process_messages(&process).unwrap();
+        let organizer = organizer_messages(&root, "task", &json!({"process":{"request_id":1}}))
+            .await
+            .unwrap();
+        let complete = organizer_view(&root, "task", &json!({"process":{"request_id":1}}), true)
+            .await
+            .unwrap()
+            .messages;
+        let history = read(&root, "task", &json!({"limit":12,"max_chars":12000}))
+            .await
+            .unwrap();
+        for record in process["records"].as_array().unwrap() {
+            let seq = record["seq"].as_i64().unwrap();
+            if record["kind"] == "tool/call" {
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| message["source"]["seq"] == seq)
+                );
+                continue;
+            }
+            let message = messages
+                .iter()
+                .find(|message| message["source"]["seq"] == seq)
+                .unwrap();
+            let source = source_header(message);
+            assert_eq!(source, source_metadata(record));
+            let forwarded = complete
+                .iter()
+                .find(|message| message["source"]["seq"] == seq)
+                .unwrap();
+            assert_eq!(source_header(forwarded), source);
+            assert_eq!(
+                history["records"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["seq"] == seq)
+                    .unwrap()["source"],
+                source
+            );
         }
-        assert!(!organizer.iter().any(|message|matches!(message["name"].as_str(),Some("worker_tool_call"|"worker_tool_result"))));
-        let failure=&messages[1];
-        assert_eq!(source_header(failure)["identity"],identity);
-        assert_eq!(source_header(failure)["actor"],"worker");
-        assert_eq!(source_header(failure)["turn"],2);
-        assert_eq!(source_header(failure)["call_id"],"read1");
-        assert_eq!(source_header(failure)["is_error"],true);
-        assert_eq!(serde_json::from_str::<Value>(original_text(failure["content"].as_str().unwrap())).unwrap(),result);
-        let native=sourced_tool_result(&root,"task",json!({"role":"tool","tool_call_id":"read1","content":result.to_string()}),"read1").await.unwrap();
-        assert_eq!(source_header(&native),source_header(failure));
-        assert_eq!(native["tool_call_id"],"read1");
-        assert_eq!(source_header(&messages[2])["review_status"],"failed");
-        assert_eq!(source_header(&messages[3])["actor"],"organizer");
-        let organizer_only=read(&root,"task",&json!({"role":"organizer"})).await.unwrap();
-        assert_eq!(organizer_only["records"][0]["content"],"最终说明");
+        assert!(
+            organizer
+                .iter()
+                .any(|message| message["role"] == "assistant"
+                    && message["tool_calls"][0]["id"] == "read1")
+        );
+        let failure = &messages[1];
+        assert_eq!(source_header(failure)["identity"], identity);
+        assert_eq!(source_header(failure)["actor"], "worker");
+        assert_eq!(source_header(failure)["turn"], 2);
+        assert_eq!(source_header(failure)["call_id"], "read1");
+        assert_eq!(source_header(failure)["is_error"], true);
+        assert_eq!(
+            serde_json::from_str::<Value>(original_text(failure["content"].as_str().unwrap()))
+                .unwrap(),
+            result
+        );
+        let native = sourced_tool_result(
+            &root,
+            "task",
+            json!({"role":"tool","tool_call_id":"read1","content":result.to_string()}),
+            "read1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(source_header(&native), source_header(failure));
+        assert_eq!(native["tool_call_id"], "read1");
+        assert_eq!(source_header(&messages[2])["review_status"], "failed");
+        assert_eq!(source_header(&messages[3])["actor"], "organizer");
+        let organizer_only = read(&root, "task", &json!({"role":"organizer"}))
+            .await
+            .unwrap();
+        assert_eq!(organizer_only["records"][0]["content"], "最终说明");
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn identical_upstream_returns_keep_their_actual_sender_work() {
-        let root=std::env::temp_dir().join(format!("handoff-source-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "handoff-source-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();
-        for (seq,id) in [(1,"first"),(2,"second")] {
+        for (seq, id) in [(1, "first"), (2, "second")] {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,0,'worker/yield',?2)",
                 params![seq,json!({"turn":1,"actor":"worker","workId":id,"output":{"id":id,"original_return":" SAME RETURN "}}).to_string()]).unwrap();
         }
         drop(conn);
-        for (seq,id) in [(1,"first"),(2,"second")] {
-            let message=handoff_message(&root,"task",&format!("worker_return_{id}"),&json!(" SAME RETURN ")).await.unwrap();
-            assert_eq!(source_header(&message)["seq"],seq);assert_eq!(source_header(&message)["work_id"],id);
-            assert_eq!(original_text(message["content"].as_str().unwrap())," SAME RETURN ");
+        for (seq, id) in [(1, "first"), (2, "second")] {
+            let message = handoff_message(
+                &root,
+                "task",
+                &format!("worker_return_{id}"),
+                &json!(" SAME RETURN "),
+            )
+            .await
+            .unwrap();
+            assert_eq!(source_header(&message)["seq"], seq);
+            assert_eq!(source_header(&message)["work_id"], id);
+            assert_eq!(
+                original_text(message["content"].as_str().unwrap()),
+                " SAME RETURN "
+            );
         }
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn provider_preparation_keeps_visible_provenance_and_typed_images() {
-        let root=std::env::temp_dir().join(format!("wire-source-complete-{}",crate::visual_artifacts::new_id()));
+    async fn provider_preparation_keeps_original_body_and_typed_images() {
+        let root = std::env::temp_dir().join(format!(
+            "wire-source-complete-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let state=crate::agent_service::tests::flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
-        let identity=json!({"task_id":"task","request_id":1,"work_id":"old"});
-        let original=json!({"content":[{"type":"text","text":" 原始文字 "},{"type":"image_url","image_url":{"url":"data:image/png;base64,EXACT_IMAGE"}}]});
-        let record=json!({"seq":3,"actor":"worker","identity":identity,"turn":1,"kind":"visual/input_result","payload":original});
-        let message=with_source(routed_message("user","worker",&original,&identity),&record);
-        let mut body=json!({"messages":[message]});
-        let context=crate::visual_artifacts::VisualContext{identity:json!({"task_id":"task","request_id":2}),..Default::default()};
-        crate::visual_artifacts::prepare_request(&state,"observer","fake",&context,&[],"review",&mut body).await.unwrap();
+        let state =
+            crate::agent_service::tests::flow_test_state(&root, "127.0.0.1:9".parse().unwrap());
+        let identity = json!({"task_id":"task","request_id":1,"work_id":"old"});
+        let original = json!({"content":[{"type":"text","text":" 原始文字 "},{"type":"image_url","image_url":{"url":"data:image/png;base64,EXACT_IMAGE"}}]});
+        let record = json!({"seq":3,"actor":"worker","identity":identity,"turn":1,"kind":"visual/input_result","payload":original});
+        let message = with_source(
+            routed_message("user", "worker", &original, &identity),
+            &record,
+        );
+        let mut body = json!({"messages":[message]});
+        let context = crate::visual_artifacts::VisualContext {
+            identity: json!({"task_id":"task","request_id":2}),
+            ..Default::default()
+        };
+        crate::visual_artifacts::prepare_request(
+            &state,
+            "observer",
+            "fake",
+            &context,
+            &[],
+            "review",
+            &mut body,
+        )
+        .await
+        .unwrap();
         assert!(body["messages"][0].get("source_identity").is_none());
-        let blocks=body["messages"][0]["content"].as_array().unwrap();
-        let source:Value=serde_json::from_str(blocks[0]["text"].as_str().unwrap().strip_prefix("Source: ").unwrap()).unwrap();
-        assert_eq!(source["identity"],identity);
-        assert_eq!(source["actor"],"worker");
-        assert_eq!(&blocks[1..],original["content"].as_array().unwrap());
+        assert_eq!(body["messages"][0]["source"]["identity"], identity);
+        assert_eq!(body["messages"][0]["content"], original["content"]);
+        crate::context_window::prepare(&mut body, 0).unwrap();
+        assert!(body["messages"][0].get("source").is_none());
+        assert_eq!(body["messages"][0]["content"], original["content"]);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn organizer_replays_original_calls_returns_failures_and_review_status_once() {
-        let root=std::env::temp_dir().join(format!("original-role-messages-{}",crate::visual_artifacts::new_id()));
+    async fn organizer_reports_a_missing_historical_tool_return_instead_of_fabricating_one() {
+        let root = std::env::temp_dir().join(format!(
+            "original-role-messages-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','load','fake','running',0,0)",[]).unwrap();
-        let call=json!({"role":"assistant","content":null,"tool_calls":[{"id":"assign","function":{"name":"schedule_task","arguments":"{\"goal\":\"load\",\"extra\":\"ORIGINAL_ARGUMENT\"}"}}]});
-        let worker=json!({"summary":"Loaded once","extra":{"receipt":"ONE_UPLOAD"},"limitations":[format!("{} WORKER_TAIL","failure detail ".repeat(1200))]});
-        let observer=json!({"summary":format!("{} OBSERVER_TAIL","review detail ".repeat(1200)),"diagnostic":{"reason":"model lacks image input"}});
-        let entries=vec![
-            ("user/message",json!({"turn":1,"message":{"content":"ORIGINAL_GOAL"}})),
-            ("organizer/method_message",json!({"turn":1,"step":1,"message":call})),
-            ("organizer/decision",json!({"turn":1,"step":1,"decision":{"action":"work","reason":"NORMALIZED_COPY"}})),
-            ("organizer/assignment",json!({"turn":1,"step":1,"order":{"id":"upload","goal":"load"}})),
-            ("worker/yield",json!({"turn":1,"output":{"id":"upload","summary":"WRAPPER_COPY","worker_return":worker}})),
-            ("observer/advice_delivered",json!({"turn":1,"advice":{"identity":{"request_id":1},"review_status":"failed","observer_return":observer}})),
-            ("user/message",json!({"turn":2,"message":{"content":"LATEST_FOLLOWUP"}})),
-            ("organizer/request_error",json!({"turn":2,"failure":{"error":"Organizer request timed out","elapsed_ms":180000}})),
-            ("observer/advice_delivered",json!({"turn":1,"advice":{"identity":{"request_id":2},"summary":"UNRELATED_ADVICE"}})),
+        let call = json!({"role":"assistant","content":null,"tool_calls":[{"id":"assign","function":{"name":"schedule_task","arguments":"{\"goal\":\"load\",\"extra\":\"ORIGINAL_ARGUMENT\"}"}}]});
+        let worker = json!({"summary":"Loaded once","extra":{"receipt":"ONE_UPLOAD"},"limitations":[format!("{} WORKER_TAIL","failure detail ".repeat(1200))]});
+        let observer = json!({"summary":format!("{} OBSERVER_TAIL","review detail ".repeat(1200)),"diagnostic":{"reason":"model lacks image input"}});
+        let entries = vec![
+            (
+                "user/message",
+                json!({"turn":1,"message":{"content":"ORIGINAL_GOAL"}}),
+            ),
+            (
+                "organizer/method_message",
+                json!({"turn":1,"step":1,"message":call}),
+            ),
+            (
+                "organizer/decision",
+                json!({"turn":1,"step":1,"decision":{"action":"work","reason":"NORMALIZED_COPY"}}),
+            ),
+            (
+                "organizer/assignment",
+                json!({"turn":1,"step":1,"order":{"id":"upload","goal":"load"}}),
+            ),
+            (
+                "worker/yield",
+                json!({"turn":1,"output":{"id":"upload","summary":"WRAPPER_COPY","worker_return":worker}}),
+            ),
+            (
+                "observer/advice_delivered",
+                json!({"turn":1,"advice":{"identity":{"request_id":1},"review_status":"failed","observer_return":observer}}),
+            ),
+            (
+                "user/message",
+                json!({"turn":2,"message":{"content":"LATEST_FOLLOWUP"}}),
+            ),
+            (
+                "organizer/request_error",
+                json!({"turn":2,"failure":{"error":"Organizer request timed out","elapsed_ms":180000}}),
+            ),
+            (
+                "observer/advice_delivered",
+                json!({"turn":1,"advice":{"identity":{"request_id":2},"summary":"UNRELATED_ADVICE"}}),
+            ),
         ];
-        for (seq,(kind,data)) in entries.iter().enumerate() {
+        for (seq, (kind, data)) in entries.iter().enumerate() {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?1,?2,?3)",params![seq,kind,data.to_string()]).unwrap();
         }
         drop(conn);
-        let messages=organizer_messages(&root,"task",&json!({"human_request":"LATEST_FOLLOWUP","process":{"request_id":1}})).await.unwrap();
-        let text=messages.iter().filter_map(|message|message["content"].as_str()).collect::<Vec<_>>().join("\n");
-        assert_eq!(text.matches("\"name\":\"schedule_task\"").count(),1);
-        assert_eq!(text.matches("ONE_UPLOAD").count(),1);
-        assert_eq!(text.matches("ORIGINAL_GOAL").count(),1);
-        assert_eq!(text.matches("LATEST_FOLLOWUP").count(),1);
-        for marker in ["ORIGINAL_ARGUMENT","WORKER_TAIL","OBSERVER_TAIL","180000"] {assert!(text.contains(marker),"missing {marker}");}
-        for marker in ["NORMALIZED_COPY","WRAPPER_COPY","UNRELATED_ADVICE","Worker returned","Observer message","[review_status]"] {assert!(!text.contains(marker));}
-        assert!(text.find("ONE_UPLOAD")<text.find("OBSERVER_TAIL"));
-        let process=task_process(&root,"task",1).await.unwrap();
-        let review_text=process_messages(&process).iter().map(|message|message["content"].as_str().unwrap()).collect::<Vec<_>>().join("\n");
-        assert!(review_text.contains("Organizer request timed out"));
-        assert_eq!(review_text.matches("\"name\":\"schedule_task\"").count(),1);
+        let error = organizer_messages(
+            &root,
+            "task",
+            &json!({"human_request":"LATEST_FOLLOWUP","process":{"request_id":1}}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("assign") && error.contains("incomplete"),
+            "missing result must be reported with its call id: {error}"
+        );
+        let process = task_process(&root, "task", 1).await.unwrap();
+        let error = process_messages(&process).unwrap_err().to_string();
+        assert!(error.contains("assign") && error.contains("incomplete"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn one_observer_reply_is_forwarded_once_even_with_multiple_recommendations() {
-        let root=std::env::temp_dir().join(format!("original-advice-once-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "original-advice-once-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut conn=crate::agent_service::open_db(&root).unwrap();
+        let mut conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
-        let raw=" \n{ \"recommendations\": [{\"adjustment\":\"检查驾驶\"},{\"adjustment\":\"检查车况\"}] }\n ";
-        for (id,review) in [("one","review1"),("two","review1"),("three","review2")] {
-            let tx=conn.transaction().unwrap();
+        let raw = " \n{ \"recommendations\": [{\"adjustment\":\"检查驾驶\"},{\"adjustment\":\"检查车况\"}] }\n ";
+        for (id, review) in [("one", "review1"), ("two", "review1"), ("three", "review2")] {
+            let tx = conn.transaction().unwrap();
             crate::agent_service::append_event_tx(&tx,"task","observer/advice_delivered",&json!({"turn":1,
                 "advice":{"id":id,"review_id":review,"request_id":1,"original_message":{"role":"assistant","content":raw}}}),None).unwrap();
             tx.commit().unwrap();
         }
-        let messages=organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap();
-        let advice=messages.iter().filter(|message|message["name"].as_str().is_some_and(|name|name.starts_with("observer_"))).collect::<Vec<_>>();
-        assert_eq!(advice.len(),2,"one reply is not repeated for each extracted recommendation; distinct replies stay distinct");
-        for message in advice {assert_eq!(original_text(message["content"].as_str().unwrap()),raw);}
+        let messages = organizer_messages(&root, "task", &json!({"process":{"request_id":1}}))
+            .await
+            .unwrap();
+        let advice = messages
+            .iter()
+            .filter(|message| {
+                message["name"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("observer_"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            advice.len(),
+            3,
+            "each original reply retains its event identity"
+        );
+        for message in advice {
+            assert_eq!(original_text(message["content"].as_str().unwrap()), raw);
+        }
         drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn plain_context_preserves_full_parameters_results_and_error_flags() {
-        let content="失败信息\n[]\n原始尾部".repeat(3000);
-        let process=json!({"records":[{"seq":1,"kind":"tool/call","call_id":"upload","payload":{"name":"browser_upload","arguments":"{\"path\":\"demo.pptx\"}"}},
-            {"seq":2,"kind":"tool/result","call_id":"upload","is_error":true,"payload":{"reason":content,"extra":[1,2,3]}}]});
-        let messages=process_messages(&process);
-        assert_eq!(messages.iter().map(|message|&message["name"]).collect::<Vec<_>>(),vec![&json!("tool_call"),&json!("tool_result")],"source array order is retained without adding index labels");
-        assert!(messages[0]["content"].as_str().unwrap().contains("browser_upload"));
-        assert_eq!(serde_json::from_str::<Value>(original_text(messages[0]["content"].as_str().unwrap())).unwrap(),process["records"][0]["payload"]);
-        let result=messages[1]["content"].as_str().unwrap();
-        assert_eq!(serde_json::from_str::<Value>(original_text(result)).unwrap(),process["records"][1]["payload"]);
-        assert!(!result.contains("\"payload\""));
+        let content = "失败信息\n[]\n原始尾部".repeat(3000);
+        let process = json!({"records":[
+            {"seq":1,"kind":"assistant/message","payload":{"role":"assistant","content":null,"tool_calls":[{"id":"upload","type":"function","function":{"name":"browser_upload","arguments":"{\"path\":\"demo.pptx\"}"}}]}},
+            {"seq":2,"kind":"tool/call","call_id":"upload","payload":{"name":"browser_upload","arguments":"{\"path\":\"demo.pptx\"}"}},
+            {"seq":3,"kind":"tool/result","call_id":"upload","is_error":true,"payload":{"reason":content,"extra":[1,2,3]}}]});
+        let messages = process_messages(&process).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "upload");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "upload");
+        assert_eq!(
+            serde_json::from_str::<Value>(messages[1]["content"].as_str().unwrap()).unwrap(),
+            process["records"][2]["payload"]
+        );
     }
     #[tokio::test]
-    async fn final_task_process_preserves_failure_recovery_and_observer_messages_across_continuations() {
-        let root=std::env::temp_dir().join(format!("task-process-history-{}",crate::visual_artifacts::new_id()));
+    async fn final_task_process_preserves_failure_recovery_and_observer_messages_across_continuations()
+     {
+        let root = std::env::temp_dir().join(format!(
+            "task-process-history-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();
-        let long_failure=format!("{} ORIGINAL_FAILURE_TAIL","detail".repeat(1200));
-        let entries=vec![
-            ("user/message",json!({"turn":1,"message":{"content":"OLD_GOAL"}})),
-            ("user/message",json!({"turn":2,"message":{"content":"Open a visible browser"}})),
-            ("tool/call",json!({"turn":2,"callId":"open1","name":"browser_open","arguments":"{\"visible\":true}"})),
-            ("tool/result",json!({"turn":2,"message":{"toolCallId":"open1","isError":true},
-                "meta":{"result":{"ok":false,"error_code":"browser_visibility_locked","reason":long_failure}}})),
-            ("observer/node_review",json!({"turn":2,"identity":{"request_id":1},"status":"completed","result":{"observer_return":{"summary":"OLD_ADVICE"}}})),
-            ("observer/node_review",json!({"turn":2,"identity":{"request_id":2},"status":"failed",
-                "result":{"observer_return":{"summary":"Original Observer failure","reason":long_failure}}})),
-            ("tool/call",json!({"turn":3,"callId":"close1","name":"browser_close","arguments":"{}"})),
-            ("tool/result",json!({"turn":3,"message":{"toolCallId":"close1","isError":false},"meta":{"result":{"closed":true}}})),
-            ("tool/call",json!({"turn":3,"callId":"open2","name":"browser_open","arguments":"{\"visible\":true}"})),
-            ("tool/result",json!({"turn":3,"message":{"toolCallId":"open2","isError":false},"meta":{"result":{"ok":true,"display_mode":"visible_window"}}})),
-            ("worker/yield",json!({"turn":3,"output":{"summary":"Host wrapper","worker_return":{"summary":"Recovered and opened successfully"}}})),
+        let long_failure = format!("{} ORIGINAL_FAILURE_TAIL", "detail".repeat(1200));
+        let entries = vec![
+            (
+                "user/message",
+                json!({"turn":1,"message":{"content":"OLD_GOAL"}}),
+            ),
+            (
+                "user/message",
+                json!({"turn":2,"message":{"content":"Open a visible browser"}}),
+            ),
+            (
+                "assistant/message",
+                json!({"turn":2,"actor":"worker","message":{"role":"assistant","content":[{"type":"tool-call","id":"open1","name":"browser_open","arguments":"{\"visible\":true}"}]}}),
+            ),
+            (
+                "tool/call",
+                json!({"turn":2,"callId":"open1","name":"browser_open","arguments":"{\"visible\":true}"}),
+            ),
+            (
+                "tool/result",
+                json!({"turn":2,"message":{"toolCallId":"open1","isError":true},
+                "meta":{"result":{"ok":false,"error_code":"browser_visibility_locked","reason":long_failure}}}),
+            ),
+            (
+                "observer/node_review",
+                json!({"turn":2,"identity":{"request_id":1},"status":"completed","result":{"observer_return":{"summary":"OLD_ADVICE"}}}),
+            ),
+            (
+                "observer/node_review",
+                json!({"turn":2,"identity":{"request_id":2},"status":"failed",
+                "result":{"observer_return":{"summary":"Original Observer failure","reason":long_failure}}}),
+            ),
+            (
+                "assistant/message",
+                json!({"turn":3,"actor":"worker","message":{"role":"assistant","content":[{"type":"tool-call","id":"close1","name":"browser_close","arguments":"{}"}]}}),
+            ),
+            (
+                "tool/call",
+                json!({"turn":3,"callId":"close1","name":"browser_close","arguments":"{}"}),
+            ),
+            (
+                "tool/result",
+                json!({"turn":3,"message":{"toolCallId":"close1","isError":false},"meta":{"result":{"closed":true}}}),
+            ),
+            (
+                "assistant/message",
+                json!({"turn":3,"actor":"worker","message":{"role":"assistant","content":[{"type":"tool-call","id":"open2","name":"browser_open","arguments":"{\"visible\":true}"}]}}),
+            ),
+            (
+                "tool/call",
+                json!({"turn":3,"callId":"open2","name":"browser_open","arguments":"{\"visible\":true}"}),
+            ),
+            (
+                "tool/result",
+                json!({"turn":3,"message":{"toolCallId":"open2","isError":false},"meta":{"result":{"ok":true,"display_mode":"visible_window"}}}),
+            ),
+            (
+                "worker/yield",
+                json!({"turn":3,"output":{"summary":"Host wrapper","worker_return":{"summary":"Recovered and opened successfully"}}}),
+            ),
         ];
-        for (seq,(kind,data)) in entries.iter().enumerate() {
+        for (seq, (kind, data)) in entries.iter().enumerate() {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?1,?2,?3)",params![seq,kind,data.to_string()]).unwrap();
         }
         drop(conn);
-        let process=task_process(&root,"task",2).await.unwrap();let records=process["records"].as_array().unwrap();
-        assert_eq!(process["coverage"],"complete");assert_eq!(records.len(),9);
-        assert!(records.windows(2).all(|pair|pair[0]["seq"].as_u64()<pair[1]["seq"].as_u64()));
-        assert!(!process.to_string().contains("OLD_GOAL"));assert!(!process.to_string().contains("OLD_ADVICE"));
-        let failed=records.iter().find(|record|record["call_id"]=="open1" && record["kind"]=="tool/result").unwrap();
-        assert_eq!(failed["is_error"],true);assert_eq!(failed["payload"]["reason"],long_failure);
-        let observer=records.iter().find(|record|record["kind"]=="observer/node_review").unwrap();
-        assert_eq!(observer["review_status"],"failed");assert_eq!(observer["payload"]["reason"],long_failure);
-        assert_eq!(records[7]["payload"]["display_mode"],"visible_window");
-        let mut query=process["history_reference"].clone();query["limit"]=json!(12);
-        let read=read(&root,"task",&query).await.unwrap();
-        assert_eq!(read["records"].as_array().unwrap().first().unwrap()["seq"],1);
-        assert!(!read.to_string().contains("OLD_GOAL"));
-        assert!(!read.to_string().contains("OLD_ADVICE"));
+        let process = task_process(&root, "task", 2).await.unwrap();
+        let records = process["records"].as_array().unwrap();
+        assert_eq!(process["coverage"], "complete");
+        assert_eq!(records.len(), 14);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0]["seq"].as_u64() < pair[1]["seq"].as_u64())
+        );
+        assert!(process.to_string().contains("OLD_GOAL"));
+        assert!(process.to_string().contains("OLD_ADVICE"));
+        let failed = records
+            .iter()
+            .find(|record| record["call_id"] == "open1" && record["kind"] == "tool/result")
+            .unwrap();
+        assert_eq!(failed["is_error"], true);
+        assert_eq!(failed["payload"]["reason"], long_failure);
+        let observer = records
+            .iter()
+            .find(|record| {
+                record["kind"] == "observer/node_review" && record["review_status"] == "failed"
+            })
+            .unwrap();
+        assert_eq!(observer["review_status"], "failed");
+        assert_eq!(observer["payload"]["reason"], long_failure);
+        assert!(records.iter().any(|record| record["kind"] == "tool/result"
+            && record["payload"]["display_mode"] == "visible_window"));
+        let mut query = process["history_reference"].clone();
+        query["limit"] = json!(12);
+        let read = read(&root, "task", &query).await.unwrap();
+        assert_eq!(
+            read["records"].as_array().unwrap().first().unwrap()["seq"],
+            0
+        );
+        assert!(read.to_string().contains("OLD_GOAL"));
+        assert!(read.to_string().contains("OLD_ADVICE"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn legacy_progress_and_original_visual_delivery_are_shared_without_transport_copies() {
-        let root=std::env::temp_dir().join(format!("shared-delivery-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "shared-delivery-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();
-        let reason=format!("{} UNKNOWN_NO_FALLBACK_TAIL","完整能力限制 ".repeat(700));
-        let entries=vec![
-            ("worker/progress",json!({"turn":1,"purpose":"LEGACY_PROGRESS","extra":{"original":"PRESERVE_EXTRA"}})),
-            ("visual/input_result",json!({"turn":1,"actor":"worker","request_trace_id":"visual-1","message":{"role":"system","content":reason}})),
-            ("visual/model_received",json!({"turn":1,"manifest":{"request_trace_id":"visual-1","copy":"DUPLICATE_TELEMETRY"}})),
+        let reason = format!("{} UNKNOWN_NO_FALLBACK_TAIL", "完整能力限制 ".repeat(700));
+        let entries = vec![
+            (
+                "worker/progress",
+                json!({"turn":1,"purpose":"LEGACY_PROGRESS","extra":{"original":"PRESERVE_EXTRA"}}),
+            ),
+            (
+                "visual/input_result",
+                json!({"turn":1,"actor":"worker","request_trace_id":"visual-1","message":{"role":"system","content":reason}}),
+            ),
+            (
+                "visual/model_received",
+                json!({"turn":1,"manifest":{"request_trace_id":"visual-1","copy":"DUPLICATE_TELEMETRY"}}),
+            ),
         ];
-        for (seq,(kind,data)) in entries.iter().enumerate() {
+        for (seq, (kind, data)) in entries.iter().enumerate() {
             conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,?1,?2,?3)",params![seq,kind,data.to_string()]).unwrap();
         }
         drop(conn);
-        let process=task_process(&root,"task",1).await.unwrap();
-        assert_eq!(process["records"].as_array().unwrap().len(),2);
-        let observer=serde_json::to_string(&process_messages(&process)).unwrap();
-        let organizer=serde_json::to_string(&organizer_messages(&root,"task",&json!({"process":{"request_id":1}})).await.unwrap()).unwrap();
-        let history=read(&root,"task",&json!({"limit":12,"max_chars":12000})).await.unwrap().to_string();
-        for text in [&observer,&history] {
-            for marker in ["LEGACY_PROGRESS","PRESERVE_EXTRA","UNKNOWN_NO_FALLBACK_TAIL"] {assert!(text.contains(marker),"missing {marker}");}
-            assert!(!text.contains("DUPLICATE_TELEMETRY"));
+        let process = task_process(&root, "task", 1).await.unwrap();
+        assert_eq!(process["records"].as_array().unwrap().len(), 3);
+        let observer = serde_json::to_string(&process_messages(&process).unwrap()).unwrap();
+        let organizer = serde_json::to_string(
+            &organizer_messages(&root, "task", &json!({"process":{"request_id":1}}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let history = read(&root, "task", &json!({"limit":12,"max_chars":12000}))
+            .await
+            .unwrap()
+            .to_string();
+        for text in [&observer] {
+            for marker in [
+                "LEGACY_PROGRESS",
+                "PRESERVE_EXTRA",
+                "UNKNOWN_NO_FALLBACK_TAIL",
+            ] {
+                assert!(text.contains(marker), "missing {marker}");
+            }
         }
-        for marker in ["LEGACY_PROGRESS","PRESERVE_EXTRA","UNKNOWN_NO_FALLBACK_TAIL"] {assert!(!organizer.contains(marker));}
-        let exact=read(&root,"task",&json!({"event_seq":1,"max_chars":12000})).await.unwrap();
-        assert_eq!(exact["records"][0]["content"],reason);
+        assert!(history.contains("DUPLICATE_TELEMETRY"));
+        for marker in [
+            "LEGACY_PROGRESS",
+            "PRESERVE_EXTRA",
+            "UNKNOWN_NO_FALLBACK_TAIL",
+        ] {
+            assert!(organizer.contains(marker));
+        }
+        let exact = read(&root, "task", &json!({"event_seq":1,"max_chars":12000}))
+            .await
+            .unwrap();
+        assert_eq!(exact["records"][0]["content"], reason);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn observer_body_is_byte_exact_including_whitespace_and_host_fields_stay_out() {
-        let raw="  {\n  \"summary\": \"请检查驾驶\"\n}  ";
-        let message=json!({"role":"assistant","content":raw});
-        assert_eq!(observer_message(&json!({"original_message":message,"summary":"HOST_SUMMARY", "disposition":"accepted",
-            "observer_return":{"summary":"normalized"}})),message);
+        let raw = "  {\n  \"summary\": \"请检查驾驶\"\n}  ";
+        let message = json!({"role":"assistant","content":raw});
+        assert_eq!(
+            observer_message(
+                &json!({"original_message":message,"summary":"HOST_SUMMARY", "disposition":"accepted",
+            "observer_return":{"summary":"normalized"}})
+            ),
+            message
+        );
     }
 
     #[test]
     fn new_observer_failure_preserves_long_original_status_and_visual_metadata() {
-        let item=json!({"review_status":"failed","observer_return":{"summary":"详情".repeat(6000),
+        let item = json!({"review_status":"failed","observer_return":{"summary":"详情".repeat(6000),
             "limitations":["模型不支持视觉"]},"visual_request":{"request_trace_id":"request"},
             "identity":{"task_id":"task"}});
-        let sent=observer_message(&item);
-        assert_eq!(serde_json::from_str::<Value>(sent["content"].as_str().unwrap()).unwrap(),item["observer_return"]);
-        for key in ["review_status","visual_request","identity","history_reference"] {assert!(sent.get(key).is_none());}
+        let sent = observer_message(&item);
+        assert_eq!(
+            serde_json::from_str::<Value>(sent["content"].as_str().unwrap()).unwrap(),
+            item["observer_return"]
+        );
+        for key in [
+            "review_status",
+            "visual_request",
+            "identity",
+            "history_reference",
+        ] {
+            assert!(sent.get(key).is_none());
+        }
         assert!(sent.get("excerpt").is_none());
     }
 }

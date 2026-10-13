@@ -11,20 +11,33 @@ use swc_ecma_visit::{Visit, VisitWith};
 use crate::ts_index::*;
 
 pub(crate) fn build_index(root: &Path) -> Result<(usize, usize)> {
-    build_index_scope(root,None)
+    build_index_scope(root, None)
 }
 
-pub(crate) fn build_index_scope(root: &Path, changed_path: Option<&Path>) -> Result<(usize, usize)> {
-    build_index_scoped(root,changed_path,false)
+pub(crate) fn build_index_scope(
+    root: &Path,
+    changed_path: Option<&Path>,
+) -> Result<(usize, usize)> {
+    build_index_scoped(root, changed_path, false)
 }
 
-pub(crate) fn build_index_scoped(root: &Path, changed_path: Option<&Path>, directory: bool) -> Result<(usize, usize)> {
+pub(crate) fn build_index_scoped(
+    root: &Path,
+    changed_path: Option<&Path>,
+    directory: bool,
+) -> Result<(usize, usize)> {
     let refresh_lock = crate::symbol_index_state::lock(root, "ts");
     let _guard = refresh_lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut conn = crate::database::init_db(root)?;
-    let plan = match changed_path {Some(path) if directory=>crate::symbol_index_state::RefreshPlan::for_directory(root,"ts",&conn,path)?, Some(path)=>crate::symbol_index_state::RefreshPlan::for_file(root,"ts",&conn,path)?,None=>crate::symbol_index_state::RefreshPlan::new(root,"ts",&conn)?};
+    let plan = match changed_path {
+        Some(path) if directory => {
+            crate::symbol_index_state::RefreshPlan::for_directory(root, "ts", &conn, path)?
+        }
+        Some(path) => crate::symbol_index_state::RefreshPlan::for_file(root, "ts", &conn, path)?,
+        None => crate::symbol_index_state::RefreshPlan::new(root, "ts", &conn)?,
+    };
     if !plan.needs_update() {
         plan.record_check(&conn, root, "ts")?;
         return Ok(crate::symbol_index_state::counts(
@@ -883,6 +896,16 @@ pub(crate) fn expr_to_text(expr: &Expr) -> Option<String> {
     }
 }
 
-pub(crate) fn ensure_query_index(root: &Path, file: Option<&str>, directory: Option<&str>) -> Result<()> {
-    crate::symbol_index_state::ensure_query_index(root,"ts",file,directory,|path,is_directory|build_index_scoped(root,path,is_directory).map(|_|()))
+pub(crate) fn ensure_query_index(
+    root: &Path,
+    file: Option<&str>,
+    directory: Option<&str>,
+) -> Result<()> {
+    crate::symbol_index_state::ensure_query_index(
+        root,
+        "ts",
+        file,
+        directory,
+        |path, is_directory| build_index_scoped(root, path, is_directory).map(|_| ()),
+    )
 }

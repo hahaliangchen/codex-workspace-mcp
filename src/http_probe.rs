@@ -50,14 +50,20 @@ pub fn is_tool(name: &str) -> bool {
 
 pub fn check_key(args: &Value) -> String {
     let raw = args["url"].as_str().unwrap_or("").trim();
-    let normalized = raw.split_once('#').map(|(url, _)|url).unwrap_or(raw);
+    let normalized = raw.split_once('#').map(|(url, _)| url).unwrap_or(raw);
     format!("http-probe:{normalized}")
 }
 
 pub async fn execute(args: &Value) -> Result<Value> {
     let request: ProbeRequest = serde_json::from_value(args.clone())?;
     anyhow::ensure!(request.url.len() <= 4_096, "url must be at most 4096 bytes");
-    anyhow::ensure!(request.reason.as_ref().is_none_or(|reason| reason.chars().count() <= 300), "reason must be at most 300 characters");
+    anyhow::ensure!(
+        request
+            .reason
+            .as_ref()
+            .is_none_or(|reason| reason.chars().count() <= 300),
+        "reason must be at most 300 characters"
+    );
     let started = Instant::now();
     let sampled_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let timeout_ms = request.timeout_ms.clamp(100, MAX_TIMEOUT_MS);
@@ -91,8 +97,12 @@ pub async fn execute(args: &Value) -> Result<Value> {
         }),
     };
     value["check_key"] = json!(check_key(args));
-    value["check_passed"] = json!(value["reachable"] == true
-        && value["http_status"].as_u64().is_some_and(|status| (200..300).contains(&status)));
+    value["check_passed"] = json!(
+        value["reachable"] == true
+            && value["http_status"]
+                .as_u64()
+                .is_some_and(|status| (200..300).contains(&status))
+    );
     value["timeout_ms"] = json!(timeout_ms);
     value["reuse_window_ms"] = json!(REUSE_WINDOW_MS);
     if let Some(reason) = request.reason.filter(|reason| !reason.trim().is_empty()) {
@@ -101,7 +111,11 @@ pub async fn execute(args: &Value) -> Result<Value> {
     Ok(value)
 }
 
-async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::result::Result<ProbeResponse, ProbeFailure> {
+async fn probe_url(
+    url_text: &str,
+    timeout: Duration,
+    started: Instant,
+) -> std::result::Result<ProbeResponse, ProbeFailure> {
     let mut url = Url::parse(url_text).map_err(|error| ProbeFailure {
         kind: "invalid_url",
         message: format!("The URL could not be parsed: {error}"),
@@ -119,10 +133,13 @@ async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::
         });
     }
     url.set_fragment(None);
-    let host = url.host_str().ok_or_else(|| ProbeFailure {
-        kind: "invalid_url",
-        message: "The URL does not contain a host.".to_owned(),
-    })?.to_owned();
+    let host = url
+        .host_str()
+        .ok_or_else(|| ProbeFailure {
+            kind: "invalid_url",
+            message: "The URL does not contain a host.".to_owned(),
+        })?
+        .to_owned();
     let port = url.port_or_known_default().ok_or_else(|| ProbeFailure {
         kind: "invalid_url",
         message: "The URL does not specify a usable HTTP port.".to_owned(),
@@ -163,7 +180,9 @@ async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::
         if resolved.iter().any(|address| !address.ip().is_loopback()) {
             return Err(ProbeFailure {
                 kind: "non_local_address",
-                message: format!("The hostname '{host}' resolved to a non-loopback address; the request was blocked."),
+                message: format!(
+                    "The hostname '{host}' resolved to a non-loopback address; the request was blocked."
+                ),
             });
         }
         builder = builder.resolve_to_addrs(&host, &resolved);
@@ -183,14 +202,22 @@ async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::
         .map_err(|error| request_failure(&error))?;
     let status = response.status().as_u16();
     let redirect_target = if response.status().is_redirection() {
-        response.headers().get(reqwest::header::LOCATION)
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
             .and_then(|value| value.to_str().ok())
-            .map(|location| url.join(location).map(|target| target.to_string()).unwrap_or_else(|_| location.to_owned()))
+            .map(|location| {
+                url.join(location)
+                    .map(|target| target.to_string())
+                    .unwrap_or_else(|_| location.to_owned())
+            })
     } else {
         None
     };
     let content_length = response.content_length();
-    let textual = response.headers().get(reqwest::header::CONTENT_TYPE)
+    let textual = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_textual_content_type);
     let mut body = Vec::new();
@@ -198,14 +225,23 @@ async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::
     if textual {
         while body.len() < MAX_BODY_SUMMARY_BYTES {
             let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() { break; }
-            match tokio::time::timeout(remaining.min(Duration::from_millis(250)), response.chunk()).await {
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining.min(Duration::from_millis(250)), response.chunk())
+                .await
+            {
                 Ok(Ok(Some(chunk))) => {
                     let take = (MAX_BODY_SUMMARY_BYTES - body.len()).min(chunk.len());
                     body.extend_from_slice(&chunk[..take]);
-                    if take < chunk.len() { break; }
+                    if take < chunk.len() {
+                        break;
+                    }
                 }
-                Ok(Ok(None)) => { body_finished = true; break; }
+                Ok(Ok(None)) => {
+                    body_finished = true;
+                    break;
+                }
                 Ok(Err(_)) | Err(_) => break,
             }
         }
@@ -213,11 +249,21 @@ async fn probe_url(url_text: &str, timeout: Duration, started: Instant) -> std::
     let body_summary = (!body.is_empty()).then(|| String::from_utf8_lossy(&body).into_owned());
     let body_summary_truncated = body_summary.is_some()
         && (!body_finished || content_length.is_some_and(|length| length > body.len() as u64));
-    Ok(ProbeResponse { status, redirect_target, body_summary, body_summary_truncated })
+    Ok(ProbeResponse {
+        status,
+        redirect_target,
+        body_summary,
+        body_summary_truncated,
+    })
 }
 
 fn is_textual_content_type(value: &str) -> bool {
-    let value = value.split(';').next().unwrap_or(value).trim().to_ascii_lowercase();
+    let value = value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase();
     value.starts_with("text/")
         || value == "application/json"
         || value.ends_with("+json")
@@ -228,7 +274,10 @@ fn is_textual_content_type(value: &str) -> bool {
 fn timeout_failure(timeout: Duration) -> ProbeFailure {
     ProbeFailure {
         kind: "timeout",
-        message: format!("The local HTTP probe timed out after {} ms; no HTTP response was received.", timeout.as_millis()),
+        message: format!(
+            "The local HTTP probe timed out after {} ms; no HTTP response was received.",
+            timeout.as_millis()
+        ),
     }
 }
 
@@ -252,9 +301,16 @@ fn request_failure(error: &reqwest::Error) -> ProbeFailure {
         || lower.contains("actively refused")
     {
         "connection_refused"
-    } else if lower.contains("dns") || lower.contains("resolve") || lower.contains("name or service not known") {
+    } else if lower.contains("dns")
+        || lower.contains("resolve")
+        || lower.contains("name or service not known")
+    {
         "dns"
-    } else if lower.contains("tls") || lower.contains("certificate") || lower.contains("rustls") || lower.contains("handshake") {
+    } else if lower.contains("tls")
+        || lower.contains("certificate")
+        || lower.contains("rustls")
+        || lower.contains("handshake")
+    {
         "tls"
     } else if error.is_connect() {
         "connection"
@@ -263,12 +319,17 @@ fn request_failure(error: &reqwest::Error) -> ProbeFailure {
     };
     let diagnostic = match kind {
         "timeout" => "The local HTTP probe timed out before receiving an HTTP response.".to_owned(),
-        "connection_refused" => "The local endpoint refused the connection; no HTTP response was received.".to_owned(),
+        "connection_refused" => {
+            "The local endpoint refused the connection; no HTTP response was received.".to_owned()
+        }
         "dns" => format!("Local hostname resolution failed: {message}"),
         "tls" => format!("The local HTTPS handshake failed: {message}"),
         _ => format!("The local HTTP request failed before receiving an HTTP response: {message}"),
     };
-    ProbeFailure { kind, message: diagnostic }
+    ProbeFailure {
+        kind,
+        message: diagnostic,
+    }
 }
 
 pub fn definitions() -> Vec<Value> {

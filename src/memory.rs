@@ -309,7 +309,12 @@ pub fn record(
             kind,
             request.applies_to,
             source_refs_json,
-            kind,request.workspace_root,request.summary,request.implementation,request.applies_to,source_refs_json,
+            kind,
+            request.workspace_root,
+            request.summary,
+            request.implementation,
+            request.applies_to,
+            source_refs_json,
         ],
     )?;
 
@@ -340,24 +345,41 @@ pub fn record(
 
 /// Keep conflicting source versions in history. Search projects only evidence
 /// whose observed file hashes still match; no model or source investigation.
-pub fn bind_observer_sources(root:&Path,summary:&str,implementation:&str,sources:&serde_json::Value)->Result<()> {
+pub fn bind_observer_sources(
+    root: &Path,
+    summary: &str,
+    implementation: &str,
+    sources: &serde_json::Value,
+) -> Result<()> {
     init_db(root)?.execute("INSERT INTO observer_memory_sources(workspace_root,summary,implementation,sources) VALUES (?1,?2,?3,?4)
         ON CONFLICT DO UPDATE SET sources=excluded.sources",params![root.to_string_lossy(),summary,implementation,sources.to_string()])?;
     Ok(())
 }
 
-pub fn observer_sources_current(root:&Path,memory:&WorkMemory)->bool {
+pub fn observer_sources_current(root: &Path, memory: &WorkMemory) -> bool {
     use rusqlite::OptionalExtension;
-    if memory.kind!="observer" {return true;}
+    if memory.kind != "observer" {
+        return true;
+    }
     let sources=init_db(root).ok().and_then(|conn|conn.query_row("SELECT sources FROM observer_memory_sources WHERE workspace_root=?1 AND summary=?2 AND implementation=?3",
         params![memory.workspace_root,memory.summary,memory.implementation],|row|row.get::<_,String>(0)).optional().ok().flatten());
-    let Some(sources)=sources else{return memory.source_refs.is_empty();};
-    let Ok(sources)=serde_json::from_str::<serde_json::Value>(&sources) else{return false;};
-    sources.as_array().is_some_and(|items|items.iter().all(|source| {
-        let file=source["file_path"].as_str().unwrap_or("");let hash=source["code_hash"].as_str().unwrap_or("");
-        !hash.is_empty() && crate::file_edit::workspace_path(root,file).ok().and_then(|path|std::fs::read(path).ok())
-            .is_some_and(|bytes|crate::symbol_description::content_hash(&bytes)==hash)
-    }))
+    let Some(sources) = sources else {
+        return memory.source_refs.is_empty();
+    };
+    let Ok(sources) = serde_json::from_str::<serde_json::Value>(&sources) else {
+        return false;
+    };
+    sources.as_array().is_some_and(|items| {
+        items.iter().all(|source| {
+            let file = source["file_path"].as_str().unwrap_or("");
+            let hash = source["code_hash"].as_str().unwrap_or("");
+            !hash.is_empty()
+                && crate::file_edit::workspace_path(root, file)
+                    .ok()
+                    .and_then(|path| std::fs::read(path).ok())
+                    .is_some_and(|bytes| crate::symbol_description::content_hash(&bytes) == hash)
+        })
+    })
 }
 
 fn work_memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkMemory> {
@@ -456,9 +478,13 @@ pub fn search(
 
     let mut matches = Vec::new();
     for row in rows {
-        if matches.len()>=request.limit {break;}
-        let memory=row?;
-        if observer_sources_current(workspace_root_path,&memory) {matches.push(memory);}
+        if matches.len() >= request.limit {
+            break;
+        }
+        let memory = row?;
+        if observer_sources_current(workspace_root_path, &memory) {
+            matches.push(memory);
+        }
     }
 
     let db_path = workspace_root_path
@@ -869,24 +895,98 @@ mod tests {
 
     #[test]
     fn observer_lessons_deduplicate_and_search_excludes_replaced_source_versions() {
-        let ws=temp_workspace("observer_versions");let file=ws.join("source.rs");fs::write(&file,"old source").unwrap();
-        let make=|summary:&str,implementation:&str,refs:Vec<String>|RecordWorkMemoryRequest {
-            workspace_root:ws.to_string_lossy().into_owned(),summary:summary.into(),implementation:implementation.into(),
-            files_changed:vec![],tests:String::new(),risks:String::new(),source_task_id:Some("one-task-many-nodes".into()),
-            kind:"observer".into(),applies_to:"mapping tasks".into(),source_refs:refs,
-        };
-        let first=record(&ws,make("Mapping fact","old mapping",vec!["source.rs".into()])).unwrap();
-        record(&ws,make("Mapping fact","old mapping",vec!["source.rs".into()])).unwrap();
+        let ws = temp_workspace("observer_versions");
+        let file = ws.join("source.rs");
+        fs::write(&file, "old source").unwrap();
+        let make =
+            |summary: &str, implementation: &str, refs: Vec<String>| RecordWorkMemoryRequest {
+                workspace_root: ws.to_string_lossy().into_owned(),
+                summary: summary.into(),
+                implementation: implementation.into(),
+                files_changed: vec![],
+                tests: String::new(),
+                risks: String::new(),
+                source_task_id: Some("one-task-many-nodes".into()),
+                kind: "observer".into(),
+                applies_to: "mapping tasks".into(),
+                source_refs: refs,
+            };
+        let first = record(
+            &ws,
+            make("Mapping fact", "old mapping", vec!["source.rs".into()]),
+        )
+        .unwrap();
+        record(
+            &ws,
+            make("Mapping fact", "old mapping", vec!["source.rs".into()]),
+        )
+        .unwrap();
         bind_observer_sources(&ws,&first.recorded.summary,&first.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"old source")}])).unwrap();
-        let route=record(&ws,make("Mapping route","start with the known source mapping",vec![])).unwrap();
-        bind_observer_sources(&ws,&route.recorded.summary,&route.recorded.implementation,&serde_json::json!([])).unwrap();
-        assert_eq!(list(&ws,ListWorkMemoryRequest{workspace_root:ws.to_string_lossy().into_owned(),limit:10}).unwrap().memories.len(),2);
-        fs::write(&file,"new source").unwrap();
-        let new=record(&ws,make("Mapping fact","new mapping",vec!["source.rs".into()])).unwrap();
+        let route = record(
+            &ws,
+            make(
+                "Mapping route",
+                "start with the known source mapping",
+                vec![],
+            ),
+        )
+        .unwrap();
+        bind_observer_sources(
+            &ws,
+            &route.recorded.summary,
+            &route.recorded.implementation,
+            &serde_json::json!([]),
+        )
+        .unwrap();
+        assert_eq!(
+            list(
+                &ws,
+                ListWorkMemoryRequest {
+                    workspace_root: ws.to_string_lossy().into_owned(),
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .memories
+            .len(),
+            2
+        );
+        fs::write(&file, "new source").unwrap();
+        let new = record(
+            &ws,
+            make("Mapping fact", "new mapping", vec!["source.rs".into()]),
+        )
+        .unwrap();
         bind_observer_sources(&ws,&new.recorded.summary,&new.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"new source")}])).unwrap();
-        let current=search(&ws,SearchWorkMemoryRequest{workspace_root:ws.to_string_lossy().into_owned(),query:"mapping".into(),limit:10}).unwrap();
-        assert_eq!(current.matches.len(),2);assert!(!current.matches.iter().any(|m|m.implementation=="old mapping"));
-        assert_eq!(list(&ws,ListWorkMemoryRequest{workspace_root:ws.to_string_lossy().into_owned(),limit:10}).unwrap().memories.len(),3);
+        let current = search(
+            &ws,
+            SearchWorkMemoryRequest {
+                workspace_root: ws.to_string_lossy().into_owned(),
+                query: "mapping".into(),
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(current.matches.len(), 2);
+        assert!(
+            !current
+                .matches
+                .iter()
+                .any(|m| m.implementation == "old mapping")
+        );
+        assert_eq!(
+            list(
+                &ws,
+                ListWorkMemoryRequest {
+                    workspace_root: ws.to_string_lossy().into_owned(),
+                    limit: 10
+                }
+            )
+            .unwrap()
+            .memories
+            .len(),
+            3
+        );
         fs::remove_dir_all(ws).unwrap();
     }
 

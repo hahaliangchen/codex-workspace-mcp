@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -92,7 +91,13 @@ pub async fn analyze_architecture(
         for context in &analysis.symbol_contexts {
             workspace.record_symbol_business_context(
                 crate::memory::RecordSymbolBusinessContextRequest {
-                    description: crate::symbol_description::RecordOptions { qualified_name: context.qualified_name.clone(), keywords: context.keywords.clone(), scope: context.scope.clone(), source: "architecture".to_owned(), expected_code_hash: None },
+                    description: crate::symbol_description::RecordOptions {
+                        qualified_name: context.qualified_name.clone(),
+                        keywords: context.keywords.clone(),
+                        scope: context.scope.clone(),
+                        source: "architecture".to_owned(),
+                        expected_code_hash: None,
+                    },
                     workspace_root: workspace.root().display().to_string(),
                     symbol_id: context.symbol_id.clone(),
                     symbol_name: context.symbol_name.clone(),

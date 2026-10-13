@@ -158,9 +158,7 @@ fn mcp_handler() -> ToolHandler {
 
 fn program_handler() -> ToolHandler {
     Arc::new(|workspace, _, args| {
-        Box::pin(async move {
-            crate::program_execution::execute(&workspace, &args).await
-        })
+        Box::pin(async move { crate::program_execution::execute(&workspace, &args).await })
     })
 }
 
@@ -332,7 +330,7 @@ impl Plugin for AgentTasksPlugin {
             observer_api_key: String::new(),
             observer_model: String::new(),
             observer_inherits_model: true,
-            visual:Default::default(),
+            visual: Default::default(),
             config: Some(settings.config.clone()),
             config_path: Some(settings.path.clone()),
             tool_catalog: Some(tools),

@@ -28,8 +28,8 @@ use crate::rust_index::{
     SearchRustSymbolsRequest,
 };
 use crate::tools::{
-    ListDirRequest, ReadFileLinesRequest, ReadFileRequest, ReplaceRangeRequest, SearchTextRequest,
-    Workspace, WorkspaceInfoRequest, WriteFileRequest, EditFileRequest,
+    EditFileRequest, ListDirRequest, ReadFileLinesRequest, ReadFileRequest, ReplaceRangeRequest,
+    SearchTextRequest, Workspace, WorkspaceInfoRequest, WriteFileRequest,
 };
 use crate::ts_index::{
     IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest, SearchTsSymbolsRequest,
@@ -495,153 +495,183 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         .unwrap_or_else(|| json!({}));
 
     if name == "run_command" {
-        let disabled=json!({"outcome":"disabled","error":"run_command has been removed and was not executed. Use run_program with a supported program and an args array, or use a dedicated project, file, HTTP, or browser tool."});
-        return Ok(json!({"content":[{"type":"text","text":disabled.to_string()}],"structuredContent":disabled}));
+        let disabled = json!({"outcome":"disabled","error":"run_command has been removed and was not executed. Use run_program with a supported program and an args array, or use a dedicated project, file, HTTP, or browser tool."});
+        return Ok(
+            json!({"content":[{"type":"text","text":disabled.to_string()}],"structuredContent":disabled}),
+        );
     }
 
     if crate::program_execution::is_tool(name) {
-        let value=crate::program_execution::execute(workspace,&arguments).await?;
-        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+        let value = crate::program_execution::execute(workspace, &arguments).await?;
+        return Ok(
+            json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}),
+        );
     }
 
     if crate::http_probe::is_tool(name) {
-        let value=crate::http_probe::execute(&arguments).await?;
-        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+        let value = crate::http_probe::execute(&arguments).await?;
+        return Ok(
+            json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}),
+        );
     }
     if crate::browser_control::is_tool(name) {
         let value = crate::browser_control::execute(workspace, name, &arguments).await?;
-        return crate::visual_artifacts::mcp_result(workspace.root(),&crate::visual_artifacts::VisualContext::mcp(workspace.root()),value);
+        return crate::visual_artifacts::mcp_result(
+            workspace.root(),
+            &crate::visual_artifacts::VisualContext::mcp(workspace.root()),
+            value,
+        );
     }
     if crate::project_process::is_tool(name) {
-        let value=crate::project_process::execute(workspace,name,arguments).await?;
-        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+        let value = crate::project_process::execute(workspace, name, arguments).await?;
+        return Ok(
+            json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}),
+        );
     }
 
     if crate::worker_read_cache::is_source_read(name) {
-        let workspace=Workspace::new(workspace.root())?;
-        let tool_name=name.to_owned();let source_args=arguments.clone();
-        let mut value=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-            if source_args["force_read"]==true {crate::source_read::clear();}
-            Ok(match tool_name.as_str() {
-                "read_file"=>serde_json::to_value(workspace.read_file(serde_json::from_value::<ReadFileRequest>(source_args)?)?)?,
-                "read_file_lines"=>serde_json::to_value(workspace.read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(source_args)?)?)?,
-                "read_rust_symbol"=>serde_json::to_value(workspace.read_rust_symbol(serde_json::from_value::<ReadRustSymbolRequest>(source_args)?)?)?,
-                "read_go_symbol"=>serde_json::to_value(workspace.read_go_symbol(serde_json::from_value::<ReadGoSymbolRequest>(source_args)?)?)?,
-                "read_ts_symbol"=>serde_json::to_value(workspace.read_ts_symbol(serde_json::from_value::<ReadTsSymbolRequest>(source_args)?)?)?,
-                "read_python_symbol"=>serde_json::to_value(workspace.read_python_symbol(serde_json::from_value::<ReadPythonSymbolRequest>(source_args)?)?)?,
-                _=>unreachable!(),
+        let workspace = Workspace::new(workspace.root())?;
+        let tool_name = name.to_owned();
+        let source_args = arguments.clone();
+        let mut value =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                if source_args["force_read"] == true {
+                    crate::source_read::clear();
+                }
+                Ok(match tool_name.as_str() {
+                    "read_file" => {
+                        serde_json::to_value(workspace.read_file(serde_json::from_value::<
+                            ReadFileRequest,
+                        >(
+                            source_args
+                        )?)?)?
+                    }
+                    "read_file_lines" => serde_json::to_value(workspace.read_file_lines(
+                        serde_json::from_value::<ReadFileLinesRequest>(source_args)?,
+                    )?)?,
+                    "read_rust_symbol" => serde_json::to_value(workspace.read_rust_symbol(
+                        serde_json::from_value::<ReadRustSymbolRequest>(source_args)?,
+                    )?)?,
+                    "read_go_symbol" => serde_json::to_value(workspace.read_go_symbol(
+                        serde_json::from_value::<ReadGoSymbolRequest>(source_args)?,
+                    )?)?,
+                    "read_ts_symbol" => serde_json::to_value(workspace.read_ts_symbol(
+                        serde_json::from_value::<ReadTsSymbolRequest>(source_args)?,
+                    )?)?,
+                    "read_python_symbol" => serde_json::to_value(workspace.read_python_symbol(
+                        serde_json::from_value::<ReadPythonSymbolRequest>(source_args)?,
+                    )?)?,
+                    _ => unreachable!(),
+                })
             })
-        }).await??;
-        crate::source_read::page(&mut value,&arguments)?;
+            .await??;
+        crate::source_read::page(&mut value, &arguments)?;
         if value.get("symbol").is_some() {
-            value["source_index_check"]=json!("current_source_hash_verified");
-            if arguments["include_context"]==true {value["related_context_freshness"]=json!("indexed_navigation_hints; related files refresh when read");}
+            value["source_index_check"] = json!("current_source_hash_verified");
+            if arguments["include_context"] == true {
+                value["related_context_freshness"] =
+                    json!("indexed_navigation_hints; related files refresh when read");
+            }
         }
-        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+        return Ok(
+            json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}),
+        );
     }
 
-    if name == "search_code_map" || name.ends_with("_symbols") || name.starts_with("index_") || name.ends_with("_index_status") {
-        let selected_root=arguments.get("workspace_root").and_then(Value::as_str).filter(|value|!value.is_empty()).map(std::path::Path::new).unwrap_or(workspace.root());
-        let workspace=Workspace::new(selected_root)?;
-        let name=name.to_owned();
-        let value=tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
-            let value=match name.as_str() {
-                "search_code_map" => crate::code_map::search(workspace.root(),serde_json::from_value(arguments)?)?,
-        "index_go_workspace" => {
-            serde_json::to_value(workspace.index_go_workspace(serde_json::from_value::<
-                IndexGoWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "go_index_status" => {
-            serde_json::to_value(workspace.go_index_status(serde_json::from_value::<
-                IndexGoWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "list_go_symbols" => serde_json::to_value(
-            workspace
-                .list_go_symbols(serde_json::from_value::<ListGoSymbolsRequest>(arguments)?)?,
-        )?,
-        "search_go_symbols" => serde_json::to_value(
-            workspace
-                .search_go_symbols(serde_json::from_value::<SearchGoSymbolsRequest>(arguments)?)?,
-        )?,
-        "read_go_symbol" => serde_json::to_value(
-            workspace.read_go_symbol(serde_json::from_value::<ReadGoSymbolRequest>(arguments)?)?,
-        )?,
-        "index_rust_workspace" => {
-            serde_json::to_value(workspace.index_rust_workspace(serde_json::from_value::<
-                IndexRustWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "rust_index_status" => {
-            serde_json::to_value(workspace.rust_index_status(serde_json::from_value::<
-                IndexRustWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "list_rust_symbols" => serde_json::to_value(
-            workspace
-                .list_rust_symbols(serde_json::from_value::<ListRustSymbolsRequest>(arguments)?)?,
-        )?,
-        "search_rust_symbols" => {
-            serde_json::to_value(workspace.search_rust_symbols(serde_json::from_value::<
-                SearchRustSymbolsRequest,
-            >(arguments)?)?)?
-        }
-        "read_rust_symbol" => serde_json::to_value(
-            workspace
-                .read_rust_symbol(serde_json::from_value::<ReadRustSymbolRequest>(arguments)?)?,
-        )?,
-        "index_ts_workspace" => {
-            serde_json::to_value(workspace.index_ts_workspace(serde_json::from_value::<
-                IndexTsWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "ts_index_status" => {
-            serde_json::to_value(workspace.ts_index_status(serde_json::from_value::<
-                IndexTsWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "list_ts_symbols" => serde_json::to_value(
-            workspace
-                .list_ts_symbols(serde_json::from_value::<ListTsSymbolsRequest>(arguments)?)?,
-        )?,
-        "search_ts_symbols" => serde_json::to_value(
-            workspace
-                .search_ts_symbols(serde_json::from_value::<SearchTsSymbolsRequest>(arguments)?)?,
-        )?,
-        "read_ts_symbol" => serde_json::to_value(
-            workspace.read_ts_symbol(serde_json::from_value::<ReadTsSymbolRequest>(arguments)?)?,
-        )?,
-        "index_python_workspace" => {
-            serde_json::to_value(workspace.index_python_workspace(serde_json::from_value::<
-                IndexPythonWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "python_index_status" => {
-            serde_json::to_value(workspace.python_index_status(serde_json::from_value::<
-                IndexPythonWorkspaceRequest,
-            >(arguments)?)?)?
-        }
-        "list_python_symbols" => {
-            serde_json::to_value(workspace.list_python_symbols(serde_json::from_value::<
-                ListPythonSymbolsRequest,
-            >(arguments)?)?)?
-        }
-        "search_python_symbols" => {
-            serde_json::to_value(workspace.search_python_symbols(serde_json::from_value::<
-                SearchPythonSymbolsRequest,
-            >(arguments)?)?)?
-        }
-        "read_python_symbol" => {
-            serde_json::to_value(workspace.read_python_symbol(serde_json::from_value::<
-                ReadPythonSymbolRequest,
-            >(arguments)?)?)?
-        }
-                _=>anyhow::bail!("unknown index tool: {name}"),
-            };
+    if name == "search_code_map"
+        || name.ends_with("_symbols")
+        || name.starts_with("index_")
+        || name.ends_with("_index_status")
+    {
+        let selected_root = arguments
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(std::path::Path::new)
+            .unwrap_or(workspace.root());
+        let workspace = Workspace::new(selected_root)?;
+        let name = name.to_owned();
+        let value = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            let value =
+                match name.as_str() {
+                    "search_code_map" => crate::code_map::search(
+                        workspace.root(),
+                        serde_json::from_value(arguments)?,
+                    )?,
+                    "index_go_workspace" => serde_json::to_value(workspace.index_go_workspace(
+                        serde_json::from_value::<IndexGoWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "go_index_status" => serde_json::to_value(workspace.go_index_status(
+                        serde_json::from_value::<IndexGoWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "list_go_symbols" => serde_json::to_value(workspace.list_go_symbols(
+                        serde_json::from_value::<ListGoSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "search_go_symbols" => serde_json::to_value(workspace.search_go_symbols(
+                        serde_json::from_value::<SearchGoSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "read_go_symbol" => serde_json::to_value(workspace.read_go_symbol(
+                        serde_json::from_value::<ReadGoSymbolRequest>(arguments)?,
+                    )?)?,
+                    "index_rust_workspace" => {
+                        serde_json::to_value(workspace.index_rust_workspace(
+                            serde_json::from_value::<IndexRustWorkspaceRequest>(arguments)?,
+                        )?)?
+                    }
+                    "rust_index_status" => serde_json::to_value(workspace.rust_index_status(
+                        serde_json::from_value::<IndexRustWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "list_rust_symbols" => serde_json::to_value(workspace.list_rust_symbols(
+                        serde_json::from_value::<ListRustSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "search_rust_symbols" => serde_json::to_value(workspace.search_rust_symbols(
+                        serde_json::from_value::<SearchRustSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "read_rust_symbol" => serde_json::to_value(workspace.read_rust_symbol(
+                        serde_json::from_value::<ReadRustSymbolRequest>(arguments)?,
+                    )?)?,
+                    "index_ts_workspace" => serde_json::to_value(workspace.index_ts_workspace(
+                        serde_json::from_value::<IndexTsWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "ts_index_status" => serde_json::to_value(workspace.ts_index_status(
+                        serde_json::from_value::<IndexTsWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "list_ts_symbols" => serde_json::to_value(workspace.list_ts_symbols(
+                        serde_json::from_value::<ListTsSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "search_ts_symbols" => serde_json::to_value(workspace.search_ts_symbols(
+                        serde_json::from_value::<SearchTsSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "read_ts_symbol" => serde_json::to_value(workspace.read_ts_symbol(
+                        serde_json::from_value::<ReadTsSymbolRequest>(arguments)?,
+                    )?)?,
+                    "index_python_workspace" => {
+                        serde_json::to_value(workspace.index_python_workspace(
+                            serde_json::from_value::<IndexPythonWorkspaceRequest>(arguments)?,
+                        )?)?
+                    }
+                    "python_index_status" => serde_json::to_value(workspace.python_index_status(
+                        serde_json::from_value::<IndexPythonWorkspaceRequest>(arguments)?,
+                    )?)?,
+                    "list_python_symbols" => serde_json::to_value(workspace.list_python_symbols(
+                        serde_json::from_value::<ListPythonSymbolsRequest>(arguments)?,
+                    )?)?,
+                    "search_python_symbols" => {
+                        serde_json::to_value(workspace.search_python_symbols(
+                            serde_json::from_value::<SearchPythonSymbolsRequest>(arguments)?,
+                        )?)?
+                    }
+                    "read_python_symbol" => serde_json::to_value(workspace.read_python_symbol(
+                        serde_json::from_value::<ReadPythonSymbolRequest>(arguments)?,
+                    )?)?,
+                    _ => anyhow::bail!("unknown index tool: {name}"),
+                };
             Ok(value)
-        }).await??;
-        return Ok(json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}));
+        })
+        .await??;
+        return Ok(
+            json!({"content":[{"type":"text","text":serde_json::to_string_pretty(&value)?}],"structuredContent":value}),
+        );
     }
 
     let value = match name {
@@ -662,17 +692,32 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             workspace.search_text(serde_json::from_value::<SearchTextRequest>(arguments)?)?,
         )?,
         "write_file" => {
-            let workspace=Workspace::new(workspace.root())?;
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.write_file(serde_json::from_value::<WriteFileRequest>(arguments)?)?)?) }).await??
-        },
+            let workspace = Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                Ok(serde_json::to_value(workspace.write_file(
+                    serde_json::from_value::<WriteFileRequest>(arguments)?,
+                )?)?)
+            })
+            .await??
+        }
         "replace_range" => {
-            let workspace=Workspace::new(workspace.root())?;
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.replace_range(serde_json::from_value::<ReplaceRangeRequest>(arguments)?)?)?) }).await??
-        },
+            let workspace = Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                Ok(serde_json::to_value(workspace.replace_range(
+                    serde_json::from_value::<ReplaceRangeRequest>(arguments)?,
+                )?)?)
+            })
+            .await??
+        }
         "edit_file" => {
-            let workspace=Workspace::new(workspace.root())?;
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { Ok(serde_json::to_value(workspace.edit_file(serde_json::from_value::<EditFileRequest>(arguments)?)?)?) }).await??
-        },
+            let workspace = Workspace::new(workspace.root())?;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                Ok(serde_json::to_value(workspace.edit_file(
+                    serde_json::from_value::<EditFileRequest>(arguments)?,
+                )?)?)
+            })
+            .await??
+        }
         "expert_code_surgery" => {
             let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
                 arguments,
@@ -778,7 +823,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
 }
 
 pub fn tool_definitions() -> Value {
-    let mut definitions=json!([
+    let mut definitions = json!([
         {
             "name": "workspace_info",
             "description": "Return workspace root, platform, file access scope, and ignore summary. Requires workspace_root.",
@@ -1428,18 +1473,38 @@ pub fn tool_definitions() -> Value {
             }
         }
     ]);
-    definitions.as_array_mut().unwrap().extend(crate::project_process::definitions());
-    definitions.as_array_mut().unwrap().extend(crate::http_probe::definitions());
-    definitions.as_array_mut().unwrap().extend(crate::program_execution::definitions());
-    definitions.as_array_mut().unwrap().extend(crate::browser_control::definitions());
+    definitions
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::project_process::definitions());
+    definitions
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::http_probe::definitions());
+    definitions
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::program_execution::definitions());
+    definitions
+        .as_array_mut()
+        .unwrap()
+        .extend(crate::browser_control::definitions());
     for tool in definitions.as_array_mut().into_iter().flatten() {
-        let name=tool["name"].as_str().unwrap_or("");
+        let name = tool["name"].as_str().unwrap_or("");
         if crate::worker_read_cache::is_source_read(name) {
-            tool["description"]=json!(format!("{} Source pages preserve original bytes and line delimiters; complete/next_start_line identify pagination. max_chars defaults to 24000, max 60000. Reads are bounded to 16 MiB; force_read bypasses snapshot caching.",tool["description"].as_str().unwrap_or("")));
-            let props=tool["inputSchema"]["properties"].as_object_mut().unwrap();
-            props.insert("max_chars".into(),json!({"type":"integer","minimum":1000,"maximum":60000,"default":24000}));
+            tool["description"] = json!(format!(
+                "{} Source pages preserve original bytes and line delimiters; complete/next_start_line identify pagination. max_chars defaults to 24000, max 60000. Reads are bounded to 16 MiB; force_read bypasses snapshot caching.",
+                tool["description"].as_str().unwrap_or("")
+            ));
+            let props = tool["inputSchema"]["properties"].as_object_mut().unwrap();
+            props.insert(
+                "max_chars".into(),
+                json!({"type":"integer","minimum":1000,"maximum":60000,"default":24000}),
+            );
             props.entry("start_line").or_insert(json!({"type":"integer","minimum":1,"description":"Optional page start within this file/definition. Use next_start_line to continue."}));
-            props.entry("end_line").or_insert(json!({"type":"integer","minimum":1}));
+            props
+                .entry("end_line")
+                .or_insert(json!({"type":"integer","minimum":1}));
             props.insert("start_column".into(),json!({"type":"integer","minimum":1,"description":"Continue a partial long line using next_column. Unicode columns include line delimiters; default 1."}));
             props.insert("force_read".into(),json!({"type":"boolean","default":false,"description":"Bypass source snapshot caching when a fresh disk read is required."}));
         }
@@ -1453,13 +1518,28 @@ mod native_tool_tests {
 
     #[tokio::test]
     async fn legacy_run_command_is_disabled_and_native_tool_is_advertised() {
-        let root=std::env::current_dir().unwrap();
-        let workspace=Workspace::new(&root).unwrap();
-        let result=call_tool(&workspace,json!({"name":"run_command","arguments":{"command":"echo should-not-run"}})).await.unwrap();
-        assert_eq!(result["structuredContent"]["outcome"],"disabled");
-        assert!(result["structuredContent"]["error"].as_str().unwrap().contains("run_program"));
-        let definitions=tool_definitions();
-        let names=definitions.as_array().unwrap().iter().filter_map(|tool|tool["name"].as_str()).collect::<Vec<_>>();
+        let root = std::env::current_dir().unwrap();
+        let workspace = Workspace::new(&root).unwrap();
+        let result = call_tool(
+            &workspace,
+            json!({"name":"run_command","arguments":{"command":"echo should-not-run"}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["structuredContent"]["outcome"], "disabled");
+        assert!(
+            result["structuredContent"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("run_program")
+        );
+        let definitions = tool_definitions();
+        let names = definitions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
         assert!(names.contains(&"run_program"));
         assert!(!names.contains(&"run_command"));
     }

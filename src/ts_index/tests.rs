@@ -69,8 +69,8 @@ function normalize(id: string) {
             workspace_root: root.display().to_string(),
             symbol_id: symbol.id.clone(),
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -105,8 +105,8 @@ function normalize(id: string) {
             workspace_root: root.display().to_string(),
             symbol_id: save.id.clone(),
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -205,8 +205,8 @@ export function run() {
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -247,8 +247,8 @@ export function run() {
             workspace_root: root.display().to_string(),
             symbol_id: create.id,
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -306,8 +306,8 @@ export function run() {
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -367,8 +367,8 @@ export function run() {
             workspace_root: root.display().to_string(),
             symbol_id: run.id,
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -463,8 +463,8 @@ foo() {}
             workspace_root: root.display().to_string(),
             symbol_id: update_disk.id.clone(),
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();
@@ -576,8 +576,8 @@ return 42;
             workspace_root: root.display().to_string(),
             symbol_id: outer.id.clone(),
             include_context: true,
-                include_related_types: false,
-                include_outline: false,
+            include_related_types: false,
+            include_outline: false,
         },
     )
     .unwrap();

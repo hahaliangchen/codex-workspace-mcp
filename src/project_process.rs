@@ -61,7 +61,9 @@ pub(crate) fn process_event_generation() -> u64 {
 }
 
 fn bump_process_event_generation() -> u64 {
-    PROCESS_EVENT_GENERATION.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    PROCESS_EVENT_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
 }
 
 fn scope_from_args(root: &Path, args: &Value) -> Result<ProcessObservationScope> {
@@ -73,13 +75,21 @@ fn scope_from_args(root: &Path, args: &Value) -> Result<ProcessObservationScope>
         Some("single_process") => ProcessObservationCoverage::SingleProcess,
         Some(other) => anyhow::bail!("unknown process observation coverage '{other}'"),
         None if args["process_id"].as_str().is_some() => ProcessObservationCoverage::SingleProcess,
-        None if args.get("project_path").and_then(Value::as_str).is_some() => ProcessObservationCoverage::ProjectList,
+        None if args.get("project_path").and_then(Value::as_str).is_some() => {
+            ProcessObservationCoverage::ProjectList
+        }
         None => ProcessObservationCoverage::WorkspaceList,
     };
-    ensure!(coverage != ProcessObservationCoverage::WorkspaceList || args.get("project_path").is_none_or(Value::is_null),
-        "workspace_list observations cannot be restricted to project_path");
-    ensure!(coverage != ProcessObservationCoverage::SingleProcess || args["process_id"].as_str().is_some(),
-        "single_process observations require process_id");
+    ensure!(
+        coverage != ProcessObservationCoverage::WorkspaceList
+            || args.get("project_path").is_none_or(Value::is_null),
+        "workspace_list observations cannot be restricted to project_path"
+    );
+    ensure!(
+        coverage != ProcessObservationCoverage::SingleProcess
+            || args["process_id"].as_str().is_some(),
+        "single_process observations require process_id"
+    );
     let project_path = match coverage {
         ProcessObservationCoverage::WorkspaceList => None,
         ProcessObservationCoverage::ProjectList | ProcessObservationCoverage::SingleProcess => {
@@ -90,30 +100,56 @@ fn scope_from_args(root: &Path, args: &Value) -> Result<ProcessObservationScope>
     Ok(ProcessObservationScope {
         coverage,
         project_path,
-        script: args.get("script").and_then(Value::as_str).map(str::to_owned),
+        script: args
+            .get("script")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         ready_url,
         ready_port,
-        process_id: args.get("process_id").and_then(Value::as_str).map(str::to_owned),
-        operation: args.get("operation").and_then(Value::as_str).map(str::to_owned),
-        script_args: args.get("script_args").and_then(Value::as_array).map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
+        process_id: args
+            .get("process_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        operation: args
+            .get("operation")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        script_args: args
+            .get("script_args")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
 fn project_input_version(root: &Path, scope: &ProcessObservationScope) -> Result<String> {
-    let canonical_root = root.canonicalize().context("workspace root is unavailable to process observations")?;
+    let canonical_root = root
+        .canonicalize()
+        .context("workspace root is unavailable to process observations")?;
     let mut digest = Sha256::new();
     digest.update(canonical_root.to_string_lossy().as_bytes());
     digest.update([0]);
     digest.update(serde_json::to_vec(scope)?);
     if let Some(project_path) = scope.project_path.as_deref() {
-        let (dir, _) = project(&canonical_root, project_path).context("could not resolve project observation scope")?;
+        let (dir, _) = project(&canonical_root, project_path)
+            .context("could not resolve project observation scope")?;
         for name in ["package.json", "package-lock.json", "npm-shrinkwrap.json"] {
             digest.update(name.as_bytes());
             digest.update([0]);
             match std::fs::read(dir.join(name)) {
                 Ok(bytes) => digest.update(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update(b"<missing>"),
-                Err(error) => return Err(error).with_context(|| format!("could not fingerprint {name}")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    digest.update(b"<missing>")
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("could not fingerprint {name}"));
+                }
             }
             digest.update([0]);
         }
@@ -122,20 +158,34 @@ fn project_input_version(root: &Path, scope: &ProcessObservationScope) -> Result
 }
 
 pub fn observation_is_fresh(root: &Path, args: &Value, sample: &Value) -> bool {
-    if !can_reuse_process_observation(args) { return false; }
-    let Ok(expected_scope) = scope_from_args(root, args) else { return false; };
-    let Ok(scope) = serde_json::from_value::<ProcessObservationScope>(sample["scope"].clone()) else { return false; };
+    if !can_reuse_process_observation(args) {
+        return false;
+    }
+    let Ok(expected_scope) = scope_from_args(root, args) else {
+        return false;
+    };
+    let Ok(scope) = serde_json::from_value::<ProcessObservationScope>(sample["scope"].clone())
+    else {
+        return false;
+    };
     scope == expected_scope && observation_sample_is_current(root, sample)
 }
 
 pub fn observation_sample_is_current(root: &Path, sample: &Value) -> bool {
-    let Ok(scope) = serde_json::from_value::<ProcessObservationScope>(sample["scope"].clone()) else { return false; };
-    let Ok(version) = project_input_version(root, &scope) else { return false; };
+    let Ok(scope) = serde_json::from_value::<ProcessObservationScope>(sample["scope"].clone())
+    else {
+        return false;
+    };
+    let Ok(version) = project_input_version(root, &scope) else {
+        return false;
+    };
     let now = now();
     sample["input_version"] == version
         && sample["host_instance_id"] == host_instance_id()
         && sample["process_event_generation"].as_u64() == Some(process_event_generation())
-        && sample["sampled_at"].as_u64().is_some_and(|sampled| now.saturating_sub(sampled) <= PROCESS_OBSERVATION_TTL_MS)
+        && sample["sampled_at"]
+            .as_u64()
+            .is_some_and(|sampled| now.saturating_sub(sampled) <= PROCESS_OBSERVATION_TTL_MS)
 }
 
 pub fn can_reuse_process_observation(args: &Value) -> bool {
@@ -163,28 +213,60 @@ pub fn build_process_observation(root: &Path, args: &Value, processes: &[Value])
     build_observation(root, scope, processes)
 }
 
-fn build_single_process_observation(root: &Path, args: &Value, processes: &[Value]) -> Result<Value> {
+fn build_single_process_observation(
+    root: &Path,
+    args: &Value,
+    processes: &[Value],
+) -> Result<Value> {
     let fact = processes.first().cloned().unwrap_or(Value::Null);
-    let process_id = fact["process_id"].as_str().or_else(|| args["process_id"].as_str())
-        .context("single-process observations require a process_id")?.to_owned();
-    let project_path = fact["project_path"].as_str().or_else(|| args["project_path"].as_str()).unwrap_or(".");
+    let process_id = fact["process_id"]
+        .as_str()
+        .or_else(|| args["process_id"].as_str())
+        .context("single-process observations require a process_id")?
+        .to_owned();
+    let project_path = fact["project_path"]
+        .as_str()
+        .or_else(|| args["project_path"].as_str())
+        .unwrap_or(".");
     let (_, project_path) = project(root, project_path)?;
     let (fallback_url, fallback_port) = probe_target(args)?;
     let scope = ProcessObservationScope {
         coverage: ProcessObservationCoverage::SingleProcess,
         project_path: Some(project_path),
-        script: fact["script"].as_str().or_else(|| args["script"].as_str()).map(str::to_owned),
-        ready_url: fact["ready_url"].as_str().map(str::to_owned).or(fallback_url),
-        ready_port: fact["ready_port"].as_u64().map(|port| port as u16).or(fallback_port),
+        script: fact["script"]
+            .as_str()
+            .or_else(|| args["script"].as_str())
+            .map(str::to_owned),
+        ready_url: fact["ready_url"]
+            .as_str()
+            .map(str::to_owned)
+            .or(fallback_url),
+        ready_port: fact["ready_port"]
+            .as_u64()
+            .map(|port| port as u16)
+            .or(fallback_port),
         process_id: Some(process_id),
-        operation: fact["operation"].as_str().or_else(|| args["operation"].as_str()).map(str::to_owned),
-        script_args: fact["args"].as_array().or_else(|| args["script_args"].as_array())
-            .into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+        operation: fact["operation"]
+            .as_str()
+            .or_else(|| args["operation"].as_str())
+            .map(str::to_owned),
+        script_args: fact["args"]
+            .as_array()
+            .or_else(|| args["script_args"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
     };
     build_observation(root, scope, processes)
 }
 
-fn build_observation(root: &Path, scope: ProcessObservationScope, processes: &[Value]) -> Result<Value> {
+fn build_observation(
+    root: &Path,
+    scope: ProcessObservationScope,
+    processes: &[Value],
+) -> Result<Value> {
     let mut metadata = observation_metadata(root, &scope)?;
     metadata["processes"] = json!(processes);
     Ok(metadata)
@@ -209,7 +291,11 @@ pub fn is_execution(name: &str) -> bool {
 pub fn is_check(name: &str) -> bool {
     matches!(
         name,
-        "run_program" | "install_dependencies" | "run_project_script" | "get_project_process" | "http_probe"
+        "run_program"
+            | "install_dependencies"
+            | "run_project_script"
+            | "get_project_process"
+            | "http_probe"
     )
 }
 pub fn may_change_files(name: &str) -> bool {
@@ -436,9 +522,17 @@ impl Record {
             .filter(|chunk| chunk["stream"] == "stderr")
             .filter_map(|chunk| chunk["text"].as_str())
             .collect::<String>();
-        let complete_stderr=logs.chunks.iter().filter(|chunk|chunk["stream"]=="stderr")
-            .filter_map(|chunk|chunk["text"].as_str()).collect::<String>();
-        let stderr=if !meta.running&&meta.exit_code.is_some_and(|code|code!=0){complete_stderr}else{recent_stderr.clone()};
+        let complete_stderr = logs
+            .chunks
+            .iter()
+            .filter(|chunk| chunk["stream"] == "stderr")
+            .filter_map(|chunk| chunk["text"].as_str())
+            .collect::<String>();
+        let stderr = if !meta.running && meta.exit_code.is_some_and(|code| code != 0) {
+            complete_stderr
+        } else {
+            recent_stderr.clone()
+        };
         json!({"process_id":meta.process_id,"pid":meta.pid,"project_path":meta.project_path,"script":meta.script,"args":meta.args,"operation":meta.operation,
             "state":if meta.running{"running"}else{"exited"},"running":meta.running,"process_running":meta.running,
             "ready":meta.running&&meta.ready,"listener_owned":meta.listener_owned,"page_ready":meta.page_ready,
@@ -511,9 +605,14 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut reader: R, record: Arc<Record
 }
 
 fn project(root: &Path, raw: &str) -> Result<(PathBuf, String)> {
-    let root = root.canonicalize().context("workspace root is unavailable to process tools")?;
-    let checked = crate::file_edit::workspace_path(&root, raw).context("project path failed workspace boundary validation")?;
-    let path = checked.canonicalize().context("project directory is unavailable to process tools")?;
+    let root = root
+        .canonicalize()
+        .context("workspace root is unavailable to process tools")?;
+    let checked = crate::file_edit::workspace_path(&root, raw)
+        .context("project path failed workspace boundary validation")?;
+    let path = checked
+        .canonicalize()
+        .context("project directory is unavailable to process tools")?;
     ensure!(path.is_dir(), "project_path is not a directory");
     let rel = path
         .strip_prefix(&root)?
@@ -522,33 +621,48 @@ fn project(root: &Path, raw: &str) -> Result<(PathBuf, String)> {
     Ok((path, if rel.is_empty() { ".".into() } else { rel }))
 }
 
-fn normalize_windows_runtime_path(raw:&str)->Result<String> {
-    if let Some(unc)=raw.strip_prefix(r"\\?\UNC\") {
-        ensure!(unc.contains('\\') && !unc.starts_with('\\'),"runtime_bootstrap: malformed extended UNC path cannot be passed to Node/npm");
+fn normalize_windows_runtime_path(raw: &str) -> Result<String> {
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        ensure!(
+            unc.contains('\\') && !unc.starts_with('\\'),
+            "runtime_bootstrap: malformed extended UNC path cannot be passed to Node/npm"
+        );
         return Ok(format!(r"\\{unc}"));
     }
-    if let Some(path)=raw.strip_prefix(r"\\?\") {
-        let bytes=path.as_bytes();
-        ensure!(bytes.len()>=3 && bytes[0].is_ascii_alphabetic() && bytes[1]==b':' && matches!(bytes[2],b'\\'|b'/'),
-            "runtime_bootstrap: unsupported Windows device path cannot be safely converted for Node/npm");
+    if let Some(path) = raw.strip_prefix(r"\\?\") {
+        let bytes = path.as_bytes();
+        ensure!(
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/'),
+            "runtime_bootstrap: unsupported Windows device path cannot be safely converted for Node/npm"
+        );
         return Ok(path.to_owned());
     }
-    ensure!(!raw.starts_with(r"\\.\") && !raw.starts_with(r"\??\"),
-        "runtime_bootstrap: unsupported Windows device path cannot be safely converted for Node/npm");
+    ensure!(
+        !raw.starts_with(r"\\.\") && !raw.starts_with(r"\??\"),
+        "runtime_bootstrap: unsupported Windows device path cannot be safely converted for Node/npm"
+    );
     Ok(raw.to_owned())
 }
 
 #[cfg(windows)]
-fn external_runtime_path(path:&Path)->Result<OsString> {
-    let raw=path.as_os_str().to_string_lossy();
-    let normalized=normalize_windows_runtime_path(&raw)?;
+fn external_runtime_path(path: &Path) -> Result<OsString> {
+    let raw = path.as_os_str().to_string_lossy();
+    let normalized = normalize_windows_runtime_path(&raw)?;
     // An ordinary path that is too long for the Win32 API cannot be made safe
     // by stripping the extended prefix; stop before invoking the runtime.
-    ensure!(normalized.encode_utf16().count()<32_760,"runtime_bootstrap: converted Windows path exceeds the runtime path limit");
+    ensure!(
+        normalized.encode_utf16().count() < 32_760,
+        "runtime_bootstrap: converted Windows path exceeds the runtime path limit"
+    );
     Ok(OsString::from(normalized))
 }
 #[cfg(not(windows))]
-fn external_runtime_path(path:&Path)->Result<OsString> { Ok(path.as_os_str().to_owned()) }
+fn external_runtime_path(path: &Path) -> Result<OsString> {
+    Ok(path.as_os_str().to_owned())
+}
 
 fn node_executable() -> Result<PathBuf> {
     let paths = std::env::var_os("PATH")
@@ -595,21 +709,30 @@ fn node_npm() -> Result<(PathBuf, PathBuf)> {
 }
 
 fn script_invokes_powershell(script: &str) -> bool {
-    script.split(|character: char| {
-        !character.is_ascii_alphanumeric() && !matches!(character, '_' | '.' | '-')
-    }).any(|token| {
-        let token = token.to_ascii_lowercase();
-        matches!(token.as_str(),
-            "powershell" | "powershell.exe" | "powershell_ise" | "powershell_ise.exe" | "pwsh" | "pwsh.exe")
-            || token.ends_with(".ps1")
-    })
+    script
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '_' | '.' | '-')
+        })
+        .any(|token| {
+            let token = token.to_ascii_lowercase();
+            matches!(
+                token.as_str(),
+                "powershell"
+                    | "powershell.exe"
+                    | "powershell_ise"
+                    | "powershell_ise.exe"
+                    | "pwsh"
+                    | "pwsh.exe"
+            ) || token.ends_with(".ps1")
+        })
 }
 
 fn powershell_script_shell(configured: &str) -> bool {
     let configured = configured.trim();
     let token = match configured.chars().next() {
         Some(quote @ ('\'' | '"')) => configured[quote.len_utf8()..]
-            .split_once(quote).map_or(configured, |(path, _)| path),
+            .split_once(quote)
+            .map_or(configured, |(path, _)| path),
         Some(_) => configured.split_whitespace().next().unwrap_or(configured),
         None => return false,
     };
@@ -626,18 +749,26 @@ async fn effective_npm_script_shell(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<String>> {
     let mut command = Command::new(external_runtime_path(node)?);
-    command.arg(external_runtime_path(npm)?).args(["config", "get", "script-shell"])
+    command
+        .arg(external_runtime_path(npm)?)
+        .args(["config", "get", "script-shell"])
         .current_dir(external_runtime_path(dir)?)
-        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let output = tokio::select! {
         _ = cancel.cancelled() => anyhow::bail!("project execution cancelled before checking npm script-shell"),
         result = tokio::time::timeout(Duration::from_secs(15), command.output()) =>
             result.context("runtime_bootstrap: timed out reading effective npm script-shell")?
                 .context("runtime_bootstrap: could not read effective npm script-shell")?,
     };
-    ensure!(output.status.success(),
+    ensure!(
+        output.status.success(),
         "runtime_bootstrap: could not verify effective npm script-shell; refusing to start package scripts ({} {})",
-        output.status, String::from_utf8_lossy(&output.stderr).trim());
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let configured = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let unwrapped = configured.trim_matches(['\'', '"']).trim();
     Ok((!configured.is_empty() && unwrapped != "null").then(|| configured.to_owned()))
@@ -651,7 +782,9 @@ pub(crate) fn native_runtime_path(path: &Path) -> Result<OsString> {
     external_runtime_path(path)
 }
 
-fn runtime_bootstrap(error:impl std::fmt::Display)->anyhow::Error {anyhow::anyhow!("runtime_bootstrap: {error}")}
+fn runtime_bootstrap(error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!("runtime_bootstrap: {error}")
+}
 fn probe_target(args: &Value) -> Result<(Option<String>, Option<u16>)> {
     let url = args
         .get("ready_url")
@@ -703,7 +836,9 @@ async fn probe(record: &Record, args: &Value) -> Result<()> {
             false
         }
     };
-    if endpoint_changed { bump_process_event_generation(); }
+    if endpoint_changed {
+        bump_process_event_generation();
+    }
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(args["wait_seconds"].as_u64().unwrap_or(0).min(60));
     let client = reqwest::Client::builder()
@@ -716,22 +851,50 @@ async fn probe(record: &Record, args: &Value) -> Result<()> {
             break;
         }
         let port = meta.ready_port.or_else(|| {
-            meta.ready_url.as_ref().and_then(|url| reqwest::Url::parse(url).ok()).and_then(|url| url.port_or_known_default())
+            meta.ready_url
+                .as_ref()
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.port_or_known_default())
         });
         let Some(port) = port else { break };
-        let host = meta.ready_url.as_ref().and_then(|url| reqwest::Url::parse(url).ok()).and_then(|url| url.host_str().map(|host| host.trim_matches(['[', ']']).to_owned())).unwrap_or_else(|| "127.0.0.1".into());
+        let host = meta
+            .ready_url
+            .as_ref()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.trim_matches(['[', ']']).to_owned())
+            })
+            .unwrap_or_else(|| "127.0.0.1".into());
         let owner_host = host.clone();
-        let ownership = tokio::task::spawn_blocking(move || listener_ownership(port, &owner_host, meta.pid)).await?;
+        let ownership =
+            tokio::task::spawn_blocking(move || listener_ownership(port, &owner_host, meta.pid))
+                .await?;
         let page = if ownership.owned {
-            if let Some(url) = meta.ready_url.clone() { page_status(&client, &url).await }
-            else {
-                let connected = tokio::time::timeout(Duration::from_millis(750), tokio::net::TcpStream::connect((host.as_str(), port)))
-                    .await.is_ok_and(|result| result.is_ok());
-                PageStatus { ready: connected, detail: if connected { "TCP listener belongs to the managed process group and accepts connections".into() }
-                    else { format!("managed listener does not accept connections on {host}:{port}") } }
+            if let Some(url) = meta.ready_url.clone() {
+                page_status(&client, &url).await
+            } else {
+                let connected = tokio::time::timeout(
+                    Duration::from_millis(750),
+                    tokio::net::TcpStream::connect((host.as_str(), port)),
+                )
+                .await
+                .is_ok_and(|result| result.is_ok());
+                PageStatus {
+                    ready: connected,
+                    detail: if connected {
+                        "TCP listener belongs to the managed process group and accepts connections"
+                            .into()
+                    } else {
+                        format!("managed listener does not accept connections on {host}:{port}")
+                    },
+                }
             }
         } else {
-            PageStatus { ready: false, detail: ownership.detail.clone() }
+            PageStatus {
+                ready: false,
+                detail: ownership.detail.clone(),
+            }
         };
         let ready = ownership.owned && page.ready;
         let readiness_changed = {
@@ -743,7 +906,9 @@ async fn probe(record: &Record, args: &Value) -> Result<()> {
             state.ready = ready && state.running;
             previous != (state.ready, state.listener_owned, state.page_ready)
         };
-        if readiness_changed { bump_process_event_generation(); }
+        if readiness_changed {
+            bump_process_event_generation();
+        }
         if ready || tokio::time::Instant::now() >= deadline {
             break;
         }
@@ -753,8 +918,14 @@ async fn probe(record: &Record, args: &Value) -> Result<()> {
     Ok(())
 }
 
-struct ListenerOwnership { owned: bool, detail: String }
-struct PageStatus { ready: bool, detail: String }
+struct ListenerOwnership {
+    owned: bool,
+    detail: String,
+}
+struct PageStatus {
+    ready: bool,
+    detail: String,
+}
 
 enum EndpointFilter {
     V4(u32),
@@ -766,9 +937,15 @@ enum EndpointFilter {
 impl EndpointFilter {
     fn parse(host: &str) -> Self {
         let host = host.trim().trim_matches(|ch| ch == '[' || ch == ']');
-        if host.eq_ignore_ascii_case("localhost") { return Self::Localhost; }
-        if let Ok(std::net::IpAddr::V4(addr)) = host.parse() { return Self::V4(u32::from(addr)); }
-        if let Ok(std::net::IpAddr::V6(addr)) = host.parse() { return Self::V6(addr.octets()); }
+        if host.eq_ignore_ascii_case("localhost") {
+            return Self::Localhost;
+        }
+        if let Ok(std::net::IpAddr::V4(addr)) = host.parse() {
+            return Self::V4(u32::from(addr));
+        }
+        if let Ok(std::net::IpAddr::V6(addr)) = host.parse() {
+            return Self::V6(addr.octets());
+        }
         Self::Any
     }
 
@@ -791,7 +968,9 @@ impl EndpointFilter {
         // Node commonly listens on :: with dual-stack enabled. A subsequent
         // HTTP/TCP probe checks that the requested IPv4 address is reachable.
         if matches!(self, Self::V4(_) | Self::Localhost) {
-            if address == &unspecified { return BindMatch::Wildcard; }
+            if address == &unspecified {
+                return BindMatch::Wildcard;
+            }
             if address[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255] {
                 return self.match_v4(u32::from_be_bytes(address[12..].try_into().unwrap()));
             }
@@ -807,7 +986,11 @@ impl EndpointFilter {
     }
 }
 
-enum BindMatch { Exact, Wildcard, None }
+enum BindMatch {
+    Exact,
+    Wildcard,
+    None,
+}
 
 fn prefer_exact(exact: Vec<u32>, wildcard: Vec<u32>) -> Vec<u32> {
     let chosen = if exact.is_empty() { wildcard } else { exact };
@@ -819,17 +1002,46 @@ fn prefer_exact(exact: Vec<u32>, wildcard: Vec<u32>) -> Vec<u32> {
 
 fn listener_ownership(port: u16, host: &str, root_pid: u32) -> ListenerOwnership {
     match listener_pids(port, host) {
-        Err(error) => ListenerOwnership { owned: false, detail: format!("could not identify the process listening on {host}:{port}: {error}") },
-        Ok(pids) if pids.is_empty() => ListenerOwnership { owned: false, detail: format!("nothing is listening on {host}:{port}") },
+        Err(error) => ListenerOwnership {
+            owned: false,
+            detail: format!("could not identify the process listening on {host}:{port}: {error}"),
+        },
+        Ok(pids) if pids.is_empty() => ListenerOwnership {
+            owned: false,
+            detail: format!("nothing is listening on {host}:{port}"),
+        },
         Ok(pids) => {
-            let descriptions = pids.iter().map(|pid| format!("pid {pid} {}", process_name(*pid))).collect::<Vec<_>>().join("; ");
+            let descriptions = pids
+                .iter()
+                .map(|pid| format!("pid {pid} {}", process_name(*pid)))
+                .collect::<Vec<_>>()
+                .join("; ");
             let host_pid = std::process::id();
             if pids.iter().any(|pid| *pid == host_pid) {
-                ListenerOwnership { owned: false, detail: format!("port {port} on {host} belongs to this workspace host ({descriptions}), not the target application") }
-            } else if root_pid != 0 && pids.iter().all(|pid| *pid == root_pid || process_is_descendant(*pid, root_pid)) {
-                ListenerOwnership { owned: true, detail: format!("listener on {host}:{port} belongs to managed pid {root_pid}: {descriptions}") }
+                ListenerOwnership {
+                    owned: false,
+                    detail: format!(
+                        "port {port} on {host} belongs to this workspace host ({descriptions}), not the target application"
+                    ),
+                }
+            } else if root_pid != 0
+                && pids
+                    .iter()
+                    .all(|pid| *pid == root_pid || process_is_descendant(*pid, root_pid))
+            {
+                ListenerOwnership {
+                    owned: true,
+                    detail: format!(
+                        "listener on {host}:{port} belongs to managed pid {root_pid}: {descriptions}"
+                    ),
+                }
             } else {
-                ListenerOwnership { owned: false, detail: format!("port {port} on {host} is owned by another process ({descriptions})") }
+                ListenerOwnership {
+                    owned: false,
+                    detail: format!(
+                        "port {port} on {host} is owned by another process ({descriptions})"
+                    ),
+                }
             }
         }
     }
@@ -837,18 +1049,34 @@ fn listener_ownership(port: u16, host: &str, root_pid: u32) -> ListenerOwnership
 
 async fn page_status(client: &reqwest::Client, url: &str) -> PageStatus {
     match client.get(url).send().await {
-        Err(error) => PageStatus { ready: false, detail: format!("page request failed: {error}") },
+        Err(error) => PageStatus {
+            ready: false,
+            detail: format!("page request failed: {error}"),
+        },
         Ok(response) => {
             let status = response.status();
-            let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("").to_owned();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
             let body = response.text().await.unwrap_or_default();
             let excerpt: String = body.chars().take(400).collect();
             let lower = excerpt.to_lowercase();
-            let broken = lower.contains("cannot get") || lower.contains("wasm") && (lower.contains("error") || lower.contains("failed")) || lower.contains("econnrefused");
+            let broken = lower.contains("cannot get")
+                || lower.contains("wasm") && (lower.contains("error") || lower.contains("failed"))
+                || lower.contains("econnrefused");
             if !status.is_success() || broken {
-                PageStatus { ready: false, detail: format!("HTTP {status} content-type {content_type}; body: {excerpt}") }
+                PageStatus {
+                    ready: false,
+                    detail: format!("HTTP {status} content-type {content_type}; body: {excerpt}"),
+                }
             } else {
-                PageStatus { ready: true, detail: format!("HTTP {status} content-type {content_type}") }
+                PageStatus {
+                    ready: true,
+                    detail: format!("HTTP {status} content-type {content_type}"),
+                }
             }
         }
     }
@@ -856,14 +1084,31 @@ async fn page_status(client: &reqwest::Client, url: &str) -> PageStatus {
 
 #[cfg(windows)]
 fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID,
+        MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
     fn table<T>(family: u32) -> Result<Vec<u8>> {
         unsafe {
             let mut size = 0u32;
-            let _ = GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            let _ = GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
             let mut buffer = vec![0u8; size as usize];
-            let status = GetExtendedTcpTable(buffer.as_mut_ptr().cast(), &mut size, 0, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            let status = GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                0,
+                family,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
             ensure!(status == 0, "GetExtendedTcpTable failed: {status}");
             Ok(buffer)
         }
@@ -873,10 +1118,18 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
     let target = EndpointFilter::parse(host);
     let v4 = table::<()>(AF_INET as u32)?;
     if v4.len() >= std::mem::size_of::<u32>() {
-        let count = usize::try_from(u32::from_ne_bytes(v4[..4].try_into().unwrap_or([0; 4]))).unwrap_or(0);
-        let rows = unsafe { std::slice::from_raw_parts(v4.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID, count.min(4096)) };
+        let count =
+            usize::try_from(u32::from_ne_bytes(v4[..4].try_into().unwrap_or([0; 4]))).unwrap_or(0);
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                v4.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID,
+                count.min(4096),
+            )
+        };
         for row in rows {
-            if u16::from_be(row.dwLocalPort as u16) != port { continue; }
+            if u16::from_be(row.dwLocalPort as u16) != port {
+                continue;
+            }
             match target.match_v4(u32::from_be(row.dwLocalAddr)) {
                 BindMatch::Exact => exact.push(row.dwOwningPid),
                 BindMatch::Wildcard => wildcard.push(row.dwOwningPid),
@@ -886,10 +1139,18 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
     }
     let v6 = table::<()>(AF_INET6 as u32)?;
     if v6.len() >= std::mem::size_of::<u32>() {
-        let count = usize::try_from(u32::from_ne_bytes(v6[..4].try_into().unwrap_or([0; 4]))).unwrap_or(0);
-        let rows = unsafe { std::slice::from_raw_parts(v6.as_ptr().add(4) as *const MIB_TCP6ROW_OWNER_PID, count.min(4096)) };
+        let count =
+            usize::try_from(u32::from_ne_bytes(v6[..4].try_into().unwrap_or([0; 4]))).unwrap_or(0);
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                v6.as_ptr().add(4) as *const MIB_TCP6ROW_OWNER_PID,
+                count.min(4096),
+            )
+        };
         for row in rows {
-            if u16::from_be(row.dwLocalPort as u16) != port { continue; }
+            if u16::from_be(row.dwLocalPort as u16) != port {
+                continue;
+            }
             match target.match_v6(&row.ucLocalAddr) {
                 BindMatch::Exact => exact.push(row.dwOwningPid),
                 BindMatch::Wildcard => wildcard.push(row.dwOwningPid),
@@ -897,22 +1158,31 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
             }
         }
     }
-    let _ = std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() + std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>();
+    let _ = std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>()
+        + std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>();
     Ok(prefer_exact(exact, wildcard))
 }
 #[cfg(target_os = "linux")]
 fn linux_tcp_listener(line: &str) -> Option<(std::net::IpAddr, u16, u64)> {
     let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.get(3)? != &"0A" { return None; }
+    if fields.get(3)? != &"0A" {
+        return None;
+    }
     let (address, port) = fields.get(1)?.rsplit_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
     // procfs encodes each address word in native byte order, including tcp6.
     let address = match address.len() {
-        8 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_str_radix(address, 16).ok()?.to_ne_bytes())),
+        8 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            u32::from_str_radix(address, 16).ok()?.to_ne_bytes(),
+        )),
         32 => {
             let mut bytes = [0; 16];
             for (index, word) in address.as_bytes().chunks_exact(8).enumerate() {
-                bytes[index * 4..index * 4 + 4].copy_from_slice(&u32::from_str_radix(std::str::from_utf8(word).ok()?, 16).ok()?.to_ne_bytes());
+                bytes[index * 4..index * 4 + 4].copy_from_slice(
+                    &u32::from_str_radix(std::str::from_utf8(word).ok()?, 16)
+                        .ok()?
+                        .to_ne_bytes(),
+                );
             }
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes))
         }
@@ -929,12 +1199,20 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let text = match std::fs::read_to_string(table) {
             Ok(text) => text,
-            Err(error) if table.ends_with("tcp6") && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error)
+                if table.ends_with("tcp6") && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue;
+            }
             Err(error) => return Err(error).with_context(|| format!("could not read {table}")),
         };
         for line in text.lines().skip(1) {
-            let Some((address, local_port, inode)) = linux_tcp_listener(line) else { continue };
-            if local_port != port { continue; }
+            let Some((address, local_port, inode)) = linux_tcp_listener(line) else {
+                continue;
+            };
+            if local_port != port {
+                continue;
+            }
             let matched = match address {
                 std::net::IpAddr::V4(address) => target.match_v4(u32::from(address)),
                 std::net::IpAddr::V6(address) => target.match_v6(&address.octets()),
@@ -942,24 +1220,52 @@ fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
             match matched {
                 BindMatch::Exact => exact.push(inode),
                 BindMatch::Wildcard => wildcard.push(inode),
-                BindMatch::None => {},
+                BindMatch::None => {}
             }
         }
     }
-    let inodes: std::collections::BTreeSet<_> = if exact.is_empty() { wildcard } else { exact }.into_iter().collect();
-    if inodes.is_empty() { return Ok(Vec::new()); }
+    let inodes: std::collections::BTreeSet<_> = if exact.is_empty() { wildcard } else { exact }
+        .into_iter()
+        .collect();
+    if inodes.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut resolved = std::collections::BTreeSet::new();
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc")?.flatten() {
-        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else { continue };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(descriptors) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
         for descriptor in descriptors.flatten() {
-            let Ok(link) = std::fs::read_link(descriptor.path()) else { continue };
-            let Some(inode) = link.to_str().and_then(|value| value.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()) else { continue };
-            if inodes.contains(&inode) { resolved.insert(inode); pids.push(pid); }
+            let Ok(link) = std::fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let Some(inode) = link.to_str().and_then(|value| {
+                value
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .parse::<u64>()
+                    .ok()
+            }) else {
+                continue;
+            };
+            if inodes.contains(&inode) {
+                resolved.insert(inode);
+                pids.push(pid);
+            }
         }
     }
-    ensure!(resolved == inodes, "listener socket owners are unavailable in /proc (permission denied or process exited)");
+    ensure!(
+        resolved == inodes,
+        "listener socket owners are unavailable in /proc (permission denied or process exited)"
+    );
     Ok(prefer_exact(pids, Vec::new()))
 }
 
@@ -972,18 +1278,33 @@ fn lsof_listener_pids(text: &str, port: u16, host: &str) -> Vec<u32> {
     let mut exact = Vec::new();
     let mut wildcard = Vec::new();
     for line in text.lines() {
-        if let Some(value) = line.strip_prefix('p') { pid = value.parse::<u32>().ok(); }
-        let Some((pid, name)) = pid.zip(line.strip_prefix('n')) else { continue };
-        let Some((address, local_port)) = name.rsplit_once(':') else { continue };
-        if local_port.parse::<u16>().ok() != Some(port) { continue; }
-        let matched = if address == "*" { BindMatch::Wildcard }
-            else if let Ok(address) = address.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-                match address {
-                    std::net::IpAddr::V4(address) => target.match_v4(u32::from(address)),
-                    std::net::IpAddr::V6(address) => target.match_v6(&address.octets()),
-                }
-            } else { BindMatch::None };
-        match matched { BindMatch::Exact => exact.push(pid), BindMatch::Wildcard => wildcard.push(pid), BindMatch::None => {} }
+        if let Some(value) = line.strip_prefix('p') {
+            pid = value.parse::<u32>().ok();
+        }
+        let Some((pid, name)) = pid.zip(line.strip_prefix('n')) else {
+            continue;
+        };
+        let Some((address, local_port)) = name.rsplit_once(':') else {
+            continue;
+        };
+        if local_port.parse::<u16>().ok() != Some(port) {
+            continue;
+        }
+        let matched = if address == "*" {
+            BindMatch::Wildcard
+        } else if let Ok(address) = address.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            match address {
+                std::net::IpAddr::V4(address) => target.match_v4(u32::from(address)),
+                std::net::IpAddr::V6(address) => target.match_v6(&address.octets()),
+            }
+        } else {
+            BindMatch::None
+        };
+        match matched {
+            BindMatch::Exact => exact.push(pid),
+            BindMatch::Wildcard => wildcard.push(pid),
+            BindMatch::None => {}
+        }
     }
     prefer_exact(exact, wildcard)
 }
@@ -992,15 +1313,28 @@ fn lsof_listener_pids(text: &str, port: u16, host: &str) -> Vec<u32> {
 fn listener_pids(port: u16, host: &str) -> Result<Vec<u32>> {
     let output = std::process::Command::new("/usr/sbin/lsof")
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fpn"])
-        .output().context("could not run system lsof")?;
+        .output()
+        .context("could not run system lsof")?;
     // lsof uses exit 1 with empty output when there are no matching sockets.
-    ensure!(output.status.success() || output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty(),
-        "lsof failed: {}", String::from_utf8_lossy(&output.stderr));
-    Ok(lsof_listener_pids(&String::from_utf8_lossy(&output.stdout), port, host))
+    ensure!(
+        output.status.success()
+            || output.status.code() == Some(1)
+                && output.stdout.is_empty()
+                && output.stderr.is_empty(),
+        "lsof failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(lsof_listener_pids(
+        &String::from_utf8_lossy(&output.stdout),
+        port,
+        host,
+    ))
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn listener_pids(_port: u16, _host: &str) -> Result<Vec<u32>> { anyhow::bail!("listener ownership is unsupported on this operating system") }
+fn listener_pids(_port: u16, _host: &str) -> Result<Vec<u32>> {
+    anyhow::bail!("listener ownership is unsupported on this operating system")
+}
 
 #[cfg(windows)]
 fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
@@ -1009,7 +1343,9 @@ fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE { return false; }
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
         let snapshot = std::os::windows::io::OwnedHandle::from_raw_handle(snapshot);
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -1021,9 +1357,15 @@ fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
         }
         let mut cursor = pid;
         for _ in 0..12 {
-            let Some(parent) = parents.get(&cursor).copied() else { return false };
-            if parent == ancestor { return true; }
-            if parent == 0 || parent == cursor { return false; }
+            let Some(parent) = parents.get(&cursor).copied() else {
+                return false;
+            };
+            if parent == ancestor {
+                return true;
+            }
+            if parent == 0 || parent == cursor {
+                return false;
+            }
             cursor = parent;
         }
         false
@@ -1034,14 +1376,26 @@ fn process_parent(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm may contain spaces and parentheses; fields after its final ')' start
     // with state, then ppid.
-    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 #[cfg(target_os = "macos")]
 fn process_parent(pid: u32) -> Option<u32> {
-    let output = std::process::Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "ppid="]).output().ok()?;
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid="])
+        .output()
+        .ok()?;
     output.status.success().then_some(())?;
-    std::str::from_utf8(&output.stdout).ok()?.trim().parse().ok()
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1049,15 +1403,21 @@ fn process_is_descendant(pid: u32, ancestor: u32) -> bool {
     let mut cursor = pid;
     let mut seen = std::collections::BTreeSet::new();
     while cursor != 0 && seen.len() < 128 && seen.insert(cursor) {
-        let Some(parent) = process_parent(cursor) else { return false };
-        if parent == ancestor { return true; }
+        let Some(parent) = process_parent(cursor) else {
+            return false;
+        };
+        if parent == ancestor {
+            return true;
+        }
         cursor = parent;
     }
     false
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn process_is_descendant(_pid: u32, _ancestor: u32) -> bool { false }
+fn process_is_descendant(_pid: u32, _ancestor: u32) -> bool {
+    false
+}
 
 #[cfg(windows)]
 fn process_name(pid: u32) -> String {
@@ -1066,14 +1426,20 @@ fn process_name(pid: u32) -> String {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot == INVALID_HANDLE_VALUE { return String::new(); }
+        if snapshot == INVALID_HANDLE_VALUE {
+            return String::new();
+        }
         let snapshot = std::os::windows::io::OwnedHandle::from_raw_handle(snapshot);
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut found = Process32FirstW(snapshot.as_raw_handle(), &mut entry) != 0;
         while found {
             if entry.th32ProcessID == pid {
-                let end = entry.szExeFile.iter().position(|ch| *ch == 0).unwrap_or(entry.szExeFile.len());
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|ch| *ch == 0)
+                    .unwrap_or(entry.szExeFile.len());
                 return String::from_utf16_lossy(&entry.szExeFile[..end]);
             }
             found = Process32NextW(snapshot.as_raw_handle(), &mut entry) != 0;
@@ -1083,42 +1449,79 @@ fn process_name(pid: u32) -> String {
 }
 #[cfg(target_os = "linux")]
 fn process_name(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default().trim().to_owned()
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 #[cfg(target_os = "macos")]
 fn process_name(pid: u32) -> String {
-    std::process::Command::new("/bin/ps").args(["-p", &pid.to_string(), "-o", "comm="]).output().ok()
-        .filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()).unwrap_or_default()
+    std::process::Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_default()
 }
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn process_name(_pid: u32) -> String { String::new() }
+fn process_name(_pid: u32) -> String {
+    String::new()
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{build_process_observation,build_single_process_observation,can_reuse_process_observation,external_runtime_path,launch,listener_ownership,normalize_windows_runtime_path,node_npm,observation_is_fresh,observation_sample_is_current,prefer_exact,PROCESS_OBSERVATION_TTL_MS};
-    use std::process::Stdio;
+    use super::{
+        PROCESS_OBSERVATION_TTL_MS, build_process_observation, build_single_process_observation,
+        can_reuse_process_observation, external_runtime_path, launch, listener_ownership, node_npm,
+        normalize_windows_runtime_path, observation_is_fresh, observation_sample_is_current,
+        prefer_exact,
+    };
     #[cfg(not(windows))]
     use std::path::Path;
+    use std::process::Stdio;
 
     #[test]
     fn lsof_fields_filter_address_family_port_and_prefer_exact_binding() {
         let output = "p10\nn*:5173\np11\nn127.0.0.1:5173\np12\nn[::1]:5173\np13\nn10.1.2.3:5173\np14\nn127.0.0.1:9999\n";
-        assert_eq!(super::lsof_listener_pids(output, 5173, "127.0.0.1"), vec![11]);
+        assert_eq!(
+            super::lsof_listener_pids(output, 5173, "127.0.0.1"),
+            vec![11]
+        );
         assert_eq!(super::lsof_listener_pids(output, 5173, "::1"), vec![12]);
-        assert_eq!(super::lsof_listener_pids(output, 5173, "localhost"), vec![11, 12]);
-        assert_eq!(super::lsof_listener_pids(output, 5173, "10.1.2.4"), vec![10]);
+        assert_eq!(
+            super::lsof_listener_pids(output, 5173, "localhost"),
+            vec![11, 12]
+        );
+        assert_eq!(
+            super::lsof_listener_pids(output, 5173, "10.1.2.4"),
+            vec![10]
+        );
         assert!(super::lsof_listener_pids(output, 4321, "localhost").is_empty());
     }
 
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     #[test]
     fn proc_tcp_tables_decode_native_words_and_ignore_connected_sockets() {
-        let v4 = "0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345";
-        assert_eq!(super::linux_tcp_listener(v4), Some(("127.0.0.1".parse().unwrap(), 5173, 12345)));
+        let v4 =
+            "0: 0100007F:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 12345";
+        assert_eq!(
+            super::linux_tcp_listener(v4),
+            Some(("127.0.0.1".parse().unwrap(), 5173, 12345))
+        );
         let v6 = "0: 00000000000000000000000001000000:1435 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 12346";
-        assert_eq!(super::linux_tcp_listener(v6), Some(("::1".parse().unwrap(), 5173, 12346)));
-        let mapped = v6.replace("00000000000000000000000001000000", "0000000000000000FFFF00000100007F");
-        assert_eq!(super::linux_tcp_listener(&mapped).unwrap().0, "::ffff:127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(
+            super::linux_tcp_listener(v6),
+            Some(("::1".parse().unwrap(), 5173, 12346))
+        );
+        let mapped = v6.replace(
+            "00000000000000000000000001000000",
+            "0000000000000000FFFF00000100007F",
+        );
+        assert_eq!(
+            super::linux_tcp_listener(&mapped).unwrap().0,
+            "::ffff:127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
         assert!(super::linux_tcp_listener(&v4.replace(" 0A ", " 01 ")).is_none());
         assert!(super::linux_tcp_listener("invalid").is_none());
     }
@@ -1126,268 +1529,642 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[tokio::test]
     async fn dual_stack_wildcard_listener_is_found_from_ipv4() {
-        let Ok(listener) = tokio::net::TcpListener::bind("[::]:0").await else { return };
+        let Ok(listener) = tokio::net::TcpListener::bind("[::]:0").await else {
+            return;
+        };
         let port = listener.local_addr().unwrap().port();
         // Platforms with IPv6-only sockets cannot provide this dual-stack case.
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() { return; }
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            return;
+        }
         let pids = super::listener_pids(port, "127.0.0.1").unwrap();
         assert!(pids.contains(&std::process::id()), "{pids:?}");
     }
 
     #[test]
     fn powershell_script_detection_covers_direct_commands_and_configured_paths() {
-        assert!(super::script_invokes_powershell(r#"powershell.exe -NoProfile -Command "exit 0""#));
-        assert!(super::script_invokes_powershell(r#"pwsh -File scripts/build.ps1"#));
-        assert!(super::powershell_script_shell(r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile"#));
-        assert!(super::powershell_script_shell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
-        assert!(super::powershell_script_shell(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"));
-        assert!(!super::powershell_script_shell(r"C:\Windows\System32\cmd.exe"));
+        assert!(super::script_invokes_powershell(
+            r#"powershell.exe -NoProfile -Command "exit 0""#
+        ));
+        assert!(super::script_invokes_powershell(
+            r#"pwsh -File scripts/build.ps1"#
+        ));
+        assert!(super::powershell_script_shell(
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile"#
+        ));
+        assert!(super::powershell_script_shell(
+            r"C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(super::powershell_script_shell(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
+        assert!(!super::powershell_script_shell(
+            r"C:\Windows\System32\cmd.exe"
+        ));
         assert!(!super::script_invokes_powershell("node scripts/build.js"));
     }
 
     #[tokio::test]
     async fn explicitly_invoked_powershell_package_script_is_rejected_before_launch() {
-        let root=std::env::current_dir().unwrap().join("target")
-            .join(format!("test-powershell-script-{}-{}",std::process::id(),super::now()));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "test-powershell-script-{}-{}",
+                std::process::id(),
+                super::now()
+            ));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"bad":"powershell.exe -NoProfile -Command \"exit 0\""}}"#).unwrap();
-        let args=serde_json::json!({"project_path":".","script":"bad"});
-        let error=launch(&root,&args,false,
-            &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
-        assert!(error.to_string().contains("unsupported_script_shell"),"{error:#}");
-        assert!(error.to_string().contains("bad"),"{error:#}");
-        for hook in ["prebad","postbad"] {
-            let mut scripts=serde_json::Map::new();
-            scripts.insert("bad".into(),serde_json::json!("node -e \"console.log('safe')\""));
-            scripts.insert(hook.into(),serde_json::json!("powershell.exe -NoProfile -Command \"exit 0\""));
-            std::fs::write(root.join("package.json"),serde_json::to_vec(&serde_json::json!({"scripts":scripts})).unwrap()).unwrap();
-            let error=launch(&root,&args,false,&tokio_util::sync::CancellationToken::new()).await.unwrap_err();
-            assert!(error.to_string().contains(hook),"{error:#}");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"bad":"powershell.exe -NoProfile -Command \"exit 0\""}}"#,
+        )
+        .unwrap();
+        let args = serde_json::json!({"project_path":".","script":"bad"});
+        let error = launch(
+            &root,
+            &args,
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported_script_shell"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("bad"), "{error:#}");
+        for hook in ["prebad", "postbad"] {
+            let mut scripts = serde_json::Map::new();
+            scripts.insert(
+                "bad".into(),
+                serde_json::json!("node -e \"console.log('safe')\""),
+            );
+            scripts.insert(
+                hook.into(),
+                serde_json::json!("powershell.exe -NoProfile -Command \"exit 0\""),
+            );
+            std::fs::write(
+                root.join("package.json"),
+                serde_json::to_vec(&serde_json::json!({"scripts":scripts})).unwrap(),
+            )
+            .unwrap();
+            let error = launch(
+                &root,
+                &args,
+                false,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(hook), "{error:#}");
         }
-        let _=std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn effective_npm_script_shell_is_checked_before_launch() {
-        if node_npm().is_err() || std::env::var_os("NPM_CONFIG_SCRIPT_SHELL").is_some() { return; }
-        let root=std::env::current_dir().unwrap().join("target")
-            .join(format!("test-powershell-shell-{}-{}",std::process::id(),super::now()));
+        if node_npm().is_err() || std::env::var_os("NPM_CONFIG_SCRIPT_SHELL").is_some() {
+            return;
+        }
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "test-powershell-shell-{}-{}",
+                std::process::id(),
+                super::now()
+            ));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"safe":"node -e \"console.log('must not run')\""}}"#).unwrap();
-        std::fs::write(root.join(".npmrc"),"script-shell=powershell.exe\n").unwrap();
-        let error=launch(&root,&serde_json::json!({"project_path":".","script":"safe"}),false,
-            &tokio_util::sync::CancellationToken::new()).await.unwrap_err();
-        let _=std::fs::remove_dir_all(&root);
-        assert!(error.to_string().contains("effective npm script-shell"),"{error:#}");
-        assert!(error.to_string().contains("PowerShell"),"{error:#}");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"safe":"node -e \"console.log('must not run')\""}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".npmrc"), "script-shell=powershell.exe\n").unwrap();
+        let error = launch(
+            &root,
+            &serde_json::json!({"project_path":".","script":"safe"}),
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            error.to_string().contains("effective npm script-shell"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("PowerShell"), "{error:#}");
     }
 
-    fn fixture_record(root:&std::path::Path,id:&str,project_path:&str,args:&[&str])->std::sync::Arc<super::Record> {
-        let (stop,_receiver)=tokio::sync::mpsc::unbounded_channel();
-        let meta=super::Meta {
-            process_id:id.to_owned(),pid:1,root:root.canonicalize().unwrap(),project_path:project_path.to_owned(),
-            script:"dev".into(),args:args.iter().map(|arg|(*arg).to_owned()).collect(),operation:"script".into(),
-            check_key:format!("npm-start:{project_path}:dev"),running:true,ready:false,listener_owned:false,page_ready:false,
-            readiness_detail:"pending".into(),script_command:"npm run dev".into(),node_executable:"node".into(),npm_cli:"npm-cli.js".into(),
-            ready_url:None,ready_port:None,started_at:super::now(),
-            ended_at:None,exit_code:None,termination_reason:None,background:true,
+    fn fixture_record(
+        root: &std::path::Path,
+        id: &str,
+        project_path: &str,
+        args: &[&str],
+    ) -> std::sync::Arc<super::Record> {
+        let (stop, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let meta = super::Meta {
+            process_id: id.to_owned(),
+            pid: 1,
+            root: root.canonicalize().unwrap(),
+            project_path: project_path.to_owned(),
+            script: "dev".into(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            operation: "script".into(),
+            check_key: format!("npm-start:{project_path}:dev"),
+            running: true,
+            ready: false,
+            listener_owned: false,
+            page_ready: false,
+            readiness_detail: "pending".into(),
+            script_command: "npm run dev".into(),
+            node_executable: "node".into(),
+            npm_cli: "npm-cli.js".into(),
+            ready_url: None,
+            ready_port: None,
+            started_at: super::now(),
+            ended_at: None,
+            exit_code: None,
+            termination_reason: None,
+            background: true,
         };
         std::sync::Arc::new(super::Record {
-            meta:tokio::sync::Mutex::new(meta),logs:tokio::sync::Mutex::new(super::Logs::default()),
-            persist_guard:tokio::sync::Mutex::new(()),dir:root.to_path_buf(),stop,ended:tokio::sync::Notify::new(),
+            meta: tokio::sync::Mutex::new(meta),
+            logs: tokio::sync::Mutex::new(super::Logs::default()),
+            persist_guard: tokio::sync::Mutex::new(()),
+            dir: root.to_path_buf(),
+            stop,
+            ended: tokio::sync::Notify::new(),
         })
     }
 
     #[tokio::test]
     async fn process_snapshot_preserves_error_output_without_diagnosis_or_repair_guidance() {
-        let root=std::env::current_dir().unwrap();
-        let record=fixture_record(&root,"raw-error",".",&[]);
-        let stderr="MODULE_NOT_FOUND: cannot find module npm-cli\n  at original.js:17\n";
+        let root = std::env::current_dir().unwrap();
+        let record = fixture_record(&root, "raw-error", ".", &[]);
+        let stderr = "MODULE_NOT_FOUND: cannot find module npm-cli\n  at original.js:17\n";
         {
-            let mut meta=record.meta.lock().await;
-            meta.running=false;
-            meta.exit_code=Some(1);
-            meta.termination_reason=Some("exited".into());
-            meta.script_command="concurrently npm run frontend npm run backend".into();
-            let mut logs=record.logs.lock().await;
-            logs.sequence=1;
-            logs.chunks.push_back(serde_json::json!({"seq":1,"stream":"stderr","text":stderr}));
+            let mut meta = record.meta.lock().await;
+            meta.running = false;
+            meta.exit_code = Some(1);
+            meta.termination_reason = Some("exited".into());
+            meta.script_command = "concurrently npm run frontend npm run backend".into();
+            let mut logs = record.logs.lock().await;
+            logs.sequence = 1;
+            logs.chunks
+                .push_back(serde_json::json!({"seq":1,"stream":"stderr","text":stderr}));
         }
-        let result=record.snapshot(&serde_json::json!({})).await;
-        assert_eq!(result["stderr"],stderr);
-        assert_eq!(result["exit_code"],1);
-        for field in ["diagnosis","failure_stage","host_fix_guidance","port_args"] {
-            assert!(result.get(field).is_none(),"host must not interpret process output into {field}");
+        let result = record.snapshot(&serde_json::json!({})).await;
+        assert_eq!(result["stderr"], stderr);
+        assert_eq!(result["exit_code"], 1);
+        for field in [
+            "diagnosis",
+            "failure_stage",
+            "host_fix_guidance",
+            "port_args",
+        ] {
+            assert!(
+                result.get(field).is_none(),
+                "host must not interpret process output into {field}"
+            );
         }
     }
 
     #[test]
     fn windows_runtime_paths_normalize_dos_unc_and_reject_device_paths() {
-        assert_eq!(normalize_windows_runtime_path(r"\\?\C:\Users\Admin\npm-cli.js").unwrap(),r"C:\Users\Admin\npm-cli.js");
-        assert_eq!(normalize_windows_runtime_path(r"\\?\UNC\server\share\npm-cli.js").unwrap(),r"\\server\share\npm-cli.js");
-        assert_eq!(normalize_windows_runtime_path(r"C:\Users\Admin\npm-cli.js").unwrap(),r"C:\Users\Admin\npm-cli.js");
-        assert!(normalize_windows_runtime_path(r"\\?\GLOBALROOT\Device\HarddiskVolume1\npm-cli.js").is_err());
+        assert_eq!(
+            normalize_windows_runtime_path(r"\\?\C:\Users\Admin\npm-cli.js").unwrap(),
+            r"C:\Users\Admin\npm-cli.js"
+        );
+        assert_eq!(
+            normalize_windows_runtime_path(r"\\?\UNC\server\share\npm-cli.js").unwrap(),
+            r"\\server\share\npm-cli.js"
+        );
+        assert_eq!(
+            normalize_windows_runtime_path(r"C:\Users\Admin\npm-cli.js").unwrap(),
+            r"C:\Users\Admin\npm-cli.js"
+        );
+        assert!(
+            normalize_windows_runtime_path(r"\\?\GLOBALROOT\Device\HarddiskVolume1\npm-cli.js")
+                .is_err()
+        );
         assert!(normalize_windows_runtime_path(r"\\.\PhysicalDrive0").is_err());
         #[cfg(not(windows))]
-        assert_eq!(external_runtime_path(Path::new("/tmp/node")).unwrap(),std::ffi::OsString::from("/tmp/node"));
+        assert_eq!(
+            external_runtime_path(Path::new("/tmp/node")).unwrap(),
+            std::ffi::OsString::from("/tmp/node")
+        );
     }
 
     #[tokio::test]
     async fn discovered_npm_cli_runs_through_the_external_runtime_path() {
-        let Ok(Ok((node,npm)))=tokio::task::spawn_blocking(node_npm).await else {return};
-        let node=external_runtime_path(&node).unwrap();let npm=external_runtime_path(&npm).unwrap();
-        let output=tokio::process::Command::new(node).arg(npm).arg("--version")
-            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().await.unwrap();
-        assert!(output.status.success(),"npm CLI failed before a project script: {}",String::from_utf8_lossy(&output.stderr));
-        assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty(),"npm CLI returned no version");
+        let Ok(Ok((node, npm))) = tokio::task::spawn_blocking(node_npm).await else {
+            return;
+        };
+        let node = external_runtime_path(&node).unwrap();
+        let npm = external_runtime_path(&npm).unwrap();
+        let output = tokio::process::Command::new(node)
+            .arg(npm)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "npm CLI failed before a project script: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "npm CLI returned no version"
+        );
     }
 
     #[tokio::test]
     async fn run_project_script_enters_the_package_script_through_the_normalized_npm_cli() {
-        if node_npm().is_err(){return;}
-        let root=std::env::current_dir().unwrap().join("target")
-            .join(format!("test-npm-script-{}-{}",std::process::id(),super::now()));
+        if node_npm().is_err() {
+            return;
+        }
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "test-npm-script-{}-{}",
+                std::process::id(),
+                super::now()
+            ));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"dev":"node -e \"console.log('npm-script-entered')\""}}"#).unwrap();
-        let result=launch(&root,&serde_json::json!({"project_path":".","script":"dev","timeout_seconds":30}),false,
-            &tokio_util::sync::CancellationToken::new()).await;
-        let _=std::fs::remove_dir_all(&root);
-        let result=result.unwrap();
-        assert_eq!(result["status"],0,"stderr: {}",result["stderr"]);
-        assert!(result["stdout"].as_str().unwrap_or("").contains("npm-script-entered"),"stdout: {}",result["stdout"]);
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"node -e \"console.log('npm-script-entered')\""}}"#,
+        )
+        .unwrap();
+        let result = launch(
+            &root,
+            &serde_json::json!({"project_path":".","script":"dev","timeout_seconds":30}),
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&root);
+        let result = result.unwrap();
+        assert_eq!(result["status"], 0, "stderr: {}", result["stderr"]);
+        assert!(
+            result["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("npm-script-entered"),
+            "stdout: {}",
+            result["stdout"]
+        );
         assert!(result["failure_stage"].is_null());
-        assert!(result["process_observation"]["input_version"].as_str().is_some());
-        assert_eq!(result["process_observation"]["scope"]["coverage"],"single_process");
-        assert_eq!(result["process_observation"]["scope"]["operation"],"script");
-        assert!(!observation_is_fresh(&root,&serde_json::json!({"project_path":"."}),&result["process_observation"]));
+        assert!(
+            result["process_observation"]["input_version"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(
+            result["process_observation"]["scope"]["coverage"],
+            "single_process"
+        );
+        assert_eq!(
+            result["process_observation"]["scope"]["operation"],
+            "script"
+        );
+        assert!(!observation_is_fresh(
+            &root,
+            &serde_json::json!({"project_path":"."}),
+            &result["process_observation"]
+        ));
     }
 
     #[test]
     fn scoped_process_observations_expire_on_inputs_host_events_and_ttl() {
-        let workspace=std::env::current_dir().unwrap();
-        let project_name=format!("test-process-observation-{}-{}",std::process::id(),super::now());
-        let root=workspace.join("target").join(&project_name);
+        let workspace = std::env::current_dir().unwrap();
+        let project_name = format!(
+            "test-process-observation-{}-{}",
+            std::process::id(),
+            super::now()
+        );
+        let root = workspace.join("target").join(&project_name);
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"dev":"node server.js"}}"#).unwrap();
-        std::fs::write(root.join("package-lock.json"),r#"{"lockfileVersion":3}"#).unwrap();
-        std::fs::write(root.join("npm-shrinkwrap.json"),r#"{"lockfileVersion":3}"#).unwrap();
-        let args=serde_json::json!({"project_path":format!("target/{project_name}"),"script":"dev","ready_url":"http://127.0.0.1:4321"});
-        let mut sample=build_process_observation(&workspace,&args,&[]).unwrap();
-        assert!(observation_sample_is_current(&workspace,&sample));
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("package-lock.json"), r#"{"lockfileVersion":3}"#).unwrap();
+        std::fs::write(root.join("npm-shrinkwrap.json"), r#"{"lockfileVersion":3}"#).unwrap();
+        let args = serde_json::json!({"project_path":format!("target/{project_name}"),"script":"dev","ready_url":"http://127.0.0.1:4321"});
+        let mut sample = build_process_observation(&workspace, &args, &[]).unwrap();
+        assert!(observation_sample_is_current(&workspace, &sample));
 
-        let mut old_host=sample.clone();old_host["host_instance_id"]=serde_json::json!("previous-host");
-        assert!(!observation_sample_is_current(&workspace,&old_host));
-        let mut old_events=sample.clone();old_events["process_event_generation"]=serde_json::json!(sample["process_event_generation"].as_u64().unwrap().saturating_sub(1));
-        assert!(!observation_sample_is_current(&workspace,&old_events));
-        sample["sampled_at"]=serde_json::json!(super::now().saturating_sub(PROCESS_OBSERVATION_TTL_MS+1));
-        assert!(!observation_sample_is_current(&workspace,&sample));
+        let mut old_host = sample.clone();
+        old_host["host_instance_id"] = serde_json::json!("previous-host");
+        assert!(!observation_sample_is_current(&workspace, &old_host));
+        let mut old_events = sample.clone();
+        old_events["process_event_generation"] = serde_json::json!(
+            sample["process_event_generation"]
+                .as_u64()
+                .unwrap()
+                .saturating_sub(1)
+        );
+        assert!(!observation_sample_is_current(&workspace, &old_events));
+        sample["sampled_at"] =
+            serde_json::json!(super::now().saturating_sub(PROCESS_OBSERVATION_TTL_MS + 1));
+        assert!(!observation_sample_is_current(&workspace, &sample));
 
-        let changed=build_process_observation(&workspace,&args,&[]).unwrap();
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"dev":"node changed.js"}}"#).unwrap();
-        assert!(!observation_sample_is_current(&workspace,&changed));
-        let _=std::fs::remove_dir_all(&root);
+        let changed = build_process_observation(&workspace, &args, &[]).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"node changed.js"}}"#,
+        )
+        .unwrap();
+        assert!(!observation_sample_is_current(&workspace, &changed));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn process_lists_mark_coverage_preserve_subprojects_and_ignore_log_limits_in_scope() {
-        let root=std::env::current_dir().unwrap().join("target")
-            .join(format!("test-process-list-{}-{}",std::process::id(),super::now()));
-        for project in ["apps/one","apps/two"] {
-            let directory=root.join(project);std::fs::create_dir_all(&directory).unwrap();
-            std::fs::write(directory.join("package.json"),r#"{"scripts":{"dev":"node server.js"}}"#).unwrap();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "test-process-list-{}-{}",
+                std::process::id(),
+                super::now()
+            ));
+        for project in ["apps/one", "apps/two"] {
+            let directory = root.join(project);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("package.json"),
+                r#"{"scripts":{"dev":"node server.js"}}"#,
+            )
+            .unwrap();
         }
-        let workspace=crate::tools::Workspace::new(&root).unwrap();
-        let canonical=workspace.root().to_path_buf();
-        let ids=["project_fixture_one_3001","project_fixture_one_3002","project_fixture_two_4001"];
+        let workspace = crate::tools::Workspace::new(&root).unwrap();
+        let canonical = workspace.root().to_path_buf();
+        let ids = [
+            "project_fixture_one_3001",
+            "project_fixture_one_3002",
+            "project_fixture_two_4001",
+        ];
         {
-            let mut records=super::registry().lock().await;
-            records.records.insert(ids[0].into(),fixture_record(&canonical,ids[0],"apps/one",&["--port","3001"]));
-            records.records.insert(ids[1].into(),fixture_record(&canonical,ids[1],"apps/one",&["--port","3002"]));
-            records.records.insert(ids[2].into(),fixture_record(&canonical,ids[2],"apps/two",&["--port","4001"]));
+            let mut records = super::registry().lock().await;
+            records.records.insert(
+                ids[0].into(),
+                fixture_record(&canonical, ids[0], "apps/one", &["--port", "3001"]),
+            );
+            records.records.insert(
+                ids[1].into(),
+                fixture_record(&canonical, ids[1], "apps/one", &["--port", "3002"]),
+            );
+            records.records.insert(
+                ids[2].into(),
+                fixture_record(&canonical, ids[2], "apps/two", &["--port", "4001"]),
+            );
         }
-        let cancel=tokio_util::sync::CancellationToken::new();
-        let workspace_list=super::execute_cancellable(&workspace,"get_project_process",serde_json::json!({}),&cancel).await;
-        let workspace_script_list=super::execute_cancellable(&workspace,"get_project_process",serde_json::json!({"script":"dev"}),&cancel).await;
-        let project_list=super::execute_cancellable(&workspace,"get_project_process",serde_json::json!({"project_path":"apps/one"}),&cancel).await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let workspace_list = super::execute_cancellable(
+            &workspace,
+            "get_project_process",
+            serde_json::json!({}),
+            &cancel,
+        )
+        .await;
+        let workspace_script_list = super::execute_cancellable(
+            &workspace,
+            "get_project_process",
+            serde_json::json!({"script":"dev"}),
+            &cancel,
+        )
+        .await;
+        let project_list = super::execute_cancellable(
+            &workspace,
+            "get_project_process",
+            serde_json::json!({"project_path":"apps/one"}),
+            &cancel,
+        )
+        .await;
         {
-            let mut records=super::registry().lock().await;
-            for id in ids {records.records.remove(id);}
+            let mut records = super::registry().lock().await;
+            for id in ids {
+                records.records.remove(id);
+            }
         }
 
-        let workspace_list=workspace_list.unwrap();
-        let workspace_script_list=workspace_script_list.unwrap();
-        let project_list=project_list.unwrap();
-        assert_eq!(workspace_list["processes"].as_array().unwrap().len(),3);
-        assert!(workspace_list["processes"].as_array().unwrap().iter().any(|process|process["project_path"]=="apps/two"),
-            "workspace listing must retain processes from child projects");
-        assert_eq!(workspace_list["process_observation"]["scope"]["coverage"],"workspace_list");
-        assert_eq!(workspace_script_list["processes"].as_array().unwrap().len(),3,
-            "script filtering without project_path remains workspace-wide");
-        assert_eq!(workspace_script_list["process_observation"]["scope"]["coverage"],"workspace_list");
-        assert_eq!(project_list["processes"].as_array().unwrap().len(),2,"same-script processes with different args must both remain visible");
-        let process_args=project_list["processes"].as_array().unwrap().iter().map(|process|process["args"].to_string()).collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(process_args.len(),2,"the list must retain each instance's distinct script args");
-        assert_eq!(project_list["process_observation"]["scope"]["coverage"],"project_list");
-        assert!(observation_is_fresh(&canonical,&serde_json::json!({"max_chars":4096}),&workspace_list["process_observation"]),
-            "max_chars changes log presentation, not process-list identity");
-        assert!(observation_is_fresh(&canonical,&serde_json::json!({"project_path":"apps/one","max_chars":8192}),&project_list["process_observation"]));
-        let active_probe=serde_json::json!({"project_path":"apps/one","ready_url":"http://127.0.0.1:4321"});
-        assert!(!can_reuse_process_observation(&active_probe),"an endpoint request asks for an active readiness probe");
+        let workspace_list = workspace_list.unwrap();
+        let workspace_script_list = workspace_script_list.unwrap();
+        let project_list = project_list.unwrap();
+        assert_eq!(workspace_list["processes"].as_array().unwrap().len(), 3);
+        assert!(
+            workspace_list["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|process| process["project_path"] == "apps/two"),
+            "workspace listing must retain processes from child projects"
+        );
+        assert_eq!(
+            workspace_list["process_observation"]["scope"]["coverage"],
+            "workspace_list"
+        );
+        assert_eq!(
+            workspace_script_list["processes"].as_array().unwrap().len(),
+            3,
+            "script filtering without project_path remains workspace-wide"
+        );
+        assert_eq!(
+            workspace_script_list["process_observation"]["scope"]["coverage"],
+            "workspace_list"
+        );
+        assert_eq!(
+            project_list["processes"].as_array().unwrap().len(),
+            2,
+            "same-script processes with different args must both remain visible"
+        );
+        let process_args = project_list["processes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|process| process["args"].to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            process_args.len(),
+            2,
+            "the list must retain each instance's distinct script args"
+        );
+        assert_eq!(
+            project_list["process_observation"]["scope"]["coverage"],
+            "project_list"
+        );
+        assert!(
+            observation_is_fresh(
+                &canonical,
+                &serde_json::json!({"max_chars":4096}),
+                &workspace_list["process_observation"]
+            ),
+            "max_chars changes log presentation, not process-list identity"
+        );
+        assert!(observation_is_fresh(
+            &canonical,
+            &serde_json::json!({"project_path":"apps/one","max_chars":8192}),
+            &project_list["process_observation"]
+        ));
+        let active_probe =
+            serde_json::json!({"project_path":"apps/one","ready_url":"http://127.0.0.1:4321"});
+        assert!(
+            !can_reuse_process_observation(&active_probe),
+            "an endpoint request asks for an active readiness probe"
+        );
 
-        let first_process=project_list["processes"][0].clone();
-        let single=build_single_process_observation(&canonical,&serde_json::json!({"project_path":"apps/one"}),&[super::process_fact(&first_process)]).unwrap();
-        assert_eq!(single["scope"]["coverage"],"single_process");
+        let first_process = project_list["processes"][0].clone();
+        let single = build_single_process_observation(
+            &canonical,
+            &serde_json::json!({"project_path":"apps/one"}),
+            &[super::process_fact(&first_process)],
+        )
+        .unwrap();
+        assert_eq!(single["scope"]["coverage"], "single_process");
         assert!(single["scope"]["process_id"].as_str().is_some());
-        assert!(!observation_is_fresh(&canonical,&serde_json::json!({"project_path":"apps/one"}),&single),
-            "a single process snapshot must not satisfy a complete project list query");
-        let install_fact=serde_json::json!({"process_id":"project_fixture_install","project_path":"apps/one","script":"install",
+        assert!(
+            !observation_is_fresh(
+                &canonical,
+                &serde_json::json!({"project_path":"apps/one"}),
+                &single
+            ),
+            "a single process snapshot must not satisfy a complete project list query"
+        );
+        let install_fact = serde_json::json!({"process_id":"project_fixture_install","project_path":"apps/one","script":"install",
             "args":[],"operation":"install","running":false,"ready":false});
-        let install_sample=build_single_process_observation(&canonical,&serde_json::json!({"project_path":"apps/one"}),&[install_fact]).unwrap();
-        assert_eq!(install_sample["scope"]["operation"],"install");
-        assert!(!observation_is_fresh(&canonical,&serde_json::json!({"project_path":"apps/one"}),&install_sample),
-            "an install result cannot mask the complete project process list");
-        let _=std::fs::remove_dir_all(&root);
+        let install_sample = build_single_process_observation(
+            &canonical,
+            &serde_json::json!({"project_path":"apps/one"}),
+            &[install_fact],
+        )
+        .unwrap();
+        assert_eq!(install_sample["scope"]["operation"], "install");
+        assert!(
+            !observation_is_fresh(
+                &canonical,
+                &serde_json::json!({"project_path":"apps/one"}),
+                &install_sample
+            ),
+            "an install result cannot mask the complete project process list"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn wait_seconds_bypasses_pending_snapshot_and_waits_for_delayed_readiness() {
-        if node_npm().is_err(){return;}
-        let root=std::env::current_dir().unwrap().join("target")
-            .join(format!("test-delayed-readiness-{}-{}",std::process::id(),super::now()));
+        if node_npm().is_err() {
+            return;
+        }
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "test-delayed-readiness-{}-{}",
+                std::process::id(),
+                super::now()
+            ));
         std::fs::create_dir_all(&root).unwrap();
-        let port_listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port=port_listener.local_addr().unwrap().port();
+        let port_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = port_listener.local_addr().unwrap().port();
         drop(port_listener);
-        std::fs::write(root.join("package.json"),r#"{"scripts":{"dev":"node server.js"}}"#).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"}}"#,
+        )
+        .unwrap();
         std::fs::write(root.join("server.js"),format!(
             "const http=require('http'); setTimeout(()=>http.createServer((req,res)=>res.end('ready')).listen({port},'127.0.0.1'),1500); setInterval(()=>{{}},1000);"
         )).unwrap();
-        let launch_args=serde_json::json!({"project_path":".","script":"dev","background":true,
+        let launch_args = serde_json::json!({"project_path":".","script":"dev","background":true,
             "ready_url":format!("http://127.0.0.1:{port}/"),"wait_seconds":0});
-        let launched=launch(&root,&launch_args,false,&tokio_util::sync::CancellationToken::new()).await;
-        let Ok(launched)=launched else {let _=std::fs::remove_dir_all(&root);panic!("fixture server did not launch: {launched:?}")};
-        let process_id=launched["process_id"].as_str().unwrap().to_owned();
-        let workspace=crate::tools::Workspace::new(&root).unwrap();
-        let query_args=serde_json::json!({"project_path":".","script":"dev","wait_seconds":0});
-        let pending_result=super::execute_cancellable(&workspace,"get_project_process",query_args,&tokio_util::sync::CancellationToken::new()).await;
-        let wait_args=serde_json::json!({"project_path":".","script":"dev","wait_seconds":5});
-        let pending_sample=pending_result.as_ref().ok().map(|result|result["process_observation"].clone()).unwrap_or_default();
-        let reuse_rejected=!observation_is_fresh(workspace.root(),&wait_args,&pending_sample);
-        let wait_started=tokio::time::Instant::now();
-        let ready_result=super::execute_cancellable(&workspace,"get_project_process",wait_args,&tokio_util::sync::CancellationToken::new()).await;
-        let waited=wait_started.elapsed();
-        let _=super::execute_cancellable(&workspace,"stop_project_process",serde_json::json!({"process_id":process_id}),&tokio_util::sync::CancellationToken::new()).await;
-        super::registry().lock().await.records.remove(launched["process_id"].as_str().unwrap());
-        let _=std::fs::remove_dir_all(&root);
+        let launched = launch(
+            &root,
+            &launch_args,
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let Ok(launched) = launched else {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("fixture server did not launch: {launched:?}")
+        };
+        let process_id = launched["process_id"].as_str().unwrap().to_owned();
+        let workspace = crate::tools::Workspace::new(&root).unwrap();
+        let query_args = serde_json::json!({"project_path":".","script":"dev","wait_seconds":0});
+        let pending_result = super::execute_cancellable(
+            &workspace,
+            "get_project_process",
+            query_args,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let wait_args = serde_json::json!({"project_path":".","script":"dev","wait_seconds":5});
+        let pending_sample = pending_result
+            .as_ref()
+            .ok()
+            .map(|result| result["process_observation"].clone())
+            .unwrap_or_default();
+        let reuse_rejected = !observation_is_fresh(workspace.root(), &wait_args, &pending_sample);
+        let wait_started = tokio::time::Instant::now();
+        let ready_result = super::execute_cancellable(
+            &workspace,
+            "get_project_process",
+            wait_args,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let waited = wait_started.elapsed();
+        let _ = super::execute_cancellable(
+            &workspace,
+            "stop_project_process",
+            serde_json::json!({"process_id":process_id}),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        super::registry()
+            .lock()
+            .await
+            .records
+            .remove(launched["process_id"].as_str().unwrap());
+        let _ = std::fs::remove_dir_all(&root);
 
-        let pending=pending_result.unwrap();
-        let ready=ready_result.unwrap();
-        assert_eq!(pending["processes"][0]["ready"],false,"fixture must first return a pending snapshot");
-        assert_eq!(pending["process_observation"]["scope"]["coverage"],"project_list");
-        assert!(reuse_rejected,"a waiting query cannot be satisfied by a pending cached snapshot");
-        assert!(waited>=std::time::Duration::from_millis(700),"readiness query returned before delayed listener appeared: {waited:?}");
-        assert_eq!(ready["processes"][0]["ready"],true,"wait_seconds query must probe until delayed readiness succeeds");
+        let pending = pending_result.unwrap();
+        let ready = ready_result.unwrap();
+        assert_eq!(
+            pending["processes"][0]["ready"], false,
+            "fixture must first return a pending snapshot"
+        );
+        assert_eq!(
+            pending["process_observation"]["scope"]["coverage"],
+            "project_list"
+        );
+        assert!(
+            reuse_rejected,
+            "a waiting query cannot be satisfied by a pending cached snapshot"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(700),
+            "readiness query returned before delayed listener appeared: {waited:?}"
+        );
+        assert_eq!(
+            ready["processes"][0]["ready"], true,
+            "wait_seconds query must probe until delayed readiness succeeds"
+        );
     }
 
     #[tokio::test]
@@ -1399,19 +2176,33 @@ mod tests {
         // Restricted Windows test runners may deny GetExtendedTcpTable. In that
         // case the production result is conservatively unowned and cannot pass
         // readiness; PID attribution itself requires a privileged runner.
-        if ownership.detail.contains("GetExtendedTcpTable failed: 5") { return; }
+        if ownership.detail.contains("GetExtendedTcpTable failed: 5") {
+            return;
+        }
         assert!(ownership.detail.contains("pid"), "{}", ownership.detail);
         let other_family = listener_ownership(port, "::1", 1);
         assert!(!other_family.owned, "{}", other_family.detail);
-        assert!(other_family.detail.contains("nothing is listening"), "{}", other_family.detail);
+        assert!(
+            other_family.detail.contains("nothing is listening"),
+            "{}",
+            other_family.detail
+        );
         assert_eq!(prefer_exact(vec![7], vec![9]), vec![7]);
         assert_eq!(prefer_exact(vec![], vec![9, 9]), vec![9]);
         drop(listener);
         if std::env::var("LIVE_PORT_CHECK").is_ok() {
             let loopback_live = listener_ownership(3000, "127.0.0.1", 1);
             assert!(!loopback_live.owned, "{}", loopback_live.detail);
-            assert!(loopback_live.detail.contains("codex-workspace-mcp"), "{}", loopback_live.detail);
-            assert!(!loopback_live.detail.contains("node"), "{}", loopback_live.detail);
+            assert!(
+                loopback_live.detail.contains("codex-workspace-mcp"),
+                "{}",
+                loopback_live.detail
+            );
+            assert!(
+                !loopback_live.detail.contains("node"),
+                "{}",
+                loopback_live.detail
+            );
             if let Ok(host) = std::env::var("LIVE_PORT_HOST") {
                 let editor = listener_ownership(3000, &host, 1);
                 assert!(editor.detail.contains("node"), "{}", editor.detail);
@@ -1631,15 +2422,38 @@ async fn launch(
                 .unwrap_or_default()
                 .join(", ")
         );
-        for invoked_script in [format!("pre{script}"),script.clone(),format!("post{script}")] {
-            if manifest["scripts"][&invoked_script].as_str().is_some_and(script_invokes_powershell) {
-                anyhow::bail!("unsupported_script_shell: package script '{invoked_script}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled");
+        for invoked_script in [
+            format!("pre{script}"),
+            script.clone(),
+            format!("post{script}"),
+        ] {
+            if manifest["scripts"][&invoked_script]
+                .as_str()
+                .is_some_and(script_invokes_powershell)
+            {
+                anyhow::bail!(
+                    "unsupported_script_shell: package script '{invoked_script}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled"
+                );
             }
         }
     } else if let Some(scripts) = manifest["scripts"].as_object() {
-        for lifecycle in ["preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare"] {
-            if scripts.get(lifecycle).and_then(Value::as_str).is_some_and(script_invokes_powershell) {
-                anyhow::bail!("unsupported_script_shell: npm lifecycle script '{lifecycle}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled");
+        for lifecycle in [
+            "preinstall",
+            "install",
+            "postinstall",
+            "prepublish",
+            "preprepare",
+            "prepare",
+            "postprepare",
+        ] {
+            if scripts
+                .get(lifecycle)
+                .and_then(Value::as_str)
+                .is_some_and(script_invokes_powershell)
+            {
+                anyhow::bail!(
+                    "unsupported_script_shell: npm lifecycle script '{lifecycle}' directly invokes PowerShell or a .ps1 file; PowerShell execution is disabled"
+                );
             }
         }
     }
@@ -1662,15 +2476,25 @@ async fn launch(
         !install || ready_url.is_none() && ready_port.is_none(),
         "dependency installation has an exit result, not a server readiness endpoint"
     );
-    let (node, npm) = tokio::task::spawn_blocking(node_npm).await.map_err(runtime_bootstrap)?.map_err(runtime_bootstrap)?;
-    let configured_shell = effective_npm_script_shell(&node, &npm, &dir, cancel).await.map_err(runtime_bootstrap)?;
-    if configured_shell.as_deref().is_some_and(powershell_script_shell) {
-        anyhow::bail!("unsupported_script_shell: effective npm script-shell '{}' is PowerShell; PowerShell execution is disabled",
-            configured_shell.as_deref().unwrap_or_default());
+    let (node, npm) = tokio::task::spawn_blocking(node_npm)
+        .await
+        .map_err(runtime_bootstrap)?
+        .map_err(runtime_bootstrap)?;
+    let configured_shell = effective_npm_script_shell(&node, &npm, &dir, cancel)
+        .await
+        .map_err(runtime_bootstrap)?;
+    if configured_shell
+        .as_deref()
+        .is_some_and(powershell_script_shell)
+    {
+        anyhow::bail!(
+            "unsupported_script_shell: effective npm script-shell '{}' is PowerShell; PowerShell execution is disabled",
+            configured_shell.as_deref().unwrap_or_default()
+        );
     }
-    let node_arg=external_runtime_path(&node).map_err(runtime_bootstrap)?;
-    let npm_arg=external_runtime_path(&npm).map_err(runtime_bootstrap)?;
-    let cwd_arg=external_runtime_path(&dir).map_err(runtime_bootstrap)?;
+    let node_arg = external_runtime_path(&node).map_err(runtime_bootstrap)?;
+    let npm_arg = external_runtime_path(&npm).map_err(runtime_bootstrap)?;
+    let cwd_arg = external_runtime_path(&dir).map_err(runtime_bootstrap)?;
     let disk_dir =
         crate::file_edit::workspace_path(&root, ".codex-workspace-mcp/project-processes")?;
     tokio::fs::create_dir_all(&disk_dir).await?;
@@ -1699,7 +2523,8 @@ async fn launch(
                 let mut result = existing.snapshot(args).await;
                 result["reused"] = json!(true);
                 let fact = process_fact(&result);
-                result["process_observation"] = build_single_process_observation(&root, args, &[fact])?;
+                result["process_observation"] =
+                    build_single_process_observation(&root, args, &[fact])?;
                 return Ok(result);
             }
         }
@@ -1744,8 +2569,10 @@ async fn launch(
             .unwrap_or_else(|| "127.0.0.1".into());
         let occupied = tokio::time::timeout(
             Duration::from_millis(300),
-            tokio::net::TcpStream::connect((host.as_str(), port))
-        ).await.is_ok_and(|v| v.is_ok());
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .is_ok_and(|v| v.is_ok());
         if occupied {
             let owner = listener_ownership(port, &host, 0);
             anyhow::bail!(
@@ -1792,7 +2619,9 @@ async fn launch(
     }
     prepare_process_group(&mut command);
     ensure!(!cancel.is_cancelled(), "project execution cancelled");
-    let mut child = command.spawn().context("runtime_bootstrap: could not launch Node/npm")?;
+    let mut child = command
+        .spawn()
+        .context("runtime_bootstrap: could not launch Node/npm")?;
     let group = match ProcessGroup::attach(&child) {
         Ok(group) => group,
         Err(error) => {
@@ -1816,12 +2645,21 @@ async fn launch(
         },
         &json!({"project_path":relative,"script":script,"args":extra,"background":background}),
     );
-    let script_command = if install { String::new() } else { manifest["scripts"][&script].as_str().unwrap_or("").chars().take(500).collect() };
+    let script_command = if install {
+        String::new()
+    } else {
+        manifest["scripts"][&script]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(500)
+            .collect()
+    };
     let record = Arc::new(Record {
         meta: Mutex::new(Meta {
             process_id: id.clone(),
             pid,
-            root:root.clone(),
+            root: root.clone(),
             project_path: relative,
             script,
             args: extra,
@@ -1874,9 +2712,9 @@ async fn launch(
             }
         }
         lease.0 = None;
-        let mut result=record.snapshot(args).await;
-        let fact=process_fact(&result);
-        result["process_observation"]=build_single_process_observation(&root,args,&[fact])?;
+        let mut result = record.snapshot(args).await;
+        let fact = process_fact(&result);
+        result["process_observation"] = build_single_process_observation(&root, args, &[fact])?;
         return Ok(result);
     }
     let timeout = args["timeout_seconds"]
@@ -1892,8 +2730,8 @@ async fn launch(
         let _ = tokio::time::timeout(Duration::from_secs(10), record.wait()).await;
     }
     let mut result = record.snapshot(args).await;
-    let fact=process_fact(&result);
-    result["process_observation"]=build_single_process_observation(&root,args,&[fact])?;
+    let fact = process_fact(&result);
+    result["process_observation"] = build_single_process_observation(&root, args, &[fact])?;
     lease.0 = None;
     if let Some(reason) = stop_reason {
         result["error"] = json!(if reason == "timeout" {
@@ -1994,8 +2832,12 @@ pub async fn execute_cancellable(
     );
     ensure!(!cancel.is_cancelled(), "project execution cancelled");
     if name == "get_project_process" && args["force_refresh"] == true {
-        ensure!(args["observation_purpose"].as_str().is_some_and(|reason| !reason.trim().is_empty() && reason.chars().count() <= 300),
-            "force_refresh requires a concrete observation_purpose (maximum 300 characters)");
+        ensure!(
+            args["observation_purpose"]
+                .as_str()
+                .is_some_and(|reason| !reason.trim().is_empty() && reason.chars().count() <= 300),
+            "force_refresh requires a concrete observation_purpose (maximum 300 characters)"
+        );
     }
     match name {
         "install_dependencies" => launch(workspace.root(), &args, true, cancel).await,
@@ -2003,18 +2845,31 @@ pub async fn execute_cancellable(
         "get_project_process" => {
             if let Some(id) = args["process_id"].as_str() {
                 let record = find(workspace.root(), id).await?;
-                let meta=record.meta.lock().await.clone();
-                ensure!(args.get("project_path").and_then(Value::as_str).is_none_or(|path|meta.project_path==path.replace('\\',"/")),
-                    "process_id does not belong to the requested project_path scope");
-                ensure!(args.get("script").and_then(Value::as_str).is_none_or(|script|meta.script==script),
-                    "process_id does not belong to the requested script scope");
+                let meta = record.meta.lock().await.clone();
+                ensure!(
+                    args.get("project_path")
+                        .and_then(Value::as_str)
+                        .is_none_or(|path| meta.project_path == path.replace('\\', "/")),
+                    "process_id does not belong to the requested project_path scope"
+                );
+                ensure!(
+                    args.get("script")
+                        .and_then(Value::as_str)
+                        .is_none_or(|script| meta.script == script),
+                    "process_id does not belong to the requested script scope"
+                );
                 probe(&record, &args).await?;
-                let mut result=record.snapshot(&args).await;
-                let fact=process_fact(&result);
-                let mut scoped_args=args.clone();
-                if scoped_args.get("project_path").is_none(){scoped_args["project_path"]=json!(meta.project_path);}
-                if scoped_args.get("script").is_none(){scoped_args["script"]=json!(meta.script);}
-                result["process_observation"]=build_single_process_observation(workspace.root(),&scoped_args,&[fact])?;
+                let mut result = record.snapshot(&args).await;
+                let fact = process_fact(&result);
+                let mut scoped_args = args.clone();
+                if scoped_args.get("project_path").is_none() {
+                    scoped_args["project_path"] = json!(meta.project_path);
+                }
+                if scoped_args.get("script").is_none() {
+                    scoped_args["script"] = json!(meta.script);
+                }
+                result["process_observation"] =
+                    build_single_process_observation(workspace.root(), &scoped_args, &[fact])?;
                 Ok(result)
             } else {
                 let root = workspace.root().canonicalize()?;
@@ -2026,25 +2881,36 @@ pub async fn execute_cancellable(
                     .cloned()
                     .collect::<Vec<_>>();
                 let mut list = Vec::new();
-                let project_filter=args.get("project_path").and_then(Value::as_str).map(|path|path.replace('\\',"/"));
+                let project_filter = args
+                    .get("project_path")
+                    .and_then(Value::as_str)
+                    .map(|path| path.replace('\\', "/"));
                 for record in records {
                     if record.meta.lock().await.root == root {
-                        let meta=record.meta.lock().await.clone();
-                        if project_filter.as_ref().is_some_and(|path|meta.project_path!=*path)
-                            || args.get("script").and_then(Value::as_str).is_some_and(|script|meta.script!=script)
+                        let meta = record.meta.lock().await.clone();
+                        if project_filter
+                            .as_ref()
+                            .is_some_and(|path| meta.project_path != *path)
+                            || args
+                                .get("script")
+                                .and_then(Value::as_str)
+                                .is_some_and(|script| meta.script != script)
                         {
                             continue;
                         }
-                        if args.get("ready_url").is_some() || args.get("ready_port").is_some()
-                            || args["wait_seconds"].as_u64().unwrap_or(0)>0 {
-                            probe(&record,&args).await?;
+                        if args.get("ready_url").is_some()
+                            || args.get("ready_port").is_some()
+                            || args["wait_seconds"].as_u64().unwrap_or(0) > 0
+                        {
+                            probe(&record, &args).await?;
                         }
                         list.push(record.snapshot(&json!({"after_seq":u64::MAX})).await);
                     }
                 }
-                let facts=list.iter().map(process_fact).collect::<Vec<_>>();
-                let mut result=json!({"processes":list,"guidance":"Use process_id and after_seq=next_seq to read incremental logs; provide ready_url or ready_port to verify a running service."});
-                result["process_observation"]=build_process_observation(workspace.root(),&args,&facts)?;
+                let facts = list.iter().map(process_fact).collect::<Vec<_>>();
+                let mut result = json!({"processes":list,"guidance":"Use process_id and after_seq=next_seq to read incremental logs; provide ready_url or ready_port to verify a running service."});
+                result["process_observation"] =
+                    build_process_observation(workspace.root(), &args, &facts)?;
                 Ok(result)
             }
         }

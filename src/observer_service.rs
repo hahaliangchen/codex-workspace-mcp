@@ -5,7 +5,7 @@ use crate::agent_service::{self, AgentServiceState};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use std::path::{Path,PathBuf};
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 // Current task view; 256k is a maximum, not a target snapshot size.
@@ -23,13 +23,20 @@ pub fn applies(identity: &Value, scope: &Value) -> bool {
 }
 
 #[cfg(test)]
-fn observation_version_key(input:&Value)->String {
-    let identity=&input["identity"];
-    let instance=format!("{}:{}:{}:{}:{}",identity["task_id"],identity["request_id"],identity["work_id"],identity["revision"],identity["plan_revision"]);
+fn observation_version_key(input: &Value) -> String {
+    let identity = &input["identity"];
+    let instance = format!(
+        "{}:{}:{}:{}:{}",
+        identity["task_id"],
+        identity["request_id"],
+        identity["work_id"],
+        identity["revision"],
+        identity["plan_revision"]
+    );
     if input["turn"].is_u64() && input["step"].is_u64() {
-        return format!("iteration:{instance}:{}:{}",input["turn"],input["step"]);
+        return format!("iteration:{instance}:{}:{}", input["turn"], input["step"]);
     }
-    format!("review:{}",input["review_id"].as_str().unwrap_or(""))
+    format!("review:{}", input["review_id"].as_str().unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -46,11 +53,18 @@ fn valid_instance(identity: &Value, scope: &Value) -> bool {
 
 /// Advice dates describe provenance; the recipient judges applicability.
 #[cfg(test)]
-pub fn annotate_advice(items: Vec<Value>, _scheduler: &crate::work_scheduler::WorkScheduler) -> Vec<Value> { items }
+pub fn annotate_advice(
+    items: Vec<Value>,
+    _scheduler: &crate::work_scheduler::WorkScheduler,
+) -> Vec<Value> {
+    items
+}
 
 /// Forward original method arguments and sender returns without field cuts.
 #[cfg(test)]
-pub fn pack(input: Value, _path: &[Value], _memories: &[Value]) -> Value { input }
+pub fn pack(input: Value, _path: &[Value], _memories: &[Value]) -> Value {
+    input
+}
 
 #[cfg(test)]
 pub fn observation(
@@ -68,7 +82,7 @@ pub fn observation(
 ) -> Value {
     let id = identity(task, scheduler, work);
     let order = scheduler.frames.get(work).map(|f| &f.order);
-    let frame=scheduler.frames.get(work);
+    let frame = scheduler.frames.get(work);
     let review_id = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}",
         task,
@@ -81,7 +95,24 @@ pub fn observation(
         step
     );
     let packet = scheduler.worker_input(prompt);
-    let allowed=packet["upstream_outputs"].as_array().into_iter().flatten().flat_map(|output|output["visual_artifact_ids"].as_array().into_iter().flatten().chain(output["exported_data"]["visual_artifact_ids"].as_array().into_iter().flatten())).cloned().collect::<Vec<_>>();
+    let allowed = packet["upstream_outputs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|output| {
+            output["visual_artifact_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(
+                    output["exported_data"]["visual_artifact_ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten(),
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let source_event_id = if stage == "progress" {
         format!("progress:{review_id}")
     } else {
@@ -189,12 +220,28 @@ fn normalize(raw: Value, input: &Value, elapsed: u128) -> Value {
             "{target}:{}",
             adjustment.split_whitespace().collect::<Vec<_>>().join(" ")
         );
-        let mut recommendation=item.as_object().cloned().map(Value::Object).unwrap_or_else(||json!({"adjustment":adjustment}));
-        recommendation["issue_key"]=json!(item["issue_key"].as_str().or_else(||raw["issue_key"].as_str()).filter(|key|!key.trim().is_empty()).map(str::to_owned).unwrap_or_else(||format!("recommendation_{}",crate::symbol_description::content_hash(key_text.as_bytes()))));
-        if recommendation["target"].is_null() {recommendation["target"]=json!("organizer");}
+        let mut recommendation = item
+            .as_object()
+            .cloned()
+            .map(Value::Object)
+            .unwrap_or_else(|| json!({"adjustment":adjustment}));
+        recommendation["issue_key"] = json!(
+            item["issue_key"]
+                .as_str()
+                .or_else(|| raw["issue_key"].as_str())
+                .filter(|key| !key.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!(
+                    "recommendation_{}",
+                    crate::symbol_description::content_hash(key_text.as_bytes())
+                ))
+        );
+        if recommendation["target"].is_null() {
+            recommendation["target"] = json!("organizer");
+        }
         recommendations.push(recommendation);
     }
-    let findings=raw["findings"].clone();
+    let findings = raw["findings"].clone();
     json!({"assessment":raw["assessment"].as_str().filter(|s|matches!(*s,"on_track"|"needs_adjustment"|"uncertain")).unwrap_or("uncertain"),
         "summary":raw["summary"],"findings":findings,
         "observer_return":raw.get("observer_return").unwrap_or(&raw),
@@ -216,103 +263,204 @@ pub struct ObserverSession {
     review: Option<Value>,
 }
 impl ObserverSession {
-    pub fn start(state:AgentServiceState,model:String,task:String,cancel:&CancellationToken)->Self {
-        Self {enabled:state.observer_enabled,root:state.workspace.root().to_path_buf(),state,model,task,scope:Value::Null,finished:false,cancel:cancel.clone(),review:None}
+    pub fn start(
+        state: AgentServiceState,
+        model: String,
+        task: String,
+        cancel: &CancellationToken,
+    ) -> Self {
+        Self {
+            enabled: state.observer_enabled,
+            root: state.workspace.root().to_path_buf(),
+            state,
+            model,
+            task,
+            scope: Value::Null,
+            finished: false,
+            cancel: cancel.clone(),
+            review: None,
+        }
     }
-    pub fn set_scope(&mut self,scheduler:&crate::work_scheduler::WorkScheduler,prompt:&str) {
-        self.scope=json!({"request_id":scheduler.request_started_turn,"goal":if scheduler.request_goal.is_empty(){prompt}else{&scheduler.request_goal},
+    pub fn set_scope(&mut self, scheduler: &crate::work_scheduler::WorkScheduler, prompt: &str) {
+        self.scope = json!({"request_id":scheduler.request_started_turn,"goal":if scheduler.request_goal.is_empty(){prompt}else{&scheduler.request_goal},
             "final_result":scheduler.final_result,"request_completed":scheduler.request_completed});
     }
     /// Only an explicit successful Observer return requests another execution.
     /// A missing action, read failure or timeout never implies a business defect.
-    pub fn followup(&self)->Option<Value> {
-        self.review.as_ref().filter(|review|review["status"]=="completed"
-            && review["observer_return"]["action"]=="continue" && !self.cancel.is_cancelled()).cloned()
+    pub fn followup(&self) -> Option<Value> {
+        self.review
+            .as_ref()
+            .filter(|review| {
+                review["status"] == "completed"
+                    && review["observer_return"]["action"] == "continue"
+                    && !self.cancel.is_cancelled()
+            })
+            .cloned()
     }
-    pub fn next_execution(&mut self) {self.finished=false;self.review=None;}
-    pub fn cancelled(&self)->bool {self.cancel.is_cancelled()}
-    pub async fn finish(&mut self,outcome:&str)->Result<()> {
-        if !self.enabled || self.finished || self.cancel.is_cancelled() {return Ok(());}
-        self.finished=true;
+    pub fn next_execution(&mut self) {
+        self.finished = false;
+        self.review = None;
+    }
+    pub fn cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+    pub async fn finish(&mut self, outcome: &str) -> Result<()> {
+        if !self.enabled || self.finished || self.cancel.is_cancelled() {
+            return Ok(());
+        }
+        self.finished = true;
         // A user cancellation or dropped execution must not start another model request.
-        if !matches!(outcome,"completed"|"failed"|"max_steps") {return Ok(());}
-        let history=crate::session_history::task_process(&self.root,&self.task,self.scope["request_id"].as_u64().unwrap_or(1) as usize).await?;
-        let turn=history["records"].as_array().into_iter().flatten().filter_map(|record|record["turn"].as_u64()).max().unwrap_or(1);
-        agent_service::emit(&self.root,&self.task,"observer/retrospective_start",
-            json!({"outcome":outcome,"request_id":self.scope["request_id"],"turn":turn})).await?;
-        let result=match retrospective(&self.state,&self.model,&self.task,&self.scope,outcome,history,turn,&self.cancel).await {
-            Ok(review)=>review,
-            Err(error)=>json!({"status":"unavailable","outcome":outcome,"message":format!("{error:#}"),"memoryRecorded":false,"turn":turn,"request_id":self.scope["request_id"]}),
+        if !matches!(outcome, "completed" | "failed" | "max_steps") {
+            return Ok(());
+        }
+        let history = crate::session_history::task_process(
+            &self.root,
+            &self.task,
+            self.scope["request_id"].as_u64().unwrap_or(1) as usize,
+        )
+        .await?;
+        let turn = history["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|record| record["turn"].as_u64())
+            .max()
+            .unwrap_or(1);
+        agent_service::emit(
+            &self.root,
+            &self.task,
+            "observer/retrospective_start",
+            json!({"outcome":outcome,"request_id":self.scope["request_id"],"turn":turn}),
+        )
+        .await?;
+        let result = match retrospective(
+            &self.state,
+            &self.model,
+            &self.task,
+            &self.scope,
+            outcome,
+            history,
+            turn,
+            &self.cancel,
+        )
+        .await
+        {
+            Ok(review) => review,
+            Err(error) => {
+                json!({"status":"unavailable","outcome":outcome,"message":format!("{error:#}"),"memoryRecorded":false,"turn":turn,"request_id":self.scope["request_id"]})
+            }
         };
-        agent_service::emit(&self.root,&self.task,"observer/retrospective",result.clone()).await?;
-        self.review=Some(result);Ok(())
+        agent_service::emit(
+            &self.root,
+            &self.task,
+            "observer/retrospective",
+            result.clone(),
+        )
+        .await?;
+        self.review = Some(result);
+        Ok(())
     }
 }
 
-async fn retrospective(state:&AgentServiceState,model:&str,task:&str,scope:&Value,outcome:&str,task_history:Value,turn:u64,cancel:&CancellationToken)->Result<Value> {
-    let input=json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
+async fn retrospective(
+    state: &AgentServiceState,
+    model: &str,
+    task: &str,
+    scope: &Value,
+    outcome: &str,
+    task_history: Value,
+    turn: u64,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let input = json!({"stage":"retrospective","identity":{"task_id":task,"request_id":scope["request_id"],"node_id":"request"},
         "request":{"goal":scope["goal"]},"outcome":outcome,"goal_achieved":scope["request_completed"],
         "final_result":scope["final_result"],"task_history":task_history,
         "history":{"tool":"read_session_history","scope":"Read original process records, or include_context=true to inspect the exact saved Worker/Organizer model inputs referenced by debug/context_request. Input views are not additional executions."}});
     let raw=agent_service::observer_json_response_cancelled(state,model,include_str!("../prompts/observer_retrospective.md"),input,3072,task,
         json!({"stage":"retrospective","nodeId":"request","turn":turn,"request_id":scope["request_id"]}),cancel).await?;
-    let report:Value=match serde_json::from_str::<Value>(raw.trim().trim_start_matches("```json").trim_end_matches("```").trim()) {
-        Ok(report) if report.is_object()=>report,
-        parsed=>return Ok(json!({"status":"unavailable","turn":turn,"request_id":scope["request_id"],
+    let report: Value = match serde_json::from_str::<Value>(
+        raw.trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim(),
+    ) {
+        Ok(report) if report.is_object() => report,
+        parsed => {
+            return Ok(
+                json!({"status":"unavailable","turn":turn,"request_id":scope["request_id"],
             "message":parsed.err().map(|error|error.to_string()).unwrap_or_else(||"Observer retrospective must return a JSON object".into()),
-            "observer_return":raw,"memoryRecorded":false})),
+            "observer_return":raw,"memoryRecorded":false}),
+            );
+        }
     };
     // Routine retrospectives belong to conversation history. Keep the explicit
     // memory tools available, but do not turn a task review into a memory write.
-    let original=report.get("observer_return").unwrap_or(&report);
-    let mut result=json!({"status":"completed","summary":original["summary"],"pathReview":original["path_review"],
+    let original = report.get("observer_return").unwrap_or(&report);
+    let mut result = json!({"status":"completed","summary":original["summary"],"pathReview":original["path_review"],
         "action":original["action"],"acceptance":original["acceptance"],"request_id":scope["request_id"],
         "shorteningOpportunities":original["shortening_opportunities"],"workFindings":original["work_findings"],
         "routeShortcuts":original["route_shortcuts"].as_array().into_iter().flatten().map(|item|{let mut item=item.clone();item["lookFirst"]=item["look_first"].clone();item}).collect::<Vec<_>>(),"memoryRecorded":false,"stored":false,"observer_return":original});
-    result["turn"]=json!(turn);
+    result["turn"] = json!(turn);
     Ok(result)
 }
 
 /// Share existing read tools and their workspace boundaries. No new shell,
 /// editing, browser navigation, upload, screenshot or automatic memory path.
-pub fn tools(state:&AgentServiceState)->Vec<Value> {
-    let mut tools=agent_service::local_tools(&state.workspace,state.tool_catalog.as_deref(),true).into_iter()
-        .filter(|tool|tool["function"]["name"].as_str().is_some_and(|name|read_tool(name)&&state.permission_mode.allows(name))).collect::<Vec<_>>();
-    tools.push(crate::session_history::tool());tools
+pub fn tools(state: &AgentServiceState) -> Vec<Value> {
+    let mut tools =
+        agent_service::local_tools(&state.workspace, state.tool_catalog.as_deref(), true)
+            .into_iter()
+            .filter(|tool| {
+                tool["function"]["name"]
+                    .as_str()
+                    .is_some_and(|name| read_tool(name) && state.permission_mode.allows(name))
+            })
+            .collect::<Vec<_>>();
+    tools.push(crate::session_history::tool());
+    tools
 }
-pub fn read_tool(name:&str)->bool {
-    matches!(name,"workspace_info"|"list_dir"|"read_file"|"read_file_lines"|"search_text"|"search_code_map"|"view_image"
-        |"search_symbol_business_context"|"list_symbol_business_context"|"browser_read"|"browser_diagnostics")
-        || ["go","rust","ts","python"].iter().any(|language|
-            name==format!("search_{language}_symbols")||name==format!("list_{language}_symbols")||name==format!("read_{language}_symbol"))
+pub fn read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "workspace_info"
+            | "list_dir"
+            | "read_file"
+            | "read_file_lines"
+            | "search_text"
+            | "search_code_map"
+            | "view_image"
+            | "search_symbol_business_context"
+            | "list_symbol_business_context"
+            | "browser_read"
+            | "browser_diagnostics"
+    ) || ["go", "rust", "ts", "python"].iter().any(|language| {
+        name == format!("search_{language}_symbols")
+            || name == format!("list_{language}_symbols")
+            || name == format!("read_{language}_symbol")
+    })
 }
 
 /// A large acceptance starts from original role deliveries, not copied source
 /// and every intermediate tool body. All omitted originals remain in history.
 /// This is message routing; it does not judge requirements or summarize facts.
-pub fn acceptance_history(history:&Value)->Value {
-    let mut selected=history.clone();let mut omitted=Vec::new();
-    if let Some(records)=selected["records"].as_array_mut() {
-        records.retain(|record| {
-            let keep=matches!(record["kind"].as_str(),Some("user/message"|"organizer/method_message"|"organizer/assignment"|"worker/yield"
-                |"worker/progress"|"worker/error"|"organizer/error"|"organizer/request_error"|"visual/input_result"|"observer/retrospective"|"turn/end"))
-                || record["kind"]=="assistant/message"&&record["actor"]=="organizer"
-                || record["kind"]=="tool/result"&&record["is_error"]==true;
-            if !keep {omitted.push(record["seq"].clone());}keep
-        });
-        let count=records.len();selected["supplied_records"]=json!(count);
-    }
-    selected["coverage"]=json!("selected_role_messages");selected["omitted_event_refs"]=json!(omitted);
-    selected["view_note"]=json!("These are original instructions, assignments, returns and image inputs. Intermediate tools and exact model requests are stored in the same history_reference; retrieve specific evidence to check actual delivery. This view does not prove a complete process review.");
-    selected
+pub fn acceptance_history(history: &Value) -> Value {
+    history.clone()
 }
 
 #[cfg(test)]
-fn iteration_records(process:&Value,after_seq:i64,through_seq:i64)->Vec<Value> {
-    process["records"].as_array().into_iter().flatten()
-        .filter(|entry|entry["seq"].as_i64().is_some_and(|seq|seq>after_seq && seq<=through_seq)
-            && entry["kind"]!="observer/node_review")
-        .cloned().collect()
+fn iteration_records(process: &Value, after_seq: i64, through_seq: i64) -> Vec<Value> {
+    process["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["seq"]
+                .as_i64()
+                .is_some_and(|seq| seq > after_seq && seq <= through_seq)
+                && entry["kind"] != "observer/node_review"
+        })
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -320,142 +468,297 @@ mod tests {
     use super::*;
     #[test]
     fn continuation_is_an_explicit_original_return_not_a_status_or_keyword_inference() {
-        let root=std::env::temp_dir();
-        let state=agent_service::tests::flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
-        let cancel=CancellationToken::new();
-        let mut observer=ObserverSession::start(state.clone(),"fake".into(),"task".into(),&cancel);
-        for report in [json!({"status":"unavailable","observer_return":{"action":"continue"}}),
+        let root = std::env::temp_dir();
+        let state = agent_service::tests::flow_test_state(&root, "127.0.0.1:9".parse().unwrap());
+        let cancel = CancellationToken::new();
+        let mut observer =
+            ObserverSession::start(state.clone(), "fake".into(), "task".into(), &cancel);
+        for report in [
+            json!({"status":"unavailable","observer_return":{"action":"continue"}}),
             json!({"status":"completed","observer_return":{"summary":"需要继续修改"}}),
-            json!({"status":"completed","observer_return":{"action":"deliver","acceptance":{"assessment":"blocked"}}})] {
-            observer.review=Some(report);assert!(observer.followup().is_none());
+            json!({"status":"completed","observer_return":{"action":"deliver","acceptance":{"assessment":"blocked"}}}),
+        ] {
+            observer.review = Some(report);
+            assert!(observer.followup().is_none());
         }
-        let report=json!({"status":"completed","observer_return":{"action":"continue","handoff":{"original":"reason\n尾部","extra":[1,null,false]}}});
-        observer.review=Some(report.clone());assert_eq!(observer.followup(),Some(report));
-        cancel.cancel();assert!(observer.followup().is_none());
-        for permission in [agent_service::PermissionMode::ReadOnly,agent_service::PermissionMode::FullAccess] {
-            let mut state=state.clone();state.permission_mode=permission;
-            let tools=tools(&state);
-            assert!(tools.iter().any(|tool|tool["function"]["name"]=="read_file"));
-            assert!(tools.iter().any(|tool|tool["function"]["name"]=="view_image"));
-            assert!(tools.iter().all(|tool|tool["function"]["name"]=="read_session_history"||read_tool(tool["function"]["name"].as_str().unwrap())));
-            assert!(!tools.iter().any(|tool|tool["function"]["name"]=="write_file"||tool["function"]["name"]=="browser_upload"));
-            assert_eq!(tools.iter().any(|tool|tool["function"]["name"]=="browser_read"),matches!(permission,agent_service::PermissionMode::FullAccess));
+        let report = json!({"status":"completed","observer_return":{"action":"continue","handoff":{"original":"reason\n尾部","extra":[1,null,false]}}});
+        observer.review = Some(report.clone());
+        assert_eq!(observer.followup(), Some(report));
+        cancel.cancel();
+        assert!(observer.followup().is_none());
+        for permission in [
+            agent_service::PermissionMode::ReadOnly,
+            agent_service::PermissionMode::FullAccess,
+        ] {
+            let mut state = state.clone();
+            state.permission_mode = permission;
+            let tools = tools(&state);
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "read_file")
+            );
+            assert!(
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "view_image")
+            );
+            assert!(
+                tools
+                    .iter()
+                    .all(|tool| tool["function"]["name"] == "read_session_history"
+                        || read_tool(tool["function"]["name"].as_str().unwrap()))
+            );
+            assert!(
+                !tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "write_file"
+                        || tool["function"]["name"] == "browser_upload")
+            );
+            assert_eq!(
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "browser_read"),
+                matches!(permission, agent_service::PermissionMode::FullAccess)
+            );
         }
     }
 
     #[test]
     fn acceptance_scope_uses_the_effective_human_goal_not_a_continue_message() {
-        let state=agent_service::tests::flow_test_state(&std::env::temp_dir(),"127.0.0.1:9".parse().unwrap());
-        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&CancellationToken::new());
-        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_goal="Current replacement requirement".into();
-        observer.set_scope(&scheduler,"continue");assert_eq!(observer.scope["goal"],scheduler.request_goal);
+        let state = agent_service::tests::flow_test_state(
+            &std::env::temp_dir(),
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        let mut observer = ObserverSession::start(
+            state,
+            "fake".into(),
+            "task".into(),
+            &CancellationToken::new(),
+        );
+        let mut scheduler = crate::work_scheduler::WorkScheduler::default();
+        scheduler.request_goal = "Current replacement requirement".into();
+        observer.set_scope(&scheduler, "continue");
+        assert_eq!(observer.scope["goal"], scheduler.request_goal);
     }
     #[test]
     fn large_acceptance_routes_original_returns_without_rewriting_or_claiming_full_coverage() {
-        let input=json!({"coverage":"complete","total_records":5,"history_reference":{"task_id":"t"},"records":[
+        let input = json!({"coverage":"complete","total_records":5,"history_reference":{"task_id":"t"},"records":[
             {"seq":1,"kind":"user/message","payload":"original requirement"},
             {"seq":2,"kind":"tool/result","payload":{"raw":"源代码".repeat(1000)}},
             {"seq":3,"kind":"worker/yield","payload":{"reason":"原始原因", "extra":[false,null,1]}},
             {"seq":4,"kind":"visual/input_result","payload":{"content":[{"type":"image_ref","artifact_id":"image"}]}},
             {"seq":5,"kind":"tool/result","is_error":true,"payload":{"error":"原始失败原因", "diagnostics":[false,null,1]}}]});
-        let routed=acceptance_history(&input);
-        assert_eq!(routed["records"],json!([input["records"][0],input["records"][2],input["records"][3],input["records"][4]]));
-        assert_eq!(routed["omitted_event_refs"],json!([2]));assert_eq!(routed["total_records"],5);
-        assert_eq!(routed["history_reference"],input["history_reference"]);assert_eq!(routed["coverage"],"selected_role_messages");
-        assert_eq!(input["records"][1]["payload"]["raw"],"源代码".repeat(1000));
+        let routed = acceptance_history(&input);
+        assert_eq!(routed["records"], input["records"]);
+        assert!(routed.get("omitted_event_refs").is_none());
+        assert_eq!(routed["total_records"], 5);
+        assert_eq!(routed["history_reference"], input["history_reference"]);
+        assert_eq!(routed["coverage"], "complete");
+        assert_eq!(input["records"][1]["payload"]["raw"], "源代码".repeat(1000));
     }
     #[tokio::test]
     async fn cancellation_during_acceptance_keeps_error_without_dispatching_more_work() {
-        let root=std::env::temp_dir().join(format!("observer-cancel-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "observer-cancel-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=agent_service::open_db(&root).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();drop(conn);
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        let notified=std::sync::Arc::new(tokio::sync::Notify::new());let arrived=notified.clone();
-        let app=axum::Router::new().route("/v1/chat/completions",axum::routing::post(move || {
-            let arrived=arrived.clone();async move {arrived.notify_one();std::future::pending::<String>().await}
-        }));
-        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
-        let cancel=CancellationToken::new();let cancellation=cancel.clone();
-        let abort=tokio::spawn(async move {notified.notified().await;cancellation.cancel();});
-        let mut state=agent_service::tests::flow_test_state(&root,address);state.observer_enabled=true;
-        state.observer_provider_url=state.provider_url.clone();
-        let mut observer=ObserverSession::start(state,"fake".into(),"task".into(),&cancel);
-        observer.set_scope(&crate::work_scheduler::WorkScheduler::default(),"goal");
-        tokio::time::timeout(std::time::Duration::from_secs(5),observer.finish("completed")).await.unwrap().unwrap();
+        let conn = agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        drop(conn);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let notified = std::sync::Arc::new(tokio::sync::Notify::new());
+        let arrived = notified.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let arrived = arrived.clone();
+                async move {
+                    arrived.notify_one();
+                    std::future::pending::<String>().await
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let cancel = CancellationToken::new();
+        let cancellation = cancel.clone();
+        let abort = tokio::spawn(async move {
+            notified.notified().await;
+            cancellation.cancel();
+        });
+        let mut state = agent_service::tests::flow_test_state(&root, address);
+        state.observer_enabled = true;
+        state.observer_provider_url = state.provider_url.clone();
+        let mut observer = ObserverSession::start(state, "fake".into(), "task".into(), &cancel);
+        observer.set_scope(&crate::work_scheduler::WorkScheduler::default(), "goal");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            observer.finish("completed"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(observer.followup().is_none());
-        let review=observer.review.as_ref().unwrap();assert_eq!(review["status"],"unavailable");
-        assert!(review["message"].as_str().unwrap().contains("cancelled by user"),"{review}");
-        abort.await.unwrap();server.abort();let _=server.await;
-        let conn=agent_service::open_db(&root).unwrap();
+        let review = observer.review.as_ref().unwrap();
+        assert_eq!(review["status"], "unavailable");
+        assert!(
+            review["message"]
+                .as_str()
+                .unwrap()
+                .contains("cancelled by user"),
+            "{review}"
+        );
+        abort.await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let conn = agent_service::open_db(&root).unwrap();
         assert_eq!(conn.query_row("SELECT count(*) FROM agent_request_contexts WHERE json_extract(metadata,'$.status')='cancelled'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
-        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='observer/followup'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
-        drop(conn);std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM agent_task_events WHERE kind='observer/followup'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn disabled_cancelled_interrupted_and_dropped_sessions_never_review() {
-        let root=std::env::temp_dir().join(format!("observer-no-background-{}",crate::visual_artifacts::new_id()));
+        let root = std::env::temp_dir().join(format!(
+            "observer-no-background-{}",
+            crate::visual_artifacts::new_id()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=agent_service::open_db(&root).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();drop(conn);
-        let mut state=agent_service::tests::flow_test_state(&root,"127.0.0.1:9".parse().unwrap());
-        let mut scheduler=crate::work_scheduler::WorkScheduler::default();scheduler.request_started_turn=1;
-        for (enabled,outcome) in [(false,"completed"),(true,"cancelled"),(true,"interrupted")] {
-            state.observer_enabled=enabled;
-            let mut observer=ObserverSession::start(state.clone(),"fake".into(),"task".into(),&CancellationToken::new());
-            observer.set_scope(&scheduler,"goal");observer.finish(outcome).await.unwrap();
+        let conn = agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','completed',0,0)",[]).unwrap();
+        drop(conn);
+        let mut state =
+            agent_service::tests::flow_test_state(&root, "127.0.0.1:9".parse().unwrap());
+        let mut scheduler = crate::work_scheduler::WorkScheduler::default();
+        scheduler.request_started_turn = 1;
+        for (enabled, outcome) in [
+            (false, "completed"),
+            (true, "cancelled"),
+            (true, "interrupted"),
+        ] {
+            state.observer_enabled = enabled;
+            let mut observer = ObserverSession::start(
+                state.clone(),
+                "fake".into(),
+                "task".into(),
+                &CancellationToken::new(),
+            );
+            observer.set_scope(&scheduler, "goal");
+            observer.finish(outcome).await.unwrap();
         }
-        drop(ObserverSession::start(state.clone(),"fake".into(),"task".into(),&CancellationToken::new()));
+        drop(ObserverSession::start(
+            state.clone(),
+            "fake".into(),
+            "task".into(),
+            &CancellationToken::new(),
+        ));
         tokio::task::yield_now().await;
-        let conn=agent_service::open_db(&root).unwrap();
-        let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='agent_request_contexts')",[],|row|row.get(0)).unwrap();
-        let requests:i64=if exists {conn.query_row("SELECT count(*) FROM agent_request_contexts",[],|row|row.get(0)).unwrap()}else{0};
-        assert_eq!(requests,0);
-        let reviews:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind LIKE 'observer/%'",[],|row|row.get(0)).unwrap();
-        assert_eq!(reviews,0);
-        drop(conn);std::fs::remove_dir_all(root).unwrap();
+        let conn = agent_service::open_db(&root).unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='agent_request_contexts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let requests: i64 = if exists {
+            conn.query_row("SELECT count(*) FROM agent_request_contexts", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        } else {
+            0
+        };
+        assert_eq!(requests, 0);
+        let reviews: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_task_events WHERE kind LIKE 'observer/%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reviews, 0);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn ongoing_context_contains_new_activity_without_repeated_history() {
-        let failure=json!({"capability":"unknown","image_input_unavailable":{"reason":"model has no configured image input"}});
-        let recent=json!([{"seq":401,"tool":"browser_screenshot","failed":false},
+        let failure = json!({"capability":"unknown","image_input_unavailable":{"reason":"model has no configured image input"}});
+        let recent = json!([{"seq":401,"tool":"browser_screenshot","failed":false},
             {"seq":402,"type":"visual/model_received","dispatch":failure}]);
-        let packed=pack(json!({"request":{"goal":"load the presentation"},
+        let packed = pack(
+            json!({"request":{"goal":"load the presentation"},
             "node_facts":{"operations":[{"outcome":"old history".repeat(20_000)}]},
             "activity_summary":{"tools":[{"outcome":"old history".repeat(20_000)}]},
             "recent_activity":recent,"activity_since_seq":400,
-            "plan_overview":[{"work_id":"earlier","status":"done"},{"work_id":"current","status":"running"}]}),&[json!({"delivery":"old original return".repeat(20_000)})],&[]);
-        assert_eq!(packed["recent_activity"],recent);
-        assert_eq!(packed["recent_activity"][1]["dispatch"],failure);
-        assert_eq!(packed["plan_overview"].as_array().unwrap().len(),2);
-        assert_eq!(packed["activity_summary"]["tools"][0]["outcome"],"old history".repeat(20_000));
+            "plan_overview":[{"work_id":"earlier","status":"done"},{"work_id":"current","status":"running"}]}),
+            &[json!({"delivery":"old original return".repeat(20_000)})],
+            &[],
+        );
+        assert_eq!(packed["recent_activity"], recent);
+        assert_eq!(packed["recent_activity"][1]["dispatch"], failure);
+        assert_eq!(packed["plan_overview"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            packed["activity_summary"]["tools"][0]["outcome"],
+            "old history".repeat(20_000)
+        );
         assert!(packed.get("node_operations").is_none());
         assert!(packed.get("path_summary").is_none());
-        assert!(packed.to_string().chars().count()>2000,"pack must not silently discard original fields");
+        assert!(
+            packed.to_string().chars().count() > 2000,
+            "pack must not silently discard original fields"
+        );
     }
     #[test]
     fn communication_keeps_original_returns_and_all_recommendations() {
-        let worker_return=json!({"summary":"原始失败链".repeat(400),"limitations":["能力未知".repeat(400)],
+        let worker_return = json!({"summary":"原始失败链".repeat(400),"limitations":["能力未知".repeat(400)],
             "diagnostic":{"reason":"original failure", "extra_fields":(0..20).collect::<Vec<_>>()}});
-        let packed=pack(json!({"delivery":{"handoff":{"worker_return":worker_return}}}),&[],&[]);
-        assert_eq!(packed["delivery"]["handoff"]["worker_return"],worker_return);
-        let observer_return=json!({"summary":"Observer原始消息".repeat(400),"failure":{"reason":"unavailable model", "details":(0..20).collect::<Vec<_>>()},
+        let packed = pack(
+            json!({"delivery":{"handoff":{"worker_return":worker_return}}}),
+            &[],
+            &[],
+        );
+        assert_eq!(
+            packed["delivery"]["handoff"]["worker_return"],
+            worker_return
+        );
+        let observer_return = json!({"summary":"Observer原始消息".repeat(400),"failure":{"reason":"unavailable model", "details":(0..20).collect::<Vec<_>>()},
             "findings":(0..5).map(|i|json!({"reason":format!("finding {i}"),"detail":"original detail"})).collect::<Vec<_>>(),
             "recommendations":(0..5).map(|i|json!({"adjustment":format!("{i}:{}","建议".repeat(800)),"extra":"original field"})).collect::<Vec<_>>()});
-        let normalized=normalize(observer_return.clone(),&json!({"source_event_id":"event"}),1);
-        assert_eq!(normalized["observer_return"],observer_return);
-        assert_eq!(normalized["summary"],observer_return["summary"]);
-        assert_eq!(normalized["recommendations"].as_array().unwrap().len(),5);
-        assert_eq!(normalized["findings"].as_array().unwrap().len(),5);
-        assert_eq!(normalized["recommendations"][4]["adjustment"],observer_return["recommendations"][4]["adjustment"]);
-        let mut inbox=crate::worker_work_state::ObserverInbox::default();inbox.start_request(1);
+        let normalized = normalize(
+            observer_return.clone(),
+            &json!({"source_event_id":"event"}),
+            1,
+        );
+        assert_eq!(normalized["observer_return"], observer_return);
+        assert_eq!(normalized["summary"], observer_return["summary"]);
+        assert_eq!(normalized["recommendations"].as_array().unwrap().len(), 5);
+        assert_eq!(normalized["findings"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            normalized["recommendations"][4]["adjustment"],
+            observer_return["recommendations"][4]["adjustment"]
+        );
+        let mut inbox = crate::worker_work_state::ObserverInbox::default();
+        inbox.start_request(1);
         inbox.insert(&json!({"request_id":1,"summary":normalized["summary"],"suggestions":[],"observer_return":normalized["observer_return"]}));
-        assert_eq!(inbox.messages()[0]["observer_return"],observer_return);
-        let restored:crate::worker_work_state::ObserverInbox=serde_json::from_value(inbox.snapshot()).unwrap();
-        assert_eq!(restored.messages(),inbox.messages());
+        assert_eq!(inbox.messages()[0]["observer_return"], observer_return);
+        let restored: crate::worker_work_state::ObserverInbox =
+            serde_json::from_value(inbox.snapshot()).unwrap();
+        assert_eq!(restored.messages(), inbox.messages());
     }
     #[test]
     fn default_issue_keys_follow_adjustments_instead_of_array_positions() {
@@ -512,65 +815,101 @@ mod tests {
         scheduler.request_started_turn = 1;
         scheduler.apply(&json!({"action":"work","reason":"start","orders":[{"id":"start","node_id":"start","goal":"Start the font service",
             "done_when":"the font API answers","completion":"check","checks":[check]}]}),false,true).unwrap();
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         scheduler.frame_mut().unwrap().project_observation = json!({"sampled_at":now-1500,
             "processes":[{"process_id":"proc-7","script":"dev","running":true,"ready":true,"ready_url":"http://127.0.0.1:38191/"}]});
         scheduler.observe("http_probe",&json!({"url":url}),&json!({"url":url,
             "sampled_at":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"elapsed_ms":2,"reachable":true,
             "http_status":200,"error_kind":Value::Null,"error_message":Value::Null,"check_key":check,"check_passed":true,
             "timeout_ms":5000,"reuse_window_ms":crate::http_probe::REUSE_WINDOW_MS}),false);
-        scheduler.return_work(&json!({"summary":"Worker explicitly returned after the HTTP 200 observation."})).unwrap();
+        scheduler
+            .return_work(
+                &json!({"summary":"Worker explicitly returned after the HTTP 200 observation."}),
+            )
+            .unwrap();
         scheduler
     }
 
     #[test]
     fn observer_sees_the_actual_startup_result_instead_of_a_field_catalog() {
         let scheduler = started_service();
-        let wide = (0..24).map(|index| (format!("key_{index:02}"), json!(index))).collect::<serde_json::Map<_, _>>();
-        let input = observation("task", &scheduler, "start", 1, 2, "handoff", "start the editor", &json!({"reason":"start"}),
-            Value::Null, json!({"summary":"started","status":"done","exported_data":{"wide":wide}}), Value::Null);
+        let wide = (0..24)
+            .map(|index| (format!("key_{index:02}"), json!(index)))
+            .collect::<serde_json::Map<_, _>>();
+        let input = observation(
+            "task",
+            &scheduler,
+            "start",
+            1,
+            2,
+            "handoff",
+            "start the editor",
+            &json!({"reason":"start"}),
+            Value::Null,
+            json!({"summary":"started","status":"done","exported_data":{"wide":wide}}),
+            Value::Null,
+        );
         let packed = pack(input, &[], &[]);
-        assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"],23);
-        assert!(packed.get("node_state").is_none(),"original calls and results are delivered by the conversation, not a generated fact catalog");
+        assert_eq!(packed["delivery"]["exported_data"]["wide"]["key_23"], 23);
+        assert!(
+            packed.get("node_state").is_none(),
+            "original calls and results are delivered by the conversation, not a generated fact catalog"
+        );
         assert!(packed.get("current_facts").is_none());
         assert!(packed["observed_at"].is_u64());
     }
 
     #[test]
     fn iteration_identity_survives_commit_and_stage_changes() {
-        let identity=json!({"task_id":"task","request_id":7,"work_id":"fonts","revision":2,"plan_revision":4});
-        let mut first=json!({"identity":identity,"turn":7,"step":2,"stage":"progress","review_id":"progress"});
-        let key=observation_version_key(&first);
-        first["source_event_seq"]=json!(991);
-        first["stage"]=json!("handoff");
-        first["review_id"]=json!("persisted");
-        assert_eq!(observation_version_key(&first),key,"persisting or waking cannot invent another iteration");
-        first["step"]=json!(3);
-        assert_ne!(observation_version_key(&first),key,"the next real Worker round gets its own observation");
+        let identity = json!({"task_id":"task","request_id":7,"work_id":"fonts","revision":2,"plan_revision":4});
+        let mut first = json!({"identity":identity,"turn":7,"step":2,"stage":"progress","review_id":"progress"});
+        let key = observation_version_key(&first);
+        first["source_event_seq"] = json!(991);
+        first["stage"] = json!("handoff");
+        first["review_id"] = json!("persisted");
+        assert_eq!(
+            observation_version_key(&first),
+            key,
+            "persisting or waking cannot invent another iteration"
+        );
+        first["step"] = json!(3);
+        assert_ne!(
+            observation_version_key(&first),
+            key,
+            "the next real Worker round gets its own observation"
+        );
     }
 
     #[test]
     fn iteration_context_preserves_complete_messages_without_later_rounds() {
-        let failure="failure-details".repeat(2000);
-        let process=json!({"records":[
+        let failure = "failure-details".repeat(2000);
+        let process = json!({"records":[
             {"seq":2,"kind":"tool/result","payload":{"old":"earlier"}},
             {"seq":3,"kind":"tool/result","payload":{"error":failure}},
             {"seq":4,"kind":"observer/node_review","payload":{"self":"review"}},
             {"seq":5,"kind":"worker/yield","payload":{"return":"complete"}},
             {"seq":6,"kind":"tool/result","payload":{"future":"later iteration"}}]});
-        assert_eq!(iteration_records(&process,2,5),vec![process["records"][1].clone(),process["records"][3].clone()]);
+        assert_eq!(
+            iteration_records(&process, 2, 5),
+            vec![process["records"][1].clone(), process["records"][3].clone()]
+        );
     }
-
 
     #[test]
     fn advice_dates_are_transmitted_without_host_applicability_judgment() {
         let scheduler = started_service();
         let latest = scheduler.latest_fact_at("start");
-        let advice = |observed_at: u64| json!({"id":"advice_1","identity":identity("task",&scheduler,"start"),
-            "observed_at":observed_at,"summary":"the startup result lacks a status code"});
-        let annotated = annotate_advice(vec![advice(latest - 5_000), advice(latest + 1)], &scheduler);
-        assert_eq!(annotated[0],advice(latest-5_000));
-        assert_eq!(annotated[1],advice(latest+1));
+        let advice = |observed_at: u64| {
+            json!({"id":"advice_1","identity":identity("task",&scheduler,"start"),
+            "observed_at":observed_at,"summary":"the startup result lacks a status code"})
+        };
+        let annotated =
+            annotate_advice(vec![advice(latest - 5_000), advice(latest + 1)], &scheduler);
+        assert_eq!(annotated[0], advice(latest - 5_000));
+        assert_eq!(annotated[1], advice(latest + 1));
         assert!(annotated[1].get("based_on_older_facts").is_none());
     }
 
@@ -584,9 +923,14 @@ mod tests {
         );
         assert_eq!(packed["request"]["goal"], goal);
         assert!(packed.get("budget").is_none());
-        let mut body=json!({"messages":[{"role":"system","content":"observe"},{"role":"user","content":crate::session_history::plain_context(&packed)}]});
-        assert!(crate::context_window::prepare(&mut body,2).is_err());
-        assert!(body["messages"][1]["content"].as_str().unwrap().contains(&goal));
+        let mut body = json!({"messages":[{"role":"system","content":"observe"},{"role":"user","content":crate::session_history::plain_context(&packed)}]});
+        assert!(crate::context_window::prepare(&mut body, 2).is_err());
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(&goal)
+        );
     }
     #[tokio::test]
     async fn durable_fast_boundaries_and_commit_replay_keep_each_delivery_once() {

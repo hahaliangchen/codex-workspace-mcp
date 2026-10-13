@@ -24,10 +24,7 @@ import { SmoothMarkdown } from './SmoothMarkdown.tsx'
 function TurnEnd({ reason, durationMs }: { reason: TurnEndReason; durationMs?: number | undefined }) {
   const durationText = durationMs !== undefined ? formatDuration(durationMs) : ''
   if (reason.kind === 'completed') {
-    return <div className={css.turnNote} role="status">
-      执行已结束{reason.goalAchieved === true ? ' · 目标已达成' : reason.goalAchieved === false ? ' · 目标未完全达成' : ' · 目标达成情况未记录'}
-      {reason.goalAchieved === false && !!reason.unresolved?.length && <ul>{reason.unresolved.map((item, index) => <li key={index}>{item}</li>)}</ul>}
-    </div>
+    return null
   }
   if (reason.kind === 'aborted') {
     return (

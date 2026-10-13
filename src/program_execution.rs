@@ -9,7 +9,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::{io::{AsyncRead, AsyncReadExt}, process::Command, task::JoinHandle};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 pub const TOOLS: &[&str] = &["run_program"];
@@ -33,9 +37,15 @@ struct ProgramRequest {
     max_output_bytes: usize,
 }
 
-fn default_project_path() -> String { ".".to_owned() }
-fn default_timeout_seconds() -> u64 { DEFAULT_TIMEOUT_SECONDS }
-fn default_output_limit() -> usize { DEFAULT_OUTPUT_LIMIT }
+fn default_project_path() -> String {
+    ".".to_owned()
+}
+fn default_timeout_seconds() -> u64 {
+    DEFAULT_TIMEOUT_SECONDS
+}
+fn default_output_limit() -> usize {
+    DEFAULT_OUTPUT_LIMIT
+}
 
 #[derive(Default)]
 struct CapturedPipe {
@@ -43,11 +53,20 @@ struct CapturedPipe {
     truncated: bool,
 }
 
-pub fn is_tool(name: &str) -> bool { TOOLS.contains(&name) }
+pub fn is_tool(name: &str) -> bool {
+    TOOLS.contains(&name)
+}
 
 pub fn check_key(args: &Value) -> String {
-    let program = args["program"].as_str().unwrap_or("").trim().to_ascii_lowercase();
-    let project = args["project_path"].as_str().unwrap_or(".").replace('\\', "/");
+    let program = args["program"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let project = args["project_path"]
+        .as_str()
+        .unwrap_or(".")
+        .replace('\\', "/");
     let arguments = args["args"].as_array().cloned().unwrap_or_default();
     format!("program:{program}:{project}:{}", Value::Array(arguments))
 }
@@ -71,16 +90,38 @@ pub async fn execute_cancellable(
     cancel: &CancellationToken,
 ) -> Result<Value> {
     let request: ProgramRequest = serde_json::from_value(args.clone())?;
-    ensure!(PROGRAMS.contains(&request.program.as_str()), "program must be one of: {}", PROGRAMS.join(", "));
-    ensure!(request.args.len() <= MAX_ARGUMENTS, "args must contain at most {MAX_ARGUMENTS} items");
-    ensure!(request.args.iter().all(|arg| !arg.contains('\0')), "program arguments cannot contain NUL bytes");
-    let argument_size = request.args.iter().map(|arg| arg.len().saturating_add(1)).sum::<usize>();
-    ensure!(argument_size <= MAX_ARGUMENT_BYTES, "combined arguments exceed {MAX_ARGUMENT_BYTES} bytes");
+    ensure!(
+        PROGRAMS.contains(&request.program.as_str()),
+        "program must be one of: {}",
+        PROGRAMS.join(", ")
+    );
+    ensure!(
+        request.args.len() <= MAX_ARGUMENTS,
+        "args must contain at most {MAX_ARGUMENTS} items"
+    );
+    ensure!(
+        request.args.iter().all(|arg| !arg.contains('\0')),
+        "program arguments cannot contain NUL bytes"
+    );
+    let argument_size = request
+        .args
+        .iter()
+        .map(|arg| arg.len().saturating_add(1))
+        .sum::<usize>();
+    ensure!(
+        argument_size <= MAX_ARGUMENT_BYTES,
+        "combined arguments exceed {MAX_ARGUMENT_BYTES} bytes"
+    );
 
     let timeout_seconds = request.timeout_seconds.clamp(1, MAX_TIMEOUT_SECONDS);
     let max_output_bytes = request.max_output_bytes.clamp(1, MAX_OUTPUT_LIMIT);
     let (cwd, relative_project) = resolve_project_path(workspace.root(), &request.project_path)?;
-    let check_key = format!("program:{}:{}:{}", request.program, relative_project, json!(request.args));
+    let check_key = format!(
+        "program:{}:{}:{}",
+        request.program,
+        relative_project,
+        json!(request.args)
+    );
     let base = json!({
         "program":request.program.clone(),
         "args":request.args.clone(),
@@ -91,45 +132,124 @@ pub async fn execute_cancellable(
     });
 
     if cancel.is_cancelled() {
-        return Ok(result(base, "cancelled", None, false, 0, Some("Program execution was cancelled before launch."), CapturedPipe::default(), CapturedPipe::default(), None, None));
+        return Ok(result(
+            base,
+            "cancelled",
+            None,
+            false,
+            0,
+            Some("Program execution was cancelled before launch."),
+            CapturedPipe::default(),
+            CapturedPipe::default(),
+            None,
+            None,
+        ));
     }
 
     let started = Instant::now();
     let executable = match resolve_program(&request.program) {
         Ok(path) => path,
-        Err(error) => return Ok(result(base, "spawn_failed", None, false, elapsed_ms(started), Some(&format!("{error:#}")), CapturedPipe::default(), CapturedPipe::default(), None, None)),
+        Err(error) => {
+            return Ok(result(
+                base,
+                "spawn_failed",
+                None,
+                false,
+                elapsed_ms(started),
+                Some(&format!("{error:#}")),
+                CapturedPipe::default(),
+                CapturedPipe::default(),
+                None,
+                None,
+            ));
+        }
     };
     let executable = match crate::project_process::native_runtime_path(&executable) {
         Ok(path) => path,
-        Err(error) => return Ok(result(base, "spawn_failed", None, false, elapsed_ms(started), Some(&format!("Could not prepare the program path: {error:#}")), CapturedPipe::default(), CapturedPipe::default(), None, None)),
+        Err(error) => {
+            return Ok(result(
+                base,
+                "spawn_failed",
+                None,
+                false,
+                elapsed_ms(started),
+                Some(&format!("Could not prepare the program path: {error:#}")),
+                CapturedPipe::default(),
+                CapturedPipe::default(),
+                None,
+                None,
+            ));
+        }
     };
 
     let mut command = Command::new(executable);
-    command.args(&request.args)
+    command
+        .args(&request.args)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    command.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
-    if request.program == "git" { command.env("GIT_PAGER", "cat").env("GIT_TERMINAL_PROMPT", "0"); }
+    command
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    if request.program == "git" {
+        command
+            .env("GIT_PAGER", "cat")
+            .env("GIT_TERMINAL_PROMPT", "0");
+    }
     crate::project_process::prepare_process_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return Ok(result(base, "spawn_failed", None, false, elapsed_ms(started), Some(&format!("Could not start '{}' in '{}': {error}", request.program, relative_project)), CapturedPipe::default(), CapturedPipe::default(), None, None)),
+        Err(error) => {
+            return Ok(result(
+                base,
+                "spawn_failed",
+                None,
+                false,
+                elapsed_ms(started),
+                Some(&format!(
+                    "Could not start '{}' in '{}': {error}",
+                    request.program, relative_project
+                )),
+                CapturedPipe::default(),
+                CapturedPipe::default(),
+                None,
+                None,
+            ));
+        }
     };
     let group = match crate::project_process::ProcessGroup::attach(&child) {
         Ok(group) => group,
         Err(error) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Ok(result(base, "spawn_failed", None, false, elapsed_ms(started), Some(&format!("Program started but process-group supervision could not be established: {error:#}")), CapturedPipe::default(), CapturedPipe::default(), None, None));
+            return Ok(result(
+                base,
+                "spawn_failed",
+                None,
+                false,
+                elapsed_ms(started),
+                Some(&format!(
+                    "Program started but process-group supervision could not be established: {error:#}"
+                )),
+                CapturedPipe::default(),
+                CapturedPipe::default(),
+                None,
+                None,
+            ));
         }
     };
 
-    let stdout_task = child.stdout.take().map(|pipe| tokio::spawn(capture_pipe(pipe, max_output_bytes)));
-    let stderr_task = child.stderr.take().map(|pipe| tokio::spawn(capture_pipe(pipe, max_output_bytes)));
+    let stdout_task = child
+        .stdout
+        .take()
+        .map(|pipe| tokio::spawn(capture_pipe(pipe, max_output_bytes)));
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|pipe| tokio::spawn(capture_pipe(pipe, max_output_bytes)));
     let wait = child.wait();
     tokio::pin!(wait);
     let (outcome, status, error_message) = tokio::select! {
@@ -158,7 +278,18 @@ pub async fn execute_cancellable(
     let stderr = collect_pipe(stderr_task).await;
     let exit_code = status.as_ref().and_then(ExitStatus::code);
     let process_success = outcome == "exited" && status.as_ref().is_some_and(ExitStatus::success);
-    Ok(result(base, outcome, exit_code, process_success, elapsed_ms(started), error_message.as_deref(), stdout.0, stderr.0, stdout.1, stderr.1))
+    Ok(result(
+        base,
+        outcome,
+        exit_code,
+        process_success,
+        elapsed_ms(started),
+        error_message.as_deref(),
+        stdout.0,
+        stderr.0,
+        stdout.1,
+        stderr.1,
+    ))
 }
 
 fn result(
@@ -200,62 +331,117 @@ fn add_decoded_pipe(value: &mut Value, name: &str, bytes: Vec<u8>) {
             let raw = error.into_bytes();
             value[name] = Value::Null;
             value[format!("{name}_encoding")] = json!("utf-8");
-            value[format!("{name}_decode_error")] = json!(format!("Invalid UTF-8 at byte offset {valid_up_to}; raw captured bytes are preserved as base64."));
-            value[format!("{name}_raw_base64")] = json!(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw));
+            value[format!("{name}_decode_error")] = json!(format!(
+                "Invalid UTF-8 at byte offset {valid_up_to}; raw captured bytes are preserved as base64."
+            ));
+            value[format!("{name}_raw_base64")] = json!(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                raw
+            ));
         }
     }
 }
 
-async fn capture_pipe<R: AsyncRead + Unpin>(mut pipe: R, limit: usize) -> std::io::Result<CapturedPipe> {
-    let mut captured = CapturedPipe { bytes: Vec::with_capacity(limit.min(16_384)), truncated: false };
+async fn capture_pipe<R: AsyncRead + Unpin>(
+    mut pipe: R,
+    limit: usize,
+) -> std::io::Result<CapturedPipe> {
+    let mut captured = CapturedPipe {
+        bytes: Vec::with_capacity(limit.min(16_384)),
+        truncated: false,
+    };
     let mut buffer = [0u8; 8192];
     loop {
         let read = pipe.read(&mut buffer).await?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         let take = limit.saturating_sub(captured.bytes.len()).min(read);
         captured.bytes.extend_from_slice(&buffer[..take]);
-        if take < read { captured.truncated = true; }
+        if take < read {
+            captured.truncated = true;
+        }
     }
     Ok(captured)
 }
 
-async fn collect_pipe(task: Option<JoinHandle<std::io::Result<CapturedPipe>>>) -> (CapturedPipe, Option<String>) {
-    let Some(mut task) = task else { return (CapturedPipe::default(), Some("captured pipe was unavailable".to_owned())); };
+async fn collect_pipe(
+    task: Option<JoinHandle<std::io::Result<CapturedPipe>>>,
+) -> (CapturedPipe, Option<String>) {
+    let Some(mut task) = task else {
+        return (
+            CapturedPipe::default(),
+            Some("captured pipe was unavailable".to_owned()),
+        );
+    };
     match tokio::time::timeout(Duration::from_secs(3), &mut task).await {
         Ok(Ok(Ok(output))) => (output, None),
         Ok(Ok(Err(error))) => (CapturedPipe::default(), Some(error.to_string())),
         Ok(Err(error)) => (CapturedPipe::default(), Some(error.to_string())),
         Err(_) => {
             task.abort();
-            (CapturedPipe { truncated: true, ..Default::default() }, Some("output pipe did not close after process exit".to_owned()))
+            (
+                CapturedPipe {
+                    truncated: true,
+                    ..Default::default()
+                },
+                Some("output pipe did not close after process exit".to_owned()),
+            )
         }
     }
 }
 
 fn termination_message(message: &str, stop_error: Option<String>) -> String {
-    match stop_error { Some(error) => format!("{message} Process-group termination reported: {error}"), None => message.to_owned() }
+    match stop_error {
+        Some(error) => format!("{message} Process-group termination reported: {error}"),
+        None => message.to_owned(),
+    }
 }
 
-fn elapsed_ms(started: Instant) -> u64 { started.elapsed().as_millis().min(u64::MAX as u128) as u64 }
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
 
 fn resolve_project_path(root: &Path, raw: &str) -> Result<(PathBuf, String)> {
-    ensure!(!raw.trim().is_empty() && raw.len() <= 4096, "project_path must be a nonempty path of at most 4096 bytes");
+    ensure!(
+        !raw.trim().is_empty() && raw.len() <= 4096,
+        "project_path must be a nonempty path of at most 4096 bytes"
+    );
     let resolved = crate::file_edit::workspace_path(root, raw.trim())?;
-    ensure!(resolved.is_dir(), "project_path must identify an existing directory inside the workspace");
+    ensure!(
+        resolved.is_dir(),
+        "project_path must identify an existing directory inside the workspace"
+    );
     let canonical = resolved.canonicalize()?;
     let root = root.canonicalize()?;
-    let relative = canonical.strip_prefix(&root).context("project_path is outside the workspace")?;
-    let relative = if relative.as_os_str().is_empty() { ".".to_owned() } else { relative.to_string_lossy().replace('\\', "/") };
+    let relative = canonical
+        .strip_prefix(&root)
+        .context("project_path is outside the workspace")?;
+    let relative = if relative.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        relative.to_string_lossy().replace('\\', "/")
+    };
     Ok((canonical, relative))
 }
 
 fn resolve_program(program: &str) -> Result<PathBuf> {
-    if program == "node" { return crate::project_process::resolve_node_executable(); }
-    let executable = if cfg!(windows) { format!("{program}.exe") } else { program.to_owned() };
-    let paths = std::env::var_os("PATH").map(|value| std::env::split_paths(&value).collect::<Vec<_>>()).unwrap_or_default();
+    if program == "node" {
+        return crate::project_process::resolve_node_executable();
+    }
+    let executable = if cfg!(windows) {
+        format!("{program}.exe")
+    } else {
+        program.to_owned()
+    };
+    let paths = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
     for directory in paths {
         let candidate = directory.join(&executable);
-        if candidate.is_file() { return Ok(candidate.canonicalize().unwrap_or(candidate)); }
+        if candidate.is_file() {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
     }
     anyhow::bail!("supported program '{program}' was not found in the host PATH")
 }
@@ -278,48 +464,68 @@ pub fn definitions() -> Vec<Value> {
 mod tests {
     use super::*;
 
-    fn workspace(label:&str)->(crate::tools::Workspace,PathBuf) {
-        let _=label;
-        let root=std::env::current_dir().unwrap();
-        (crate::tools::Workspace::new(&root).unwrap(),root)
+    fn workspace(label: &str) -> (crate::tools::Workspace, PathBuf) {
+        let _ = label;
+        let root = std::env::current_dir().unwrap();
+        (crate::tools::Workspace::new(&root).unwrap(), root)
     }
 
     #[test]
     fn check_key_keeps_program_working_directory_and_argv_boundaries() {
-        let key=check_key(&json!({"program":"python","project_path":"apps/demo","args":["-c","print('空 格')","two words"]}));
-        assert_eq!(key,"program:python:apps/demo:[\"-c\",\"print('空 格')\",\"two words\"]");
-        assert!(definitions()[0]["inputSchema"]["properties"]["program"]["enum"].as_array().unwrap().iter().any(|value|value=="python"));
+        let key = check_key(
+            &json!({"program":"python","project_path":"apps/demo","args":["-c","print('空 格')","two words"]}),
+        );
+        assert_eq!(
+            key,
+            "program:python:apps/demo:[\"-c\",\"print('空 格')\",\"two words\"]"
+        );
+        assert!(
+            definitions()[0]["inputSchema"]["properties"]["program"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "python")
+        );
     }
 
     #[tokio::test]
     async fn python_receives_argv_without_shell_and_exit_nine_is_not_success() {
-        if resolve_program("python").is_err() { return; }
-        let (workspace,root)=workspace("argv");
-        let code="import json,sys; print(json.dumps(sys.argv[1:], ensure_ascii=False)); sys.exit(9)";
+        if resolve_program("python").is_err() {
+            return;
+        }
+        let (workspace, root) = workspace("argv");
+        let code =
+            "import json,sys; print(json.dumps(sys.argv[1:], ensure_ascii=False)); sys.exit(9)";
         let result=execute(&workspace,&json!({"program":"python","args":["-c",code,"two words","a\"b","中文"],"project_path":"."})).await.unwrap();
-        assert_eq!(result["outcome"],"exited");
-        assert_eq!(result["process_exit_code"],9);
-        assert_eq!(result["process_success"],false);
+        assert_eq!(result["outcome"], "exited");
+        assert_eq!(result["process_exit_code"], 9);
+        assert_eq!(result["process_success"], false);
         assert!(result["stdout"].as_str().unwrap().contains("two words"));
         assert!(result["stdout"].as_str().unwrap().contains("中文"));
-        let _=root;
+        let _ = root;
     }
 
     #[tokio::test]
     async fn timeout_and_cancellation_have_explicit_outcomes() {
-        if resolve_program("python").is_err() { return; }
-        let (workspace,root)=workspace("termination");
+        if resolve_program("python").is_err() {
+            return;
+        }
+        let (workspace, root) = workspace("termination");
         let timeout=execute(&workspace,&json!({"program":"python","args":["-c","import time; time.sleep(5)"],"timeout_seconds":1})).await.unwrap();
-        assert_eq!(timeout["outcome"],"timed_out");
-        assert_eq!(timeout["process_exit_code"],Value::Null);
-        let cancel=CancellationToken::new();
-        let child_cancel=cancel.clone();
-        let args=json!({"program":"python","args":["-c","import time; time.sleep(5)"],"timeout_seconds":10});
-        let child_workspace=crate::tools::Workspace::new(workspace.root()).unwrap();
-        let task=tokio::spawn(async move {execute_cancellable(&child_workspace,&args,&child_cancel).await.unwrap()});
+        assert_eq!(timeout["outcome"], "timed_out");
+        assert_eq!(timeout["process_exit_code"], Value::Null);
+        let cancel = CancellationToken::new();
+        let child_cancel = cancel.clone();
+        let args = json!({"program":"python","args":["-c","import time; time.sleep(5)"],"timeout_seconds":10});
+        let child_workspace = crate::tools::Workspace::new(workspace.root()).unwrap();
+        let task = tokio::spawn(async move {
+            execute_cancellable(&child_workspace, &args, &child_cancel)
+                .await
+                .unwrap()
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancel.cancel();
-        assert_eq!(task.await.unwrap()["outcome"],"cancelled");
-        let _=root;
+        assert_eq!(task.await.unwrap()["outcome"], "cancelled");
+        let _ = root;
     }
 }

@@ -1,28 +1,45 @@
 //! Same model as Worker, separate context and a small scheduling interface.
+use crate::agent_service::AgentServiceState;
 use anyhow::Result;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use crate::agent_service::AgentServiceState;
 
 #[derive(Debug)]
-pub struct OrganizerContractError { pub details:Value }
+pub struct OrganizerContractError {
+    pub details: Value,
+}
 
 impl std::fmt::Display for OrganizerContractError {
-    fn fmt(&self,formatter:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
-        write!(formatter,"{}",self.details["error"].as_str().unwrap_or("Organizer response violates its tool contract"))
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}",
+            self.details["error"]
+                .as_str()
+                .unwrap_or("Organizer response violates its tool contract")
+        )
     }
 }
 impl std::error::Error for OrganizerContractError {}
 
-fn contract_error(rule:&str,field:&str,submitted:Option<&Value>,message:impl Into<String>)->anyhow::Error {
-    anyhow::Error::new(OrganizerContractError{details:json!({"rule_id":rule,"error_code":rule,"field_path":field,
-        "submitted_value_present":submitted.is_some(),"rejected_value":submitted.cloned().unwrap_or(Value::Null),"error":message.into()})})
+fn contract_error(
+    rule: &str,
+    field: &str,
+    submitted: Option<&Value>,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(OrganizerContractError {
+        details: json!({"rule_id":rule,"error_code":rule,"field_path":field,
+        "submitted_value_present":submitted.is_some(),"rejected_value":submitted.cloned().unwrap_or(Value::Null),"error":message.into()}),
+    })
 }
 
-pub fn contract_details(error:&anyhow::Error)->Option<&Value> {
-    error.downcast_ref::<OrganizerContractError>().map(|error|&error.details)
+pub fn contract_details(error: &anyhow::Error) -> Option<&Value> {
+    error
+        .downcast_ref::<OrganizerContractError>()
+        .map(|error| &error.details)
 }
 
 pub fn yield_tool() -> Value {
@@ -53,14 +70,18 @@ pub fn yield_tool() -> Value {
     },"required":["summary"]}}})
 }
 
-fn request_action_schema(input:&Value)->Value {
-    let allowed=input.pointer("/capabilities/allowed_request_actions").and_then(Value::as_array)
-        .filter(|items|!items.is_empty()).cloned().unwrap_or_else(||vec![json!("continue")]);
+fn request_action_schema(input: &Value) -> Value {
+    let allowed = input
+        .pointer("/capabilities/allowed_request_actions")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .cloned()
+        .unwrap_or_else(|| vec![json!("continue")]);
     json!({"type":"string","enum":allowed,"description":"On a session_continuation handoff choose continue, subtask, or replace. Omit on an ordinary task."})
 }
 
-fn organizer_tools(input:&Value)->Vec<Value> {
-    let schedule=json!({"type":"function","function":{"name":"schedule_task",
+fn organizer_tools(input: &Value) -> Vec<Value> {
+    let schedule = json!({"type":"function","function":{"name":"schedule_task",
         "description":"Create exactly one focused work node. The host generates IDs, Flow events and dependency links. completion is legacy metadata and does not classify the task or decide success. Declare checks only when useful; checks and browser/visual work may coexist. The Worker explicitly returns each invocation with yield_work, including negative or incomplete findings.",
         "parameters":{"type":"object","properties":{
             "goal":{"type":"string","minLength":1,"maxLength":2400},"return_when":{"type":"string","minLength":1,"maxLength":1200},
@@ -81,89 +102,197 @@ fn organizer_tools(input:&Value)->Vec<Value> {
                 "project_observation":{"type":"object"}}},
             "request_action":request_action_schema(input)
         },"required":["goal","return_when","reason"]}}});
-    let resume=json!({"type":"function","function":{"name":"resume_task",
+    let resume = json!({"type":"function","function":{"name":"resume_task",
         "description":"Continue an existing unfinished node without creating another node or replacing its task contract. Use a work_id and revision from process.resumable_tasks when the user continues the same goal.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"revision":{"type":"integer","minimum":1},
             "reason":{"type":"string","minLength":1},"context":{"type":"object","description":"Updated necessary information selected for this unfinished Worker. Replaces its prior provided context when present."},"request_action":request_action_schema(input)},"required":["work_id","revision","reason"]}}});
-    let read=json!({"type":"function","function":{"name":"read_task_result",
+    let read = json!({"type":"function","function":{"name":"read_task_result",
         "description":"Read exact selected fields from any completed task instance by work_id, including historical/deprecated revisions. The response labels whether it is historical and dependency-eligible. Raw source and operation materials remain in the notebook.",
         "parameters":{"type":"object","properties":{"work_id":{"type":"string"},"node_id":{"type":"string"},
             "fields":{"type":"array","maxItems":16,"items":{"type":"string"}}},
             "anyOf":[{"required":["work_id"]},{"required":["node_id"]}]}}});
-    let flow=json!({"type":"function","function":{"name":"read_flow_page",
+    let context_note = json!({"type":"function","function":{"name":"record_context_note",
+        "description":"Save a concise Organizer-authored organization of relevant conversation history or completed tool exchanges as a new immutable shared-history message. This never edits or replaces raw calls/results. Cite the exact source event sequence numbers read from history. Distinguish original tool output from your interpretation and keep uncertainty explicit. Never state what an image depicts from metadata, image presence, or another actor's description; a visual conclusion requires your own successful view_image call with image content actually supplied.",
+        "parameters":{"type":"object","properties":{"content":{"type":"string","minLength":1,"maxLength":24000,"description":"Your exact note text; preserve attribution, evidence and uncertainty."},"source_event_seqs":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"integer","minimum":0},"description":"Original event sequence numbers that support this note."}},"required":["content","source_event_seqs"]}}});
+    let view_image = json!({"type":"function","function":{"name":"view_image",
+        "description":"Select an existing host-issued visual artifact for your next Organizer request. The next request will receive its pixels only if the configured model route supports images and the artifact is authorized for this task. A successful tool result alone is not visual inspection; base visual conclusions on the following request that actually includes the image.",
+        "parameters":{"type":"object","properties":{"artifact_id":{"type":"string","minLength":1},"original":{"type":"boolean","description":"Request original-resolution pixels; may fail if they exceed the model image budget."}},"required":["artifact_id"]}}});
+    let flow = json!({"type":"function","function":{"name":"read_flow_page",
         "description":"Read a compact chronological page of flow nodes, up to 50. Use a returned next_cursor to read another page only when needed.",
         "parameters":{"type":"object","properties":{"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":50}},"required":[]}}});
-    let memory_search=|name:&str,description:&str|json!({"type":"function","function":{"name":name,"description":description,
-        "parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":4}},"required":["query"]}}});
-    let work_memory=memory_search("search_work_memory","Search existing work memory directly without starting a Worker task. Returns a small set of relevant records.");
-    let architecture_memory=memory_search("search_architecture_memory","Search existing architecture memory directly without starting a Worker task. Returns a small set of relevant records.");
-    let symbol_memory=memory_search("search_symbol_business_context","Search saved symbol responsibility descriptions directly without starting a Worker task.");
-    let symbols=json!({"type":"function","function":{"name":"search_project_symbols",
+    let memory_search = |name: &str, description: &str| {
+        json!({"type":"function","function":{"name":name,"description":description,
+        "parameters":{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":1000},"limit":{"type":"integer","minimum":1,"maximum":4}},"required":["query"]}}})
+    };
+    let work_memory = memory_search(
+        "search_work_memory",
+        "Search existing work memory directly without starting a Worker task. Returns a small set of relevant records.",
+    );
+    let architecture_memory = memory_search(
+        "search_architecture_memory",
+        "Search existing architecture memory directly without starting a Worker task. Returns a small set of relevant records.",
+    );
+    let symbol_memory = memory_search(
+        "search_symbol_business_context",
+        "Search saved symbol responsibility descriptions directly without starting a Worker task.",
+    );
+    let symbols = json!({"type":"function","function":{"name":"search_project_symbols",
         "description":"Search the existing project symbol index directly. This is a read-only Organizer lookup and does not create a Worker node.",
         "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"query":{"type":"string","minLength":1,"maxLength":1000},
             "file_path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":5}},"required":["language","query"]}}});
-    let read_symbol=json!({"type":"function","function":{"name":"read_project_symbol",
+    let read_symbol = json!({"type":"function","function":{"name":"read_project_symbol",
         "description":"Read one known symbol definition and its responsibility description from the existing project index. Source is saved in the task notebook; the Organizer receives the complete method result and a material reference.",
         "parameters":{"type":"object","properties":{"language":{"type":"string","enum":["go","rust","ts","python"]},"symbol_id":{"type":"string"},"file_path":{"type":"string"},"name":{"type":"string"},
             "include_context":{"type":"boolean"}},"required":["language"],"anyOf":[{"required":["symbol_id"]},{"required":["file_path","name"]}]}}});
-    let read_material=json!({"type":"function","function":{"name":"read_source_material",
+    let read_material = json!({"type":"function","function":{"name":"read_source_material",
         "description":"Read a focused version-checked notebook source page by material ID or query. Choose the needed line range; results include paging references when a tool page is incomplete.",
         "parameters":{"type":"object","properties":{"query":{"type":"string","maxLength":1000},"material_ids":{"type":"array","maxItems":4,"items":{"type":"integer"}},
             "start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"max_chars":{"type":"integer","minimum":1000,"maximum":60000}},"anyOf":[{"required":["query"]},{"required":["material_ids"]}]}}});
-    let finish=json!({"type":"function","function":{"name":"finish_request",
+    let finish = json!({"type":"function","function":{"name":"finish_request",
         "description":"Deliver the user-facing result. The task invocation may have ended without meeting the overall goal; report that honestly.",
         "parameters":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":6000},
             "achieved":{"type":"boolean"},"unresolved":{"type":"array","items":{"type":"string","maxLength":1200}},
             "reason":{"type":"string","maxLength":1200},"request_action":request_action_schema(input)},
             "required":["summary","achieved"]}}});
-    let revisit=json!({"type":"function","function":{"name":"revisit_task",
+    let revisit = json!({"type":"function","function":{"name":"revisit_task",
         "description":"Re-execute an upstream node under a new revision. The host preserves its old result and deprecates downstream work.",
         "parameters":{"type":"object","properties":{"target_node_id":{"type":"string"},"target_revision":{"type":"integer"},
             "reason":{"type":"string","minLength":1},"repair_goal":{"type":"string","maxLength":2400},
             "replacement_checks":{"type":"array","maxItems":4,"items":{"type":"string","maxLength":2000}},
             "request_action":request_action_schema(input)},"required":["target_node_id","reason"]}}});
-    let mut tools=vec![schedule,resume,read,flow,crate::session_history::tool(),work_memory,architecture_memory,symbol_memory,symbols,read_symbol,read_material,finish,revisit];
-    if input.pointer("/process/handoff/intent").and_then(Value::as_str)==Some("session_continuation") {
+    let mut tools = vec![
+        schedule,
+        resume,
+        read,
+        flow,
+        crate::session_history::tool(),
+        context_note,
+        view_image,
+        work_memory,
+        architecture_memory,
+        symbol_memory,
+        symbols,
+        read_symbol,
+        read_material,
+        finish,
+        revisit,
+    ];
+    if input
+        .pointer("/process/handoff/intent")
+        .and_then(Value::as_str)
+        == Some("session_continuation")
+    {
         for tool in &mut tools {
-            if tool.pointer("/function/parameters/properties/request_action").is_some() {
-                tool["function"]["parameters"]["required"].as_array_mut().unwrap().push(json!("request_action"));
+            if tool
+                .pointer("/function/parameters/properties/request_action")
+                .is_some()
+            {
+                tool["function"]["parameters"]["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("request_action"));
             }
         }
     }
     tools
 }
 
-fn host_work_id(task_id:&str,turn:usize,step:usize)->String {
-    let slug=task_id.chars().filter(|ch|ch.is_ascii_alphanumeric()||matches!(ch,'_'|'-'|'.')).take(32).collect::<String>();
-    format!("task_{}_{}_{}",if slug.is_empty(){"request"}else{&slug},turn,step)
+fn host_work_id(task_id: &str, turn: usize, step: usize) -> String {
+    let slug = task_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        .take(32)
+        .collect::<String>();
+    format!(
+        "task_{}_{}_{}",
+        if slug.is_empty() { "request" } else { &slug },
+        turn,
+        step
+    )
 }
 
-fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->Result<Value> {
-    if !args.is_object() {return Err(contract_error("INVALID_ARGUMENTS","arguments",Some(&args),"Organizer tool arguments must be an object"));}
+fn normalize_decision(
+    name: &str,
+    args: Value,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+) -> Result<Value> {
+    if !args.is_object() {
+        return Err(contract_error(
+            "INVALID_ARGUMENTS",
+            "arguments",
+            Some(&args),
+            "Organizer tool arguments must be an object",
+        ));
+    }
     match name {
-        "schedule_task"=>{
-            for (field,rule,message) in [("goal","INVALID_TASK_GOAL","goal must be a nonempty string"),
-                ("return_when","INVALID_RETURN_CONDITION","return_when must be a nonempty string"),
-                ("reason","INVALID_SCHEDULING_REASON","reason must be a nonempty string")] {
-                if args[field].as_str().is_none_or(|value|value.trim().is_empty()) {
-                    return Err(contract_error(rule,field,args.get(field),message));
+        "schedule_task" => {
+            for (field, rule, message) in [
+                (
+                    "goal",
+                    "INVALID_TASK_GOAL",
+                    "goal must be a nonempty string",
+                ),
+                (
+                    "return_when",
+                    "INVALID_RETURN_CONDITION",
+                    "return_when must be a nonempty string",
+                ),
+                (
+                    "reason",
+                    "INVALID_SCHEDULING_REASON",
+                    "reason must be a nonempty string",
+                ),
+            ] {
+                if args[field]
+                    .as_str()
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    return Err(contract_error(rule, field, args.get(field), message));
                 }
             }
-            let goal=args["goal"].as_str().unwrap().trim();
-            let return_when=args["return_when"].as_str().unwrap().trim();
-            let reason=args["reason"].as_str().unwrap().trim();
-            if args.get("context").is_some_and(|value|!value.is_object()) {
-                return Err(contract_error("INVALID_WORK_CONTEXT","context",args.get("context"),"context must be an object selected by Organizer"));
+            let goal = args["goal"].as_str().unwrap().trim();
+            let return_when = args["return_when"].as_str().unwrap().trim();
+            let reason = args["reason"].as_str().unwrap().trim();
+            if args.get("context").is_some_and(|value| !value.is_object()) {
+                return Err(contract_error(
+                    "INVALID_WORK_CONTEXT",
+                    "context",
+                    args.get("context"),
+                    "context must be an object selected by Organizer",
+                ));
             }
-            if args.get("completion").is_some_and(|value|!matches!(value.as_str(),Some("output"|"write"|"check"|"write_check"))) {
-                return Err(contract_error("INVALID_COMPLETION","completion",args.get("completion"),"completion must be output, write, check, or write_check"));
+            if args.get("completion").is_some_and(|value| {
+                !matches!(
+                    value.as_str(),
+                    Some("output" | "write" | "check" | "write_check")
+                )
+            }) {
+                return Err(contract_error(
+                    "INVALID_COMPLETION",
+                    "completion",
+                    args.get("completion"),
+                    "completion must be output, write, check, or write_check",
+                ));
             }
-            if args.get("execution_scope").is_some_and(|scope|!scope.is_object()) {
-                return Err(contract_error("INVALID_EXECUTION_SCOPE","execution_scope",args.get("execution_scope"),"execution_scope must be an object"));
+            if args
+                .get("execution_scope")
+                .is_some_and(|scope| !scope.is_object())
+            {
+                return Err(contract_error(
+                    "INVALID_EXECUTION_SCOPE",
+                    "execution_scope",
+                    args.get("execution_scope"),
+                    "execution_scope must be an object",
+                ));
             }
-            let scope=args.get("execution_scope").cloned().unwrap_or_else(||json!({}));
-            let id=host_work_id(task_id,turn,step);
-            let order=json!({"id":id,"node_id":format!("work_{id}"),"goal":goal,"done_when":return_when,
+            let scope = args
+                .get("execution_scope")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let id = host_work_id(task_id, turn, step);
+            let order = json!({"id":id,"node_id":format!("work_{id}"),"goal":goal,"done_when":return_when,
                 "completion":args.get("completion").cloned().unwrap_or(json!("output")),"checks":args.get("checks").cloned().unwrap_or_else(||json!([])),
                 "constraints":args.get("constraints").cloned().unwrap_or_else(||json!([])),
                 "context":args.get("context").cloned().unwrap_or_else(||json!({})),"original_command":args.to_string(),
@@ -175,178 +304,548 @@ fn normalize_decision(name:&str,args:Value,task_id:&str,turn:usize,step:usize)->
                 "material_ranges":scope.get("material_ranges").cloned().unwrap_or_else(||json!([])),
                 "finding_ids":scope.get("finding_ids").cloned().unwrap_or_else(||json!([])),
                 "project_observation":scope.get("project_observation")});
-            let mut decision=json!({"action":"work","reason":reason,"orders":[order]});
-            if let Some(request_action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=request_action.clone();}
-            if decision["request_action"]=="subtask" {decision["preserve_current"]=json!(true);}
+            let mut decision = json!({"action":"work","reason":reason,"orders":[order]});
+            if let Some(request_action) =
+                args.get("request_action").filter(|value| !value.is_null())
+            {
+                decision["request_action"] = request_action.clone();
+            }
+            if decision["request_action"] == "subtask" {
+                decision["preserve_current"] = json!(true);
+            }
             Ok(decision)
-        },
-        "resume_task"=>{
-            let work_id=args["work_id"].as_str().filter(|id|!id.trim().is_empty()).ok_or_else(||
-                contract_error("RESUME_TARGET_REQUIRED","work_id",args.get("work_id"),"provide the existing unfinished work_id"))?;
-            let revision=args["revision"].as_u64().filter(|revision|*revision>0).ok_or_else(||
-                contract_error("RESUME_REVISION_REQUIRED","revision",args.get("revision"),"provide the existing node revision"))?;
-            if args["reason"].as_str().is_none_or(|reason|reason.trim().is_empty()) {return Err(contract_error("RESUME_REASON_REQUIRED","reason",args.get("reason"),"state why this existing task continues"));}
-            let mut decision=json!({"action":"select","task_id":work_id,"target_revision":revision,"reason":args["reason"]});
-            if let Some(context)=args.get("context") {
-                if !context.is_object() {return Err(contract_error("INVALID_WORK_CONTEXT","context",Some(context),"context must be an object selected by Organizer"));}
-                decision["context"]=context.clone();
+        }
+        "resume_task" => {
+            let work_id = args["work_id"]
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    contract_error(
+                        "RESUME_TARGET_REQUIRED",
+                        "work_id",
+                        args.get("work_id"),
+                        "provide the existing unfinished work_id",
+                    )
+                })?;
+            let revision = args["revision"]
+                .as_u64()
+                .filter(|revision| *revision > 0)
+                .ok_or_else(|| {
+                    contract_error(
+                        "RESUME_REVISION_REQUIRED",
+                        "revision",
+                        args.get("revision"),
+                        "provide the existing node revision",
+                    )
+                })?;
+            if args["reason"]
+                .as_str()
+                .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err(contract_error(
+                    "RESUME_REASON_REQUIRED",
+                    "reason",
+                    args.get("reason"),
+                    "state why this existing task continues",
+                ));
             }
-            if let Some(action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=action.clone();}
+            let mut decision = json!({"action":"select","task_id":work_id,"target_revision":revision,"reason":args["reason"]});
+            if let Some(context) = args.get("context") {
+                if !context.is_object() {
+                    return Err(contract_error(
+                        "INVALID_WORK_CONTEXT",
+                        "context",
+                        Some(context),
+                        "context must be an object selected by Organizer",
+                    ));
+                }
+                decision["context"] = context.clone();
+            }
+            if let Some(action) = args.get("request_action").filter(|value| !value.is_null()) {
+                decision["request_action"] = action.clone();
+            }
             Ok(decision)
-        },
-        "read_task_result"=>{
-            if args["work_id"].as_str().is_none_or(str::is_empty)&&args["node_id"].as_str().is_none_or(str::is_empty) {
-                return Err(contract_error("RESULT_REFERENCE_REQUIRED","work_id",args.get("work_id"),"provide a completed work_id or node_id"));
+        }
+        "read_task_result" => {
+            if args["work_id"].as_str().is_none_or(str::is_empty)
+                && args["node_id"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(contract_error(
+                    "RESULT_REFERENCE_REQUIRED",
+                    "work_id",
+                    args.get("work_id"),
+                    "provide a completed work_id or node_id",
+                ));
             }
-            Ok(json!({"action":"read_task_result","work_id":args["work_id"],"node_id":args["node_id"],
-                "fields":args.get("fields").cloned().unwrap_or_else(||json!([]))}))
-        },
-        "read_flow_page"=>Ok(json!({"action":"read_flow_page","cursor":args["cursor"],"limit":args.get("limit").cloned().unwrap_or(json!(50))})),
-        "read_session_history"=>{let mut decision=args;decision["action"]=json!(name);Ok(decision)},
-        "search_work_memory"|"search_architecture_memory"|"search_symbol_business_context"=>{
-            let query=args["query"].as_str().unwrap_or("").trim();
-            if query.is_empty(){return Err(contract_error("SEARCH_QUERY_REQUIRED","query",args.get("query"),"provide a focused query"));}
-            Ok(json!({"action":name,"query":query,"limit":args.get("limit").cloned().unwrap_or(json!(3))}))
-        },
-        "search_project_symbols"=>{
-            let language=args["language"].as_str().unwrap_or("");let query=args["query"].as_str().unwrap_or("").trim();
-            if !matches!(language,"go"|"rust"|"ts"|"python") {return Err(contract_error("SYMBOL_LANGUAGE_REQUIRED","language",args.get("language"),"language must be go, rust, ts, or python"));}
-            if query.is_empty(){return Err(contract_error("SEARCH_QUERY_REQUIRED","query",args.get("query"),"provide a focused symbol query"));}
-            Ok(json!({"action":"search_project_symbols","language":language,"query":query,"file_path":args["file_path"],"limit":args.get("limit").cloned().unwrap_or(json!(5))}))
-        },
-        "read_project_symbol"=>{
-            let language=args["language"].as_str().unwrap_or("");
-            if !matches!(language,"go"|"rust"|"ts"|"python") {return Err(contract_error("SYMBOL_LANGUAGE_REQUIRED","language",args.get("language"),"language must be go, rust, ts, or python"));}
-            if args["symbol_id"].as_str().is_none_or(str::is_empty)&&!(args["file_path"].as_str().is_some_and(|s|!s.trim().is_empty())&&args["name"].as_str().is_some_and(|s|!s.trim().is_empty())) {
-                return Err(contract_error("SYMBOL_REFERENCE_REQUIRED","symbol_id",args.get("symbol_id"),"provide symbol_id or file_path and name"));
+            Ok(
+                json!({"action":"read_task_result","work_id":args["work_id"],"node_id":args["node_id"],
+                "fields":args.get("fields").cloned().unwrap_or_else(||json!([]))}),
+            )
+        }
+        "read_flow_page" => Ok(
+            json!({"action":"read_flow_page","cursor":args["cursor"],"limit":args.get("limit").cloned().unwrap_or(json!(50))}),
+        ),
+        "read_session_history" => {
+            let mut decision = args;
+            decision["action"] = json!(name);
+            Ok(decision)
+        }
+        "record_context_note" => {
+            let content = args["content"].as_str().unwrap_or("");
+            if content.trim().is_empty() {
+                return Err(contract_error(
+                    "CONTEXT_NOTE_REQUIRED",
+                    "content",
+                    args.get("content"),
+                    "provide a non-empty Organizer-authored context note",
+                ));
             }
-            Ok(json!({"action":"read_project_symbol","language":language,"symbol_id":args["symbol_id"],"file_path":args["file_path"],"name":args["name"],"include_context":args.get("include_context").cloned().unwrap_or(json!(false))}))
-        },
-        "read_source_material"=>{
-            if args["query"].as_str().is_none_or(str::is_empty)&&args["material_ids"].as_array().is_none_or(Vec::is_empty) {
-                return Err(contract_error("MATERIAL_REFERENCE_REQUIRED","query",args.get("query"),"provide a focused query or material_ids"));
+            let refs = args["source_event_seqs"].as_array().filter(|refs| !refs.is_empty());
+            if refs.is_none() || refs.is_some_and(|refs| refs.iter().any(|seq| seq.as_i64().is_none_or(|seq| seq < 0))) {
+                return Err(contract_error(
+                    "CONTEXT_NOTE_SOURCES_REQUIRED",
+                    "source_event_seqs",
+                    args.get("source_event_seqs"),
+                    "cite one or more non-negative original history event sequence numbers",
+                ));
             }
-            Ok(json!({"action":"read_source_material","query":args["query"],"material_ids":args["material_ids"],
-                "start_line":args["start_line"],"end_line":args["end_line"],"max_chars":args["max_chars"]}))
-        },
-        "finish_request"=>{
-            let summary=args["summary"].as_str().unwrap_or("").trim();
-            if summary.is_empty() {return Err(contract_error("FINISH_SUMMARY_REQUIRED","summary",args.get("summary"),"finish_request.summary is required and must be nonempty"));}
-            let achieved=args["achieved"].as_bool().ok_or_else(||contract_error("FINISH_ACHIEVED_REQUIRED","achieved",args.get("achieved"),"finish_request.achieved must be a boolean"))?;
-            let unresolved=args["unresolved"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).collect::<Vec<_>>();
-            let final_summary=if unresolved.is_empty(){summary.to_owned()}else{format!("{summary}\n\n未确认或未解决事项：\n\n- {}",unresolved.join("\n- "))};
-            let mut decision=json!({"action":if achieved{"finish"}else{"blocked"},"achieved":achieved,
+            let mut decision = args;
+            decision["action"] = json!(name);
+            Ok(decision)
+        }
+        "view_image" => {
+            if args["artifact_id"].as_str().is_none_or(|id| id.trim().is_empty()) {
+                return Err(contract_error(
+                    "VISUAL_ARTIFACT_REQUIRED",
+                    "artifact_id",
+                    args.get("artifact_id"),
+                    "provide an artifact_id from this task's saved visual history",
+                ));
+            }
+            let mut decision = args;
+            decision["action"] = json!(name);
+            Ok(decision)
+        }
+        "search_work_memory" | "search_architecture_memory" | "search_symbol_business_context" => {
+            let query = args["query"].as_str().unwrap_or("").trim();
+            if query.is_empty() {
+                return Err(contract_error(
+                    "SEARCH_QUERY_REQUIRED",
+                    "query",
+                    args.get("query"),
+                    "provide a focused query",
+                ));
+            }
+            Ok(
+                json!({"action":name,"query":query,"limit":args.get("limit").cloned().unwrap_or(json!(3))}),
+            )
+        }
+        "search_project_symbols" => {
+            let language = args["language"].as_str().unwrap_or("");
+            let query = args["query"].as_str().unwrap_or("").trim();
+            if !matches!(language, "go" | "rust" | "ts" | "python") {
+                return Err(contract_error(
+                    "SYMBOL_LANGUAGE_REQUIRED",
+                    "language",
+                    args.get("language"),
+                    "language must be go, rust, ts, or python",
+                ));
+            }
+            if query.is_empty() {
+                return Err(contract_error(
+                    "SEARCH_QUERY_REQUIRED",
+                    "query",
+                    args.get("query"),
+                    "provide a focused symbol query",
+                ));
+            }
+            Ok(
+                json!({"action":"search_project_symbols","language":language,"query":query,"file_path":args["file_path"],"limit":args.get("limit").cloned().unwrap_or(json!(5))}),
+            )
+        }
+        "read_project_symbol" => {
+            let language = args["language"].as_str().unwrap_or("");
+            if !matches!(language, "go" | "rust" | "ts" | "python") {
+                return Err(contract_error(
+                    "SYMBOL_LANGUAGE_REQUIRED",
+                    "language",
+                    args.get("language"),
+                    "language must be go, rust, ts, or python",
+                ));
+            }
+            if args["symbol_id"].as_str().is_none_or(str::is_empty)
+                && !(args["file_path"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty())
+                    && args["name"].as_str().is_some_and(|s| !s.trim().is_empty()))
+            {
+                return Err(contract_error(
+                    "SYMBOL_REFERENCE_REQUIRED",
+                    "symbol_id",
+                    args.get("symbol_id"),
+                    "provide symbol_id or file_path and name",
+                ));
+            }
+            Ok(
+                json!({"action":"read_project_symbol","language":language,"symbol_id":args["symbol_id"],"file_path":args["file_path"],"name":args["name"],"include_context":args.get("include_context").cloned().unwrap_or(json!(false))}),
+            )
+        }
+        "read_source_material" => {
+            if args["query"].as_str().is_none_or(str::is_empty)
+                && args["material_ids"].as_array().is_none_or(Vec::is_empty)
+            {
+                return Err(contract_error(
+                    "MATERIAL_REFERENCE_REQUIRED",
+                    "query",
+                    args.get("query"),
+                    "provide a focused query or material_ids",
+                ));
+            }
+            Ok(
+                json!({"action":"read_source_material","query":args["query"],"material_ids":args["material_ids"],
+                "start_line":args["start_line"],"end_line":args["end_line"],"max_chars":args["max_chars"]}),
+            )
+        }
+        "finish_request" => {
+            let summary = args["summary"].as_str().unwrap_or("").trim();
+            if summary.is_empty() {
+                return Err(contract_error(
+                    "FINISH_SUMMARY_REQUIRED",
+                    "summary",
+                    args.get("summary"),
+                    "finish_request.summary is required and must be nonempty",
+                ));
+            }
+            let achieved = args["achieved"].as_bool().ok_or_else(|| {
+                contract_error(
+                    "FINISH_ACHIEVED_REQUIRED",
+                    "achieved",
+                    args.get("achieved"),
+                    "finish_request.achieved must be a boolean",
+                )
+            })?;
+            let unresolved = args["unresolved"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            let final_summary = if unresolved.is_empty() {
+                summary.to_owned()
+            } else {
+                format!(
+                    "{summary}\n\n未确认或未解决事项：\n\n- {}",
+                    unresolved.join("\n- ")
+                )
+            };
+            let mut decision = json!({"action":if achieved{"finish"}else{"blocked"},"achieved":achieved,
                 "unresolved":unresolved,"summary":final_summary,"reason":args.get("reason").cloned().unwrap_or(json!(summary))});
-            if let Some(request_action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=request_action.clone();}
+            if let Some(request_action) =
+                args.get("request_action").filter(|value| !value.is_null())
+            {
+                decision["request_action"] = request_action.clone();
+            }
             Ok(decision)
-        },
-        "revisit_task"=>{
-            let target=args["target_node_id"].as_str().unwrap_or("").trim();
-            let reason=args["reason"].as_str().unwrap_or("").trim();
-            if target.is_empty() {return Err(contract_error("REVISIT_TARGET_REQUIRED","target_node_id",args.get("target_node_id"),"revisit_task.target_node_id is required"));}
-            if reason.is_empty() {return Err(contract_error("REVISIT_REASON_REQUIRED","reason",args.get("reason"),"revisit_task.reason is required"));}
-            let mut decision=json!({"action":"revisit","target_node_id":target,"target_revision":args["target_revision"],
+        }
+        "revisit_task" => {
+            let target = args["target_node_id"].as_str().unwrap_or("").trim();
+            let reason = args["reason"].as_str().unwrap_or("").trim();
+            if target.is_empty() {
+                return Err(contract_error(
+                    "REVISIT_TARGET_REQUIRED",
+                    "target_node_id",
+                    args.get("target_node_id"),
+                    "revisit_task.target_node_id is required",
+                ));
+            }
+            if reason.is_empty() {
+                return Err(contract_error(
+                    "REVISIT_REASON_REQUIRED",
+                    "reason",
+                    args.get("reason"),
+                    "revisit_task.reason is required",
+                ));
+            }
+            let mut decision = json!({"action":"revisit","target_node_id":target,"target_revision":args["target_revision"],
                 "reason":reason,"repair_goal":args.get("repair_goal"),"replacement_checks":args.get("replacement_checks")});
-            if let Some(request_action)=args.get("request_action").filter(|value|!value.is_null()) {decision["request_action"]=request_action.clone();}
+            if let Some(request_action) =
+                args.get("request_action").filter(|value| !value.is_null())
+            {
+                decision["request_action"] = request_action.clone();
+            }
             Ok(decision)
-        },
-        _=>anyhow::bail!("unknown Organizer method: {name}"),
+        }
+        _ => anyhow::bail!("unknown Organizer method: {name}"),
     }
 }
 
-pub fn is_organizer_tool(name:&str)->bool {
-    matches!(name,"schedule_task"|"resume_task"|"read_task_result"|"read_flow_page"|"read_session_history"|"search_work_memory"|"search_architecture_memory"
-        |"search_symbol_business_context"|"search_project_symbols"|"read_project_symbol"|"read_source_material"|"finish_request"|"revisit_task")
+pub fn is_organizer_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "schedule_task"
+            | "resume_task"
+            | "read_task_result"
+            | "read_flow_page"
+            | "read_session_history"
+            | "record_context_note"
+            | "view_image"
+            | "search_work_memory"
+            | "search_architecture_memory"
+            | "search_symbol_business_context"
+            | "search_project_symbols"
+            | "read_project_symbol"
+            | "read_source_material"
+            | "finish_request"
+            | "revisit_task"
+    )
 }
 
-const MAX_METHOD_ARGUMENT_BYTES:usize=24_000;
-const LIMITS:crate::model_stream::Limits=crate::model_stream::Limits{max_total_bytes:8*1024*1024,max_line_bytes:1024*1024,
-    max_tool_argument_bytes:MAX_METHOD_ARGUMENT_BYTES,retain_reasoning:false};
-const PROGRESS_INTERVAL:Duration=Duration::from_millis(1000);
+const MAX_METHOD_ARGUMENT_BYTES: usize = 24_000;
+const LIMITS: crate::model_stream::Limits = crate::model_stream::Limits {
+    max_total_bytes: 8 * 1024 * 1024,
+    max_line_bytes: 1024 * 1024,
+    max_tool_argument_bytes: MAX_METHOD_ARGUMENT_BYTES,
+    retain_reasoning: false,
+};
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(1000);
+
+#[derive(Debug)]
+pub struct OrganizerResponse {
+    pub decision: Value,
+    pub call_ids: Vec<String>,
+}
 
 /// Exactly one complete method from a finished assistant message.
-fn decision_from_message(message:&Value,task_id:&str,turn:usize,step:usize)->Result<Value> {
-    let calls=message.get("tool_calls").and_then(Value::as_array)
-        .ok_or_else(||contract_error("TOOL_CALL_REQUIRED","tool_calls",Some(message),"Organizer must return one scheduling method"))?;
-    if calls.len()>1 && calls.iter().all(|call|call.pointer("/function/name").and_then(Value::as_str)
-        .is_some_and(|name|is_organizer_tool(name) && !matches!(name,"schedule_task"|"resume_task"|"revisit_task"|"finish_request"))) {
-        let mut reads=Vec::new();
+fn decision_from_message(
+    message: &Value,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+) -> Result<Value> {
+    let calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            contract_error(
+                "TOOL_CALL_REQUIRED",
+                "tool_calls",
+                Some(message),
+                "Organizer must return one scheduling method",
+            )
+        })?;
+    if calls.len() > 1
+        && calls.iter().all(|call| {
+            call.pointer("/function/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    is_organizer_tool(name)
+                        && !matches!(
+                            name,
+                            "schedule_task" | "resume_task" | "revisit_task" | "finish_request"
+                        )
+                })
+        })
+    {
+        let mut reads = Vec::new();
         for call in calls {
-            let name=call["function"]["name"].as_str().unwrap();
-            let args=serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))?;
-            reads.push(normalize_decision(name,args,task_id,turn,step)?);
+            let name = call["function"]["name"].as_str().unwrap();
+            let args =
+                serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))?;
+            reads.push(normalize_decision(name, args, task_id, turn, step)?);
         }
         return Ok(json!({"action":"read_many","reads":reads}));
     }
-    if calls.len()!=1 {return Err(contract_error("ONE_METHOD_PER_DECISION","tool_calls",Some(&json!(calls)),"Return one state-changing scheduling method; independent read methods may share a response"));}
-    let name=calls[0].pointer("/function/name").and_then(Value::as_str)
-        .ok_or_else(||contract_error("METHOD_REQUIRED","method",Some(&calls[0]),"Organizer method name is missing"))?;
-    #[cfg(test)]
-    if name=="organize_work" {
-        // Legacy integration fixtures exercise the internal scheduler adapter only in tests.
-        let raw=calls[0].pointer("/function/arguments").and_then(Value::as_str)
-            .ok_or_else(||contract_error("ARGUMENTS_REQUIRED","arguments",Some(&calls[0]),"tool arguments are missing"))?;
-        return serde_json::from_str(raw).map_err(|error|contract_error("INVALID_ARGUMENTS","arguments",Some(&json!(raw)),error.to_string()));
+    if calls.len() != 1 {
+        return Err(contract_error(
+            "ONE_METHOD_PER_DECISION",
+            "tool_calls",
+            Some(&json!(calls)),
+            "Return one state-changing scheduling method; independent read methods may share a response",
+        ));
     }
-    if !is_organizer_tool(name) {return Err(contract_error("UNSUPPORTED_METHOD","method",Some(&json!(name)),format!("Organizer returned unsupported method '{name}'")));}
-    let raw=calls[0].pointer("/function/arguments").and_then(Value::as_str)
-        .ok_or_else(||contract_error("ARGUMENTS_REQUIRED","arguments",Some(&calls[0]),"Organizer method arguments are missing"))?;
-    if raw.len()>MAX_METHOD_ARGUMENT_BYTES {return Err(contract_error("ARGUMENTS_TOO_LARGE","arguments",Some(&json!(raw.len())),"Organizer method arguments exceed contract size"));}
-    let args:Value=serde_json::from_str(raw).map_err(|error|contract_error("INVALID_ARGUMENTS","arguments",Some(&json!(raw)),error.to_string()))?;
-    let mut decision=normalize_decision(name,args,task_id,turn,step)?;
-    if name=="schedule_task" {decision["orders"][0]["original_command"]=json!(raw);}
-    if matches!(name,"resume_task"|"revisit_task") {decision["original_command"]=json!(raw);}
+    let name = calls[0]
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            contract_error(
+                "METHOD_REQUIRED",
+                "method",
+                Some(&calls[0]),
+                "Organizer method name is missing",
+            )
+        })?;
+    #[cfg(test)]
+    if name == "organize_work" {
+        // Legacy integration fixtures exercise the internal scheduler adapter only in tests.
+        let raw = calls[0]
+            .pointer("/function/arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                contract_error(
+                    "ARGUMENTS_REQUIRED",
+                    "arguments",
+                    Some(&calls[0]),
+                    "tool arguments are missing",
+                )
+            })?;
+        return serde_json::from_str(raw).map_err(|error| {
+            contract_error(
+                "INVALID_ARGUMENTS",
+                "arguments",
+                Some(&json!(raw)),
+                error.to_string(),
+            )
+        });
+    }
+    if !is_organizer_tool(name) {
+        return Err(contract_error(
+            "UNSUPPORTED_METHOD",
+            "method",
+            Some(&json!(name)),
+            format!("Organizer returned unsupported method '{name}'"),
+        ));
+    }
+    let raw = calls[0]
+        .pointer("/function/arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            contract_error(
+                "ARGUMENTS_REQUIRED",
+                "arguments",
+                Some(&calls[0]),
+                "Organizer method arguments are missing",
+            )
+        })?;
+    if raw.len() > MAX_METHOD_ARGUMENT_BYTES {
+        return Err(contract_error(
+            "ARGUMENTS_TOO_LARGE",
+            "arguments",
+            Some(&json!(raw.len())),
+            "Organizer method arguments exceed contract size",
+        ));
+    }
+    let args: Value = serde_json::from_str(raw).map_err(|error| {
+        contract_error(
+            "INVALID_ARGUMENTS",
+            "arguments",
+            Some(&json!(raw)),
+            error.to_string(),
+        )
+    })?;
+    let mut decision = normalize_decision(name, args, task_id, turn, step)?;
+    if name == "schedule_task" {
+        decision["orders"][0]["original_command"] = json!(raw);
+    }
+    if matches!(name, "resume_task" | "revisit_task") {
+        decision["original_command"] = json!(raw);
+    }
     Ok(decision)
 }
 
 /// A completed response is accepted only after the provider signalled its end.
-fn completed_decision(completed:crate::model_stream::Completed,task_id:&str,turn:usize,step:usize)->Result<Value> {
+fn completed_decision(
+    completed: crate::model_stream::Completed,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+) -> Result<Value> {
     if !completed.terminated {
-        anyhow::bail!("Organizer stream ended before [DONE] or a finish_reason; no scheduling method was applied");
+        anyhow::bail!(
+            "Organizer stream ended before [DONE] or a finish_reason; no scheduling method was applied"
+        );
     }
-    if matches!(completed.stats["finish_reason"].as_str(),Some("length"|"content_filter")) {
-        anyhow::bail!("Organizer response stopped early (finish_reason={}); no scheduling method was applied",completed.stats["finish_reason"]);
+    if matches!(
+        completed.stats["finish_reason"].as_str(),
+        Some("length" | "content_filter")
+    ) {
+        anyhow::bail!(
+            "Organizer response stopped early (finish_reason={}); no scheduling method was applied",
+            completed.stats["finish_reason"]
+        );
     }
-    decision_from_message(&completed.message,task_id,turn,step)
+    decision_from_message(&completed.message, task_id, turn, step)
 }
 
-enum Interrupted { Cancelled, TimedOut, Failed(anyhow::Error) }
+enum Interrupted {
+    Cancelled,
+    TimedOut,
+    Failed(anyhow::Error),
+}
 
-struct Progress<'a> { state:&'a AgentServiceState, task_id:&'a str, turn:usize, step:usize, node:&'a str }
+struct Progress<'a> {
+    state: &'a AgentServiceState,
+    task_id: &'a str,
+    turn: usize,
+    step: usize,
+    node: &'a str,
+}
 
 impl Progress<'_> {
-    async fn emit(&self,phase:&str,stats:&Value,headers_ms:Option<u64>,elapsed_ms:u64) {
-        let event=json!({"turn":self.turn,"step":self.step,"nodeId":self.node,"phase":phase,"elapsed_ms":elapsed_ms,
+    async fn emit(&self, phase: &str, stats: &Value, headers_ms: Option<u64>, elapsed_ms: u64) {
+        let event = json!({"turn":self.turn,"step":self.step,"nodeId":self.node,"phase":phase,"elapsed_ms":elapsed_ms,
             "response_headers_ms":headers_ms,"first_chunk_ms":stats["first_chunk_ms"],"first_delta_ms":stats["first_delta_ms"],
             "first_tool_delta_ms":stats["first_tool_delta_ms"],"received_bytes":stats["received_bytes"],
             "reasoning_chars":stats["reasoning_chars"],"tool_argument_bytes":stats["tool_argument_bytes"]});
-        if let Err(error)=crate::agent_service::emit(self.state.workspace.root(),self.task_id,"organizer/progress",event).await {
+        if let Err(error) = crate::agent_service::emit(
+            self.state.workspace.root(),
+            self.task_id,
+            "organizer/progress",
+            event,
+        )
+        .await
+        {
             tracing::warn!(task_id=self.task_id,%error,"could not save Organizer progress");
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn receive(state:&AgentServiceState,body:&Value,cancel:&CancellationToken,deadline:tokio::time::Instant,started:Instant,
-    accumulator:&mut crate::model_stream::ChatStream,headers_ms:&mut Option<u64>,status:&mut Option<u16>,progress:&Progress<'_>)
-    ->std::result::Result<(),Interrupted> {
-    let send=state.client.post(format!("{}/chat/completions",state.provider_url.trim_end_matches('/')))
-        .bearer_auth(&state.api_key).json(body).send();
-    let response=tokio::select! {
+async fn receive(
+    state: &AgentServiceState,
+    body: &Value,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+    started: Instant,
+    accumulator: &mut crate::model_stream::ChatStream,
+    headers_ms: &mut Option<u64>,
+    status: &mut Option<u16>,
+    progress: &Progress<'_>,
+) -> std::result::Result<(), Interrupted> {
+    let send = state
+        .client
+        .post(format!(
+            "{}/chat/completions",
+            state.provider_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&state.api_key)
+        .json(body)
+        .send();
+    let response = tokio::select! {
         biased;
         _=cancel.cancelled()=>return Err(Interrupted::Cancelled),
         _=tokio::time::sleep_until(deadline)=>return Err(Interrupted::TimedOut),
         response=send=>response.map_err(|error|Interrupted::Failed(error.into()))?,
     };
-    *status=Some(response.status().as_u16());
-    *headers_ms=Some(started.elapsed().as_millis() as u64);
-    let response=crate::visual_probe::successful_response(response).await.map_err(Interrupted::Failed)?;
-    let mut phase="waiting_first_delta";
-    progress.emit(phase,&accumulator.stats(),*headers_ms,started.elapsed().as_millis() as u64).await;
-    let mut last_progress=Instant::now();
-    let mut bytes=response.bytes_stream();
+    *status = Some(response.status().as_u16());
+    *headers_ms = Some(started.elapsed().as_millis() as u64);
+    let response = crate::visual_probe::successful_response(response)
+        .await
+        .map_err(Interrupted::Failed)?;
+    let mut phase = "waiting_first_delta";
+    progress
+        .emit(
+            phase,
+            &accumulator.stats(),
+            *headers_ms,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+    let mut last_progress = Instant::now();
+    let mut bytes = response.bytes_stream();
     while !accumulator.received_done() {
-        let chunk=tokio::select! {
+        let chunk = tokio::select! {
             biased;
             _=cancel.cancelled()=>return Err(Interrupted::Cancelled),
             _=tokio::time::sleep_until(deadline)=>return Err(Interrupted::TimedOut),
@@ -356,12 +855,25 @@ async fn receive(state:&AgentServiceState,body:&Value,cancel:&CancellationToken,
                 None=>break,
             },
         };
-        let delta=accumulator.push(&chunk).map_err(Interrupted::Failed)?;
-        let next_phase=if delta.tool_call||phase=="receiving_decision" {"receiving_decision"}
-            else if !delta.is_empty()||phase=="reasoning" {"reasoning"} else {phase};
-        if next_phase!=phase||last_progress.elapsed()>=PROGRESS_INTERVAL {
-            phase=next_phase;last_progress=Instant::now();
-            progress.emit(phase,&accumulator.stats(),*headers_ms,started.elapsed().as_millis() as u64).await;
+        let delta = accumulator.push(&chunk).map_err(Interrupted::Failed)?;
+        let next_phase = if delta.tool_call || phase == "receiving_decision" {
+            "receiving_decision"
+        } else if !delta.is_empty() || phase == "reasoning" {
+            "reasoning"
+        } else {
+            phase
+        };
+        if next_phase != phase || last_progress.elapsed() >= PROGRESS_INTERVAL {
+            phase = next_phase;
+            last_progress = Instant::now();
+            progress
+                .emit(
+                    phase,
+                    &accumulator.stats(),
+                    *headers_ms,
+                    started.elapsed().as_millis() as u64,
+                )
+                .await;
         }
     }
     Ok(())
@@ -370,74 +882,239 @@ async fn receive(state:&AgentServiceState,body:&Value,cancel:&CancellationToken,
 /// Streams one Organizer call. Partial tool arguments are never acted on; the
 /// host validates and applies the single method only after the stream ends.
 #[allow(clippy::too_many_arguments)]
-pub async fn decide(state:&AgentServiceState, model:&str, task_id:&str, turn:usize, step:usize, node:&str, input:Value,
-    cancel:&CancellationToken, timeout:Duration) -> Result<Value> {
-    let construction_started=Instant::now();
-    let tools=organizer_tools(&input);
-    let mut view=crate::session_history::organizer_view(state.workspace.root(),task_id,&input,false).await?;
+pub async fn decide(
+    state: &AgentServiceState,
+    model: &str,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+    node: &str,
+    input: Value,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<OrganizerResponse> {
+    let construction_started = Instant::now();
+    let tools = organizer_tools(&input);
+    let mut view =
+        crate::session_history::organizer_view(state.workspace.root(), task_id, &input, false)
+            .await?;
     view.prepend(json!({"role":"system","content":include_str!("../prompts/organizer_system.md")}));
-    let messages=view.messages.clone();
-    let mut body=json!({"model":model,"stream":true,"messages":messages,"tools":tools,"tool_choice":"auto"});
-    if let Some(effort)=state.reasoning_effort.as_deref(){body["reasoning_effort"]=json!(effort);}
-    if state.fast_mode {body["service_tier"]=json!("fast");}
-    let scope=format!("request:{}",input["process"]["request_id"].as_u64().unwrap_or(1));
-    let context_window=crate::context_rebuild::prepare(state,model,"organizer",task_id,&scope,&input,&mut body,view,
-        json!({"turn":turn,"step":step,"nodeId":node,"request_id":input["process"]["request_id"]}),cancel,timeout).await?;
-    let visual_context=crate::visual_artifacts::VisualContext {turn:Some(turn),identity:json!({"task_id":task_id,
-        "request_id":input["process"]["request_id"].as_u64().unwrap_or(1),"node_id":node}),..Default::default()};
-    let visual_dispatch=crate::visual_artifacts::prepare_request(state,"organizer",model,&visual_context,&[],input["human_request"].as_str().unwrap_or("review current task"),&mut body).await?;
-    crate::context_window::prepare(&mut body,2)?;
-    let request_construction_ms=construction_started.elapsed().as_millis() as u64;
-    let request_bytes=body.to_string().len();
-    let metadata=json!({"actor":"organizer","stage":"organization","turn":turn,"step":step,"nodeId":node,
+    let messages = view.messages.clone();
+    let mut body =
+        json!({"model":model,"stream":true,"messages":messages,"tools":tools,"tool_choice":"auto"});
+    if let Some(effort) = state.reasoning_effort.as_deref() {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if state.fast_mode {
+        body["service_tier"] = json!("fast");
+    }
+    let scope = format!(
+        "request:{}",
+        input["process"]["request_id"].as_u64().unwrap_or(1)
+    );
+    let context_window = crate::context_rebuild::prepare(
+        state,
+        model,
+        "organizer",
+        task_id,
+        &scope,
+        &input,
+        &mut body,
+        view,
+        json!({"turn":turn,"step":step,"nodeId":node,"request_id":input["process"]["request_id"]}),
+        cancel,
+        timeout,
+    )
+    .await?;
+    let visual_context = crate::visual_artifacts::VisualContext {
+        turn: Some(turn),
+        identity: json!({"task_id":task_id,
+        "request_id":input["process"]["request_id"].as_u64().unwrap_or(1),"node_id":node}),
+        ..Default::default()
+    };
+    let visual_dispatch = crate::visual_artifacts::prepare_request(
+        state,
+        "organizer",
+        model,
+        &visual_context,
+        &[],
+        input["human_request"]
+            .as_str()
+            .unwrap_or("review current task"),
+        &mut body,
+    )
+    .await?;
+    crate::context_window::prepare(&mut body, 2)?;
+    let request_construction_ms = construction_started.elapsed().as_millis() as u64;
+    let request_bytes = body.to_string().len();
+    let metadata = json!({"actor":"organizer","stage":"organization","turn":turn,"step":step,"nodeId":node,
         "request_id":input["process"]["request_id"],"workId":input["process"]["current_work"]["id"],"revision":input["process"]["current_revision"],
         "plan_revision":input["process"]["plan_revision"],"request_construction_ms":request_construction_ms,"request_bytes":request_bytes,
         "context_window":context_window,"visual_dispatch":visual_dispatch});
-    let trace=crate::request_context::record(state.workspace.root(),task_id,metadata.clone(),&body).await;
-    let progress=Progress{state,task_id,turn,step,node};
-    let request_started=Instant::now();
-    let deadline=tokio::time::Instant::now()+timeout;
-    let mut accumulator=crate::model_stream::ChatStream::new(LIMITS,request_started);
-    let mut response_headers_ms=None;
-    let mut response_status=None;
-    progress.emit("waiting_response",&accumulator.stats(),None,0).await;
-    let received=receive(state,&body,cancel,deadline,request_started,&mut accumulator,&mut response_headers_ms,&mut response_status,&progress).await;
-    let mut stats=accumulator.stats();
-    stats["response_complete_ms"]=Value::Null;
-    let (result,outcome)=match received {
-        Ok(())=>match accumulator.finish() {
-            Ok(completed)=>{
-                stats=completed.stats.clone();
+    let trace =
+        crate::request_context::record(state.workspace.root(), task_id, metadata.clone(), &body)
+            .await;
+    let progress = Progress {
+        state,
+        task_id,
+        turn,
+        step,
+        node,
+    };
+    let request_started = Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut accumulator = crate::model_stream::ChatStream::new(LIMITS, request_started);
+    let mut response_headers_ms = None;
+    let mut response_status = None;
+    progress
+        .emit("waiting_response", &accumulator.stats(), None, 0)
+        .await;
+    let received = receive(
+        state,
+        &body,
+        cancel,
+        deadline,
+        request_started,
+        &mut accumulator,
+        &mut response_headers_ms,
+        &mut response_status,
+        &progress,
+    )
+    .await;
+    let mut stats = accumulator.stats();
+    stats["response_complete_ms"] = Value::Null;
+    let (result, outcome) = match received {
+        Ok(()) => match accumulator.finish() {
+            Ok(completed) => {
+                stats = completed.stats.clone();
+                let call_ids = completed.message["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|call| {
+                        call["id"]
+                            .as_str()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Organizer tool call is missing its original call ID"
+                                )
+                            })
+                            .map(str::to_owned)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                anyhow::ensure!(
+                    call_ids.iter().all(|id| !id.is_empty()),
+                    "Organizer tool call has an empty call ID"
+                );
+                anyhow::ensure!(
+                    call_ids
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == call_ids.len(),
+                    "Organizer response repeats a tool call ID"
+                );
                 crate::agent_service::emit(state.workspace.root(),task_id,"organizer/method_message",
                     json!({"turn":turn,"step":step,"actor":"organizer","identity":{"task_id":task_id,"request_id":input["process"]["request_id"]},"message":completed.message})).await?;
-                (completed_decision(completed,task_id,turn,step),None)
-            },
-            Err(error)=>(Err(error),None),
+                let decision = completed_decision(completed, task_id, turn, step);
+                if let Err(error) = &decision {
+                    let failed_result = json!({"error":format!("{error:#}")});
+                    for call_id in &call_ids {
+                        crate::agent_service::emit_organizer_tool_result(
+                            state.workspace.root(),
+                            task_id,
+                            turn,
+                            step,
+                            call_id,
+                            failed_result.clone(),
+                            true,
+                        )
+                        .await?;
+                    }
+                }
+                (
+                    decision.map(|decision| OrganizerResponse { decision, call_ids }),
+                    None,
+                )
+            }
+            Err(error) => (Err(error), None),
         },
-        Err(Interrupted::Failed(error))=>(Err(error),None),
-        Err(Interrupted::Cancelled)=>(Err(anyhow::anyhow!("cancelled")),Some("cancelled")),
-        Err(Interrupted::TimedOut)=>(Err(anyhow::anyhow!("Organizer request timed out")),Some("timeout")),
+        Err(Interrupted::Failed(error)) => (Err(error), None),
+        Err(Interrupted::Cancelled) => (Err(anyhow::anyhow!("cancelled")), Some("cancelled")),
+        Err(Interrupted::TimedOut) => (
+            Err(anyhow::anyhow!("Organizer request timed out")),
+            Some("timeout"),
+        ),
     };
-    let result=result.map_err(|error| match crate::model_stream::stream_error_code(&error) {
-        Some("ARGUMENTS_TOO_LARGE")=>contract_error("ARGUMENTS_TOO_LARGE","arguments",None,"Organizer method arguments exceed contract size"),
-        _=>error,
+    let result = result.map_err(
+        |error| match crate::model_stream::stream_error_code(&error) {
+            Some("ARGUMENTS_TOO_LARGE") => contract_error(
+                "ARGUMENTS_TOO_LARGE",
+                "arguments",
+                None,
+                "Organizer method arguments exceed contract size",
+            ),
+            _ => error,
+        },
+    );
+    let contract_failure = result
+        .as_ref()
+        .err()
+        .and_then(contract_details)
+        .cloned()
+        .unwrap_or(Value::Null);
+    let request_failure = result
+        .as_ref()
+        .err()
+        .filter(|_| contract_failure.is_null())
+        .map(ToString::to_string);
+    let outcome = outcome.unwrap_or(if result.is_ok() {
+        "decision"
+    } else if !contract_failure.is_null() {
+        "contract_error"
+    } else {
+        "request_error"
     });
-    let contract_failure=result.as_ref().err().and_then(contract_details).cloned().unwrap_or(Value::Null);
-    let request_failure=result.as_ref().err().filter(|_|contract_failure.is_null()).map(ToString::to_string);
-    let outcome=outcome.unwrap_or(if result.is_ok(){"decision"}else if !contract_failure.is_null(){"contract_error"}else{"request_error"});
-    let mut metrics=json!({"turn":turn,"step":step,"node_id":node,"request_bytes":request_bytes,
+    let mut metrics = json!({"turn":turn,"step":step,"node_id":node,"request_bytes":request_bytes,
         "request_construction_ms":request_construction_ms,"response_headers_ms":response_headers_ms,
         "response_status":response_status,"response_body_bytes":stats["received_bytes"],
         "result":outcome,"contract_failure":contract_failure,"request_failure":request_failure});
-    for (key,value) in stats.as_object().into_iter().flatten() {metrics[key]=value.clone();}
-    if let Err(error)=crate::agent_service::emit(state.workspace.root(),task_id,"organizer/request_metrics",metrics.clone()).await {
+    for (key, value) in stats.as_object().into_iter().flatten() {
+        metrics[key] = value.clone();
+    }
+    if let Err(error) = crate::agent_service::emit(
+        state.workspace.root(),
+        task_id,
+        "organizer/request_metrics",
+        metrics.clone(),
+    )
+    .await
+    {
         tracing::warn!(task_id,%error,"could not save Organizer request metrics");
     }
-    let phase=match outcome {"decision"=>"completed","cancelled"=>"cancelled","timeout"=>"timeout",_=>"failed"};
-    progress.emit(phase,&stats,response_headers_ms,request_started.elapsed().as_millis() as u64).await;
-    let trace_status=match outcome {"decision"=>"completed","contract_error"=>"contract_error","cancelled"=>"cancelled","timeout"=>"timeout",_=>"failed"};
+    let phase = match outcome {
+        "decision" => "completed",
+        "cancelled" => "cancelled",
+        "timeout" => "timeout",
+        _ => "failed",
+    };
+    progress
+        .emit(
+            phase,
+            &stats,
+            response_headers_ms,
+            request_started.elapsed().as_millis() as u64,
+        )
+        .await;
+    let trace_status = match outcome {
+        "decision" => "completed",
+        "contract_error" => "contract_error",
+        "cancelled" => "cancelled",
+        "timeout" => "timeout",
+        _ => "failed",
+    };
     crate::request_context::finish(trace,trace_status,
-        json!({"decision":result.as_ref().ok(),"error":result.as_ref().err().map(ToString::to_string),"metrics":metrics})).await;
+        json!({"decision":result.as_ref().ok().map(|response|&response.decision),"error":result.as_ref().err().map(ToString::to_string),"metrics":metrics})).await;
     result
 }
 
@@ -447,11 +1124,24 @@ mod tests {
 
     #[test]
     fn continuation_schema_requires_the_same_request_action_as_runtime() {
-        for continuation in [false,true] {
-            let input=if continuation {json!({"process":{"handoff":{"intent":"session_continuation"}},"capabilities":{"allowed_request_actions":["continue","subtask","replace"]}})} else {json!({})};
+        for continuation in [false, true] {
+            let input = if continuation {
+                json!({"process":{"handoff":{"intent":"session_continuation"}},"capabilities":{"allowed_request_actions":["continue","subtask","replace"]}})
+            } else {
+                json!({})
+            };
             for tool in organizer_tools(&input) {
-                if tool.pointer("/function/parameters/properties/request_action").is_some() {
-                    assert_eq!(tool["function"]["parameters"]["required"].as_array().unwrap().contains(&json!("request_action")),continuation);
+                if tool
+                    .pointer("/function/parameters/properties/request_action")
+                    .is_some()
+                {
+                    assert_eq!(
+                        tool["function"]["parameters"]["required"]
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!("request_action")),
+                        continuation
+                    );
                 }
             }
         }
@@ -462,209 +1152,407 @@ mod tests {
         let calls=[("read_task_result",json!({"work_id":"upload","fields":["worker_return"]})),
             ("read_session_history",json!({"event_seq":42}))].into_iter().enumerate().map(|(index,(name,args))|
             json!({"id":format!("read_{index}"),"function":{"name":name,"arguments":args.to_string()}})).collect::<Vec<_>>();
-        let decision=decision_from_message(&json!({"tool_calls":calls}),"task",1,1).unwrap();
-        assert_eq!(decision["action"],"read_many");
-        assert_eq!(decision["reads"][0]["work_id"],"upload");
-        assert_eq!(decision["reads"][1]["event_seq"],42);
+        let decision = decision_from_message(&json!({"tool_calls":calls}), "task", 1, 1).unwrap();
+        assert_eq!(decision["action"], "read_many");
+        assert_eq!(decision["reads"][0]["work_id"], "upload");
+        assert_eq!(decision["reads"][1]["event_seq"], 42);
     }
 
     #[test]
     fn malformed_organizer_decisions_have_structured_contract_errors() {
-        let error=normalize_decision("schedule_task",json!({"return_when":"ready","reason":"check","completion":"check"}),
-            "task",2,3).unwrap_err();
-        let details=contract_details(&error).unwrap();
-        assert_eq!(details["rule_id"],"INVALID_TASK_GOAL");
-        assert_eq!(details["field_path"],"goal");
-        assert_eq!(details["submitted_value_present"],false);
+        let error = normalize_decision(
+            "schedule_task",
+            json!({"return_when":"ready","reason":"check","completion":"check"}),
+            "task",
+            2,
+            3,
+        )
+        .unwrap_err();
+        let details = contract_details(&error).unwrap();
+        assert_eq!(details["rule_id"], "INVALID_TASK_GOAL");
+        assert_eq!(details["field_path"], "goal");
+        assert_eq!(details["submitted_value_present"], false);
         assert!(contract_details(&anyhow::anyhow!("network timeout")).is_none());
 
-        let finish=normalize_decision("finish_request",json!({"achieved":false}),"task",2,3).unwrap_err();
-        let details=contract_details(&finish).unwrap();
-        assert_eq!(details["field_path"],"summary");
-        assert_eq!(details["rule_id"],"FINISH_SUMMARY_REQUIRED");
+        let finish = normalize_decision("finish_request", json!({"achieved":false}), "task", 2, 3)
+            .unwrap_err();
+        let details = contract_details(&finish).unwrap();
+        assert_eq!(details["field_path"], "summary");
+        assert_eq!(details["rule_id"], "FINISH_SUMMARY_REQUIRED");
     }
 
     #[test]
     fn organizer_context_is_preserved_in_schedule_and_resume_and_rejects_nonobjects() {
-        let context=json!({"fact":"collision","source_event_seq":42,"instruction":"check driving"});
+        let context =
+            json!({"fact":"collision","source_event_seq":42,"instruction":"check driving"});
         let scheduled=normalize_decision("schedule_task",json!({"goal":"check driving","return_when":"report","reason":"observed collision","context":context}),"task",1,1).unwrap();
-        assert_eq!(scheduled["orders"][0]["context"],context);
-        let resumed=normalize_decision("resume_task",json!({"work_id":"w","revision":1,"reason":"new facts","context":context}),"task",1,1).unwrap();
-        assert_eq!(resumed["context"],context);
-        for (tool,args) in [
-            ("schedule_task",json!({"goal":"check","return_when":"report","reason":"fact","context":"wrong"})),
-            ("resume_task",json!({"work_id":"w","revision":1,"reason":"fact","context":[]}))
-        ] {assert_eq!(contract_details(&normalize_decision(tool,args,"task",1,1).unwrap_err()).unwrap()["rule_id"],"INVALID_WORK_CONTEXT");}
+        assert_eq!(scheduled["orders"][0]["context"], context);
+        let resumed = normalize_decision(
+            "resume_task",
+            json!({"work_id":"w","revision":1,"reason":"new facts","context":context}),
+            "task",
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(resumed["context"], context);
+        for (tool, args) in [
+            (
+                "schedule_task",
+                json!({"goal":"check","return_when":"report","reason":"fact","context":"wrong"}),
+            ),
+            (
+                "resume_task",
+                json!({"work_id":"w","revision":1,"reason":"fact","context":[]}),
+            ),
+        ] {
+            assert_eq!(
+                contract_details(&normalize_decision(tool, args, "task", 1, 1).unwrap_err())
+                    .unwrap()["rule_id"],
+                "INVALID_WORK_CONTEXT"
+            );
+        }
     }
 
     #[test]
     fn original_schedule_and_resume_arguments_retain_exact_bytes() {
-        for (name,raw) in [
-            ("schedule_task"," {\n \"goal\":\"执行任务\", \"return_when\":\"返回\", \"reason\":\"用户要求\" } "),
-            ("resume_task"," { \"work_id\":\"w\", \"revision\":1, \"reason\":\"改用新信息\", \"context\":{\"fact\":\"原文\"} } ")
+        for (name, raw) in [
+            (
+                "schedule_task",
+                " {\n \"goal\":\"执行任务\", \"return_when\":\"返回\", \"reason\":\"用户要求\" } ",
+            ),
+            (
+                "resume_task",
+                " { \"work_id\":\"w\", \"revision\":1, \"reason\":\"改用新信息\", \"context\":{\"fact\":\"原文\"} } ",
+            ),
         ] {
-            let message=json!({"tool_calls":[{"id":"call","function":{"name":name,"arguments":raw}}]});
-            let decision=decision_from_message(&message,"task",1,1).unwrap();
-            let command=if name=="schedule_task" {&decision["orders"][0]["original_command"]} else {&decision["original_command"]};
-            assert_eq!(command,raw);
+            let message =
+                json!({"tool_calls":[{"id":"call","function":{"name":name,"arguments":raw}}]});
+            let decision = decision_from_message(&message, "task", 1, 1).unwrap();
+            let command = if name == "schedule_task" {
+                &decision["orders"][0]["original_command"]
+            } else {
+                &decision["original_command"]
+            };
+            assert_eq!(command, raw);
         }
     }
 
     #[test]
     fn schedule_task_host_id_is_stable_for_a_replayed_organizer_call() {
-        let args=json!({"goal":"Probe font API","return_when":"Return actual HTTP status","reason":"Known service is ready",
+        let args = json!({"goal":"Probe font API","return_when":"Return actual HTTP status","reason":"Known service is ready",
             "completion":"check","checks":["http-probe:http://127.0.0.1:3000/api/fonts"]});
-        let first=normalize_decision("schedule_task",args.clone(),"task-abc",4,2).unwrap();
-        let replay=normalize_decision("schedule_task",args,"task-abc",4,2).unwrap();
-        assert_eq!(first,replay);
-        assert_eq!(first["orders"].as_array().unwrap().len(),1);
-        assert_eq!(first["orders"][0]["id"],"task_task-abc_4_2");
+        let first = normalize_decision("schedule_task", args.clone(), "task-abc", 4, 2).unwrap();
+        let replay = normalize_decision("schedule_task", args, "task-abc", 4, 2).unwrap();
+        assert_eq!(first, replay);
+        assert_eq!(first["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(first["orders"][0]["id"], "task_task-abc_4_2");
     }
 
-    type Chunks=std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+    type Chunks = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
-    async fn sse_server(chunks:Vec<Vec<u8>>,hang:bool)->(std::net::SocketAddr,tokio::task::JoinHandle<()>) {
-        let chunks:Chunks=std::sync::Arc::new(std::sync::Mutex::new(chunks));
-        let app=axum::Router::new().route("/v1/chat/completions",axum::routing::post(
-            move |axum::extract::State(chunks):axum::extract::State<Chunks>|async move {
-                let items=chunks.lock().unwrap().clone().into_iter().map(|chunk|Ok::<_,std::io::Error>(axum::body::Bytes::from(chunk)));
-                let body=futures::stream::iter(items).chain(futures::stream::unfold(hang,|hang|async move {
-                    if hang {futures::future::pending::<()>().await;}
-                    None::<(Result<axum::body::Bytes,std::io::Error>,bool)>
-                }));
-                axum::response::Response::builder().header("content-type","text/event-stream")
-                    .body(axum::body::Body::from_stream(body)).unwrap()
-            })).with_state(chunks);
-        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address=listener.local_addr().unwrap();
-        (address,tokio::spawn(async move {axum::serve(listener,app).await.unwrap();}))
+    async fn sse_server(
+        chunks: Vec<Vec<u8>>,
+        hang: bool,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let chunks: Chunks = std::sync::Arc::new(std::sync::Mutex::new(chunks));
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(
+                    move |axum::extract::State(chunks): axum::extract::State<Chunks>| async move {
+                        let items =
+                            chunks.lock().unwrap().clone().into_iter().map(|chunk| {
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk))
+                            });
+                        let body = futures::stream::iter(items).chain(futures::stream::unfold(
+                            hang,
+                            |hang| async move {
+                                if hang {
+                                    futures::future::pending::<()>().await;
+                                }
+                                None::<(Result<axum::body::Bytes, std::io::Error>, bool)>
+                            },
+                        ));
+                        axum::response::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .body(axum::body::Body::from_stream(body))
+                            .unwrap()
+                    },
+                ),
+            )
+            .with_state(chunks);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (
+            address,
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }),
+        )
     }
 
-    fn fixture()->std::path::PathBuf {
-        let root=std::env::temp_dir().join(format!("organizer-stream-{}",crate::agent_service::uuid_like()));
+    fn fixture() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "organizer-stream-{}",
+            crate::agent_service::uuid_like()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=crate::agent_service::open_db(&root).unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','p','fake','running',0,0)",[]).unwrap();
         root
     }
 
-    fn metrics(root:&std::path::Path)->Vec<Value> {
-        let conn=crate::agent_service::open_db(root).unwrap();
+    fn metrics(root: &std::path::Path) -> Vec<Value> {
+        let conn = crate::agent_service::open_db(root).unwrap();
         let mut statement=conn.prepare("SELECT data FROM agent_task_events WHERE task_id='task' AND kind='organizer/request_metrics' ORDER BY seq").unwrap();
-        statement.query_map([],|row|row.get::<_,String>(0)).unwrap().map(|raw|serde_json::from_str(&raw.unwrap()).unwrap()).collect()
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|raw| serde_json::from_str(&raw.unwrap()).unwrap())
+            .collect()
     }
 
-    fn tool_frame(index:usize,name:Option<&str>,arguments:&str)->String {
-        let mut function=json!({"arguments":arguments});
-        if let Some(name)=name {function["name"]=json!(name);}
-        format!("data: {}\n\n",json!({"choices":[{"delta":{"tool_calls":[{"index":index,"id":format!("call_{index}"),"function":function}]}}]}))
+    fn tool_frame(index: usize, name: Option<&str>, arguments: &str) -> String {
+        let mut function = json!({"arguments":arguments});
+        if let Some(name) = name {
+            function["name"] = json!(name);
+        }
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":index,"id":format!("call_{index}"),"function":function}]}}]})
+        )
     }
 
-    async fn run(chunks:Vec<String>,hang:bool,cancel:CancellationToken,timeout:Duration)->(Result<Value>,Vec<Value>) {
-        let root=fixture();
-        let (address,server)=sse_server(chunks.into_iter().map(String::into_bytes).collect(),hang).await;
-        let state=crate::agent_service::tests::flow_test_state(&root,address);
-        let result=decide(&state,"fake-model","task",1,1,"work_a",json!({"process":{}}),&cancel,timeout).await;
-        let recorded=metrics(&root);
+    async fn run(
+        chunks: Vec<String>,
+        hang: bool,
+        cancel: CancellationToken,
+        timeout: Duration,
+    ) -> (Result<OrganizerResponse>, Vec<Value>) {
+        let root = fixture();
+        let (address, server) =
+            sse_server(chunks.into_iter().map(String::into_bytes).collect(), hang).await;
+        let state = crate::agent_service::tests::flow_test_state(&root, address);
+        let result = decide(
+            &state,
+            "fake-model",
+            "task",
+            1,
+            1,
+            "work_a",
+            json!({"process":{}}),
+            &cancel,
+            timeout,
+        )
+        .await;
+        let recorded = metrics(&root);
         server.abort();
-        let _=std::fs::remove_dir_all(root);
-        (result,recorded)
+        let _ = std::fs::remove_dir_all(root);
+        (result, recorded)
     }
 
     #[tokio::test]
     async fn streamed_method_is_applied_once_after_the_terminal_frame() {
         let arguments=json!({"goal":"上传真实演示文稿并确认 8 页","return_when":"返回页码","reason":"服务已返回 200","completion":"output"}).to_string();
-        let middle=arguments.find('文').unwrap();
-        let mut stream=format!(": keepalive\n\n{}",tool_frame(0,Some("schedule_task"),&arguments[..middle]));
-        stream.push_str(&tool_frame(0,None,&arguments[middle..]));
-        stream.push_str(&format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),json!({"choices":[],"usage":{"total_tokens":9}})));
-        let bytes=stream.into_bytes();
-        let cut=bytes.windows(3).position(|window|window=="文".as_bytes()).unwrap()+1;
-        let root=fixture();
+        let middle = arguments.find('文').unwrap();
+        let mut stream = format!(
+            ": keepalive\n\n{}",
+            tool_frame(0, Some("schedule_task"), &arguments[..middle])
+        );
+        stream.push_str(&tool_frame(0, None, &arguments[middle..]));
+        stream.push_str(&format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            json!({"choices":[],"usage":{"total_tokens":9}})
+        ));
+        let bytes = stream.into_bytes();
+        let cut = bytes
+            .windows(3)
+            .position(|window| window == "文".as_bytes())
+            .unwrap()
+            + 1;
+        let root = fixture();
         // The middle boundary falls inside the UTF-8 encoding of '文'.
-        let (address,server)=sse_server(vec![bytes[..5].to_vec(),bytes[5..cut].to_vec(),bytes[cut..].to_vec()],false).await;
-        let state=crate::agent_service::tests::flow_test_state(&root,address);
-        let decision=decide(&state,"fake-model","task",3,2,"work_a",json!({"process":{}}),&CancellationToken::new(),Duration::from_secs(5)).await.unwrap();
-        assert_eq!(decision["action"],"work");
-        assert_eq!(decision["orders"].as_array().unwrap().len(),1);
-        assert_eq!(decision["orders"][0]["goal"],"上传真实演示文稿并确认 8 页");
-        let recorded=metrics(&root);
-        assert_eq!(recorded.len(),1);
-        let metric=&recorded[0];
-        assert_eq!(metric["result"],"decision");
-        assert_eq!(metric["response_format"],"sse");
-        assert_eq!(metric["received_done"],true);
-        assert_eq!(metric["finish_reason"],"tool_calls");
-        assert_eq!(metric["usage"]["total_tokens"],9);
-        for field in ["response_headers_ms","first_chunk_ms","first_delta_ms","first_tool_delta_ms","response_complete_ms"] {
-            assert!(metric[field].is_u64(),"{field} must be recorded: {metric}");
+        let (address, server) = sse_server(
+            vec![
+                bytes[..5].to_vec(),
+                bytes[5..cut].to_vec(),
+                bytes[cut..].to_vec(),
+            ],
+            false,
+        )
+        .await;
+        let state = crate::agent_service::tests::flow_test_state(&root, address);
+        let decision = decide(
+            &state,
+            "fake-model",
+            "task",
+            3,
+            2,
+            "work_a",
+            json!({"process":{}}),
+            &CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.decision["action"], "work");
+        assert_eq!(decision.decision["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            decision.decision["orders"][0]["goal"],
+            "上传真实演示文稿并确认 8 页"
+        );
+        let recorded = metrics(&root);
+        assert_eq!(recorded.len(), 1);
+        let metric = &recorded[0];
+        assert_eq!(metric["result"], "decision");
+        assert_eq!(metric["response_format"], "sse");
+        assert_eq!(metric["received_done"], true);
+        assert_eq!(metric["finish_reason"], "tool_calls");
+        assert_eq!(metric["usage"]["total_tokens"], 9);
+        for field in [
+            "response_headers_ms",
+            "first_chunk_ms",
+            "first_delta_ms",
+            "first_tool_delta_ms",
+            "response_complete_ms",
+        ] {
+            assert!(metric[field].is_u64(), "{field} must be recorded: {metric}");
         }
         server.abort();
-        let _=std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn incomplete_error_and_multi_method_streams_produce_no_decision() {
-        let half=vec![tool_frame(0,Some("schedule_task"),"{\"goal\":\"probe\"")];
-        let (result,recorded)=run(half,false,CancellationToken::new(),Duration::from_secs(5)).await;
-        let error=result.unwrap_err();
+        let half = vec![tool_frame(0, Some("schedule_task"), "{\"goal\":\"probe\"")];
+        let (result, recorded) = run(
+            half,
+            false,
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await;
+        let error = result.unwrap_err();
         assert!(contract_details(&error).is_none());
-        assert!(error.to_string().contains("ended before"),"{error}");
-        assert_eq!(recorded[0]["result"],"request_error");
+        assert!(error.to_string().contains("ended before"), "{error}");
+        assert_eq!(recorded[0]["result"], "request_error");
         assert!(recorded[0]["response_complete_ms"].is_u64());
 
-        let upstream=vec![tool_frame(0,Some("schedule_task"),"{"),"data: {\"error\":{\"message\":\"overloaded\"}}\n\n".to_owned()];
-        let (result,recorded)=run(upstream,false,CancellationToken::new(),Duration::from_secs(5)).await;
+        let upstream = vec![
+            tool_frame(0, Some("schedule_task"), "{"),
+            "data: {\"error\":{\"message\":\"overloaded\"}}\n\n".to_owned(),
+        ];
+        let (result, recorded) = run(
+            upstream,
+            false,
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(result.unwrap_err().to_string().contains("overloaded"));
-        assert_eq!(recorded[0]["result"],"request_error");
+        assert_eq!(recorded[0]["result"], "request_error");
         assert!(recorded[0]["response_complete_ms"].is_null());
 
-        let finish=json!({"summary":"done","achieved":true}).to_string();
-        let two=vec![tool_frame(0,Some("finish_request"),&finish),tool_frame(1,Some("finish_request"),&finish),
-            format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))];
-        let (result,recorded)=run(two,false,CancellationToken::new(),Duration::from_secs(5)).await;
-        assert_eq!(contract_details(&result.unwrap_err()).unwrap()["rule_id"],"ONE_METHOD_PER_DECISION");
-        assert_eq!(recorded[0]["result"],"contract_error");
+        let finish = json!({"summary":"done","achieved":true}).to_string();
+        let two = vec![
+            tool_frame(0, Some("finish_request"), &finish),
+            tool_frame(1, Some("finish_request"), &finish),
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})
+            ),
+        ];
+        let (result, recorded) =
+            run(two, false, CancellationToken::new(), Duration::from_secs(5)).await;
+        assert_eq!(
+            contract_details(&result.unwrap_err()).unwrap()["rule_id"],
+            "ONE_METHOD_PER_DECISION"
+        );
+        assert_eq!(recorded[0]["result"], "contract_error");
 
-        let truncated=vec![tool_frame(0,Some("finish_request"),&finish),
-            format!("data: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"delta":{},"finish_reason":"length"}]}))];
-        let (result,_)=run(truncated,false,CancellationToken::new(),Duration::from_secs(5)).await;
+        let truncated = vec![
+            tool_frame(0, Some("finish_request"), &finish),
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{},"finish_reason":"length"}]})
+            ),
+        ];
+        let (result, _) = run(
+            truncated,
+            false,
+            CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(result.unwrap_err().to_string().contains("finish_reason"));
     }
 
     #[tokio::test]
     async fn cancellation_and_timeout_while_reading_end_the_request_with_partial_timing() {
-        let first=vec![": keepalive\n\n".to_owned(),tool_frame(0,Some("schedule_task"),"{\"goal\":")];
-        let root=fixture();
-        let (address,server)=sse_server(first.iter().cloned().map(String::into_bytes).collect(),true).await;
-        let state=crate::agent_service::tests::flow_test_state(&root,address);
-        let cancel=CancellationToken::new();
-        let (trigger,watched)=(cancel.clone(),root.clone());
+        let first = vec![
+            ": keepalive\n\n".to_owned(),
+            tool_frame(0, Some("schedule_task"), "{\"goal\":"),
+        ];
+        let root = fixture();
+        let (address, server) = sse_server(
+            first.iter().cloned().map(String::into_bytes).collect(),
+            true,
+        )
+        .await;
+        let state = crate::agent_service::tests::flow_test_state(&root, address);
+        let cancel = CancellationToken::new();
+        let (trigger, watched) = (cancel.clone(), root.clone());
         // Cancel only once the partial tool call has actually been received.
         tokio::spawn(async move {
             loop {
-                let receiving={let conn=crate::agent_service::open_db(&watched).unwrap();
-                    conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='organizer/progress' AND json_extract(data,'$.phase')='receiving_decision'",[],|row|row.get::<_,i64>(0)).unwrap()>0};
-                if receiving {trigger.cancel();break;}
+                let receiving = {
+                    let conn = crate::agent_service::open_db(&watched).unwrap();
+                    conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='organizer/progress' AND json_extract(data,'$.phase')='receiving_decision'",[],|row|row.get::<_,i64>(0)).unwrap()>0
+                };
+                if receiving {
+                    trigger.cancel();
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        let started=Instant::now();
-        let result=decide(&state,"fake-model","task",1,1,"work_a",json!({"process":{}}),&cancel,Duration::from_secs(30)).await;
-        let recorded=metrics(&root);
+        let started = Instant::now();
+        let result = decide(
+            &state,
+            "fake-model",
+            "task",
+            1,
+            1,
+            "work_a",
+            json!({"process":{}}),
+            &cancel,
+            Duration::from_secs(30),
+        )
+        .await;
+        let recorded = metrics(&root);
         server.abort();
-        let _=std::fs::remove_dir_all(&root);
-        assert!(started.elapsed()<Duration::from_secs(10));
-        assert_eq!(result.unwrap_err().to_string(),"cancelled");
-        assert_eq!(recorded[0]["result"],"cancelled");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(result.unwrap_err().to_string(), "cancelled");
+        assert_eq!(recorded[0]["result"], "cancelled");
         assert!(recorded[0]["first_tool_delta_ms"].is_u64());
         assert!(recorded[0]["response_complete_ms"].is_null());
 
         // Keepalives cannot extend the overall deadline.
-        let (result,recorded)=run(first,true,CancellationToken::new(),Duration::from_millis(300)).await;
-        assert_eq!(result.unwrap_err().to_string(),"Organizer request timed out");
-        assert_eq!(recorded[0]["result"],"timeout");
-        assert_eq!(recorded[0]["keepalives"],1);
+        let (result, recorded) = run(
+            first,
+            true,
+            CancellationToken::new(),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Organizer request timed out"
+        );
+        assert_eq!(recorded[0]["result"], "timeout");
+        assert_eq!(recorded[0]["keepalives"], 1);
     }
 }

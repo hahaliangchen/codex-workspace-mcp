@@ -1,7 +1,7 @@
-use rusqlite::{Connection, Result, params, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, Result, params};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 pub fn init_db(workspace_root: &Path) -> Result<Connection> {
@@ -31,21 +31,38 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     )?;
     // Older workspaces already have the original memories table.
     let _ = conn.execute("ALTER TABLE memories ADD COLUMN source_task_id TEXT", []);
-    let _ = conn.execute("ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'", []);
-    let _ = conn.execute("ALTER TABLE memories ADD COLUMN applies_to TEXT NOT NULL DEFAULT ''", []);
-    let _ = conn.execute("ALTER TABLE memories ADD COLUMN source_refs TEXT NOT NULL DEFAULT '[]'", []);
-    let legacy_memory_index:Option<String>=conn.query_row("SELECT sql FROM sqlite_master WHERE name='idx_memories_source_task'",[],|row|row.get(0)).optional()?;
-    if legacy_memory_index.is_some_and(|sql|!sql.contains("kind")) {
-        conn.execute("DROP INDEX IF EXISTS idx_memories_source_task",[])?;
+    let _ = conn.execute(
+        "ALTER TABLE memories ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE memories ADD COLUMN applies_to TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE memories ADD COLUMN source_refs TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    let legacy_memory_index: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name='idx_memories_source_task'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if legacy_memory_index.is_some_and(|sql| !sql.contains("kind")) {
+        conn.execute("DROP INDEX IF EXISTS idx_memories_source_task", [])?;
     }
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_task
          ON memories(workspace_root, source_task_id) WHERE source_task_id IS NOT NULL AND kind <> 'observer'",
         [],
     )?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS observer_memory_sources (
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS observer_memory_sources (
         workspace_root TEXT NOT NULL, summary TEXT NOT NULL, implementation TEXT NOT NULL,
-        sources TEXT NOT NULL, PRIMARY KEY(workspace_root,summary,implementation));")?;
+        sources TEXT NOT NULL, PRIMARY KEY(workspace_root,summary,implementation));",
+    )?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS architecture_memories (
@@ -191,7 +208,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
 
     migrate_legacy_symbol_keys(&mut conn)?;
 
-    for language in ["rust","ts","python","go"] {
+    for language in ["rust", "ts", "python", "go"] {
         conn.execute_batch(&format!("CREATE INDEX IF NOT EXISTS idx_{language}_workspace_file ON {language}_symbols(workspace_root,file_path,start_line); CREATE INDEX IF NOT EXISTS idx_{language}_workspace_name ON {language}_symbols(workspace_root,name);"))?;
     }
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ts_workspace_parent ON ts_symbols(workspace_root,parent_id)",[])?;
@@ -292,7 +309,9 @@ fn migrate_legacy_symbol_keys(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for (table, schema) in legacy {
         let columns = &schema[schema.find('(').expect("symbol table has columns") + 1
-            ..schema.rfind(')').expect("symbol table has closing parenthesis")];
+            ..schema
+                .rfind(')')
+                .expect("symbol table has closing parenthesis")];
         let columns = columns.replacen("id TEXT PRIMARY KEY", "id TEXT NOT NULL", 1);
         let migrated = format!("{table}_scope_key_migration");
         tx.execute_batch(&format!(
@@ -329,7 +348,7 @@ pub static DB_WRITE_QUEUE: OnceLock<mpsc::Sender<DbWriteEvent>> = OnceLock::new(
 pub fn init_db_writer(workspace_root: &Path) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<DbWriteEvent>(1024);
     let root_path = workspace_root.to_path_buf();
-    
+
     tokio::spawn(async move {
         if let Ok(conn) = init_db(&root_path) {
             while let Some(event) = rx.recv().await {
