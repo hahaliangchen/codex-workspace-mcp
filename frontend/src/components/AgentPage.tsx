@@ -3,6 +3,7 @@ import clsx from 'clsx'
 import logoImg from '../assets/logo.png'
 import { taskTitle, workspaceName } from './Sidebar.tsx'
 import { FlowView } from './FlowView.tsx'
+import { SkillPagesView } from './SkillPagesView.tsx'
 import type { AgentSlotProps } from '../cordis/slot-contract.ts'
 import root from '../dsh/conversation/ConversationRoot.module.css'
 import welcomeCss from './Welcome.module.css'
@@ -59,7 +60,14 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
   )
 }
 
-export type Tab = 'chat' | 'flow' | 'trajectory'
+export function SkillPackagesPage({ workspace, onBack }: { workspace: AgentWorkspace; onBack: () => void }) {
+  return <main className={root.root} style={{ minHeight: 0 }}>
+    <header className={headerCss.header}><strong>技能页面</strong><button onClick={onBack}>返回对话</button></header>
+    <SkillPagesView workspaceRoot={workspace.activeWorkspace ?? workspace.info?.workspace ?? ''} />
+  </main>
+}
+
+export type Tab = 'chat' | 'flow' | 'trajectory' | 'skill-pages'
 
 export function ConversationPage({
   workspace,
@@ -138,6 +146,7 @@ export function ConversationPage({
           >
             任务流
           </button>
+          <button type="button" role="tab" aria-selected={tab === 'skill-pages'} className={clsx(headerCss.tabPill, tab === 'skill-pages' && headerCss.tabPillActive)} onClick={() => setTab('skill-pages')}>技能页面</button>
           <button
             type="button"
             role="tab"
@@ -199,10 +208,12 @@ export function ConversationPage({
             followTail.current = box.scrollHeight - box.scrollTop - box.clientHeight < 80
           }}
         >
-          <div className={css.session} data-slot="conversation.session" style={tab === 'flow' ? { height: '100%', flex: 1, display: 'flex', flexDirection: 'column' } : undefined}>
-            <div className={root.viewArea} style={tab === 'flow' ? { height: '100%', flex: 1, minHeight: 520, display: 'flex' } : undefined}>
+          <div className={css.session} data-slot="conversation.session" style={tab === 'flow' || tab === 'skill-pages' ? { height: '100%', flex: 1, display: 'flex', flexDirection: 'column' } : undefined}>
+            <div className={root.viewArea} style={tab === 'flow' || tab === 'skill-pages' ? { height: '100%', flex: 1, minHeight: 520, display: 'flex' } : undefined}>
               {tab === 'chat'
                 ? renderSlot('agent.chat', { events: session.events, task, running, onOpenTask: openTask, onChangesUpdated: session.reload })
+                : tab === 'skill-pages'
+                ? <SkillPagesView workspaceRoot={workspace.activeWorkspace ?? workspace.info?.workspace ?? ''} />
                 : tab === 'flow'
                 ? <FlowView key={workspace.taskId} events={session.events} task={task} running={running} onInterruptNode={interruptNode}
                     onResumeNode={workspace.resumeNode} resumeDisabled={!ready || !canContinue || workspace.resumeBusy || isChild} />

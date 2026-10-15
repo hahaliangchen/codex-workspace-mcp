@@ -19,9 +19,9 @@ type Disposer = Box<dyn FnOnce() + Send>;
 type Listener = Arc<dyn Fn(&Value) + Send + Sync>;
 
 pub trait Plugin: Send + Sync {
-    fn id(&self) -> &'static str;
-    fn requires(&self) -> &'static [&'static str] {
-        &[]
+    fn id(&self) -> &str;
+    fn requires(&self) -> Vec<String> {
+        vec![]
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()>;
 }
@@ -156,7 +156,7 @@ impl PluginRuntime {
     }
 
     pub fn mount<P: Plugin>(&self, parent: ScopeId, plugin: P) -> Result<ScopeId> {
-        let id = plugin.id();
+        let id = plugin.id().to_owned();
         let scope = {
             let mut inner = self.inner.lock().unwrap();
             ensure!(
@@ -173,7 +173,7 @@ impl PluginRuntime {
                 .map(|key| {
                     inner
                         .lookup(parent, key)
-                        .map(|service| ((*key).to_owned(), service.owner))
+                        .map(|service| (key.clone(), service.owner))
                         .ok_or_else(|| anyhow!("plugin {id} requires unavailable service {key}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -182,7 +182,7 @@ impl PluginRuntime {
             inner.scopes.insert(
                 scope,
                 Scope {
-                    id: id.into(),
+                    id: id.clone(),
                     parent: Some(parent),
                     children: Vec::new(),
                     requires: dependencies,
@@ -349,11 +349,14 @@ impl PluginRuntime {
 }
 
 impl PluginContext<'_> {
+    pub fn scope(&self) -> ScopeId {
+        self.scope
+    }
     pub fn require<T: Any + Send + Sync>(&self, key: &str) -> Result<Arc<T>> {
         self.runtime.service(self.scope, key)
     }
 
-    pub fn provide<T: Any + Send + Sync>(&self, key: &'static str, value: Arc<T>) -> Result<()> {
+    pub fn provide<T: Any + Send + Sync>(&self, key: &str, value: Arc<T>) -> Result<()> {
         let mut inner = self.runtime.inner.lock().unwrap();
         let parent = inner
             .scopes

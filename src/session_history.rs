@@ -1,8 +1,12 @@
 //! Read the existing conversation/event log on demand; no second history store.
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, params};
+#[cfg(test)]
+use rusqlite::params;
 use serde_json::{Value, json};
 use std::path::Path;
+
+mod store;
+pub use store::{EventQuery, load_events, read_event, requirement_snapshot};
 
 /// Forward text unchanged; serialize original structured values without interpretation.
 /// Values are never summarized, shortened or interpreted here.
@@ -166,14 +170,30 @@ pub async fn record_context_note(
     content: &str,
     source_event_seqs: &[Value],
 ) -> Result<Value> {
-    ensure!(!content.trim().is_empty(), "context note content must not be empty");
-    ensure!(!source_event_seqs.is_empty(), "context note must cite at least one source event");
-    ensure!(source_event_seqs.len() <= 64, "context note may cite at most 64 source events");
+    ensure!(
+        !content.trim().is_empty(),
+        "context note content must not be empty"
+    );
+    ensure!(
+        !source_event_seqs.is_empty(),
+        "context note must cite at least one source event"
+    );
+    ensure!(
+        source_event_seqs.len() <= 64,
+        "context note may cite at most 64 source events"
+    );
     let refs = source_event_seqs
         .iter()
-        .map(|value| value.as_i64().context("context note source references must be event sequence numbers"))
+        .map(|value| {
+            value
+                .as_i64()
+                .context("context note source references must be event sequence numbers")
+        })
         .collect::<Result<std::collections::BTreeSet<_>>>()?;
-    ensure!(refs.iter().all(|seq| *seq >= 0), "context note source references must be non-negative");
+    ensure!(
+        refs.iter().all(|seq| *seq >= 0),
+        "context note source references must be non-negative"
+    );
     let root = root.to_path_buf();
     let task = task.to_owned();
     let content = content.to_owned();
@@ -181,12 +201,19 @@ pub async fn record_context_note(
         let mut conn = crate::agent_service::open_db(&root)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for seq in &refs {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM agent_task_events WHERE task_id=?1 AND seq=?2)",
-                params![task, seq],
-                |row| row.get(0),
-            )?;
-            ensure!(exists, "context note source event {seq} does not exist in this conversation");
+            let exists = !load_events(
+                &tx,
+                &task,
+                &EventQuery {
+                    exact: Some(*seq),
+                    ..Default::default()
+                },
+            )?
+            .is_empty();
+            ensure!(
+                exists,
+                "context note source event {seq} does not exist in this conversation"
+            );
         }
         let message = json!({"role":"user","name":"organizer_context_note","content":content});
         let seq = crate::agent_service::append_event_tx(
@@ -198,7 +225,8 @@ pub async fn record_context_note(
         )?;
         tx.commit()?;
         Ok(json!({"stored":true,"event_seq":seq,"source_event_seqs":refs,"message":message}))
-    }).await?
+    })
+    .await?
 }
 
 fn observer_process_message(kind: &str, payload: &Value, source: &Value) -> Result<Value> {
@@ -362,12 +390,11 @@ pub async fn task_process(root: &Path, task: &str, started_turn: usize) -> Resul
     let task = task.to_owned();
     tokio::task::spawn_blocking(move ||->Result<Value>{
         let conn=crate::agent_service::open_db(&root)?;
-        let mut stmt=conn.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
-        let rows=stmt.query_map(params![task],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,
-            row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows=load_events(&conn,&task,&Default::default())?;
         let mut records=Vec::new();
-        for (seq,time,kind,raw) in rows {
-            let data:Value=serde_json::from_str(&raw)?;
+        for event in rows {
+            let data=event.data()?;
+            let (seq,time,kind)=(event.seq,event.time,event.kind);
             saved_history_payload(&kind,&data)?;
             if kind=="tool/result" {tool_result_call_id(&data)?;}
             records.push(source_record(&task,seq,time,&kind,&data));
@@ -399,19 +426,10 @@ pub async fn organizer_view(
         "human_request":input["human_request"],"resumable_tasks":input["process"]["resumable_tasks"],"turn":input["turn"]});
     tokio::task::spawn_blocking(move || -> Result<crate::context_window::HistoryView> {
         let conn = crate::agent_service::open_db(&root)?;
-        let mut stmt = conn.prepare(
-            "SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq",
-        )?;
-        let rows = stmt
-            .query_map(params![task], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = load_events(&conn, &task, &Default::default())?
+            .into_iter()
+            .map(|event| (event.seq, event.time, event.kind, event.raw))
+            .collect::<Vec<_>>();
         let mut messages = vec![
             json!({"role":"system","name":"runtime","content":plain_context(&initial_context)}),
         ];
@@ -439,10 +457,7 @@ pub async fn organizer_view(
             // them into ordinary Organizer/Worker conversation messages.
             if matches!(
                 kind.as_str(),
-                "execution/commit"
-                    | "scheduler/state"
-                    | "flow/plan"
-                    | "flow/tree_state"
+                "execution/commit" | "scheduler/state" | "flow/plan" | "flow/tree_state"
             ) {
                 continue;
             }
@@ -522,7 +537,10 @@ pub async fn organizer_view(
                     messages.push(replayed);
                     return Ok(());
                 }
-                if matches!(kind.as_str(), "organizer/continuation_plan" | "organizer/context_note") {
+                if matches!(
+                    kind.as_str(),
+                    "organizer/continuation_plan" | "organizer/context_note"
+                ) {
                     ensure!(
                         pending_tool_calls.is_empty(),
                         "saved tool exchange is incomplete before {kind}: {:?}",
@@ -590,7 +608,9 @@ pub async fn organizer_view(
                         pending_tool_sources.remove(call_id);
                         pending_tool_calls.remove(index);
                         messages.push(result_message);
-                        for mut image in history_image_messages(saved_history_payload(&kind, &data)?) {
+                        for mut image in
+                            history_image_messages(saved_history_payload(&kind, &data)?)
+                        {
                             // A selected image is part of the completed view_image
                             // exchange. Group it with the call event so context
                             // selection cannot keep the pixels while dropping the call.
@@ -741,25 +761,59 @@ pub async fn handoff_message(
         name.to_owned(),
         original.clone(),
     );
-    tokio::task::spawn_blocking(move ||->Result<Value> {
-        let conn=crate::agent_service::open_db(&root)?;
-        let kind=if name=="organizer" {"organizer/method_message"}else{"worker/yield"};
-        let mut query=conn.prepare("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind=?2 ORDER BY seq DESC")?;
-        let rows=query.query_map(params![task,kind],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?;
-        for row in rows {
-            let (seq,time,text)=row?;let data:Value=serde_json::from_str(&text)?;
-            let matching_call=if name=="organizer" {data["message"]["tool_calls"].as_array().into_iter().flatten()
-                .find(|call|call["function"]["arguments"]==original)}else{None};
-            if matching_call.is_some() || (name!="organizer" && name==format!("worker_return_{}",data["output"]["id"].as_str().unwrap_or("").chars().take(50).collect::<String>()) && saved_history_payload(kind,&data)?==&original) {
-                let mut source=source_record(&task,seq,time,kind,&data);
-                if let Some(call)=matching_call {source["call_id"]=call["id"].clone();}
-                return Ok(with_source(raw_message(&name,&original),&source));
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let conn = crate::agent_service::open_db(&root)?;
+        let kind = if name == "organizer" {
+            "organizer/method_message"
+        } else {
+            "worker/yield"
+        };
+        let rows = load_events(
+            &conn,
+            &task,
+            &EventQuery {
+                kinds: &[kind],
+                ..Default::default()
+            },
+        )?;
+        for event in rows.into_iter().rev() {
+            let data = event.data()?;
+            let (seq, time) = (event.seq, event.time);
+            let matching_call = if name == "organizer" {
+                data["message"]["tool_calls"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|call| call["function"]["arguments"] == original)
+            } else {
+                None
+            };
+            if matching_call.is_some()
+                || (name != "organizer"
+                    && name
+                        == format!(
+                            "worker_return_{}",
+                            data["output"]["id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .chars()
+                                .take(50)
+                                .collect::<String>()
+                        )
+                    && saved_history_payload(kind, &data)? == &original)
+            {
+                let mut source = source_record(&task, seq, time, kind, &data);
+                if let Some(call) = matching_call {
+                    source["call_id"] = call["id"].clone();
+                }
+                return Ok(with_source(raw_message(&name, &original), &source));
             }
         }
         // Older execution snapshots may predate original message persistence.
         // Do not invent an event identity for those restored bodies.
-        Ok(raw_message(&name,&original))
-    }).await?
+        Ok(raw_message(&name, &original))
+    })
+    .await?
 }
 
 pub async fn sourced_tool_result(
@@ -769,15 +823,28 @@ pub async fn sourced_tool_result(
     call_id: &str,
 ) -> Result<Value> {
     let (root, task, call_id) = (root.to_path_buf(), task.to_owned(), call_id.to_owned());
-    tokio::task::spawn_blocking(move ||->Result<Value> {
-        let conn=crate::agent_service::open_db(&root)?;
-        let source=conn.query_row("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND COALESCE(json_extract(data,'$.callId'),json_extract(data,'$.message.toolCallId'),json_extract(data,'$.message.source.callId'))=?2 ORDER BY seq DESC LIMIT 1",
-            params![task,call_id],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?))).optional()?;
-        if let Some((seq,time,text))=source {
-            return Ok(with_source(message,&source_record(&task,seq,time,"tool/result",&serde_json::from_str(&text)?)));
+    tokio::task::spawn_blocking(move || -> Result<Value> {
+        let conn = crate::agent_service::open_db(&root)?;
+        if let Some(event) = load_events(
+            &conn,
+            &task,
+            &EventQuery {
+                kinds: &["tool/result"],
+                call_id: Some(&call_id),
+                newest: Some(1),
+                ..Default::default()
+            },
+        )?
+        .pop()
+        {
+            return Ok(with_source(
+                message,
+                &source_record(&task, event.seq, event.time, "tool/result", &event.data()?),
+            ));
         }
         Ok(message)
-    }).await?
+    })
+    .await?
 }
 
 fn routed_message(role: &str, name: &str, message: &Value, identity: &Value) -> Value {
@@ -803,8 +870,7 @@ fn routed_message(role: &str, name: &str, message: &Value, identity: &Value) -> 
 
 /// Keep original image blocks typed, without host-authored captions.
 pub fn history_image_messages(result: &Value) -> Vec<Value> {
-    if result["artifact_id"].as_str().is_some()
-        && result["visual_artifact"]["identity"].is_object()
+    if result["artifact_id"].as_str().is_some() && result["visual_artifact"]["identity"].is_object()
     {
         return vec![json!({
             "role":"user",
@@ -983,7 +1049,10 @@ pub fn process_messages(process: &Value) -> Result<Vec<Value>> {
         let name = kind.replace('/', "_");
         if matches!(
             kind,
-            "assistant/message" | "organizer/method_message" | "organizer/continuation_plan" | "organizer/context_note"
+            "assistant/message"
+                | "organizer/method_message"
+                | "organizer/continuation_plan"
+                | "organizer/context_note"
         ) {
             if !pending.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -1066,7 +1135,10 @@ pub fn process_messages(process: &Value) -> Result<Vec<Value>> {
         }
         let message = if matches!(
             kind,
-            "user/message" | "visual/input_result" | "organizer/continuation_plan" | "organizer/context_note"
+            "user/message"
+                | "visual/input_result"
+                | "organizer/continuation_plan"
+                | "organizer/context_note"
         ) {
             replay_history_message(kind, payload, record)?
         } else if matches!(
@@ -1146,129 +1218,20 @@ pub async fn read(root: &Path, task: &str, args: &Value) -> Result<Value> {
 }
 
 fn read_saved(root: &Path, task: &str, args: &Value) -> Result<Value> {
-    let scope = args["scope"].as_str().unwrap_or("conversation");
-    ensure!(
-        matches!(scope, "conversation" | "project"),
-        "invalid history scope"
-    );
-    let project = scope == "project";
-    let target = args["task_id"].as_str().unwrap_or(task);
-    let role = args["role"].as_str().unwrap_or("all");
-    ensure!(
-        matches!(
-            role,
-            "all" | "user" | "agent" | "context_agent" | "worker" | "organizer" | "observer" | "tool"
-        ),
-        "invalid history role"
-    );
-    let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();
-    let node = args["node_id"].as_str().unwrap_or("");
-    let turn = args["turn"].as_i64();
-    let exact = args["event_seq"].as_i64();
-    let before = args["before_seq"].as_i64();
-    let after = args["after_seq"].as_i64();
-    let request = args["request_id"].as_i64();
-    let limit = if exact.is_some() {
-        1
-    } else {
-        args["limit"].as_u64().unwrap_or(4).clamp(1, 12) as usize
-    };
-    let max_chars = args["max_chars"].as_u64().unwrap_or(6000).clamp(256, 12000) as usize;
-    let offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
-    ensure!(
-        offset == 0 || exact.is_some(),
-        "char_offset requires event_seq"
-    );
-    ensure!(
-        !project
-            || (exact.is_none()
-                && before.is_none()
-                && after.is_none()
-                && args["task_id"].is_null()),
-        "Project search returns conversation references; use scope=conversation with task_id for exact events or before_seq."
-    );
     let conn = crate::agent_service::open_db(root)?;
-    let has_contexts:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_request_contexts')",[],|row|row.get(0))?;
-    let context_search = if has_contexts {
-        "OR (kind='debug/context_request' AND instr(lower(COALESCE((SELECT request_json FROM agent_request_contexts c WHERE c.task_id=history.task_id AND c.id=json_extract(history.data,'$.id')),'')),?3)>0)"
-    } else {
-        ""
-    };
-    if !project {
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM agent_tasks WHERE id=?1)",
-            params![target],
-            |row| row.get(0),
-        )?;
-        ensure!(exists, "Conversation not found in this workspace: {target}");
-    }
-    let project_offset = args["project_offset"].as_i64().unwrap_or(0).max(0);
-    let base=format!("WITH history AS (
-        SELECT e.task_id,e.seq,e.timestamp,e.kind,e.data,
-            CASE WHEN e.kind LIKE 'tool/%' THEN 'tool'
-                 WHEN json_extract(e.data,'$.actor') IS NOT NULL THEN json_extract(e.data,'$.actor')
-                 WHEN e.kind='debug/context_request' THEN 'unknown'
-                 WHEN e.kind='user/message' THEN 'user'
-                 WHEN e.kind='visual/input_result' THEN COALESCE(json_extract(e.data,'$.actor'),'worker')
-                 WHEN e.kind LIKE 'observer/%' THEN 'observer'
-                 WHEN e.kind LIKE 'organizer/%' THEN 'organizer'
-                 WHEN e.kind LIKE 'tool/%' THEN 'tool' ELSE 'worker' END AS role,
-            COALESCE(json_extract(e.data,'$.nodeId'),json_extract(e.data,'$.flowNodeId'),
-                json_extract(e.data,'$.identity.node_id'),
-                (SELECT json_extract(c.data,'$.flowNodeId') FROM agent_task_events c
-                 WHERE c.task_id=e.task_id AND c.kind='tool/call'
-                   AND json_extract(c.data,'$.callId')=json_extract(e.data,'$.message.toolCallId') ORDER BY c.seq DESC LIMIT 1)) AS node_id
-        FROM agent_task_events e WHERE (?1 IS NULL OR e.task_id=?1)
-          AND (e.kind!='debug/context_request' OR ?6 IS NOT NULL OR ?12)
-    ), filtered AS (SELECT * FROM history
-      WHERE (?2='all' OR role=?2) AND (?3='' OR instr(lower(data),?3)>0 {context_search})
-        AND (?4='' OR node_id=?4) AND (?5 IS NULL OR json_extract(data,'$.turn')=?5)
-        AND (?6 IS NULL OR seq=?6) AND (?7 IS NULL OR seq<?7) AND (?10 IS NULL OR seq>?10)
-        AND (?11 IS NULL OR json_extract(data,'$.identity.request_id') IS NULL OR json_extract(data,'$.identity.request_id')=?11)
-    )");
-    let select = if project {
-        ", ranked AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY task_id ORDER BY seq DESC) AS rank,
-           COUNT(*) OVER(PARTITION BY task_id) AS matched_events FROM filtered)
-         SELECT r.seq,r.timestamp,r.kind,r.data,r.role,r.node_id,r.task_id,t.prompt,t.status,r.matched_events
-         FROM ranked r JOIN agent_tasks t ON t.id=r.task_id WHERE r.rank=1
-         ORDER BY t.updated_at DESC,t.id DESC LIMIT ?8 OFFSET ?9"
-    } else {
-        " SELECT seq,timestamp,kind,data,role,node_id,task_id,NULL,NULL,NULL FROM filtered
-          ORDER BY seq DESC LIMIT ?8 OFFSET ?9"
-    };
-    let mut stmt = conn.prepare(&format!("{base}{select}"))?;
-    let rows = stmt
-        .query_map(
-            params![
-                if project { None } else { Some(target) },
-                role,
-                query,
-                node,
-                turn,
-                exact,
-                before,
-                (limit + 1) as i64,
-                if project { project_offset } else { 0 },
-                after,
-                request,
-                args["include_context"] == true
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let store::SearchSelection {
+        rows,
+        project,
+        target,
+        role,
+        query,
+        turn,
+        limit,
+        max_chars,
+        offset,
+        project_offset,
+    } = store::search_events(&conn, task, args)?;
+    let scope = if project { "project" } else { "conversation" };
     let more = rows.len() > limit;
     let mut records = Vec::new();
     let mut remaining = max_chars;
@@ -1298,7 +1261,9 @@ fn read_saved(root: &Path, task: &str, args: &Value) -> Result<Value> {
                     "user/message" | "assistant/message" | "visual/input_result" => {
                         &["/message/content"]
                     }
-                    "organizer/context_note" | "organizer/continuation_plan" => & ["/message/content"],
+                    "organizer/context_note" | "organizer/continuation_plan" => {
+                        &["/message/content"]
+                    }
                     "worker/yield" => &[
                         "/output/original_return",
                         "/output/worker_return",
@@ -1858,11 +1823,7 @@ mod tests {
             .unwrap();
         let advice = messages
             .iter()
-            .filter(|message| {
-                message["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with("observer_"))
-            })
+            .filter(|message| message["source"]["actor"] == "observer")
             .collect::<Vec<_>>();
         assert_eq!(
             advice.len(),
@@ -2001,9 +1962,16 @@ mod tests {
         let read = read(&root, "task", &query).await.unwrap();
         assert_eq!(
             read["records"].as_array().unwrap().first().unwrap()["seq"],
+            2
+        );
+        assert_eq!(read["next_before_seq"], 2);
+        query["before_seq"] = read["next_before_seq"].clone();
+        let older = read_saved(&root, "task", &query).unwrap();
+        assert_eq!(
+            older["records"].as_array().unwrap().first().unwrap()["seq"],
             0
         );
-        assert!(read.to_string().contains("OLD_GOAL"));
+        assert!(older.to_string().contains("OLD_GOAL"));
         assert!(read.to_string().contains("OLD_ADVICE"));
         std::fs::remove_dir_all(root).unwrap();
     }

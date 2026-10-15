@@ -15,7 +15,7 @@ export type TurnEndReason =
 
 export type ChatItem =
   | { readonly kind: 'turn'; readonly key: string; readonly turn: number }
-  | { readonly kind: 'user'; readonly key: string; readonly text: string; readonly time: number }
+  | { readonly kind: 'user'; readonly key: string; readonly text: string; readonly time: number; readonly attachments?:readonly {name:string;url:string;image:boolean}[] }
   | { readonly kind: 'assistant'; readonly key: string; readonly text: string; readonly reasoning: string; readonly time: number; readonly streaming: boolean; readonly turn: number; readonly step: number }
   | { readonly kind: 'progress'; readonly key: string; readonly purpose: string; readonly knownConditions: readonly string[]; readonly nextAction: string; readonly time: number }
   | { readonly kind: 'observer'; readonly key: string; readonly summary: string; readonly suggestions: readonly string[]; readonly time: number }
@@ -150,7 +150,12 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
           turnStartTime = event.time
         }
         const text = textOf(messageOf(event).content)
-        if (text !== '') items.push({ kind: 'user', key, text, time: event.time })
+        const content=messageOf(event).content
+        const attachments=(Array.isArray(content)?content:[]).filter(p=>p&&typeof p==='object'&&('attachment' in p)).map(p=>{
+          const part=p as {type:string;attachment:{attachmentId:string;name:string}}
+          return {name:part.attachment.name,url:`/agent/tasks/${encodeURIComponent(String(event.data.task_id))}/attachments/${encodeURIComponent(part.attachment.attachmentId)}`,image:part.type==='image'}
+        })
+        if (text !== ''||attachments.length) items.push({ kind: 'user', key, text, attachments, time: event.time })
         break
       }
       case 'assistant/delta': {

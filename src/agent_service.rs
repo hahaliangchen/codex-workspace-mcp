@@ -119,9 +119,11 @@ pub struct AgentServiceState {
     pub observer_model: String,
     pub observer_inherits_model: bool,
     pub visual: crate::visual_artifacts::VisualSettings,
+    pub visual_tool_settings: crate::model_settings::ModelSettings,
+    pub context_agent_settings: crate::model_settings::ModelSettings,
     pub config: Option<Arc<tokio::sync::RwLock<crate::ai_proxy::AiProxyConfig>>>,
     pub config_path: Option<std::path::PathBuf>,
-    pub tool_catalog: Option<Arc<crate::plugin_builtin::ToolCatalog>>,
+    pub tool_catalog: Option<Arc<crate::builtin_plugins::ToolCatalog>>,
     pub plugin_cancel: CancellationToken,
     pub cancellations: Arc<Mutex<HashMap<String, ActiveTask>>>,
 }
@@ -144,7 +146,12 @@ async fn clear_active_task(state: &AgentServiceState, task_id: &str, run_id: &st
     }
 }
 
-pub(crate) async fn set_active_flow_node(state: &AgentServiceState, task_id: &str, turn: usize, node: &str) {
+pub(crate) async fn set_active_flow_node(
+    state: &AgentServiceState,
+    task_id: &str,
+    turn: usize,
+    node: &str,
+) {
     let active = state.cancellations.lock().await.get(task_id).cloned();
     if let Some(active) = active {
         *active.flow_node.lock().await = format!("turn_{turn}:{node}");
@@ -308,7 +315,12 @@ pub async fn create_draft_task(State(state): State<AgentServiceState>) -> impl I
 
 #[derive(Debug, Deserialize)]
 pub struct ContinueTaskRequest {
+    #[serde(default)]
     pub prompt: String,
+    #[serde(default)]
+    pub content: Vec<Value>,
+    #[serde(default, rename = "requestId")]
+    pub request_id: Option<String>,
     #[serde(default)]
     pub max_steps: Option<usize>,
     #[serde(default)]
@@ -345,6 +357,8 @@ pub struct UpdateTaskRequest {
 }
 
 enum ResumeLoad {
+    InvalidAttachment(String),
+    AlreadyAccepted,
     Ready {
         model: String,
         provider_name: String,
@@ -406,6 +420,19 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
             kind TEXT NOT NULL, data TEXT NOT NULL, surface_op TEXT, PRIMARY KEY(task_id, seq),
             FOREIGN KEY(task_id) REFERENCES agent_tasks(id) ON DELETE CASCADE
          );
+         CREATE TABLE IF NOT EXISTS plugin_sessions (
+            task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+            plugin_id TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS ppt_session_bindings (
+            task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+            subject TEXT NOT NULL, project_id INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS ppt_session_jobs (
+            host_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
+            remote_task_id TEXT NOT NULL, tool TEXT NOT NULL,
+            PRIMARY KEY(host_task_id,remote_task_id)
+         );
          CREATE TABLE IF NOT EXISTS agent_observations (
             task_id TEXT NOT NULL, review_id TEXT NOT NULL, request_id INTEGER NOT NULL,
             input TEXT NOT NULL, status TEXT NOT NULL, result TEXT,
@@ -440,12 +467,9 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
         };
         for task_id in ids {
             crate::request_context::recover_interrupted(&mut conn, &task_id)?;
-            if let Ok((kind, data)) = conn.query_row(
-                "SELECT kind,data FROM agent_task_events WHERE task_id=?1 AND kind IN ('step/start','step/end') ORDER BY seq DESC LIMIT 1",
-                [&task_id],
-                |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
-            ) && kind == "step/start" {
-                let step_data: Value = serde_json::from_str(&data)?;
+            if let Some(event)=crate::session_history::load_events(&conn,&task_id,&crate::session_history::EventQuery{kinds:&["step/start","step/end"],newest:Some(1),..Default::default()})?.pop()
+                && event.kind=="step/start" {
+                let step_data=event.data()?;
                 let step_seq: i64 = conn.query_row(
                     "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id=?1",
                     [&task_id],
@@ -456,13 +480,7 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
                     params![task_id,step_seq,now(),step_data.to_string()],
                 )?;
             }
-            let turn: usize = conn.query_row(
-                "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='turn/start' ORDER BY seq DESC LIMIT 1",
-                [&task_id],
-                |row| row.get::<_, String>(0),
-            ).optional()?.and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-                .and_then(|data| data.get("turn").and_then(Value::as_u64))
-                .map(|turn| turn as usize).unwrap_or(1);
+            let turn=crate::session_history::load_events(&conn,&task_id,&crate::session_history::EventQuery{kinds:&["turn/start"],newest:Some(1),..Default::default()})?.pop().map(|event|event.data()).transpose()?.and_then(|data|data["turn"].as_u64()).unwrap_or(1) as usize;
             let seq: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id=?1",
                 [&task_id],
@@ -1175,17 +1193,17 @@ pub(crate) fn load_observer_trace_since(
     after_seq: i64,
 ) -> anyhow::Result<Vec<Value>> {
     let conn = open_db(root)?;
-    let mut stmt = conn.prepare(
-        "SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 AND seq>?2 ORDER BY seq",
-    )?;
-    let rows = stmt.query_map(params![task_id, after_seq], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    let raw_events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let raw_events = crate::session_history::load_events(
+        &conn,
+        task_id,
+        &crate::session_history::EventQuery {
+            after: Some(after_seq),
+            ..Default::default()
+        },
+    )?
+    .into_iter()
+    .map(|event| (event.seq, event.kind, event.raw))
+    .collect::<Vec<_>>();
     let mut tool_names = HashMap::<String, String>::new();
     for (_, kind, raw) in &raw_events {
         if kind != "tool/call" {
@@ -1276,9 +1294,28 @@ pub(crate) fn load_observer_trace_since(
                     .and_then(Value::as_str)
                     .or_else(|| message.get("toolCallId").and_then(Value::as_str))
                     .unwrap_or("");
-                let tool_name=tool_names.get(call_id).cloned().or_else(||conn.query_row(
-                    "SELECT json_extract(data,'$.name') FROM agent_task_events WHERE task_id=?1 AND kind='tool/call' AND json_extract(data,'$.callId')=?2 ORDER BY seq DESC LIMIT 1",
-                    params![task_id,call_id],|row|row.get::<_,String>(0)).optional().ok().flatten()).unwrap_or_default();
+                let tool_name = tool_names
+                    .get(call_id)
+                    .cloned()
+                    .or_else(|| {
+                        crate::session_history::load_events(
+                            &conn,
+                            task_id,
+                            &crate::session_history::EventQuery {
+                                kinds: &["tool/call"],
+                                call_id: Some(call_id),
+                                newest: Some(1),
+                                ..Default::default()
+                            },
+                        )
+                        .ok()?
+                        .pop()?
+                        .data()
+                        .ok()?["name"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_default();
                 entry["tool"] = json!(tool_name);
                 let output = data
                     .pointer("/meta/result")
@@ -1886,7 +1923,10 @@ fn history_from_events(
                     last_turn.max(data.get("turn").and_then(Value::as_u64).unwrap_or(1) as usize);
             }
             "user/message" => {
-                let message = crate::session_history::saved_history_message(kind, data)?;
+                let mut message = crate::session_history::saved_history_message(kind, data)?;
+                if data["model_content"].is_string() || data["model_content"].is_array() {
+                    message["content"] = data["model_content"].clone();
+                }
                 let source = data["_replay_source"].clone();
                 history.push(crate::session_history::replay_history_message(
                     kind, &message, &source,
@@ -2036,10 +2076,24 @@ pub async fn workspace_files(
 
 pub async fn slash_commands(State(state): State<AgentServiceState>) -> impl IntoResponse {
     let root = state.workspace.root().to_path_buf();
-    let commands =
+    let mut commands = serde_json::to_value(
         tokio::task::spawn_blocking(move || crate::composer_catalog::slash_commands(&root))
             .await
-            .unwrap_or_default();
+            .unwrap_or_default(),
+    )
+    .unwrap_or(json!([]));
+    if let Some(catalog) = state.tool_catalog {
+        for skill in catalog.packages.skills().as_array().into_iter().flatten() {
+            if !commands
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|command| command["name"] == skill["name"])
+            {
+                commands.as_array_mut().unwrap().push(skill.clone());
+            }
+        }
+    }
     Json(json!({"commands": commands})).into_response()
 }
 
@@ -2056,8 +2110,18 @@ pub async fn continue_task(
         )
             .into_response();
     }
-    let prompt = request.prompt.trim().to_owned();
-    if prompt.is_empty() {
+    let prompt = if request.prompt.trim().is_empty() {
+        request
+            .content
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        request.prompt.trim().to_owned()
+    };
+    if prompt.is_empty() && request.content.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"prompt must not be empty"})),
@@ -2078,7 +2142,24 @@ pub async fn continue_task(
     let default_effort = state.reasoning_effort.clone();
     let default_fast_mode = state.fast_mode;
     let routes = state.provider_routes.clone();
-    let title = prompt.clone();
+    let title = if prompt.is_empty() {
+        "附件消息".to_owned()
+    } else {
+        prompt.clone()
+    };
+    let attachment_content = request.content.clone();
+    let attachment_prompt = prompt.clone();
+    let attachment_request_id = request.request_id.clone();
+    let attachment_policy = match crate::attachments::policy(&state, &task_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":e.to_string()})),
+            )
+                .into_response();
+        }
+    };
     let req_model = request.model.clone();
     let req_provider = request.provider.clone();
     let req_effort = request.reasoning_effort.clone();
@@ -2088,6 +2169,12 @@ pub async fn continue_task(
     let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<ResumeLoad> {
         let mut conn = open_db(&root)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(request_id)=&attachment_request_id {
+            match crate::attachments::already(&tx,&read_id,request_id,&attachment_prompt,&attachment_content) {
+                Ok(true)=>return Ok(ResumeLoad::AlreadyAccepted), Ok(false)=>{},
+                Err(e)=>return Ok(ResumeLoad::InvalidAttachment(e.to_string())),
+            }
+        }
         let task: Option<(String, String, Option<String>, Option<String>, Option<String>, i64)> = tx.query_row(
             "SELECT model,status,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1", [&read_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
@@ -2097,16 +2184,12 @@ pub async fn continue_task(
         if !matches!(status.as_str(), "draft" | "completed" | "failed" | "cancelled" | "max_steps" | "interrupted") {
             return Ok(ResumeLoad::Busy);
         }
-        let events = {
-            let mut stmt = tx.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
-            let rows = stmt.query_map([&read_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?)))?;
-            rows.map(|row| {
-                let (seq,time,kind,text) = row?;
-                let mut data:Value=serde_json::from_str(&text)?;
-                data["_replay_source"]=crate::session_history::event_source(&read_id,seq,time,&kind,&data);
-                Ok((kind,data))
-            }).collect::<anyhow::Result<Vec<_>>>()?
-        };
+        let events = crate::session_history::load_events(&tx, &read_id, &Default::default())?
+            .into_iter().map(|event| {
+                let mut data = event.data()?;
+                data["_replay_source"] = crate::session_history::event_source(&read_id,event.seq,event.time,&event.kind,&data);
+                Ok((event.kind,data))
+            }).collect::<anyhow::Result<Vec<_>>>()?;
         // The single-agent runtime restores its durable window itself, including
         // importing legacy records without requiring legacy native tool pairs.
         let (history, turn, subagent_used) = (Vec::new(),
@@ -2143,6 +2226,9 @@ pub async fn continue_task(
             let fast_mode = req_fast.unwrap_or(saved_fast_mode != 0);
             (target_model, provider_name, reasoning_effort, fast_mode)
         };
+        if let Err(e)=crate::attachments::admit(&tx,&root,&read_id,turn,&attachment_prompt,&attachment_content,attachment_request_id.as_deref(),attachment_policy.as_deref()) {
+            return Ok(ResumeLoad::InvalidAttachment(e.to_string()));
+        }
         let changed = tx.execute(
             "UPDATE agent_tasks SET model=?2,status='running',updated_at=?3,prompt=CASE WHEN prompt='' THEN ?5 ELSE prompt END,provider_name=?6,reasoning_effort=?7,fast_mode=?8 WHERE id=?1 AND status=?4",
             params![read_id, model, now(), status, title, provider_name, reasoning_effort, fast_mode],
@@ -2161,6 +2247,16 @@ pub async fn continue_task(
         history,
         subagent_used,
     ) = match loaded {
+        Ok(Ok(ResumeLoad::AlreadyAccepted)) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({"task_id":task_id,"already_accepted":true})),
+            )
+                .into_response();
+        }
+        Ok(Ok(ResumeLoad::InvalidAttachment(error))) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response();
+        }
         Ok(Ok(ResumeLoad::Ready {
             model,
             provider_name,
@@ -2273,16 +2369,20 @@ pub async fn get_events(
     let root = state.workspace.root().to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<AgentEvent>> {
         let conn = open_db(&root)?;
-        let mut stmt = conn.prepare("SELECT seq,timestamp,kind,data,surface_op FROM agent_task_events WHERE task_id=?1 ORDER BY seq")?;
-        let rows = stmt.query_map([&task_id], |row| {
-            let data: String = row.get(3)?;
-            Ok((row.get::<_,i64>(0)?, row.get::<_,i64>(1)?, row.get::<_,String>(2)?, data, row.get::<_,Option<String>>(4)?))
-        })?;
-        rows.map(|row| {
-            let (seq,time,kind,data,surface_op) = row?;
-            Ok(AgentEvent { seq, time, kind, data: serde_json::from_str(&data)?, surface_op })
-        }).collect()
-    }).await;
+        crate::session_history::load_events(&conn, &task_id, &Default::default())?
+            .into_iter()
+            .map(|event| {
+                Ok(AgentEvent {
+                    seq: event.seq,
+                    time: event.time,
+                    data: event.data()?,
+                    kind: event.kind,
+                    surface_op: event.surface_op,
+                })
+            })
+            .collect()
+    })
+    .await;
     match result {
         Ok(Ok(events)) => Json(json!({"events":events})).into_response(),
         _ => (
@@ -2312,20 +2412,39 @@ pub async fn stream_events(
             loop {
                 let root = state.workspace.root().to_path_buf();
                 let read_id = task_id.clone();
-                let read = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<AgentEvent>, Option<String>)> {
-                    let conn = open_db(&root)?;
-                    let mut stmt = conn.prepare("SELECT seq,timestamp,kind,data,surface_op FROM agent_task_events WHERE task_id=?1 AND seq>?2 ORDER BY seq")?;
-                    let rows = stmt.query_map(params![read_id,last_seq], |row| {
-                        let data: String = row.get(3)?;
-                        Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,data,row.get::<_,Option<String>>(4)?))
-                    })?;
-                    let events = rows.map(|row| {
-                        let (seq,time,kind,data,surface_op)=row?;
-                        Ok(AgentEvent {seq,time,kind,data:serde_json::from_str(&data)?,surface_op})
-                    }).collect::<anyhow::Result<Vec<_>>>()?;
-                    let status = conn.query_row("SELECT status FROM agent_tasks WHERE id=?1",[read_id],|row|row.get::<_,String>(0)).optional()?;
-                    Ok((events,status))
-                }).await;
+                let read = tokio::task::spawn_blocking(
+                    move || -> anyhow::Result<(Vec<AgentEvent>, Option<String>)> {
+                        let conn = open_db(&root)?;
+                        let events = crate::session_history::load_events(
+                            &conn,
+                            &read_id,
+                            &crate::session_history::EventQuery {
+                                after: Some(last_seq),
+                                ..Default::default()
+                            },
+                        )?
+                        .into_iter()
+                        .map(|event| {
+                            Ok(AgentEvent {
+                                seq: event.seq,
+                                time: event.time,
+                                data: event.data()?,
+                                kind: event.kind,
+                                surface_op: event.surface_op,
+                            })
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                        let status = conn
+                            .query_row(
+                                "SELECT status FROM agent_tasks WHERE id=?1",
+                                [read_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()?;
+                        Ok((events, status))
+                    },
+                )
+                .await;
                 let Ok(Ok((new_events, status))) = read else {
                     return None;
                 };
@@ -2585,16 +2704,32 @@ async fn emit_surface(
     .await
 }
 
-pub(crate) async fn finish(state: &AgentServiceState, task_id: &str, status: &str) -> anyhow::Result<()> {
+pub(crate) async fn finish(
+    state: &AgentServiceState,
+    task_id: &str,
+    status: &str,
+) -> anyhow::Result<()> {
     // A single-agent conversation owns durable resources across user turns.
     // Closing its browser is an explicit tool action, not failure cleanup.
     let lookup_root = state.workspace.root().to_path_buf();
     let lookup_task = task_id.to_owned();
     let single_agent = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let conn = open_db(&lookup_root)?;
-        Ok(conn.query_row("SELECT json_extract(data,'$.runtime')='single_agent' FROM agent_task_events WHERE task_id=?1 AND kind='turn/start' ORDER BY seq DESC LIMIT 1",
-            [&lookup_task], |r|r.get::<_,Option<bool>>(0)).optional()?.flatten().unwrap_or(false))
-    }).await??;
+        Ok(crate::session_history::load_events(
+            &conn,
+            &lookup_task,
+            &crate::session_history::EventQuery {
+                kinds: &["turn/start"],
+                newest: Some(1),
+                ..Default::default()
+            },
+        )?
+        .pop()
+        .map(|event| event.data())
+        .transpose()?
+        .is_some_and(|data| data["runtime"] == "single_agent"))
+    })
+    .await??;
     if !single_agent {
         crate::browser_control::cleanup_after_finish(state.workspace.root(), task_id, status).await;
     }
@@ -2672,6 +2807,18 @@ pub(crate) async fn consume_model_stream(
     step: usize,
     cancel: &CancellationToken,
 ) -> anyhow::Result<(Value, Value)> {
+    consume_model_stream_observed(response, root, task_id, turn, step, cancel, None).await
+}
+
+pub(crate) async fn consume_model_stream_observed(
+    response: reqwest::Response,
+    root: &std::path::Path,
+    task_id: &str,
+    turn: usize,
+    step: usize,
+    cancel: &CancellationToken,
+    diagnostics: Option<&crate::model_transport::ModelRequestLog>,
+) -> anyhow::Result<(Value, Value)> {
     let stream_started = Instant::now();
     let mut accumulator =
         crate::model_stream::ChatStream::new(crate::model_stream::Limits::WORKER, stream_started);
@@ -2682,15 +2829,25 @@ pub(crate) async fn consume_model_stream(
     let mut flushed = false;
 
     while !accumulator.received_done() {
+        if let Some(log) = diagnostics {
+            log.phase("stream_read");
+        }
         let chunk = tokio::select! {
             _ = cancel.cancelled() => return Err(anyhow::anyhow!("cancelled")),
             next = bytes.next() => match next {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(error)) => return Err(error.into()),
-                None => break,
+                None => { if let Some(log) = diagnostics { log.eof(); } break; },
             },
         };
+        if let Some(log) = diagnostics {
+            log.chunk(chunk.len());
+            log.phase("stream_decode");
+        }
         let delta = accumulator.push(&chunk)?;
+        if let Some(log) = diagnostics {
+            log.delta(&delta);
+        }
         delta_text.push_str(&delta.text);
         delta_reasoning.push_str(&delta.reasoning);
         let ready = !delta_text.is_empty() || !delta_reasoning.is_empty();
@@ -2698,6 +2855,9 @@ pub(crate) async fn consume_model_stream(
             || last_flush.elapsed() >= Duration::from_millis(80)
             || delta_text.len() + delta_reasoning.len() >= 32;
         if ready && due {
+            if let Some(log) = diagnostics {
+                log.phase("event_persistence");
+            }
             emit(
                 root,
                 task_id,
@@ -2712,6 +2872,9 @@ pub(crate) async fn consume_model_stream(
         }
     }
     if !delta_text.is_empty() || !delta_reasoning.is_empty() {
+        if let Some(log) = diagnostics {
+            log.phase("event_persistence");
+        }
         emit(
             root,
             task_id,
@@ -2720,12 +2883,19 @@ pub(crate) async fn consume_model_stream(
         )
         .await?;
     }
+    if let Some(log) = diagnostics {
+        log.phase("stream_decode");
+        log.decoded(&accumulator.stats());
+    }
     let completed = accumulator.finish()?;
     let mut stats = completed.stats;
     stats["format"] = stats["response_format"].clone();
     stats["first_delta_after_headers_ms"] = stats["first_delta_ms"].clone();
     stats["stream_ms"] = stats["response_complete_ms"].clone();
     stats["terminated"] = json!(completed.terminated);
+    if let Some(log) = diagnostics {
+        log.decoded(&stats);
+    }
     Ok((completed.message, stats))
 }
 
@@ -3370,13 +3540,33 @@ async fn request_goal_from_events(
     task: String,
     request_turn: usize,
 ) -> anyhow::Result<Option<String>> {
-    tokio::task::spawn_blocking(move ||->anyhow::Result<Option<String>> {
-        let conn=open_db(&root)?;
-        let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='user/message' AND json_extract(data,'$.turn')=?2 ORDER BY seq LIMIT 1",
-            params![task,request_turn],|row|row.get::<_,String>(0)).optional()?;
-        Ok(raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|data|data["model_content"].as_str().or_else(||data.pointer("/message/content/0/text").and_then(Value::as_str)).map(str::to_owned)))
-    }).await?
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let conn = open_db(&root)?;
+        let raw = crate::session_history::load_events(
+            &conn,
+            &task,
+            &crate::session_history::EventQuery {
+                kinds: &["user/message"],
+                turn: Some(request_turn),
+                ..Default::default()
+            },
+        )?
+        .into_iter()
+        .next()
+        .map(|event| event.raw);
+        Ok(raw
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|data| {
+                data["model_content"]
+                    .as_str()
+                    .or_else(|| {
+                        data.pointer("/message/content/0/text")
+                            .and_then(Value::as_str)
+                    })
+                    .map(str::to_owned)
+            }))
+    })
+    .await?
 }
 
 fn restore_execution_session(
@@ -4151,7 +4341,9 @@ async fn execute_organizer_read_single(
             let source_event_seqs = decision["source_event_seqs"]
                 .as_array()
                 .context("context note source_event_seqs must be an array")?;
-            Ok(json!({"_context_note_to_persist":{"content":decision["content"],"source_event_seqs":source_event_seqs}}))
+            Ok(
+                json!({"_context_note_to_persist":{"content":decision["content"],"source_event_seqs":source_event_seqs}}),
+            )
         }
         "view_image" => {
             let visual_context = worker_visual_context(task_id, scheduler);
@@ -4162,7 +4354,8 @@ async fn execute_organizer_read_single(
                 &visual_context,
                 "view_image",
                 &args,
-            ).await
+            )
+            .await
         }
         "search_work_memory" | "search_architecture_memory" | "search_symbol_business_context" => {
             let workspace = state.workspace.clone();
@@ -4257,7 +4450,17 @@ pub(crate) async fn run_task(
     _subagent_used: bool,
     ban_run_command: bool,
 ) -> anyhow::Result<()> {
-    crate::single_agent::run_task(state, task_id, model, prompt, max_steps, cancel, turn, ban_run_command).await
+    crate::single_agent::run_task(
+        state,
+        task_id,
+        model,
+        prompt,
+        max_steps,
+        cancel,
+        turn,
+        ban_run_command,
+    )
+    .await
 }
 
 // Retained for legacy event/recovery fixtures. New task execution uses the
@@ -4330,20 +4533,53 @@ pub(crate) async fn run_legacy_task(
     );
     let history_root = root.clone();
     let history_task = task_id.clone();
-    let (mut work_state, legacy_revisions) = tokio::task::spawn_blocking(move || -> anyhow::Result<(crate::worker_work_state::WorkState, Vec<Value>)> {
-        let conn = open_db(&history_root)?;
-        let previous = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind IN ('worker/work_state','flow/session') ORDER BY seq DESC LIMIT 1", [&history_task], |row| row.get::<_,String>(0)).optional()?;
-        let mut work:crate::worker_work_state::WorkState=previous.and_then(|text|serde_json::from_str::<Value>(&text).ok())
-            .and_then(|data|serde_json::from_value(data.get("worker_state").or_else(||data.get("state")).cloned().unwrap_or(Value::Null)).ok()).unwrap_or_default();
-        let mut statement=conn.prepare("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='worker/progress' ORDER BY seq")?;
-        let mut observations=Vec::new();
-        for row in statement.query_map([&history_task],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))? {
-            let (seq,time,raw)=row?;
-            if let Ok(mut record)=serde_json::from_str::<Value>(&raw) {record["seq"]=json!(seq);record["time"]=json!(time);observations.push(record);}
-        }
-        let revisions=work.import_legacy(&observations);
-        Ok((work,revisions))
-    }).await??;
+    let (mut work_state, legacy_revisions) = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(crate::worker_work_state::WorkState, Vec<Value>)> {
+            let conn = open_db(&history_root)?;
+            let previous = crate::session_history::load_events(
+                &conn,
+                &history_task,
+                &crate::session_history::EventQuery {
+                    kinds: &["worker/work_state", "flow/session"],
+                    newest: Some(1),
+                    ..Default::default()
+                },
+            )?
+            .pop()
+            .map(|event| event.raw);
+            let mut work: crate::worker_work_state::WorkState = previous
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|data| {
+                    serde_json::from_value(
+                        data.get("worker_state")
+                            .or_else(|| data.get("state"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    )
+                    .ok()
+                })
+                .unwrap_or_default();
+            let rows = crate::session_history::load_events(
+                &conn,
+                &history_task,
+                &crate::session_history::EventQuery {
+                    kinds: &["worker/progress"],
+                    ..Default::default()
+                },
+            )?;
+            let mut observations = Vec::new();
+            for event in rows {
+                if let Ok(mut record) = event.data() {
+                    record["seq"] = json!(event.seq);
+                    record["time"] = json!(event.time);
+                    observations.push(record);
+                }
+            }
+            let revisions = work.import_legacy(&observations);
+            Ok((work, revisions))
+        },
+    )
+    .await??;
     for revision in legacy_revisions {
         emit(&root, &task_id, "worker/finding_revision", revision).await?;
     }
@@ -4364,10 +4600,7 @@ pub(crate) async fn run_legacy_task(
     let (commit_root, commit_task) = (root.clone(), task_id.clone());
     let restored_commit = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<(crate::flow_tree::TaskTree, crate::work_scheduler::WorkScheduler)>> {
         let conn = open_db(&commit_root)?;
-        let raw = conn.query_row(
-            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind IN ('execution/commit','flow/session') ORDER BY seq DESC LIMIT 1",
-            [&commit_task], |row| row.get::<_, String>(0)
-        ).optional()?;
+        let raw = crate::session_history::load_events(&conn,&commit_task,&crate::session_history::EventQuery{kinds:&["execution/commit","flow/session"],newest:Some(1),..Default::default()})?.pop().map(|event|event.raw);
         if let Some(raw_str) = raw {
             if let Ok(data) = serde_json::from_str::<Value>(&raw_str) {
                 let tree_opt: Option<crate::flow_tree::TaskTree> = serde_json::from_value(data["task_tree"].clone()).ok();
@@ -4386,21 +4619,48 @@ pub(crate) async fn run_legacy_task(
         let (tree_root, tree_task) = (root.clone(), task_id.clone());
         tokio::task::spawn_blocking(move || -> anyhow::Result<crate::flow_tree::TaskTree> {
             let conn = open_db(&tree_root)?;
-            let raw = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='flow/tree_state' ORDER BY seq DESC LIMIT 1",
-                [tree_task], |row| row.get::<_, String>(0)).optional()?;
-            Ok(raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|data| serde_json::from_value(data["state"].clone()).ok()).unwrap_or_default())
-        }).await??
+            let raw = crate::session_history::load_events(
+                &conn,
+                &tree_task,
+                &crate::session_history::EventQuery {
+                    kinds: &["flow/tree_state"],
+                    newest: Some(1),
+                    ..Default::default()
+                },
+            )?
+            .pop()
+            .map(|event| event.raw);
+            Ok(raw
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|data| serde_json::from_value(data["state"].clone()).ok())
+                .unwrap_or_default())
+        })
+        .await??
     };
     let (sched_root, sched_task) = (root.clone(), task_id.clone());
     let mut previous_scheduler = if let Some((_, sched)) = restored_commit {
         Some(sched)
     } else {
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::work_scheduler::WorkScheduler>> {
-            let conn = open_db(&sched_root)?;
-            let raw = conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='scheduler/state' ORDER BY seq DESC LIMIT 1",
-                [sched_task], |row| row.get::<_, String>(0)).optional()?;
-            Ok(raw.and_then(|raw| serde_json::from_str::<Value>(&raw).ok()).and_then(|data| serde_json::from_value(data["state"].clone()).ok()))
-        }).await??
+        tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Option<crate::work_scheduler::WorkScheduler>> {
+                let conn = open_db(&sched_root)?;
+                let raw = crate::session_history::load_events(
+                    &conn,
+                    &sched_task,
+                    &crate::session_history::EventQuery {
+                        kinds: &["scheduler/state"],
+                        newest: Some(1),
+                        ..Default::default()
+                    },
+                )?
+                .pop()
+                .map(|event| event.raw);
+                Ok(raw
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .and_then(|data| serde_json::from_value(data["state"].clone()).ok()))
+            },
+        )
+        .await??
     };
 
     if let Some(previous) = previous_scheduler
@@ -4474,12 +4734,26 @@ pub(crate) async fn run_legacy_task(
     }
     scheduler.prepare_legacy_check_migration();
     let (resume_root, resume_task) = (root.clone(), task_id.clone());
-    let resume_target=tokio::task::spawn_blocking(move ||->anyhow::Result<Option<ResumeTarget>> {
-        let conn=open_db(&resume_root)?;
-        let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='flow/resume_requested' AND json_extract(data,'$.turn')=?2 ORDER BY seq DESC LIMIT 1",
-            params![resume_task,turn],|row|row.get::<_,String>(0)).optional()?;
-        Ok(raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).and_then(|data|serde_json::from_value(data["target"].clone()).ok()))
-    }).await??;
+    let resume_target =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ResumeTarget>> {
+            let conn = open_db(&resume_root)?;
+            let raw = crate::session_history::load_events(
+                &conn,
+                &resume_task,
+                &crate::session_history::EventQuery {
+                    kinds: &["flow/resume_requested"],
+                    turn: Some(turn),
+                    newest: Some(1),
+                    ..Default::default()
+                },
+            )?
+            .pop()
+            .map(|event| event.raw);
+            Ok(raw
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|data| serde_json::from_value(data["target"].clone()).ok()))
+        })
+        .await??;
     if let Some(target) = resume_target {
         anyhow::ensure!(
             scheduler.request_started_turn == target.request_id
@@ -4695,10 +4969,16 @@ pub(crate) async fn run_legacy_task(
                                         &root,
                                         &task_id,
                                         note["content"].as_str().unwrap_or_default(),
-                                        note["source_event_seqs"].as_array().context("context note source_event_seqs must be an array")?,
-                                    ).await {
+                                        note["source_event_seqs"].as_array().context(
+                                            "context note source_event_seqs must be an array",
+                                        )?,
+                                    )
+                                    .await
+                                    {
                                         Ok(receipt) => receipt,
-                                        Err(error) => json!({"error":format!("context note was not saved: {error:#}")}),
+                                        Err(error) => {
+                                            json!({"error":format!("context note was not saved: {error:#}")})
+                                        }
                                     };
                                 }
                                 let query_key = crate::source_read::query_fingerprint(&decision);
@@ -6092,19 +6372,43 @@ fn run_subagent<'a>(
 
         let read_id = child_id.clone();
         let root = state.workspace.root().to_path_buf();
-        let (status, answer) = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-        let conn = open_db(&root)?;
-        let status: String = conn.query_row("SELECT status FROM agent_tasks WHERE id=?1", [&read_id], |r| r.get(0))?;
-        let raw: Option<String> = conn.query_row(
-            "SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='assistant/message' ORDER BY seq DESC LIMIT 1",
-            [&read_id], |r| r.get(0),
-        ).optional()?;
-        let answer = raw.and_then(|data| serde_json::from_str::<Value>(&data).ok())
-            .and_then(|data| data.pointer("/message/content").and_then(Value::as_array).cloned())
-            .map(|blocks| blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join("\n"))
-            .unwrap_or_default();
-        Ok((status, answer))
-    }).await??;
+        let (status, answer) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+                let conn = open_db(&root)?;
+                let status: String = conn.query_row(
+                    "SELECT status FROM agent_tasks WHERE id=?1",
+                    [&read_id],
+                    |r| r.get(0),
+                )?;
+                let raw = crate::session_history::load_events(
+                    &conn,
+                    &read_id,
+                    &crate::session_history::EventQuery {
+                        kinds: &["assistant/message"],
+                        newest: Some(1),
+                        ..Default::default()
+                    },
+                )?
+                .pop()
+                .map(|event| event.raw);
+                let answer = raw
+                    .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+                    .and_then(|data| {
+                        data.pointer("/message/content")
+                            .and_then(Value::as_array)
+                            .cloned()
+                    })
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                Ok((status, answer))
+            })
+            .await??;
         emit(
             &state.workspace.root().to_path_buf(),
             parent_id,
@@ -6118,7 +6422,7 @@ fn run_subagent<'a>(
 
 pub(crate) fn local_tools(
     _workspace: &crate::tools::Workspace,
-    catalog: Option<&crate::plugin_builtin::ToolCatalog>,
+    catalog: Option<&crate::builtin_plugins::ToolCatalog>,
     ban_run_command: bool,
 ) -> Vec<Value> {
     let definitions = crate::mcp::tool_definitions();
@@ -6178,7 +6482,7 @@ pub(crate) fn local_tools(
         "list_symbol_business_context",
         "search_symbol_business_context",
     ];
-    definitions.as_array().into_iter().flatten().filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|n| (!ban_run_command || (n != "run_program" && !crate::project_process::is_execution(n))) && catalog.map_or(allowed.contains(&n), |catalog| catalog.contains(n)))).map(|tool| {
+    definitions.as_array().into_iter().flatten().filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|n| (!ban_run_command || (n != "run_program" && !crate::project_process::is_execution(n))) && catalog.map_or(allowed.contains(&n), |catalog| catalog.contains(n) && !catalog.packages.declares_tool(n)))).map(|tool| {
         let name=tool["name"].as_str().unwrap_or_default(); let description=tool["description"].as_str().unwrap_or_default();
         let mut schema=tool.get("inputSchema").cloned().unwrap_or_else(||json!({"type":"object","properties":{}}));
         if let Some(props)=schema.get_mut("properties").and_then(Value::as_object_mut) {props.remove("workspace_root");}
@@ -6211,7 +6515,7 @@ fn can_run_check(state: &AgentServiceState, ban_run_command: bool) -> bool {
 
 pub(crate) async fn execute_tool(
     workspace: Arc<crate::tools::Workspace>,
-    catalog: Option<&crate::plugin_builtin::ToolCatalog>,
+    catalog: Option<&crate::builtin_plugins::ToolCatalog>,
     name: &str,
     mut args: Value,
 ) -> anyhow::Result<Value> {
@@ -6444,8 +6748,8 @@ pub(crate) mod tests {
         let root = std::env::temp_dir().join(format!("agent-catalog-prompt-test-{}", uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         let workspace = crate::tools::Workspace::new(root.clone()).unwrap();
-        let catalog = crate::plugin_builtin::ToolCatalog::default();
-        let handler: crate::plugin_builtin::ToolHandler =
+        let catalog = crate::builtin_plugins::ToolCatalog::default();
+        let handler: crate::builtin_plugins::ToolHandler =
             Arc::new(|_workspace, _name, _args| Box::pin(async { Ok(json!({"ok":true})) }));
         catalog
             .register(&["list_dir", "read_file", "run_program"], handler)
@@ -6600,6 +6904,8 @@ pub(crate) mod tests {
             observer_model: String::new(),
             observer_inherits_model: true,
             visual: Default::default(),
+            visual_tool_settings: Default::default(),
+            context_agent_settings: Default::default(),
             config: None,
             config_path: None,
             tool_catalog: None,
@@ -6860,6 +7166,8 @@ pub(crate) mod tests {
             observer_model: String::new(),
             observer_inherits_model: true,
             visual: Default::default(),
+            visual_tool_settings: Default::default(),
+            context_agent_settings: Default::default(),
             config: None,
             config_path: None,
             tool_catalog: None,
@@ -7042,6 +7350,8 @@ pub(crate) mod tests {
             observer_model: String::new(),
             observer_inherits_model: true,
             visual: Default::default(),
+            visual_tool_settings: Default::default(),
+            context_agent_settings: Default::default(),
             config: None,
             config_path: None,
             tool_catalog: None,
@@ -7364,6 +7674,8 @@ pub(crate) mod tests {
             observer_model: String::new(),
             observer_inherits_model: true,
             visual: Default::default(),
+            visual_tool_settings: Default::default(),
+            context_agent_settings: Default::default(),
             config: None,
             config_path: None,
             tool_catalog: None,

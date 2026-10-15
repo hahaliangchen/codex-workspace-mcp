@@ -1,11 +1,12 @@
+import type {AttachmentSubmission} from './components/Attachments'
 import type { PermissionMode, ResumeTarget } from './api'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { acceptsPrompt, type AgentInfo, type SettingsData, type Task } from './api.ts'
 import { useAgentApi } from './cordis/react.tsx'
 import { t } from './i18n.ts'
 import { useSession } from './useSession.ts'
 
-export type SettingsTab = 'general' | 'models' | 'observer' | 'subagent' | 'plugins'
+export type SettingsTab = 'general' | 'models' | 'observer' | 'subagent' | 'tools' | 'plugins'
 
 function routeTaskId(): string | undefined {
   const match = /^#\/tasks\/(.+)$/.exec(location.hash)
@@ -312,16 +313,28 @@ export function useAgentWorkspace() {
     : (task?.fast_mode ?? settings?.fast_mode ?? false)
   const subagentEnabled = info?.subagent_enabled ?? settings?.enable_subagent ?? true
 
-  const submit = useCallback(async (text: string, permissionMode: PermissionMode): Promise<boolean> => {
+  const pendingSession=useRef<Promise<string>|null>(null)
+  const uploadedAttachments=useRef(new Map<File,{task:string;receiptId:string}>())
+  useEffect(()=>{pendingSession.current=null},[taskId,activeWorkspace])
+  const submit = useCallback(async (text: string, permissionMode: PermissionMode, attachment?:AttachmentSubmission): Promise<boolean> => {
     setNotice(undefined)
     try {
-      const id = taskId ?? await api.createSession()
+      const id = taskId ?? await (pendingSession.current??=api.createSession().catch(error=>{pendingSession.current=null;throw error}))
+      const content=[]
+      for(const file of attachment?.files??[]){
+        let uploaded=uploadedAttachments.current.get(file)
+        if(!uploaded||uploaded.task!==id){const value=await api.upload(id,file,attachment!.signal,p=>attachment!.onProgress(`正在上传 ${file.name} · ${p}%`));uploaded={task:id,receiptId:value.receiptId};uploadedAttachments.current.set(file,uploaded)}
+        content.push({type:'file',receiptId:uploaded.receiptId})
+      }
+      if(attachment?.signal.aborted)throw Error('上传已取消')
       await api.prompt(id, text, {
+        content,requestId:attachment?.requestId??crypto.randomUUID(),
         permission_mode: permissionMode,
         model: modelName ?? undefined,
         reasoning_effort: reasoningEffort ? reasoningEffort : undefined,
         fast_mode: fastMode,
       })
+      uploadedAttachments.current.clear()
       refreshTasks()
       if (id === taskId) session.reload()
       else openTask(id)

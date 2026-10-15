@@ -593,15 +593,29 @@ pub async fn undo_turn(
         let saved_root = root.clone();
         let saved_task = task.clone();
         let snapshot = summary.clone();
-        let updated=tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
-            let conn=connection(&saved_root)?;
-            let previous=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/work_state' ORDER BY seq DESC LIMIT 1",[&saved_task],|row|row.get::<_,String>(0)).optional()?;
-            let Some(previous)=previous else {return Ok(None)};
-            let value:Value=serde_json::from_str(&previous)?;
-            let mut state:crate::worker_work_state::WorkState=serde_json::from_value(value["state"].clone())?;
+        let updated = tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
+            let conn = connection(&saved_root)?;
+            let previous = crate::session_history::load_events(
+                &conn,
+                &saved_task,
+                &crate::session_history::EventQuery {
+                    kinds: &["worker/work_state"],
+                    newest: Some(1),
+                    ..Default::default()
+                },
+            )?
+            .pop()
+            .map(|event| event.raw);
+            let Some(previous) = previous else {
+                return Ok(None);
+            };
+            let value: Value = serde_json::from_str(&previous)?;
+            let mut state: crate::worker_work_state::WorkState =
+                serde_json::from_value(value["state"].clone())?;
             state.notify_revert(&snapshot);
             Ok(Some(state.snapshot()))
-        }).await;
+        })
+        .await;
         if let Ok(Ok(Some(state))) = updated {
             let _ = crate::agent_service::emit(
                 &root,

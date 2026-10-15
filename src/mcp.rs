@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -35,14 +35,60 @@ use crate::ts_index::{
     IndexTsWorkspaceRequest, ListTsSymbolsRequest, ReadTsSymbolRequest, SearchTsSymbolsRequest,
 };
 
-pub async fn handle_mcp_get() -> Response {
-    info!("mcp GET probe received");
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        [("allow", "POST"), ("accept-post", "application/json")],
-        "MCP Streamable HTTP endpoint accepts JSON-RPC over POST\n",
-    )
+pub async fn handle_mcp_get(headers: HeaderMap) -> Response {
+    if !valid_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(id) = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [("allow", "POST, DELETE")],
+            "Initialize an MCP session before opening its notification stream",
+        )
+            .into_response();
+    };
+    let (receiver, cancel) = {
+        let mut sessions = sessions().lock().unwrap();
+        sessions.retain(|_, session| session.last_used.elapsed().as_secs() < 7200);
+        let Some(session) = sessions.get_mut(id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        session.last_used = std::time::Instant::now();
+        session.stream.cancel();
+        session.stream = tokio_util::sync::CancellationToken::new();
+        (session.changed.subscribe(), session.stream.clone())
+    };
+    let stream = futures::stream::unfold((receiver, cancel), |(mut receiver, cancel)| async move {
+        tokio::select! {
+            _ = cancel.cancelled() => None,
+            changed = receiver.changed() => {
+                if changed.is_err() { return None; }
+                Some((Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().event("message").data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#)), (receiver, cancel)))
+            }
+        }
+    });
+    axum::response::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+fn valid_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
+    };
+    let Some(host) = headers.get("host").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    origin.to_str().is_ok_and(|origin| {
+        origin == format!("http://{host}") || origin == format!("https://{host}")
+    })
+}
+pub fn notify_tools_changed() {
+    for session in sessions().lock().unwrap().values() {
+        session.changed.send_modify(|seq| *seq += 1);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,10 +119,68 @@ pub struct JsonRpcError {
     pub message: String,
 }
 
+#[derive(Default)]
+struct SkillActivation {
+    active: std::collections::BTreeSet<String>,
+    scopes: std::collections::BTreeMap<String, crate::plugin_runtime::ScopeId>,
+}
+struct McpSession {
+    last_used: std::time::Instant,
+    skills: Arc<tokio::sync::Mutex<SkillActivation>>,
+    changed: tokio::sync::watch::Sender<u64>,
+    stream: tokio_util::sync::CancellationToken,
+}
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        self.stream.cancel();
+    }
+}
+static MCP_SESSIONS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, McpSession>>,
+> = std::sync::OnceLock::new();
+fn sessions() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, McpSession>> {
+    MCP_SESSIONS.get_or_init(Default::default)
+}
+fn session(
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<Arc<tokio::sync::Mutex<SkillActivation>>>> {
+    let Some(id) = headers.get("mcp-session-id") else {
+        return Ok(None);
+    };
+    let id = id.to_str()?;
+    let mut sessions = sessions().lock().unwrap();
+    sessions.retain(|_, session| session.last_used.elapsed().as_secs() < 7200);
+    let session = sessions.get_mut(id).ok_or_else(|| {
+        anyhow::anyhow!("MCP session expired or unknown; initialize a new session")
+    })?;
+    session.last_used = std::time::Instant::now();
+    Ok(Some(session.skills.clone()))
+}
+pub async fn handle_mcp_delete(headers: HeaderMap) -> Response {
+    if !valid_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(id) = headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if sessions().lock().unwrap().remove(id).is_some() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 pub async fn handle_mcp(
     State(workspace): State<Arc<Workspace>>,
+    headers: HeaderMap,
     Json(message): Json<Value>,
 ) -> Response {
+    if !valid_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     info!(body = %message, "mcp POST received");
 
     if message.is_array() {
@@ -100,7 +204,63 @@ pub async fn handle_mcp(
     let id = request.id.clone();
     let is_notification = id.is_none();
     info!(id = ?id, method = ?request.method, notification = is_notification, "mcp json-rpc dispatch");
-    let result = dispatch(&workspace, request).await;
+    let mut new_session = None;
+    let activation = if request.method.as_deref() == Some("initialize") {
+        if request.jsonrpc.as_deref() != Some("2.0") || is_notification {
+            return json_error(id, -32600, "initialize requires JSON-RPC 2.0 and an id");
+        }
+        let mut sessions = sessions().lock().unwrap();
+        sessions.retain(|_, session| session.last_used.elapsed().as_secs() < 7200);
+        if sessions.len() >= 1024 {
+            return json_error(id, -32000, "MCP session capacity reached");
+        }
+        let mut random = [0u8; 32];
+        if getrandom::fill(&mut random).is_err() {
+            return json_error(id, -32000, "could not generate an MCP session ID");
+        }
+        let token = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let skills = Arc::new(tokio::sync::Mutex::new(SkillActivation::default()));
+        sessions.insert(
+            token.clone(),
+            McpSession {
+                last_used: std::time::Instant::now(),
+                skills: skills.clone(),
+                changed: tokio::sync::watch::channel(0).0,
+                stream: tokio_util::sync::CancellationToken::new(),
+            },
+        );
+        new_session = Some(token);
+        Some(skills)
+    } else {
+        match session(&headers) {
+            Ok(session) => session,
+            Err(error) => return (StatusCode::NOT_FOUND, error.to_string()).into_response(),
+        }
+    };
+    let mut activation = if let Some(activation) = &activation {
+        Some(activation.lock().await)
+    } else {
+        None
+    };
+    let changed = request.method.as_deref() == Some("tools/call")
+        && matches!(
+            request.params["name"].as_str(),
+            Some("read_skill" | "unload_skill" | "reset_skill_activation")
+        );
+    let result = dispatch(&workspace, request, activation.as_deref_mut()).await;
+    if result.is_ok()
+        && changed
+        && let Some(id) = headers
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+    {
+        if let Some(session) = sessions().lock().unwrap().get(id) {
+            session.changed.send_modify(|seq| *seq += 1);
+        }
+    }
     if is_notification {
         return match result {
             Ok(_) => {
@@ -114,7 +274,7 @@ pub async fn handle_mcp(
         };
     }
 
-    Json(match result {
+    let response = Json(match result {
         Ok(result) => {
             info!(id = ?id, "mcp json-rpc success");
             JsonRpcResponse {
@@ -137,10 +297,27 @@ pub async fn handle_mcp(
             },
         },
     })
-    .into_response()
+    .into_response();
+    if let Some(token) = new_session {
+        let mut response = response;
+        response
+            .headers_mut()
+            .insert("mcp-session-id", token.parse().unwrap());
+        response
+    } else {
+        response
+    }
 }
 
-async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Result<Value> {
+fn mcp_value(value: Value) -> Value {
+    json!({"content":[{"type":"text","text":value.to_string()}],"structuredContent":value})
+}
+
+async fn dispatch(
+    workspace: &Arc<Workspace>,
+    request: JsonRpcRequest,
+    mut activation: Option<&mut SkillActivation>,
+) -> anyhow::Result<Value> {
     if request.jsonrpc.as_deref() != Some("2.0") {
         anyhow::bail!("jsonrpc must be \"2.0\"");
     }
@@ -164,15 +341,99 @@ async fn dispatch(workspace: &Workspace, request: JsonRpcRequest) -> anyhow::Res
                     "version": env!("CARGO_PKG_VERSION")
                 },
                 "capabilities": {
-                    "tools": {},
+                    "tools": {"listChanged": true},
                     "resources": {}
                 }
             }))
         }
-        "tools/list" => Ok(json!({
-            "tools": tool_definitions()
-        })),
-        "tools/call" => call_tool(workspace, request.params).await,
+        "tools/list" => {
+            let catalog = crate::skill_packages::root_catalog();
+            let mut definitions = tool_definitions()
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| {
+                    let name = tool["name"].as_str().unwrap_or("");
+                    catalog
+                        .as_ref()
+                        .is_none_or(|catalog| !catalog.packages.declares_tool(name))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if let (Some(catalog), Some(activation)) = (&catalog, activation.as_deref()) {
+                let active = catalog
+                    .packages
+                    .valid_active(&activation.active, &activation.scopes);
+                definitions.extend(catalog.packages.tools(&active).into_iter().map(|tool| json!({"name":tool["function"]["name"],"description":tool["function"]["description"],"inputSchema":tool["function"]["parameters"]})));
+            }
+            Ok(json!({"tools":definitions}))
+        }
+        "tools/call" => {
+            let name = request.params["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("tool name required"))?;
+            let args = request
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(json!({}));
+            if name == "unload_skill" || name == "reset_skill_activation" {
+                let activation = activation.as_deref_mut().ok_or_else(|| {
+                    anyhow::anyhow!("initialize an MCP session before changing skill activation")
+                })?;
+                if name == "reset_skill_activation" {
+                    activation.active.clear();
+                    activation.scopes.clear();
+                } else {
+                    let skill = args["name"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("skill name required"))?;
+                    activation.active.remove(skill);
+                    activation.scopes.remove(skill);
+                }
+                return Ok(mcp_value(json!({"tools_hidden":true})));
+            }
+            if let Some(catalog) = crate::skill_packages::root_catalog() {
+                if name == "read_skill"
+                    && let Some(result) =
+                        crate::skill_packages::root_read(args["name"].as_str().unwrap_or(""))
+                {
+                    let activation = activation.as_deref_mut().ok_or_else(|| {
+                        anyhow::anyhow!("initialize an MCP session before loading package tools")
+                    })?;
+                    let result = result?;
+                    let skill = result["skill"].as_str().unwrap().to_owned();
+                    activation.active.insert(skill.clone());
+                    activation.scopes.insert(
+                        skill,
+                        result["package_scope"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("package activation version missing"))?,
+                    );
+                    return Ok(mcp_value(result));
+                }
+                if catalog.packages.declares_tool(name) {
+                    let activation = activation.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("TOOL_UNAVAILABLE: load the owning skill in an MCP session")
+                    })?;
+                    let active = catalog
+                        .packages
+                        .valid_active(&activation.active, &activation.scopes);
+                    anyhow::ensure!(
+                        catalog
+                            .packages
+                            .tools(&active)
+                            .iter()
+                            .any(|tool| tool["function"]["name"] == name),
+                        "TOOL_UNAVAILABLE: load the owning skill"
+                    );
+                    return Ok(mcp_value(
+                        catalog.execute(workspace.clone(), name, args).await?,
+                    ));
+                }
+            }
+            call_tool(workspace, request.params).await
+        }
         "notifications/initialized" => Ok(json!({})),
         "ping" => Ok(json!({})),
         "resources/list" => {
@@ -779,14 +1040,24 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         }
         // Skills 按需懒加载：列出所有可用技能（名称+一句话描述）
         "list_skills" => {
-            let skills = crate::skills::list_skills();
-            serde_json::to_value(skills)?
+            let mut skills = serde_json::to_value(crate::skills::list_skills())?;
+            if let Some(packages) = crate::skill_packages::root_skills() {
+                skills
+                    .as_array_mut()
+                    .unwrap()
+                    .extend(packages.as_array().unwrap().iter().cloned());
+            }
+            skills
         }
         // Skills 按需懒加载：读取指定技能的完整 SKILL.md 内容
         "read_skill" => {
             let skill_name = arguments.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let content = crate::skills::read_skill(skill_name)?;
-            json!({ "skill": skill_name, "content": content })
+            if let Some(result) = crate::skill_packages::root_read(skill_name) {
+                result?
+            } else {
+                let content = crate::skills::read_skill(skill_name)?;
+                json!({"skill":skill_name,"content":content})
+            }
         }
         "analyze_image" => {
             let image_ref = arguments
@@ -1420,6 +1691,14 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "unload_skill", "description": "Hide a loaded skill's tools in this MCP session; original instructions remain in client history.",
+            "inputSchema": {"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+        },
+        {
+            "name": "reset_skill_activation", "description": "Begin a new task or user turn by clearing loaded package tools in this MCP session. MCP has no automatic user-turn signal; call explicitly at the boundary.",
+            "inputSchema": {"type":"object","properties":{}}
+        },
+        {
             "name": "spawn_subagent",
             "description": "Spawn a specialized sub-agent with its own clean context in the background to handle a specific code analysis or search sub-task. Use this to save token context size of the main agent.",
             "inputSchema": {
@@ -1515,6 +1794,171 @@ pub fn tool_definitions() -> Value {
 #[cfg(test)]
 mod native_tool_tests {
     use super::*;
+
+    async fn rpc(
+        workspace: &Arc<Workspace>,
+        token: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> (HeaderMap, Value) {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = token {
+            headers.insert("mcp-session-id", token.parse().unwrap());
+        }
+        let response = handle_mcp(
+            State(workspace.clone()),
+            headers,
+            Json(json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})),
+        )
+        .await;
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (headers, serde_json::from_slice(&bytes).unwrap())
+    }
+    #[tokio::test]
+    async fn mcp_skill_sessions_isolate_activation_and_invalidate_reloaded_packages() {
+        let root =
+            std::env::temp_dir().join(format!("mcp-skill-{}", crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("code-flow.json"),
+            r#"{"version":1,"features":[]}"#,
+        )
+        .unwrap();
+        let workspace = Arc::new(Workspace::new(&root).unwrap());
+        let (runtime, catalog) = crate::skill_packages::test_runtime();
+        crate::skill_packages::bind_root(&catalog);
+        let (headers, init) = rpc(&workspace, None, "initialize", json!({})).await;
+        assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
+        let first = headers["mcp-session-id"].to_str().unwrap().to_owned();
+        let (headers, _) = rpc(&workspace, None, "initialize", json!({})).await;
+        let second = headers["mcp-session-id"].to_str().unwrap().to_owned();
+        let has_flow = |packet: &Value| {
+            packet["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "read_code_flow")
+        };
+        assert!(!has_flow(
+            &rpc(&workspace, Some(&first), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        let mut changed = sessions()
+            .lock()
+            .unwrap()
+            .get(&first)
+            .unwrap()
+            .changed
+            .subscribe();
+        let packet = rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"read_skill","arguments":{"name":"code-flow"}}),
+        )
+        .await
+        .1;
+        assert!(packet["error"].is_null());
+        assert!(changed.has_changed().unwrap());
+        changed.borrow_and_update();
+        assert!(has_flow(
+            &rpc(&workspace, Some(&first), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        assert!(!has_flow(
+            &rpc(&workspace, Some(&second), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        assert!(!has_flow(
+            &rpc(&workspace, None, "tools/list", json!({})).await.1
+        ));
+        let rejected = rpc(
+            &workspace,
+            Some(&second),
+            "tools/call",
+            json!({"name":"read_code_flow"}),
+        )
+        .await
+        .1;
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("TOOL_UNAVAILABLE")
+        );
+        let result = rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"read_code_flow"}),
+        )
+        .await
+        .1;
+        assert!(result["result"]["structuredContent"]["features"].is_array());
+        crate::skill_packages::reload(&runtime, &catalog.packages, "code-flow").unwrap();
+        assert!(!has_flow(
+            &rpc(&workspace, Some(&first), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"read_skill","arguments":{"name":"code-flow"}}),
+        )
+        .await;
+        rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"unload_skill","arguments":{"name":"code-flow"}}),
+        )
+        .await;
+        assert!(!has_flow(
+            &rpc(&workspace, Some(&first), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"read_skill","arguments":{"name":"code-flow"}}),
+        )
+        .await;
+        rpc(
+            &workspace,
+            Some(&first),
+            "tools/call",
+            json!({"name":"reset_skill_activation"}),
+        )
+        .await;
+        assert!(!has_flow(
+            &rpc(&workspace, Some(&first), "tools/list", json!({}))
+                .await
+                .1
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-session-id", first.parse().unwrap());
+        assert_eq!(
+            handle_mcp_delete(headers.clone()).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            handle_mcp_get(headers).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        sessions().lock().unwrap().remove(&second);
+        runtime.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn legacy_run_command_is_disabled_and_native_tool_is_advertised() {

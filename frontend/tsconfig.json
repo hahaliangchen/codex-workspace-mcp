@@ -19,6 +19,9 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "paths": {
+      "react": ["./node_modules/@types/react"],
+      "react/jsx-runtime": ["./node_modules/@types/react/jsx-runtime.d.ts"],
+      "@xyflow/react": ["./node_modules/@xyflow/react"],
       "@deepseek-ai/dsh-client-ui-primitives": ["./src/dsh/ui-primitives/index.ts"],
       "@deepseek-ai/dsh-client-store": ["./src/dsh/store/index.ts"],
       "@deepseek-ai/dsh-client-ui-slots": ["./src/dsh/ui-slots/index.ts"],

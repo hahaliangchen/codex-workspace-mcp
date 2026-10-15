@@ -90,6 +90,7 @@ pub type ToolHandler =
 #[derive(Default)]
 pub struct ToolCatalog {
     handlers: RwLock<BTreeMap<String, ToolHandler>>,
+    pub packages: Arc<crate::skill_packages::Registry>,
 }
 
 impl ToolCatalog {
@@ -168,14 +169,15 @@ impl Plugin for ToolCatalogPlugin {
     fn id(&self) -> &'static str {
         "tools"
     }
-    fn requires(&self) -> &'static [&'static str] {
-        &["workspace"]
+    fn requires(&self) -> Vec<String> {
+        ["workspace"].into_iter().map(str::to_owned).collect()
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()> {
         context.provide("tools", Arc::new(ToolCatalog::default()))?;
         context.mount(FileToolsPlugin)?;
         context.mount(MemoryPlugin)?;
         context.mount(CodeIndexPlugin)?;
+        context.mount(crate::skill_packages::PackagesPlugin)?;
         context.mount(AgentTasksPlugin(self.0.clone()))?;
         Ok(())
     }
@@ -242,8 +244,11 @@ impl Plugin for FileToolsPlugin {
     fn id(&self) -> &'static str {
         "file-tools"
     }
-    fn requires(&self) -> &'static [&'static str] {
-        &["tools", "workspace"]
+    fn requires(&self) -> Vec<String> {
+        ["tools", "workspace"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()> {
         register_tools(context, FILE_TOOLS, mcp_handler())?;
@@ -260,8 +265,11 @@ impl Plugin for MemoryPlugin {
     fn id(&self) -> &'static str {
         "memory"
     }
-    fn requires(&self) -> &'static [&'static str] {
-        &["tools", "workspace"]
+    fn requires(&self) -> Vec<String> {
+        ["tools", "workspace"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()> {
         register_tools(context, MEMORY_TOOLS, mcp_handler())?;
@@ -274,8 +282,11 @@ impl Plugin for CodeIndexPlugin {
     fn id(&self) -> &'static str {
         "code-index"
     }
-    fn requires(&self) -> &'static [&'static str] {
-        &["tools", "workspace"]
+    fn requires(&self) -> Vec<String> {
+        ["tools", "workspace"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()> {
         register_tools(context, INDEX_TOOLS, mcp_handler())?;
@@ -289,15 +300,19 @@ impl Plugin for AgentTasksPlugin {
     fn id(&self) -> &'static str {
         "agent-tasks"
     }
-    fn requires(&self) -> &'static [&'static str] {
-        &[
+    fn requires(&self) -> Vec<String> {
+        [
             "workspace",
             "model-settings",
             "tools",
             "file-tools",
             "memory",
             "code-index",
+            "skill-packages",
         ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
     }
     fn start(&self, context: &PluginContext<'_>) -> Result<()> {
         let workspace = context.require::<Workspace>("workspace")?;
@@ -331,6 +346,8 @@ impl Plugin for AgentTasksPlugin {
             observer_model: String::new(),
             observer_inherits_model: true,
             visual: Default::default(),
+            visual_tool_settings: Default::default(),
+            context_agent_settings: Default::default(),
             config: Some(settings.config.clone()),
             config_path: Some(settings.path.clone()),
             tool_catalog: Some(tools),

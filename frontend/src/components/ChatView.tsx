@@ -67,7 +67,8 @@ function Item({
       return (
         <div className={messageCss.userRow}>
           <div className={messageCss.userStack}>
-            <div className={messageCss.bubble}>{projectUserText(item.text, [], slashNames, 'skill')}</div>
+            {item.attachments?.length ? <div style={{display:'flex',flexWrap:'wrap',gap:8}}>{item.attachments.map((file,i)=><a key={i} href={file.url} target='_blank' rel='noreferrer' download={file.image?undefined:file.name} style={{display:'flex',flexDirection:'column',gap:4,padding:8,border:'1px solid #dce1e7',borderRadius:10,maxWidth:240}}>{file.image&&<img src={file.url} alt={file.name} style={{maxWidth:220,maxHeight:180,objectFit:'contain'}}/>}<span>{file.name}</span></a>)}</div>:null}
+            {item.text&&<div className={messageCss.bubble}>{projectUserText(item.text, [], slashNames, 'skill')}</div>}
           </div>
         </div>
       )

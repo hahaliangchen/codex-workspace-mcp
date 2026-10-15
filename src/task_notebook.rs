@@ -302,11 +302,10 @@ impl Notebook {
             let conn=connection(&root)?;
             ensure!(conn.query_row("SELECT 1 FROM agent_tasks WHERE id=?1",[&task],|_|Ok(())).optional()?.is_some(),"task not found");
             let terms=query.split_whitespace().take(12).collect::<Vec<_>>();
-            let mut statement=conn.prepare("SELECT seq,timestamp,data FROM agent_task_events WHERE task_id=?1 AND kind='worker/finding_revision' AND seq<?2 ORDER BY seq DESC")?;
-            let rows=statement.query_map(params![task,before],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)))?;
+            let rows=crate::session_history::load_events(&conn,&task,&crate::session_history::EventQuery{through:Some(before.saturating_sub(1)),kinds:&["worker/finding_revision"],..Default::default()})?;
             let mut items=Vec::new();
-            for row in rows {
-                let (seq,time,raw)=row?;
+            for event in rows.into_iter().rev() {
+                let (seq,time,raw)=(event.seq,event.time,event.raw);
                 if !terms.is_empty() && !terms.iter().any(|term|raw.to_lowercase().contains(term)) {continue;}
                 items.push(json!({"seq":seq,"time":time,"record":serde_json::from_str::<Value>(&raw)?}));
                 if items.len()>limit {break;}
@@ -334,8 +333,8 @@ impl Notebook {
         tokio::task::spawn_blocking(move || -> Result<Value> {
             let conn=connection(&root)?;let mut pages=Vec::new();
             for id in ids {
-                let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.message.toolCallId')=?2 ORDER BY seq DESC LIMIT 1",params![task,id],|row|row.get::<_,String>(0)).optional()?.context("tool result not found in this task")?;
-                let event:Value=serde_json::from_str(&raw)?;
+                let record=crate::session_history::load_events(&conn,&task,&crate::session_history::EventQuery{kinds:&["tool/result"],call_id:Some(&id),newest:Some(1),..Default::default()})?.pop().context("tool result not found in this task")?;
+                let event=record.data()?;
                 let result=event.pointer("/meta/result").context("original tool result unavailable")?;
                 let mut page=crate::source_read::result_page(result,&request)?;
                 page["tool_call_id"]=json!(id);page["historical"]=json!(true);pages.push(page);
@@ -771,7 +770,7 @@ pub async fn list(
         let mut work=tokio::task::spawn_blocking(move || -> Result<Value> {
             let conn=connection(&root)?;
             ensure!(conn.query_row("SELECT 1 FROM agent_tasks WHERE id=?1",[&task_id],|_|Ok(())).optional()?.is_some(),"task not found");
-            let raw=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='worker/work_state' ORDER BY seq DESC LIMIT 1",[task_id],|row|row.get::<_,String>(0)).optional()?;
+            let raw=crate::session_history::load_events(&conn,&task_id,&crate::session_history::EventQuery{kinds:&["worker/work_state"],newest:Some(1),..Default::default()})?.pop().map(|event|event.raw);
             Ok(raw.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).map(|event|event["state"].clone()).unwrap_or(json!({})))
         }).await??;
         work["finding_timeline"]=notebook.history(&json!({})).await?;

@@ -8,7 +8,10 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{collections::{BTreeMap, BTreeSet}, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Default)]
@@ -109,11 +112,7 @@ async fn save_with_organizer_material(
                     .as_i64()
                     .context("context note source references must be event sequence numbers")?;
                 ensure!(source >= 0, "context note source references must be non-negative");
-                let exists: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agent_task_events WHERE task_id=?1 AND seq=?2)",
-                    params![task, source],
-                    |row| row.get(0),
-                )?;
+                let exists=!crate::session_history::load_events(&tx,&task,&crate::session_history::EventQuery{exact:Some(source),..Default::default()})?.is_empty();
                 ensure!(exists, "context note references missing event {source}");
                 source_event_seqs.insert(source);
             }
@@ -183,21 +182,33 @@ struct SelectionReferences {
 }
 impl SelectionReferences {
     fn resolve(&self, requested: &BTreeSet<i64>) -> Option<BTreeSet<i64>> {
-        requested.iter().map(|seq| self.anchors.get(seq).copied()).collect()
+        requested
+            .iter()
+            .map(|seq| self.anchors.get(seq).copied())
+            .collect()
     }
 
     fn slices(&self, slices: Vec<MessageSlice>) -> Result<Vec<MessageSlice>> {
-        slices.into_iter().map(|(seq, index, start, end)| {
-            let anchor = self.anchors.get(&seq).context("message slice references an unavailable event")?;
-            // Existing anchor/index pairs retain their saved-window semantics.
-            let (anchor, index) = if *anchor == seq {
-                (seq, index)
-            } else {
-                *self.message_indexes.get(&seq).and_then(|messages| messages.get(index))
-                    .context("message slice points to a missing original event message")?
-            };
-            Ok((anchor, index, start, end))
-        }).collect()
+        slices
+            .into_iter()
+            .map(|(seq, index, start, end)| {
+                let anchor = self
+                    .anchors
+                    .get(&seq)
+                    .context("message slice references an unavailable event")?;
+                // Existing anchor/index pairs retain their saved-window semantics.
+                let (anchor, index) = if *anchor == seq {
+                    (seq, index)
+                } else {
+                    *self
+                        .message_indexes
+                        .get(&seq)
+                        .and_then(|messages| messages.get(index))
+                        .context("message slice points to a missing original event message")?
+                };
+                Ok((anchor, index, start, end))
+            })
+            .collect()
     }
 }
 
@@ -224,16 +235,27 @@ async fn selection_references(
     let mut pending = BTreeMap::<String, (i64, i64)>::new();
     let mut exchanges = Vec::new();
     for (message, anchor) in view.messages.iter().zip(&view.sources) {
-        let Some(anchor) = anchor.filter(|anchor| eligible.contains(anchor)) else { continue };
+        let Some(anchor) = anchor.filter(|anchor| eligible.contains(anchor)) else {
+            continue;
+        };
         let index = indexes.entry(anchor).or_default();
         let original = original_event_seq(message, task);
-        let native = message["role"] == "tool" || (message["role"] == "assistant"
-            && message["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty()));
+        let native = message["role"] == "tool"
+            || (message["role"] == "assistant"
+                && message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| !calls.is_empty()));
         if let Some(seq) = original.filter(|seq| native || *seq == anchor) {
             if let Some(previous) = refs.anchors.insert(seq, anchor) {
-                ensure!(previous == anchor, "history reference {seq} belongs to conflicting exchanges");
+                ensure!(
+                    previous == anchor,
+                    "history reference {seq} belongs to conflicting exchanges"
+                );
             }
-            refs.message_indexes.entry(seq).or_default().push((anchor, *index));
+            refs.message_indexes
+                .entry(seq)
+                .or_default()
+                .push((anchor, *index));
         }
         *index += 1;
         if message["role"] == "assistant" {
@@ -245,13 +267,19 @@ async fn selection_references(
         } else if message["role"] == "tool" {
             if let Some(id) = message["tool_call_id"].as_str() {
                 if let Some((call_anchor, start)) = pending.remove(id) {
-                    ensure!(call_anchor == anchor, "tool result lost its exchange anchor");
+                    ensure!(
+                        call_anchor == anchor,
+                        "tool result lost its exchange anchor"
+                    );
                     exchanges.push((id.to_owned(), anchor, start, original.unwrap_or(anchor)));
                 }
             }
         }
     }
-    ensure!(pending.is_empty(), "selectable history has an incomplete tool exchange");
+    ensure!(
+        pending.is_empty(),
+        "selectable history has an incomplete tool exchange"
+    );
     // tool/call audit events have their own IDs but no separate wire message.
     // Accept those IDs too, using call ID plus event interval (call IDs can be
     // reused later in the same conversation).
@@ -260,12 +288,19 @@ async fn selection_references(
         let task = task.to_owned();
         let aliases = tokio::task::spawn_blocking(move || -> Result<Vec<(i64, i64)>> {
             let conn = crate::agent_service::open_db(&root)?;
-            let mut stmt = conn.prepare("SELECT seq,data FROM agent_task_events WHERE task_id=?1 AND kind='tool/call' AND seq<=?2 ORDER BY seq")?;
-            let rows = stmt.query_map(params![task, through], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+            let rows = crate::session_history::load_events(
+                &conn,
+                &task,
+                &crate::session_history::EventQuery {
+                    through: Some(through),
+                    kinds: &["tool/call"],
+                    ..Default::default()
+                },
+            )?;
             let mut aliases = Vec::new();
-            for row in rows {
-                let (seq, data) = row?;
-                let data: Value = serde_json::from_str(&data)?;
+            for event in rows {
+                let data = event.data()?;
+                let seq = event.seq;
                 for (id, anchor, start, end) in &exchanges {
                     if data["callId"] == id.as_str() && *start <= seq && seq <= *end {
                         aliases.push((seq, *anchor));
@@ -273,7 +308,8 @@ async fn selection_references(
                 }
             }
             Ok(aliases)
-        }).await??;
+        })
+        .await??;
         for (seq, anchor) in aliases {
             if let Some(previous) = refs.anchors.insert(seq, anchor) {
                 ensure!(previous == anchor, "tool call reference {seq} is ambiguous");
@@ -346,8 +382,7 @@ fn select_held_context_tool() -> Value {
     json!({"type":"function","function":{"name":"select_held_context","description":"After inspecting the saved raw context through read_session_history, choose original event references and any exact text ranges needed for the active task. You may create concise Organizer-authored context notes when several completed tool records or long sources can be usefully organized; each note must cite its original source event sequence numbers. Notes are new immutable history messages, not replacements for raw history. Do not infer visual content from a screenshot reference, metadata or another actor's description: a visual conclusion requires your own successful view_image call with image content actually supplied. State the next Organizer round's task and missing facts in continuation_plan. You may select the original event ID of a tool call or result; the host includes the whole native exchange once before checking capacity. Event sequence numbers remain unchanged. The host restores choices and enforces capacity; it does not choose or rewrite context for you.","parameters":{"type":"object","properties":{"event_seqs":{"type":"array","maxItems":2048,"items":{"type":"integer","minimum":0}},"message_slices":{"type":"array","description":"Optional exact excerpts for selected event messages. Messages not listed here remain whole. Do not slice assistant messages containing tool_calls; their exchanges stay intact.","items":{"type":"object","properties":{"event_seq":{"type":"integer","minimum":0},"message_index":{"type":"integer","minimum":0,"description":"Zero-based message index within the referenced original event (normally 0 for a tool result). Existing exchange-anchor indexes remain supported."},"start_char":{"type":"integer","minimum":0},"end_char":{"type":"integer","minimum":0,"description":"Exclusive Unicode-character offset within that message's content."}},"required":["event_seq","message_index","start_char","end_char"]}},"context_notes":{"type":"array","maxItems":32,"description":"Optional concise notes you authored to organize important information or completed tool exchanges. Preserve raw history unchanged. Cite the original event sequence(s) used; these provenance references do not replace event_seqs.","items":{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Your exact note text. Attribute claims and uncertainty; only report visual conclusions you personally made after successfully calling view_image and receiving image content."},"source_event_seqs":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"integer","minimum":0}}},"required":["content","source_event_seqs"]}},"continuation_plan":{"type":"string","description":"Your next-round task plan: what to continue, what information is missing, and what you will retrieve or do next."}},"required":["event_seqs","continuation_plan"]}}})
 }
 fn held_context_refs(view: &HistoryView, selected: &BTreeSet<i64>) -> BTreeSet<i64> {
-    view
-        .sources
+    view.sources
         .iter()
         .flatten()
         .filter(|source| selected.contains(source))
@@ -538,11 +573,17 @@ async fn prepare_at_limit(
         "context provenance array mismatch"
     );
     let before = estimate(body);
-    let through = metadata["history_through_seq"]
-        .as_i64()
-        .unwrap_or_else(|| references(&view).into_iter()
-            .chain(view.messages.iter().filter_map(|message| original_event_seq(message, task)))
-            .max().unwrap_or(0));
+    let through = metadata["history_through_seq"].as_i64().unwrap_or_else(|| {
+        references(&view)
+            .into_iter()
+            .chain(
+                view.messages
+                    .iter()
+                    .filter_map(|message| original_event_seq(message, task)),
+            )
+            .max()
+            .unwrap_or(0)
+    });
     let previous = load(state, task, actor, scope)
         .await?
         .filter(|window| window.through <= through);
@@ -612,10 +653,19 @@ async fn prepare_at_limit(
     let selection_refs = selection_references(
         state,
         task,
-        if organizer_compaction { &view } else { &originals },
-        if organizer_compaction { &held_refs } else { &available },
+        if organizer_compaction {
+            &view
+        } else {
+            &originals
+        },
+        if organizer_compaction {
+            &held_refs
+        } else {
+            &available
+        },
         through,
-    ).await?;
+    )
+    .await?;
     let context_reference = if organizer_compaction {
         let mut snapshot_metadata = metadata.clone();
         snapshot_metadata["actor"] = json!(actor);
@@ -729,14 +779,14 @@ async fn prepare_at_limit(
                                     .context("context reference must be an existing event sequence")
                             })
                             .collect::<Result<BTreeSet<_>>>()?;
-                                let continuation_plan = args["continuation_plan"]
-                                    .as_str()
-                                    .filter(|plan| !plan.trim().is_empty())
-                                    .map(str::to_owned);
-                                let context_notes = args["context_notes"]
-                                    .as_array()
-                                    .cloned()
-                                    .unwrap_or_default();
+                        let continuation_plan = args["continuation_plan"]
+                            .as_str()
+                            .filter(|plan| !plan.trim().is_empty())
+                            .map(str::to_owned);
+                        let context_notes = args["context_notes"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
                         let resolved = selection_refs.resolve(&requested);
                         if resolved.is_none() {
                             json!({"error_code":"REFERENCE_NOT_HELD","requested_refs":requested,"held_refs":selection_refs.anchors.keys().collect::<Vec<_>>()})
@@ -758,7 +808,9 @@ async fn prepare_at_limit(
                                     usize::try_from(slice["end_char"].as_u64().context("message_slices.end_char must be a non-negative integer")?)?,
                                 ))
                             }).collect::<Result<Vec<_>>>();
-                            let slices = match slices_result.and_then(|slices| selection_refs.slices(slices)) {
+                            let slices = match slices_result
+                                .and_then(|slices| selection_refs.slices(slices))
+                            {
                                 Ok(slices) => slices,
                                 Err(error) => {
                                     selection_body["messages"].as_array_mut().unwrap().push(
@@ -789,7 +841,10 @@ async fn prepare_at_limit(
                                 let sources = note["source_event_seqs"]
                                     .as_array()
                                     .context("context note source_event_seqs must be an array")?;
-                                ensure!(!sources.is_empty(), "context notes must cite at least one source event");
+                                ensure!(
+                                    !sources.is_empty(),
+                                    "context notes must cite at least one source event"
+                                );
                                 for source in sources {
                                     source.as_i64().context("context note source references must be event sequence numbers")?;
                                 }
@@ -802,7 +857,14 @@ async fn prepare_at_limit(
                             if estimate(&candidate_body) > limit {
                                 json!({"error_code":"SELECTION_OVER_CAPACITY","estimated_input_tokens":estimate(&candidate_body),"input_budget":limit,"instruction":"Refine your own current-context selection and keep the continuation plan concise. The host only enforces capacity."})
                             } else {
-                                return Ok::<_, anyhow::Error>((candidate_body, chosen, slices, context_notes, continuation_plan, requested));
+                                return Ok::<_, anyhow::Error>((
+                                    candidate_body,
+                                    chosen,
+                                    slices,
+                                    context_notes,
+                                    continuation_plan,
+                                    requested,
+                                ));
                             }
                         }
                     }
@@ -991,19 +1053,57 @@ pub async fn prepare_worker(
 ) -> Result<Value> {
     let root = state.workspace.root().to_path_buf();
     let saved_task = task.to_owned();
-    let (calls,texts,through)=tokio::task::spawn_blocking(move ||->Result<_> {
-        let conn=crate::agent_service::open_db(&root)?;
-        let through=conn.query_row("SELECT COALESCE(MAX(seq),0) FROM agent_task_events WHERE task_id=?1",[&saved_task],|r|r.get::<_,i64>(0))?;
-        let mut stmt=conn.prepare("SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 AND kind IN ('tool/call','assistant/message') ORDER BY seq")?;
-        let rows=stmt.query_map([saved_task],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut calls=std::collections::HashMap::new();let mut texts=std::collections::HashMap::new();
-        for (seq,kind,data) in rows {
-            let data:Value=serde_json::from_str(&data)?;
-            if kind=="tool/call" {if let Some(id)=data["callId"].as_str(){calls.insert(id.to_owned(),seq);}}
-            else {let text=data["message"]["content"].as_str().map(str::to_owned).unwrap_or_else(||data["message"]["content"].as_array().into_iter().flatten().filter_map(|b|b["text"].as_str()).collect::<Vec<_>>().join("\n"));if !text.is_empty(){texts.insert(text,seq);}}
+    let (calls, texts, through) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = crate::agent_service::open_db(&root)?;
+        let through = crate::session_history::load_events(
+            &conn,
+            &saved_task,
+            &crate::session_history::EventQuery {
+                newest: Some(1),
+                ..Default::default()
+            },
+        )?
+        .pop()
+        .map(|event| event.seq)
+        .unwrap_or(0);
+        let rows = crate::session_history::load_events(
+            &conn,
+            &saved_task,
+            &crate::session_history::EventQuery {
+                kinds: &["tool/call", "assistant/message"],
+                ..Default::default()
+            },
+        )?;
+        let mut calls = std::collections::HashMap::new();
+        let mut texts = std::collections::HashMap::new();
+        for event in rows {
+            let data = event.data()?;
+            let (seq, kind) = (event.seq, event.kind);
+            if kind == "tool/call" {
+                if let Some(id) = data["callId"].as_str() {
+                    calls.insert(id.to_owned(), seq);
+                }
+            } else {
+                let text = data["message"]["content"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        data["message"]["content"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|b| b["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
+                if !text.is_empty() {
+                    texts.insert(text, seq);
+                }
+            }
         }
-        Ok((calls,texts,through))
-    }).await??;
+        Ok((calls, texts, through))
+    })
+    .await??;
     let messages = body["messages"]
         .as_array()
         .context("Worker messages are missing")?
@@ -1098,15 +1198,40 @@ mod tests {
     }
 
     fn tool_exchange(root: &std::path::Path, seq: i64, result: &str) {
-        insert(root, seq, "assistant/message", json!({"actor":"worker","message":{
+        insert(
+            root,
+            seq,
+            "assistant/message",
+            json!({"actor":"worker","message":{
             "role":"assistant","content":null,"tool_calls":[
                 {"id":"read","type":"function","function":{"name":"browser_read","arguments":"{}"}},
                 {"id":"diagnostics","type":"function","function":{"name":"browser_diagnostics","arguments":"{}"}}
-            ]}}));
-        insert(root, seq + 1, "tool/call", json!({"callId":"read","name":"browser_read","arguments":"{}"}));
-        insert(root, seq + 2, "tool/result", json!({"callId":"read","meta":{"result":result}}));
-        insert(root, seq + 3, "tool/call", json!({"callId":"diagnostics","name":"browser_diagnostics","arguments":"{}"}));
-        insert(root, seq + 4, "tool/result", json!({"callId":"diagnostics","meta":{"result":{"error":"original diagnostic failure"}}}));
+            ]}}),
+        );
+        insert(
+            root,
+            seq + 1,
+            "tool/call",
+            json!({"callId":"read","name":"browser_read","arguments":"{}"}),
+        );
+        insert(
+            root,
+            seq + 2,
+            "tool/result",
+            json!({"callId":"read","meta":{"result":result}}),
+        );
+        insert(
+            root,
+            seq + 3,
+            "tool/call",
+            json!({"callId":"diagnostics","name":"browser_diagnostics","arguments":"{}"}),
+        );
+        insert(
+            root,
+            seq + 4,
+            "tool/result",
+            json!({"callId":"diagnostics","meta":{"result":{"error":"original diagnostic failure"}}}),
+        );
     }
 
     #[tokio::test]
@@ -1116,32 +1241,72 @@ mod tests {
         tool_exchange(&root, 559, "loaded 8 pages");
         // The same call IDs may occur in a later invocation.
         tool_exchange(&root, 600, "later result");
-        let state = crate::agent_service::tests::flow_test_state(&root, "127.0.0.1:1".parse().unwrap());
+        let state =
+            crate::agent_service::tests::flow_test_state(&root, "127.0.0.1:1".parse().unwrap());
         let input = json!({"process":{"request_id":1}});
         let organizer = organizer_view(&root, &input).await;
-        let process = crate::session_history::task_process(&root, "task", 0).await.unwrap();
+        let process = crate::session_history::task_process(&root, "task", 0)
+            .await
+            .unwrap();
         let observer = crate::session_history::process_view(&process).unwrap();
         for view in [&organizer, &observer] {
-            let refs = selection_references(&state, "task", view, &references(view), 604).await.unwrap();
+            let refs = selection_references(&state, "task", view, &references(view), 604)
+                .await
+                .unwrap();
             for seq in 559..=563 {
-                assert_eq!(refs.resolve(&BTreeSet::from([seq])), Some(BTreeSet::from([559])));
+                assert_eq!(
+                    refs.resolve(&BTreeSet::from([seq])),
+                    Some(BTreeSet::from([559]))
+                );
             }
-            assert_eq!(refs.resolve(&BTreeSet::from([559,560,561,562,563])), Some(BTreeSet::from([559])));
-            assert_eq!(refs.resolve(&BTreeSet::from([602,561])), Some(BTreeSet::from([559,600])));
+            assert_eq!(
+                refs.resolve(&BTreeSet::from([559, 560, 561, 562, 563])),
+                Some(BTreeSet::from([559]))
+            );
+            assert_eq!(
+                refs.resolve(&BTreeSet::from([602, 561])),
+                Some(BTreeSet::from([559, 600]))
+            );
             assert!(refs.resolve(&BTreeSet::from([999])).is_none());
-            let selected = assemble_held_context(view, &refs.resolve(&BTreeSet::from([561])).unwrap(), &[]).unwrap();
-            let native = selected.iter().filter(|m| m["role"] == "assistant" || m["role"] == "tool").collect::<Vec<_>>();
+            let selected =
+                assemble_held_context(view, &refs.resolve(&BTreeSet::from([561])).unwrap(), &[])
+                    .unwrap();
+            let native = selected
+                .iter()
+                .filter(|m| m["role"] == "assistant" || m["role"] == "tool")
+                .collect::<Vec<_>>();
             assert_eq!(native.len(), 3);
-            assert_eq!(native.iter().map(|m| m["source"]["seq"].as_i64().unwrap()).collect::<Vec<_>>(), vec![559,561,563]);
+            assert_eq!(
+                native
+                    .iter()
+                    .map(|m| m["source"]["seq"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![559, 561, 563]
+            );
             assert_eq!(native[0]["tool_calls"].as_array().unwrap().len(), 2);
             assert_eq!(native[1]["content"], json!("loaded 8 pages").to_string());
-            assert_eq!(native[2]["content"], json!({"error":"original diagnostic failure"}).to_string());
-            let bounded = selection_references(&state, "task", view, &references(view), 563).await.unwrap();
+            assert_eq!(
+                native[2]["content"],
+                json!({"error":"original diagnostic failure"}).to_string()
+            );
+            let bounded = selection_references(&state, "task", view, &references(view), 563)
+                .await
+                .unwrap();
             assert!(bounded.resolve(&BTreeSet::from([602])).is_none());
-            assert_eq!(bounded.resolve(&BTreeSet::from([560])), Some(BTreeSet::from([559])));
-            let incomplete = selection_references(&state, "task", view, &references(view), 560).await.unwrap();
-            assert!(incomplete.resolve(&BTreeSet::from([559])).is_none(), "an earlier call cannot expose future results");
-            let not_held = selection_references(&state, "task", view, &BTreeSet::from([600]), 604).await.unwrap();
+            assert_eq!(
+                bounded.resolve(&BTreeSet::from([560])),
+                Some(BTreeSet::from([559]))
+            );
+            let incomplete = selection_references(&state, "task", view, &references(view), 560)
+                .await
+                .unwrap();
+            assert!(
+                incomplete.resolve(&BTreeSet::from([559])).is_none(),
+                "an earlier call cannot expose future results"
+            );
+            let not_held = selection_references(&state, "task", view, &BTreeSet::from([600]), 604)
+                .await
+                .unwrap();
             assert!(not_held.resolve(&BTreeSet::from([561])).is_none());
         }
         std::fs::remove_dir_all(root).unwrap();
@@ -1151,16 +1316,32 @@ mod tests {
     async fn raw_result_selection_checks_expanded_capacity_and_restores_excerpt_after_reload() {
         let root = root();
         task(&root);
-        let result = format!("{}已加载8页，仍需检查前两页。{}", "背景。".repeat(2000), "细节。".repeat(2000));
+        let result = format!(
+            "{}已加载8页，仍需检查前两页。{}",
+            "背景。".repeat(2000),
+            "细节。".repeat(2000)
+        );
         tool_exchange(&root, 559, &result);
         let wire_result = json!(result).to_string();
         let phrase = "已加载8页，仍需检查前两页。";
-        let start = wire_result[..wire_result.find(phrase).unwrap()].chars().count();
+        let start = wire_result[..wire_result.find(phrase).unwrap()]
+            .chars()
+            .count();
         let end = start + phrase.chars().count();
         let originals = || {
             let conn = crate::agent_service::open_db(&root).unwrap();
             let mut stmt = conn.prepare("SELECT seq,timestamp,kind,data FROM agent_task_events WHERE task_id='task' AND seq<=563 ORDER BY seq").unwrap();
-            stmt.query_map([], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
         };
         let before = originals();
         let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1195,26 +1376,73 @@ mod tests {
         let state = crate::agent_service::tests::flow_test_state(&root, address);
         let view = organizer_view(&root, &input).await;
         let mut request = body(&view);
-        let metadata = prepare_at_limit(&state,"fake","organizer","task","request:1",&input,&mut request,view,json!({}),&CancellationToken::new(),Duration::from_secs(5),3000).await.unwrap();
+        let metadata = prepare_at_limit(
+            &state,
+            "fake",
+            "organizer",
+            "task",
+            "request:1",
+            &input,
+            &mut request,
+            view,
+            json!({}),
+            &CancellationToken::new(),
+            Duration::from_secs(5),
+            3000,
+        )
+        .await
+        .unwrap();
         assert_eq!(metadata["requested_event_refs"], json!([561]));
         let plan_ref = metadata["continuation_plan_ref"].as_i64().unwrap();
-        assert_eq!(metadata["selected_event_refs"], json!([559,plan_ref]));
+        assert_eq!(metadata["selected_event_refs"], json!([559, plan_ref]));
         for _ in 0..2 {
             let state = crate::agent_service::tests::flow_test_state(&root, address);
             let view = organizer_view(&root, &input).await;
             request = body(&view);
-            let restored = prepare_at_limit(&state,"fake","organizer","task","request:1",&input,&mut request,view,json!({}),&CancellationToken::new(),Duration::from_secs(5),3000).await.unwrap();
+            let restored = prepare_at_limit(
+                &state,
+                "fake",
+                "organizer",
+                "task",
+                "request:1",
+                &input,
+                &mut request,
+                view,
+                json!({}),
+                &CancellationToken::new(),
+                Duration::from_secs(5),
+                3000,
+            )
+            .await
+            .unwrap();
             assert_eq!(restored["mode"], "rolling_window");
-            let native = request["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "assistant" || m["role"] == "tool").collect::<Vec<_>>();
+            let native = request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "assistant" || m["role"] == "tool")
+                .collect::<Vec<_>>();
             assert_eq!(native.len(), 3);
             assert_eq!(native[1]["source"]["seq"], 561);
             assert_eq!(native[1]["content"], phrase);
             assert_eq!(native[2]["source"]["seq"], 563);
-            assert_eq!(request["messages"].as_array().unwrap().iter().filter(|m| m["name"] == "organizer_continuation_plan").count(), 1);
+            assert_eq!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|m| m["name"] == "organizer_continuation_plan")
+                    .count(),
+                1
+            );
             assert!(estimate(&request) <= 3000);
         }
         assert_eq!(calls.lock().unwrap().len(), 4);
-        assert_eq!(before, originals(), "the raw calls and returns remain byte-for-byte unchanged");
+        assert_eq!(
+            before,
+            originals(),
+            "the raw calls and returns remain byte-for-byte unchanged"
+        );
         server.abort();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1343,7 +1571,10 @@ mod tests {
         let plan_ref = metadata["continuation_plan_ref"].as_i64().unwrap();
         assert!(plan_ref > 11);
         assert_eq!(metadata["selected_event_refs"], json!([3, 9, 11, plan_ref]));
-        let saved_plan = load(&state, "task", "organizer", "request:1").await.unwrap().unwrap();
+        let saved_plan = load(&state, "task", "organizer", "request:1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(saved_plan.continuation_plan_ref, Some(plan_ref));
         let selection = requests.lock().unwrap();
         assert_eq!(
@@ -1429,11 +1660,21 @@ mod tests {
         assert!(!request.to_string().contains("noise noise"));
         assert!(!request.to_string().contains("前置背景"));
         assert!(!request.to_string().contains("后续细节"));
-        let plans = request["messages"].as_array().unwrap().iter()
+        let plans = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
             .filter(|message| message["name"] == "organizer_continuation_plan")
             .collect::<Vec<_>>();
-        assert_eq!(plans.len(), 1, "the persisted plan is restored exactly once");
-        assert_eq!(plans[0]["content"], "Continue checking the current file; retrieve missing upload evidence from conversation history if needed.");
+        assert_eq!(
+            plans.len(),
+            1,
+            "the persisted plan is restored exactly once"
+        );
+        assert_eq!(
+            plans[0]["content"],
+            "Continue checking the current file; retrieve missing upload evidence from conversation history if needed."
+        );
         assert_eq!(
             requests.lock().unwrap().len(),
             2,
@@ -1603,7 +1844,14 @@ mod tests {
         let plan_ref = metadata["continuation_plan_ref"].as_i64().unwrap();
         assert!(plan_ref > 5);
         assert_eq!(metadata["selected_event_refs"], json!([1, 3, 5, plan_ref]));
-        assert_eq!(load(&state, "task", "organizer", "request:1").await.unwrap().unwrap().continuation_plan_ref, Some(plan_ref));
+        assert_eq!(
+            load(&state, "task", "organizer", "request:1")
+                .await
+                .unwrap()
+                .unwrap()
+                .continuation_plan_ref,
+            Some(plan_ref)
+        );
         let captured = pages.lock().unwrap();
         assert!(
             captured.len() >= 8,
@@ -2000,8 +2248,13 @@ mod tests {
         let native_call = |id: &str| json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}}]});
         let mut request = json!({"model":"fake","messages":[{"role":"system","content":"Worker"},{"role":"user","name":"organizer","content":"original command"},native_call("noise"),{"role":"tool","tool_call_id":"noise","content":"FILLER ".repeat(150000)},native_call("needed"),{"role":"tool","tool_call_id":"needed","content":"needed own original"}]});
         request["messages"][5] = crate::session_history::sourced_tool_result(
-            &root, "task", request["messages"][5].clone(), "needed",
-        ).await.unwrap();
+            &root,
+            "task",
+            request["messages"][5].clone(),
+            "needed",
+        )
+        .await
+        .unwrap();
         let metadata = prepare_worker(
             &state,
             "fake",

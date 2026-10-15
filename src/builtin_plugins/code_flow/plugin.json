@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "id": "code-flow",
+  "title": "代码 Flow",
+  "skill": "SKILL.md",
+  "tools": ["read_code_flow"],
+  "pages": [{"id": "architecture", "title": "代码 Flow", "entry": "code-flow.architecture", "renderer": "react"}]
+}

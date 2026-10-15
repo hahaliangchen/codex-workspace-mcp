@@ -1,3 +1,4 @@
+import {AttachmentRail,useAttachmentDraft,type AttachmentSubmission} from './Attachments.tsx'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
@@ -96,10 +97,18 @@ export function Composer({
   onSetGenerationOptions?: ((reasoningEffort: string, fastMode: boolean) => Promise<void>) | undefined
   onToggleSubagent?: (() => Promise<void>) | undefined
   onOpenSettings?: ((tab?: SettingsTab) => void) | undefined
-  onSubmit: (text: string, permissionMode: DshPermissionMode) => Promise<boolean>
+  onSubmit: (text: string, permissionMode: DshPermissionMode, attachment?: AttachmentSubmission) => Promise<boolean>
   onStop: (() => void) | undefined
 }) {
   const [draft, setDraft] = useState('')
+  const attachments=useAttachmentDraft()
+  const fileInput=useRef<HTMLInputElement>(null)
+  const uploadAbort=useRef<AbortController|null>(null)
+  const requestId=useRef(crypto.randomUUID())
+  const [uploadLabel,setUploadLabel]=useState('')
+  useEffect(()=>{requestId.current=crypto.randomUUID()},[draft,attachments.items])
+  useEffect(()=>()=>uploadAbort.current?.abort(),[])
+
   const [submitting, setSubmitting] = useState(false)
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false)
   const workspaceAnchorRef = useRef<HTMLButtonElement>(null)
@@ -142,7 +151,7 @@ export function Composer({
     if (variant === 'hero' && !disabled) inputRef.current?.focus()
   }, [variant, disabled])
 
-  const canSend = !disabled && !running && !submitting && draft.trim() !== ''
+  const canSend = !disabled && !running && !submitting && (draft.trim() !== '' || attachments.items.length>0)
   const token = useMemo(() => activeToken(draft, caret), [draft, caret])
   const tokenKey = token === null ? '' : `${token.kind}:${token.start}:${token.query}`
 
@@ -316,9 +325,10 @@ export function Composer({
     if (!canSend) return
     setSubmitting(true)
     try {
-      if (await onSubmit(draft.trim(), permissionMode)) setDraft('')
+      const controller=new AbortController();uploadAbort.current=controller
+      if (await onSubmit(draft.trim(), permissionMode,{files:attachments.items.map(x=>x.file),signal:controller.signal,requestId:requestId.current,onProgress:setUploadLabel})) {setDraft('');attachments.clear()}
     } finally {
-      setSubmitting(false)
+      setSubmitting(false);setUploadLabel('');uploadAbort.current=null
     }
   }
 
@@ -514,14 +524,19 @@ export function Composer({
         )}
 
         {/* Layer 2: White Floating Input Card */}
-        <div className={codexCss.card} data-composer-card>
+        <div className={codexCss.card} data-composer-card onDragOver={event=>{if(event.dataTransfer.types.includes('Files'))event.preventDefault()}} onDrop={event=>{event.preventDefault();if(!disabled&&!running&&!submitting)attachments.add(event.dataTransfer.files)}}>
+          <input ref={fileInput} type='file' multiple hidden aria-label='上传附件' onChange={event=>{if(event.target.files)attachments.add(event.target.files);event.target.value=''}}/>
+          <AttachmentRail items={attachments.items} onRemove={attachments.remove} disabled={submitting}/>
+          {attachments.error&&<div role='alert' style={{color:'#b42318',padding:'4px 12px'}}>{attachments.error}</div>}
+          {uploadLabel&&<div role='status' style={{padding:'4px 12px',fontSize:12}}>{uploadLabel}</div>}
           <div className={codexCss.inputWrap}>
             <textarea
               ref={inputRef}
               className={codexCss.textarea}
               rows={1}
               value={draft}
-              disabled={disabled}
+              disabled={disabled||submitting}
+              onPaste={event=>{const files=Array.from(event.clipboardData.files);if(files.length&&!running){attachments.add(files);if(!event.clipboardData.getData('text/plain'))event.preventDefault()}}}
               placeholder={placeholder}
               aria-label={placeholder}
               onChange={(event) => {
@@ -538,6 +553,8 @@ export function Composer({
 
           <div className={codexCss.toolbar}>
             <div className={codexCss.leftControls}>
+              <button type='button' title='添加附件（支持拖拽、粘贴图片）' aria-label='添加附件' disabled={disabled||running||submitting} onClick={()=>fileInput.current?.click()} className={codexCss.micBtn}>📎</button>
+
               {/* Bare Plus Button matching media_1791084397752.png */}
               <Tooltip label="添加上下文或文件 (@)" side="top" delayMs={500}>
                 <button
@@ -653,7 +670,7 @@ export function Composer({
               </button>
 
               {/* Blue Action Circle: Stop / Send / Audio Wave (media_1791084397752.png) */}
-              {running && onStop !== undefined ? (
+              {submitting ? <button type='button' aria-label='取消上传' className={codexCss.stopBtn} onClick={()=>uploadAbort.current?.abort()}>{STOP_ICON}</button> : running && onStop !== undefined ? (
                 <Tooltip label={t('input.stop')} side="top" delayMs={500}>
                   <button
                     type="button"
@@ -664,7 +681,7 @@ export function Composer({
                     {STOP_ICON}
                   </button>
                 </Tooltip>
-              ) : draft.trim() !== '' ? (
+              ) : (draft.trim() !== '' || attachments.items.length>0) ? (
                 <Tooltip label={t('input.send')} side="top" delayMs={500} disabled={!canSend}>
                   <button
                     type="button"

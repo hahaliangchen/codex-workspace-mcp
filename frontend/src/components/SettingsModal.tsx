@@ -20,6 +20,7 @@ import {
   api,
   REASONING_LEVELS,
   type ModelCapabilities,
+  type ModelUseSettings,
   type PluginsSnapshot,
   type ProviderApiType,
   type SettingsData,
@@ -48,6 +49,8 @@ interface DraftProvider {
 }
 
 interface DraftSettings {
+  visual_tool: ModelUseSettings
+  context_agent: ModelUseSettings
   visual_fallback_enabled: boolean
   visual_provider: string
   visual_model: string
@@ -82,6 +85,8 @@ function parseModels(lines: string): string[] {
 function toDraft(data: SettingsData): DraftSettings {
   return {
     revision: data.revision,
+    visual_tool: data.visual_tool ?? {},
+    context_agent: data.context_agent ?? {},
     providers: data.providers.map((p, index) => ({
       _draftId: `saved-${index}-${p.id}`,
       _new: false,
@@ -245,6 +250,8 @@ export function SettingsModal({
         ?.model_capabilities[draft.orchestrator_model]
       const saved = await api.saveSettings({
         revision: draft.revision,
+        visual_tool: draft.visual_tool,
+        context_agent: draft.context_agent,
         providers: providersPayload,
         orchestrator_provider: draft.orchestrator_provider || null,
         orchestrator_model: draft.orchestrator_model || null,
@@ -395,6 +402,7 @@ export function SettingsModal({
     { id: 'general', label: '通用', icon: <IconSettingsOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'models', label: '模型与提供商', icon: <IconDatabaseOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'observer', label: 'Observer', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
+    { id: 'tools', label: '视觉与压缩', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'subagent', label: '子代理', icon: <IconUsersOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'plugins', label: '插件状态', icon: <IconCordisPluginOutlineRegular className={rootCss.navIcon} size={18} /> },
   ]
@@ -840,6 +848,46 @@ export function SettingsModal({
                   </button>
                 </div>
               </div>
+            )}
+
+            {activeTab === 'tools' && draft !== null && (
+              <section className={modelsCss.section}>
+                <h2 className={modelsCss.title}>视觉与上下文压缩</h2>
+                <p className={modelsCss.intro}>每个留空的选项跟随主 Agent。设置不会改变主 Agent 的模型或窗口。</p>
+                {(['visual_tool', 'context_agent'] as const).map(kind => {
+                  const config = draft[kind]
+                  const provider = draft.providers.find(p => p.id === (config.provider || draft.orchestrator_provider))
+                  const update = (patch: Partial<ModelUseSettings>) => updateDraft({ [kind]: { ...config, ...patch } })
+                  return (
+                    <div key={kind} className={modelsCss.rowCard}>
+                      <h3>{kind === 'visual_tool' ? '视觉分析工具' : '上下文压缩子 Agent'}</h3>
+                      <p className={modelsCss.intro}>{kind === 'visual_tool' ? '分析已保存图片，结果通过普通工具返回。' : '只整理当前任务上下文，提交后继续由主 Agent 执行。'}</p>
+                      <div className={modelsCss.modelAdvanced}>
+                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>提供商</span>
+                          <select className={modelsCss.select} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null })}>
+                            <option value="">跟随主 Agent</option>
+                            {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => <option key={p._draftId} value={p.id}>{p.display_name || p.id}</option>)}
+                          </select>
+                        </label>
+                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>模型 ID</span>
+                          <input className={modelsCss.input} list={`${kind}-models`} placeholder="留空跟随主 Agent" value={config.model || ''} onChange={e => update({ model: e.target.value || null })} />
+                          <datalist id={`${kind}-models`}>{(provider ? parseModels(provider.models_text) : []).map(m => <option key={m} value={m} />)}</datalist>
+                        </label>
+                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>推理档位</span>
+                          <select className={modelsCss.select} value={config.reasoning_effort || ''} onChange={e => update({ reasoning_effort: e.target.value || null })}>
+                            <option value="">跟随主 Agent</option>
+                            {['none','low','medium','high','xhigh','max'].map(level => <option key={level} value={level}>{({ none:'无', low:'轻度', medium:'中档', high:'高', xhigh:'更高', max:'最高' } as Record<string,string>)[level]}</option>)}
+                          </select>
+                        </label>
+                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>最大上下文（tokens）</span>
+                          <input className={modelsCss.input} type="number" min={32768} max={1050000} step={1} placeholder="留空跟随主 Agent" value={config.context_window ?? ''} onChange={e => update({ context_window: e.target.value === '' ? null : Number(e.target.value) })} />
+                        </label>
+                      </div>
+                      <button type="button" className={modelsCss.secondaryButton} onClick={() => updateDraft({ [kind]: {} })}>全部跟随主 Agent</button>
+                    </div>
+                  )
+                })}
+              </section>
             )}
 
             {activeTab === 'subagent' && draft !== null && (

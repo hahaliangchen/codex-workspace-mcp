@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ConversationPage, HeroPage, type Tab } from './components/AgentPage.tsx'
+import { ConversationPage, HeroPage, SkillPackagesPage, type Tab } from './components/AgentPage.tsx'
 import { CodexDock } from './components/CodexDock.tsx'
 import { CodexRightPanel } from './components/CodexRightPanel.tsx'
 import { SettingsModal } from './components/SettingsModal.tsx'
@@ -70,7 +70,7 @@ export function App({ renderSlot }: AgentSlotProps) {
     width: sidebarWidth,
     onToggleCollapse: handleToggleCollapse,
     onNew: handleNewChat,
-    onSelect: workspace.openTask,
+    onSelect: id => { setTab('chat'); workspace.openTask(id) },
     onToggleTheme: () => {
       toggleTheme()
       setDark(document.body.hasAttribute('data-ds-dark-theme'))
@@ -84,7 +84,8 @@ export function App({ renderSlot }: AgentSlotProps) {
     <div className={css.appFrame} data-ds-dark-theme={dark ? '' : undefined}>
       {/* 1. Activity Dock (48px fixed on left) */}
       <CodexDock
-        activeTab="home"
+        activeTab={tab === 'skill-pages' ? 'skills' : 'home'}
+        onSelectTab={selected => { if (selected === 'skills') setTab('skill-pages'); else if (selected === 'home' && tab === 'skill-pages') handleNewChat() }}
         dark={dark}
         onNewChat={handleNewChat}
         onOpenSettings={workspace.openSettings}
@@ -125,7 +126,7 @@ export function App({ renderSlot }: AgentSlotProps) {
 
       {/* 3. Center Main Column (Header + Conversation + Floating Composer) */}
       <div className={css.centerCol}>
-        {workspace.heroPhase ? (
+        {tab === 'skill-pages' ? <SkillPackagesPage workspace={workspace} onBack={() => setTab('chat')} /> : workspace.heroPhase ? (
           <HeroPage key={newChatVersion} workspace={workspace} renderSlot={renderSlot} />
         ) : (
           <ConversationPage
@@ -140,7 +141,7 @@ export function App({ renderSlot }: AgentSlotProps) {
       </div>
 
       {/* Drag handle for Right Panel */}
-      {rightPanelOpen && !workspace.heroPhase && (
+      {rightPanelOpen && !workspace.heroPhase && tab !== 'skill-pages' && (
         <div
           className={css.dragHandle}
           title="拖动调整面板宽度"
@@ -163,7 +164,7 @@ export function App({ renderSlot }: AgentSlotProps) {
       )}
 
       {/* 4. Right Inspector Panel (Changes, Sources) */}
-      {rightPanelOpen && !workspace.heroPhase && (
+      {rightPanelOpen && !workspace.heroPhase && tab !== 'skill-pages' && (
         <CodexRightPanel
           width={rightPanelWidth}
           taskId={workspace.taskId}

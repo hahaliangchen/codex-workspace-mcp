@@ -3,3 +3,7 @@
 /frontend/dist
 /ai_proxy_config.json
 /.codex-workspace-mcp/
+
+/logs/
+
+/.vite/

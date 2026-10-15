@@ -9,6 +9,7 @@ export default defineConfig({
   base: '/agent/',
   plugins: [react()],
   resolve: {
+    dedupe: ['react', 'react-dom', '@xyflow/react'],
     alias: {
       '@deepseek-ai/cordis': dsh('cordis/index.ts'),
       '@deepseek-ai/dsh-client-ui-primitives': dsh('ui-primitives/index.ts'),
@@ -19,11 +20,14 @@ export default defineConfig({
   },
   server: {
     proxy: {
+      '/api/session/uploadFileBinary': backend,
       '/agent/tasks': backend,
       '/agent/sessions': backend,
       '/agent/info': backend,
       '/agent/settings': backend,
       '/agent/plugins': backend,
+      '/agent/skill-packages': backend,
+      '/agent/skill-page-sdk.js': backend,
       '/agent/workspace/files': backend,
       '/agent/commands': backend,
     },

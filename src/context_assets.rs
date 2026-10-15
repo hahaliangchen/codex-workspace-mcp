@@ -26,13 +26,17 @@ fn connection(root: &Path) -> Result<Connection> {
 pub fn is_material_tool(name: &str) -> bool {
     matches!(
         name,
-        "read_file"
+        "read_attachment"
+            | "read_file"
             | "read_file_lines"
             | "search_text"
             | "search_code_map"
+            | "read_code_flow"
+            | "read_skill"
             | "browser_read"
             | "browser_screenshot"
             | "view_image"
+            | "analyze_images"
             | "browser_diagnostics"
             | "run_program"
             | "run_project_script"
@@ -418,18 +422,40 @@ pub fn hydrate(root: &Path, task: &str, messages: &mut [Value]) -> Result<()> {
         ) else {
             continue;
         };
-        let row:Option<String>=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND seq=?2 AND kind IN ('tool/result','context/tool_result')",params![task,seq],|r|r.get(0)).optional()?;
-        let Some(raw) = row else { continue };
-        let event: Value = serde_json::from_str(&raw)?;
+        let Some(record) = crate::session_history::load_events(
+            &conn,
+            task,
+            &crate::session_history::EventQuery {
+                exact: Some(seq),
+                kinds: &["tool/result", "context/tool_result"],
+                ..Default::default()
+            },
+        )?
+        .pop() else {
+            continue;
+        };
+        let event = record.data()?;
         if event["message"]["isError"] == true {
             continue;
         }
         let Some(result) = event.pointer("/meta/result") else {
             continue;
         };
-        let call:Option<String>=conn.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND seq<?2 AND kind IN ('tool/call','context/tool_call') AND json_extract(data,'$.callId')=?3 ORDER BY seq DESC LIMIT 1",params![task,seq,call_id],|r|r.get(0)).optional()?;
-        let Some(call) = call else { continue };
-        let call: Value = serde_json::from_str(&call)?;
+        let Some(call) = crate::session_history::load_events(
+            &conn,
+            task,
+            &crate::session_history::EventQuery {
+                through: Some(seq - 1),
+                kinds: &["tool/call", "context/tool_call"],
+                call_id: Some(call_id),
+                newest: Some(1),
+                ..Default::default()
+            },
+        )?
+        .pop() else {
+            continue;
+        };
+        let call = call.data()?;
         let name = call["name"].as_str().unwrap_or("");
         let args = match &call["arguments"] {
             Value::String(text) => serde_json::from_str::<Value>(text)?,

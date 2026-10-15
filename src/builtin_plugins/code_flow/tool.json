@@ -1,0 +1,18 @@
+{
+  "name": "read_code_flow",
+  "description": "Read an explicitly authored feature hierarchy from code-flow.json. Omit feature_id for the catalog; select one feature for its current Rust call graph, shared nodes, source evidence, boundary/unresolved calls and declared test entries. Select node_id to read that node's exact source. Membership and responsibilities are declarations; call edges are syntax evidence, not compiler-proven or runtime coverage. This tool does not run tests or edit source. Update the manifest with normal file tools after analyzing source.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "workspace_root": {
+        "type": "string"
+      },
+      "feature_id": {
+        "type": "string"
+      },
+      "node_id": {
+        "type": "string"
+      }
+    }
+  }
+}

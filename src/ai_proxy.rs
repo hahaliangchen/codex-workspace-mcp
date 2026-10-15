@@ -22,7 +22,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 use crate::format_translate;
-use crate::{plugin_builtin, plugin_runtime};
+use crate::{builtin_plugins, plugin_runtime};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -109,6 +109,10 @@ pub(crate) struct AiProxyConfig {
     #[serde(default)]
     visual_fallback_enabled: bool,
     #[serde(default)]
+    visual_tool: crate::model_settings::ModelSettings,
+    #[serde(default)]
+    context_agent: crate::model_settings::ModelSettings,
+    #[serde(default)]
     visual_provider: Option<String>,
     #[serde(default)]
     visual_model: Option<String>,
@@ -145,6 +149,8 @@ pub(crate) fn apply_agent_config(
     state: &mut crate::agent_service::AgentServiceState,
     config: &AiProxyConfig,
 ) {
+    state.visual_tool_settings = config.visual_tool.clone();
+    state.context_agent_settings = config.context_agent.clone();
     let main_name = config
         .orchestrator_provider
         .as_deref()
@@ -537,6 +543,16 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         .unwrap_or(false);
     config.visual_provider = generation["visual_provider"].as_str().map(str::to_owned);
     config.visual_model = generation["visual_model"].as_str().map(str::to_owned);
+    config.visual_tool =
+        serde_json::from_value(generation.get("visual_tool").cloned().unwrap_or(json!({})))?;
+    config.context_agent = serde_json::from_value(
+        generation
+            .get("context_agent")
+            .cloned()
+            .unwrap_or(json!({})),
+    )?;
+    config.visual_tool.normalize()?;
+    config.context_agent.normalize()?;
     config.model_capabilities = generation
         .get("model_capabilities")
         .cloned()
@@ -658,6 +674,7 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         "observer_provider": config.observer_provider,
         "observer_model": config.observer_model,
         "visual_fallback_enabled":config.visual_fallback_enabled,"visual_provider":config.visual_provider,"visual_model":config.visual_model,
+        "visual_tool":config.visual_tool,"context_agent":config.context_agent,
     })
 }
 
@@ -754,6 +771,10 @@ struct SettingsEdit {
     observer_model: Option<String>,
     #[serde(default)]
     visual_fallback_enabled: Option<bool>,
+    #[serde(default)]
+    visual_tool: Option<crate::model_settings::ModelSettings>,
+    #[serde(default)]
+    context_agent: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     visual_provider: Option<String>,
     #[serde(default)]
@@ -1076,6 +1097,24 @@ fn save_settings(
         config.visual_provider = nonempty(request.visual_provider);
         config.visual_model = nonempty(request.visual_model);
     }
+    for (edit, target) in [
+        (request.visual_tool, &mut config.visual_tool),
+        (request.context_agent, &mut config.context_agent),
+    ] {
+        if let Some(mut edit) = edit {
+            edit.normalize()?;
+            *target = edit;
+        }
+        if let Some(provider) = &target.provider {
+            anyhow::ensure!(
+                config
+                    .providers
+                    .get(provider)
+                    .is_some_and(|p| p.api_type == "openai-completions"),
+                "configured tool/compression provider is unavailable or incompatible"
+            );
+        }
+    }
     config.default_provider = config.orchestrator_provider.clone();
     if let Some(effort) = request.reasoning_effort {
         let effort = effort.trim();
@@ -1343,6 +1382,7 @@ fn save_settings(
         "fast_mode": config.fast_mode,
         "model_capabilities": config.model_capabilities,
         "visual_fallback_enabled":config.visual_fallback_enabled,"visual_provider":config.visual_provider,"visual_model":config.visual_model,
+        "visual_tool":config.visual_tool,"context_agent":config.context_agent,
     });
     if disk_revision(config_path)? != request.revision {
         return Ok(Err(
@@ -1534,10 +1574,229 @@ struct AiProxyState {
 async fn plugin_tree(State(state): State<AiProxyState>) -> Json<Value> {
     let events = state
         .runtime
-        .service::<plugin_builtin::LifecycleLog>(plugin_runtime::ROOT, "plugin-events")
+        .service::<builtin_plugins::LifecycleLog>(plugin_runtime::ROOT, "plugin-events")
         .map(|log| log.snapshot())
         .unwrap_or_default();
     Json(json!({"plugins":state.runtime.snapshot(),"events":events}))
+}
+
+async fn skill_packages(State(state): State<AiProxyState>) -> Json<Value> {
+    let registry = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    Json(json!({"packages":registry.packages.catalog()}))
+}
+#[derive(Deserialize)]
+struct PackageEnable {
+    enabled: bool,
+}
+async fn enable_skill_package(
+    State(state): State<AiProxyState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<PackageEnable>,
+) -> Response {
+    let registry = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    if input.enabled && registry.packages.is_remote(&id) {
+        if let Err(error) =
+            crate::skill_packages::remote::reconnect(&state.runtime, &registry.packages, &id).await
+        {
+            return package_response(Err(error));
+        }
+    }
+    let result = crate::skill_packages::set_enabled(
+        &state.runtime,
+        &registry.packages,
+        &id,
+        input.enabled,
+        true,
+    );
+    match result {
+        Ok(packages) => Json(json!({"packages":packages})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+    }
+}
+#[derive(Deserialize)]
+struct PackageInstall {
+    path: std::path::PathBuf,
+}
+async fn install_skill_package(
+    State(state): State<AiProxyState>,
+    Json(input): Json<PackageInstall>,
+) -> Response {
+    let catalog = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    package_response(crate::skill_packages::install(
+        &state.runtime,
+        &catalog.packages,
+        &input.path,
+    ))
+}
+async fn connect_remote_package(
+    State(state): State<AiProxyState>,
+    Json(input): Json<crate::skill_packages::remote::Config>,
+) -> Response {
+    let catalog = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    package_response(
+        crate::skill_packages::remote::install(&state.runtime, &catalog.packages, input, true)
+            .await,
+    )
+}
+async fn ppt_page_request(
+    State(state): State<AiProxyState>,
+    axum::extract::Path(method): axum::extract::Path<String>,
+    headers: HeaderMap,
+    Json(args): Json<Value>,
+) -> Response {
+    let scope = state
+        .runtime
+        .snapshot()
+        .into_iter()
+        .find(|p| p.id == "agent-tasks")
+        .map(|p| p.scope)
+        .unwrap_or(plugin_runtime::ROOT);
+    let agent = match state
+        .runtime
+        .service::<crate::agent_service::AgentServiceState>(scope, "agent-tasks")
+    {
+        Ok(agent) => agent,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"Agent service unavailable"})),
+            )
+                .into_response();
+        }
+    };
+    crate::ppt_sessions::request(&state.runtime, (*agent).clone(), &method, headers, args).await
+}
+async fn reload_skill_package(
+    State(state): State<AiProxyState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let catalog = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    if catalog.packages.is_remote(&id) {
+        return package_response(
+            crate::skill_packages::remote::reconnect(&state.runtime, &catalog.packages, &id).await,
+        );
+    }
+    package_response(crate::skill_packages::reload(
+        &state.runtime,
+        &catalog.packages,
+        &id,
+    ))
+}
+async fn remove_skill_package(
+    State(state): State<AiProxyState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let catalog = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    package_response(crate::skill_packages::remove(
+        &state.runtime,
+        &catalog.packages,
+        &id,
+    ))
+}
+fn package_response(result: anyhow::Result<Value>) -> Response {
+    match result {
+        Ok(packages) => Json(json!({"packages":packages})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+    }
+}
+async fn skill_page_asset(
+    State(state): State<AiProxyState>,
+    axum::extract::Path((id, page, resource)): axum::extract::Path<(String, String, String)>,
+) -> Response {
+    let registry = state
+        .runtime
+        .service::<builtin_plugins::ToolCatalog>(plugin_runtime::ROOT, "tools")
+        .unwrap();
+    if let Ok(Some((connection, entry))) = registry.packages.remote_page(&id, &page) {
+        if resource != "index" {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        return match connection.asset(&entry, &[]).await {
+            Ok((mime, bytes)) => {
+                let mut response = (
+                    [
+                        (axum::http::header::CONTENT_TYPE, mime),
+                        (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
+                        (
+                            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                            "nosniff".to_owned(),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response();
+                if entry == "page" {
+                    response.headers_mut().insert(axum::http::header::CONTENT_SECURITY_POLICY, axum::http::HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'"));
+                }
+                response
+            }
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"remote page unavailable; check plugin connection"})),
+            )
+                .into_response(),
+        };
+    }
+    let result = registry.packages.page(
+        &id,
+        &page,
+        if resource == "index" {
+            None
+        } else {
+            Some(&resource)
+        },
+    );
+    match result {
+        Ok(path) => match tokio::fs::read(&path).await {
+            Ok(bytes) => {
+                let content_type = match path.extension().and_then(|extension| extension.to_str()) {
+                    Some("html") => "text/html; charset=utf-8",
+                    Some("js" | "mjs") => "text/javascript",
+                    Some("css") => "text/css",
+                    Some("png") => "image/png",
+                    Some("svg") => "image/svg+xml",
+                    _ => "application/octet-stream",
+                };
+                ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+            }
+            Err(error) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":error.to_string()})),
+            )
+                .into_response(),
+        },
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 async fn current_config(state: &AiProxyState) -> AiProxyConfig {
@@ -1961,25 +2220,35 @@ pub async fn run(
     info!("config: {} total model mappings", total_maps);
 
     let runtime = Arc::new(plugin_runtime::PluginRuntime::new());
-    runtime.mount(plugin_runtime::ROOT, plugin_builtin::DiagnosticsPlugin)?;
+    runtime.mount(plugin_runtime::ROOT, builtin_plugins::DiagnosticsPlugin)?;
     runtime.mount(
         plugin_runtime::ROOT,
-        plugin_builtin::WorkspacePlugin(workspace.clone()),
+        builtin_plugins::WorkspacePlugin(workspace.clone()),
     )?;
     runtime.mount(
         plugin_runtime::ROOT,
-        plugin_builtin::ModelSettingsPlugin(Arc::new(plugin_builtin::ModelSettings {
+        builtin_plugins::ModelSettingsPlugin(Arc::new(builtin_plugins::ModelSettings {
             path: config_path.to_path_buf(),
             config: config.clone(),
         })),
     )?;
     let tools_scope = runtime.mount(
         plugin_runtime::ROOT,
-        plugin_builtin::ToolCatalogPlugin(client.clone()),
+        builtin_plugins::ToolCatalogPlugin(client.clone()),
     )?;
     let agent_state = (*runtime
         .service::<crate::agent_service::AgentServiceState>(tools_scope, "agent-tasks")?)
     .clone();
+    crate::skill_packages::bind_root(agent_state.tool_catalog.as_ref().unwrap());
+    let remote_runtime = runtime.clone();
+    let remote_registry = agent_state.tool_catalog.as_ref().unwrap().packages.clone();
+    tokio::spawn(async move {
+        if let Err(_) =
+            crate::skill_packages::remote::restore(&remote_runtime, &remote_registry).await
+        {
+            tracing::warn!("remote plugin configuration could not be restored");
+        }
+    });
     let agent_routes = Router::new()
         .route("/agent", get(crate::agent_web::page))
         .route("/agent/", get(crate::agent_web::page))
@@ -2012,6 +2281,19 @@ pub async fn run(
             get(crate::agent_service::workspace_files),
         )
         .route("/agent/commands", get(crate::agent_service::slash_commands))
+        .route(
+            "/agent/skill-packages/{id}/tools/{name}",
+            post(crate::skill_packages::call_tool),
+        )
+        .route(
+            "/agent/skill-packages/{id}/session",
+            post(crate::plugin_sessions::request)
+                .layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)),
+        )
+        .route(
+            "/agent/skill-packages/{id}/service",
+            post(crate::skill_packages::remote::service),
+        )
         .route(
             "/agent/tasks",
             get(crate::agent_service::list_tasks).post(crate::agent_service::create_task),
@@ -2076,11 +2358,20 @@ pub async fn run(
         )
         .route(
             "/agent/tasks/{task_id}/messages",
-            post(crate::agent_service::continue_task),
+            post(crate::agent_service::continue_task)
+                .layer(axum::extract::DefaultBodyLimit::max(280 * 1024 * 1024)),
         )
         .route(
             "/agent/tasks/{task_id}/stream",
             get(crate::agent_service::stream_events),
+        )
+        .route(
+            "/api/session/uploadFileBinary",
+            post(crate::attachments::upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/agent/tasks/{task_id}/attachments/{receipt}",
+            get(crate::attachments::download),
         )
         .with_state(agent_state);
 
@@ -2109,6 +2400,43 @@ pub async fn run(
         .route("/agent/settings/discover", post(discover_agent_models))
         .route("/agent/settings/probe-image", post(probe_agent_image_input))
         .route("/agent/plugins", get(plugin_tree))
+        .route(
+            "/agent/skill-page-sdk.js",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/javascript; charset=utf-8",
+                    )],
+                    include_str!("../web/skill-page-sdk.js"),
+                )
+            }),
+        )
+        .route(
+            "/agent/skill-packages",
+            get(skill_packages).post(install_skill_package),
+        )
+        .route("/agent/skill-packages/remote", post(connect_remote_package))
+        .route(
+            "/agent/ppt/{method}",
+            post(ppt_page_request).layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)),
+        )
+        .route(
+            "/agent/skill-packages/{id}",
+            axum::routing::delete(remove_skill_package),
+        )
+        .route(
+            "/agent/skill-packages/{id}/reload",
+            post(reload_skill_package),
+        )
+        .route(
+            "/agent/skill-packages/{id}/enabled",
+            post(enable_skill_package),
+        )
+        .route(
+            "/agent/skill-packages/{id}/pages/{page}/{*resource}",
+            get(skill_page_asset),
+        )
         .merge(agent_routes)
         .with_state(state)
         .layer(CorsLayer::permissive());
@@ -2168,6 +2496,8 @@ mod tests {
             observer_provider: None,
             observer_model: None,
             visual_fallback_enabled: false,
+            visual_tool: Default::default(),
+            context_agent: Default::default(),
             visual_provider: None,
             visual_model: None,
             providers: [(
@@ -2204,6 +2534,8 @@ mod tests {
             observer_provider: None,
             observer_model: None,
             visual_fallback_enabled: false,
+            visual_tool: Default::default(),
+            context_agent: Default::default(),
             visual_provider: None,
             visual_model: None,
             providers: [
@@ -2289,6 +2621,49 @@ mod tests {
                 .contains("verify image input"),
             "UI payloads cannot manufacture support evidence"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn tool_and_compression_settings_roundtrip_preserve_omitted_and_clear_explicitly() {
+        let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
+        let path = root.join("profiles/web/cordis.patch.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_yaml_atomic(&path,&json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m"}]}}}},{"id":"agent-default-model","config":{"provider":"test","model":"m"}}])).unwrap();
+        write_yaml_atomic(
+            &credentials_path(&path),
+            &json!({"version":1,"refs":{},"records":{}}),
+        )
+        .unwrap();
+        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000}});
+        save_settings(&path, serde_json::from_value(payload.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.context_agent.context_window, Some(500000));
+        assert_eq!(
+            loaded.visual_tool.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        payload["revision"] = json!(disk_revision(&path).unwrap());
+        payload.as_object_mut().unwrap().remove("visual_tool");
+        payload.as_object_mut().unwrap().remove("context_agent");
+        save_settings(&path, serde_json::from_value(payload.clone()).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            load_config(&path).unwrap().context_agent,
+            loaded.context_agent
+        );
+        payload["revision"] = json!(disk_revision(&path).unwrap());
+        payload["visual_tool"] = json!({});
+        payload["context_agent"] = json!({});
+        save_settings(&path, serde_json::from_value(payload).unwrap())
+            .unwrap()
+            .unwrap();
+        let cleared = load_config(&path).unwrap();
+        assert_eq!(cleared.context_agent, Default::default());
+        assert_eq!(cleared.visual_tool, Default::default());
+        assert_eq!(cleared.orchestrator_model.as_deref(), Some("m"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

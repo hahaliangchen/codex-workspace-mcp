@@ -7,7 +7,7 @@ export function CordisProvider({ context, children }: { context: Context; childr
   return <BrowserCordis.Provider value={context}>{children}</BrowserCordis.Provider>
 }
 
-function useCordis(): Context {
+export function useCordis(): Context {
   const ctx = useContext(BrowserCordis)
   if (ctx === null) throw new Error('browser Cordis has not booted')
   return ctx

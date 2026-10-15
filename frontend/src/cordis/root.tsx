@@ -6,7 +6,7 @@ import { CordisProvider } from './react.tsx'
 /** Declare the page's child slots in the original DSH renderer's root tree. */
 export const RootPlugin = {
   name: 'agent-root',
-  inject: ['slots', 'agentApi'],
+  inject: ['slots', 'agentApi', 'pluginPages'],
   apply(ctx: Context): void {
     ctx.slots.register({
       name: 'root',

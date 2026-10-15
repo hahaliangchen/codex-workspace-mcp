@@ -55,6 +55,16 @@
                 </div>
               </details>
             </div>
+            <div class="settings-card"><h2>视觉分析工具</h2><p class="card-help">分析已保存的图片，通过普通工具返回结果。 各项留空时跟随主 Agent。</p><div class="field-grid">
+<label>提供商<select id="visual-tool-provider"></select></label>
+<label>模型 ID<input id="visual-tool-model" list="visual-tool-models" placeholder="留空跟随主 Agent"><datalist id="visual-tool-models"></datalist></label>
+<label>推理档位<select id="visual-tool-effort"><option value="">跟随主 Agent</option><option value="none">无</option><option value="low">轻度</option><option value="medium">中档</option><option value="high">高</option><option value="xhigh">更高</option><option value="max">最高</option></select></label>
+<label>最大上下文（tokens）<input id="visual-tool-window" type="number" min="32768" max="1050000" placeholder="留空跟随主 Agent"></label></div></div>
+            <div class="settings-card"><h2>上下文压缩子 Agent</h2><p class="card-help">只整理当前上下文，提交后由主 Agent 继续执行。 各项留空时跟随主 Agent。</p><div class="field-grid">
+<label>提供商<select id="context-agent-provider"></select></label>
+<label>模型 ID<input id="context-agent-model" list="context-agent-models" placeholder="留空跟随主 Agent"><datalist id="context-agent-models"></datalist></label>
+<label>推理档位<select id="context-agent-effort"><option value="">跟随主 Agent</option><option value="none">无</option><option value="low">轻度</option><option value="medium">中档</option><option value="high">高</option><option value="xhigh">更高</option><option value="max">最高</option></select></label>
+<label>最大上下文（tokens）<input id="context-agent-window" type="number" min="32768" max="1050000" placeholder="留空跟随主 Agent"></label></div></div>
           </section>
           <section id="plugins-panel" hidden>
             <p class="intro">Rust 与浏览器运行时都按作用域挂载内置插件。浏览器视图通过插槽组合，任务和设置通过 Rust API 交互。</p>

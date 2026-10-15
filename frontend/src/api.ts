@@ -1,3 +1,11 @@
+import type {AttachmentRef} from './components/Attachments.tsx'
+export interface SkillPackage {
+  remote?: boolean
+  origin: 'builtin' | 'external'; inject: string[]
+  id: string; name: string; title: string; description: string; enabled: boolean; scope: number | null; tools: string[]
+  pages: { id: string; title: string; entry: string; renderer: string }[]
+}
+
 export type PermissionMode = 'read_only' | 'workspace_write' | 'full_access'
 
 export interface ResumeTarget {
@@ -161,7 +169,16 @@ export interface ProviderConfig {
   readonly api_key_env?: string | null
 }
 
+export interface ModelUseSettings {
+  readonly provider?: string | null
+  readonly model?: string | null
+  readonly reasoning_effort?: string | null
+  readonly context_window?: number | null
+}
+
 export interface SettingsData {
+  readonly visual_tool?: ModelUseSettings
+  readonly context_agent?: ModelUseSettings
   readonly visual_fallback_enabled?: boolean
   readonly visual_provider?: string | null
   readonly visual_model?: string | null
@@ -191,6 +208,8 @@ export interface SaveProviderInput {
 }
 
 export interface SaveSettingsInput {
+  readonly visual_tool?: ModelUseSettings
+  readonly context_agent?: ModelUseSettings
   readonly visual_fallback_enabled?: boolean
   readonly visual_provider?: string | null
   readonly visual_model?: string | null
@@ -285,6 +304,23 @@ function patch<T>(path: string, body?: unknown): Promise<T> {
 const task = (id: string): string => `/agent/tasks/${encodeURIComponent(id)}`
 
 export const api = {
+  upload: (id:string,file:File,signal:AbortSignal,onProgress:(percent:number)=>void) => new Promise<{receiptId:string;file:AttachmentRef}>((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();xhr.open('POST',`/api/session/uploadFileBinary?sessionId=${encodeURIComponent(id)}&name=${encodeURIComponent(file.name)}`);xhr.setRequestHeader('Content-Type','application/octet-stream');
+    const abort=()=>xhr.abort();signal.addEventListener('abort',abort,{once:true});
+    xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(Math.round(e.loaded/e.total*100))};
+    xhr.onload=()=>{signal.removeEventListener('abort',abort);try{const r=JSON.parse(xhr.responseText);if(xhr.status>=400||!r.ok)throw Error(r.error?.message||'上传失败');resolve(r.value)}catch(e){reject(e)}};
+    xhr.onerror=()=>{signal.removeEventListener('abort',abort);reject(Error('附件上传失败'))};xhr.onabort=()=>{signal.removeEventListener('abort',abort);reject(Error('上传已取消'))};
+    if(signal.aborted){signal.removeEventListener('abort',abort);reject(Error('上传已取消'));return}xhr.send(file)
+  }),
+  skillPackages: () => request<{ packages: SkillPackage[] }>('/agent/skill-packages'),
+  installPackage: (path: string) => post<{ packages: SkillPackage[] }>('/agent/skill-packages', { path }),
+  connectRemotePackage: (url: string, token: string) => post<{ packages: SkillPackage[] }>('/agent/skill-packages/remote', { url, token }),
+  pluginSession: <T>(id: string, payload: unknown) => post<T>(`/agent/skill-packages/${encodeURIComponent(id)}/session`, payload),
+  pluginService: <T>(id: string, payload: unknown) => post<T>(`/agent/skill-packages/${encodeURIComponent(id)}/service`, payload),
+  reloadPackage: (id: string) => post<{ packages: SkillPackage[] }>(`/agent/skill-packages/${encodeURIComponent(id)}/reload`, {}),
+  removePackage: (id: string) => request<{ packages: SkillPackage[] }>(`/agent/skill-packages/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  setPackageEnabled: (id: string, enabled: boolean) => post<{ packages: SkillPackage[] }>(`/agent/skill-packages/${encodeURIComponent(id)}/enabled`, { enabled }),
+  skillTool: <T>(id: string, name: string, payload: unknown) => post<T>(`/agent/skill-packages/${encodeURIComponent(id)}/tools/${encodeURIComponent(name)}`, payload),
   info: () => request<AgentInfo>('/agent/info'),
   listTasks: async (limit = 50) => (await request<{ tasks: Task[] }>(`/agent/tasks?limit=${limit}`)).tasks,
   getTask: (id: string) => request<Task>(task(id)),
@@ -302,7 +338,7 @@ export const api = {
   changeDiff: (id: string, turn: number, index: number, path?: string) => request<FileDiff>(`${task(id)}/changes/${turn}/files/${index}${path === undefined ? '' : `?path=${encodeURIComponent(path)}`}`, { cache: 'no-store' }),
   undoChanges: (id: string, turn: number) => post<ChangesSummary>(`${task(id)}/changes/${turn}/undo`, {}),
   createSession: async () => (await post<{ task_id: string }>('/agent/sessions')).task_id,
-  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; resume_target?: ResumeTarget | undefined }) =>
+  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; resume_target?: ResumeTarget | undefined; content?: readonly unknown[]; requestId?: string }) =>
     post<{ task_id: string }>(`${task(id)}/messages`, { prompt, ...options }),
   cancel: (id: string) => request<unknown>(task(id), { method: 'DELETE' }),
   interruptNode: (id: string, nodeId: string) =>

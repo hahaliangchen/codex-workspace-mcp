@@ -1,0 +1,448 @@
+{
+  "version": 1,
+  "features": [
+    {
+      "id": "agent",
+      "title": "单 Agent 执行",
+      "summary": "按功能展开当前执行链路。分组与职责由人或 AI 声明，连线由当前源码提取。",
+      "nodes": []
+    },
+    {
+      "id": "history",
+      "parent": "agent",
+      "title": "历史会话读取",
+      "summary": "主 Agent、压缩、恢复与历史界面共享历史数据访问层。原始事件完整保存，返回按编号升序；读取窗口快照与历史事件是不同职责。",
+      "nodes": [
+        {
+          "id": "tool-route",
+          "label": "主 Agent / 压缩历史查询",
+          "file": "src/single_agent.rs",
+          "name": "business_tool",
+          "module": "",
+          "role": "entry",
+          "responsibility": "约束压缩可读的会话及冻结边界，然后调用历史接口。",
+          "inputs": "会话、工具名、查询参数",
+          "outputs": "原始历史查询结果",
+          "tests": []
+        },
+        {
+          "id": "requirement",
+          "label": "读取原始用户要求",
+          "file": "src/single_agent.rs",
+          "name": "read_requirement",
+          "module": "",
+          "role": "entry",
+          "responsibility": "检查引用属于当前压缩材料，委托历史接口读取。",
+          "inputs": "冻结材料、事件编号、分页参数",
+          "outputs": "原始要求及稳定历史引用",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "search",
+          "label": "公共历史检索",
+          "file": "src/session_history.rs",
+          "name": "read",
+          "module": "",
+          "role": "shared",
+          "responsibility": "异步历史检索入口，业务选择由调用参数决定。",
+          "inputs": "工作区、会话、显式查询条件",
+          "outputs": "带引用的历史页",
+          "tests": []
+        },
+        {
+          "id": "projection",
+          "label": "历史结果格式组装",
+          "file": "src/session_history.rs",
+          "name": "read_saved",
+          "module": "",
+          "role": "unit",
+          "responsibility": "将已选原始记录组装为分页响应，不生成总结。",
+          "inputs": "显式查询条件",
+          "outputs": "历史页、来源及后续读取引用",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        },
+        {
+          "id": "query",
+          "label": "历史检索数据访问",
+          "file": "src/session_history/store.rs",
+          "name": "search_events",
+          "module": "",
+          "role": "shared",
+          "responsibility": "集中处理会话和跨会话检索的数据库查询。",
+          "inputs": "连接、会话、显式检索条件",
+          "outputs": "原始记录及分页元数据",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        },
+        {
+          "id": "exact",
+          "label": "公共原始事件读取",
+          "file": "src/session_history/store.rs",
+          "name": "read_event",
+          "module": "",
+          "role": "shared",
+          "responsibility": "按引用返回数据库原始 JSON 的字符页，不重新序列化。",
+          "inputs": "会话、编号、边界、字符范围",
+          "outputs": "原文页及引用",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        },
+        {
+          "id": "records",
+          "label": "公共历史记录访问",
+          "file": "src/session_history/store.rs",
+          "name": "load_events",
+          "module": "",
+          "role": "shared",
+          "responsibility": "按调用者给定的编号、类型和工具调用标识选择事件；统一升序返回。",
+          "inputs": "数据库连接、会话、EventQuery",
+          "outputs": "完整原始事件记录",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        },
+        {
+          "id": "snapshot",
+          "label": "历史边界和需求引用",
+          "file": "src/session_history/store.rs",
+          "name": "requirement_snapshot",
+          "module": "",
+          "role": "unit",
+          "responsibility": "返回历史上界及原始用户要求的升序编号。",
+          "inputs": "连接、会话",
+          "outputs": "冻结上界及需求引用",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        },
+        {
+          "id": "freeze",
+          "label": "压缩材料冻结",
+          "file": "src/single_agent.rs",
+          "name": "freeze",
+          "module": "",
+          "role": "unit",
+          "responsibility": "冻结当前工作窗口，并通过历史接口取得边界和需求引用。",
+          "inputs": "会话、当前消息",
+          "outputs": "冻结材料",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "validation",
+          "label": "压缩交付检查",
+          "file": "src/single_agent.rs",
+          "name": "validate_summary",
+          "module": "",
+          "role": "unit",
+          "responsibility": "校验引用、已交付原文范围和容量；历史原文由公共访问层读取。",
+          "inputs": "压缩结果、读取范围、冻结材料",
+          "outputs": "接受或明确错误",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "events",
+          "label": "聊天界面历史读取",
+          "file": "src/agent_service.rs",
+          "name": "get_events",
+          "module": "",
+          "role": "entry",
+          "responsibility": "把公共接口读取的原始事件交给界面。",
+          "inputs": "会话编号",
+          "outputs": "升序历史事件",
+          "tests": []
+        },
+        {
+          "id": "stream",
+          "label": "聊天界面增量读取",
+          "file": "src/agent_service.rs",
+          "name": "stream_events",
+          "module": "",
+          "role": "entry",
+          "responsibility": "通过公共接口读取游标之后的事件。",
+          "inputs": "会话编号、历史游标",
+          "outputs": "原始事件流",
+          "tests": []
+        },
+        {
+          "id": "storage",
+          "label": "唯一历史查询执行点",
+          "file": "src/session_history/store.rs",
+          "name": "query_events",
+          "module": "",
+          "role": "shared",
+          "responsibility": "执行历史模块的参数化查询，原文数据不解释、不改写。精确读取与历史检索在这里汇合。",
+          "inputs": "内部查询、绑定参数及记录结构",
+          "outputs": "原始历史记录",
+          "tests": [
+            "session_history::store::tests::raw_pages_and_queries_preserve_history"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "compression",
+      "parent": "agent",
+      "title": "上下文压缩",
+      "summary": "压缩子 Agent 整理冻结窗口和必要历史，提交后主 Agent 继续；当前窗口材料保留独立读取职责。",
+      "nodes": [
+        {
+          "id": "run",
+          "label": "主 Agent 执行入口",
+          "file": "src/single_agent.rs",
+          "name": "run_task",
+          "module": "",
+          "role": "entry",
+          "responsibility": "恢复持久窗口并进入公共模型工具循环。",
+          "inputs": "会话、用户要求、运行配置",
+          "outputs": "答复及持久执行记录",
+          "tests": [
+            "single_agent::tests::restart_recovers_saved_tool_result_without_reexecuting"
+          ]
+        },
+        {
+          "id": "loop",
+          "label": "主 Agent / 压缩公共循环",
+          "file": "src/single_agent.rs",
+          "name": "run_loop",
+          "module": "",
+          "role": "shared",
+          "responsibility": "按 Mode 调用模型和工具；压缩仅有只读能力及交付工具。",
+          "inputs": "Session、Window、轮次限制",
+          "outputs": "答复、压缩交付或轮次结束",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "round",
+          "label": "模型请求",
+          "file": "src/single_agent.rs",
+          "name": "model_round",
+          "module": "",
+          "role": "unit",
+          "responsibility": "保存请求上下文并调用当前角色配置的模型。",
+          "inputs": "会话窗口、工具定义",
+          "outputs": "原始模型消息",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "freeze",
+          "label": "冻结当前材料",
+          "file": "src/single_agent.rs",
+          "name": "freeze",
+          "module": "",
+          "role": "unit",
+          "responsibility": "保存当前工作窗口，取得原始要求引用。",
+          "inputs": "当前消息",
+          "outputs": "Material",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "requirements",
+          "label": "读取原始要求",
+          "file": "src/single_agent.rs",
+          "name": "read_requirement",
+          "module": "",
+          "role": "unit",
+          "responsibility": "通过公共历史接口按引用读取要求。",
+          "inputs": "要求引用、分页参数",
+          "outputs": "原始事件页",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "history",
+          "label": "历史读取聚焦点",
+          "file": "src/session_history.rs",
+          "name": "read",
+          "module": "",
+          "role": "shared",
+          "responsibility": "按需补齐当前输入缺少的历史。",
+          "inputs": "显式查询条件",
+          "outputs": "历史记录页",
+          "tests": []
+        },
+        {
+          "id": "route",
+          "label": "工具路由",
+          "file": "src/single_agent.rs",
+          "name": "business_tool",
+          "module": "",
+          "role": "unit",
+          "responsibility": "检查权限和冻结边界，执行所选普通工具。",
+          "inputs": "工具名及参数",
+          "outputs": "工具原始返回",
+          "tests": []
+        },
+        {
+          "id": "validate",
+          "label": "检查压缩交付",
+          "file": "src/single_agent.rs",
+          "name": "validate_summary",
+          "module": "",
+          "role": "unit",
+          "responsibility": "检查引用、材料交付覆盖和容量。",
+          "inputs": "压缩结果",
+          "outputs": "通过或错误",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        },
+        {
+          "id": "save",
+          "label": "窗口持久化",
+          "file": "src/single_agent.rs",
+          "name": "save",
+          "module": "",
+          "role": "shared",
+          "responsibility": "完整保存当前工作窗口，不自行选择或释放内容。",
+          "inputs": "Session、Window",
+          "outputs": "保存完成",
+          "tests": [
+            "single_agent::tests::multi_round_context_subagent_preserves_plan_and_records_every_request",
+            "single_agent::tests::oversized_summary_is_rejected_and_main_window_is_unchanged"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "assets",
+      "parent": "agent",
+      "title": "持久资产引用",
+      "summary": "保存原始工具产物及稳定引用；读取原版本和刷新当前文件分开。内容释放由 AI 明确选择。",
+      "nodes": [
+        {
+          "id": "register",
+          "label": "登记工具产物",
+          "file": "src/context_assets.rs",
+          "name": "register",
+          "module": "",
+          "role": "entry",
+          "responsibility": "保存内容快照并建立稳定 asset_id。",
+          "inputs": "工具调用、原始结果、历史引用",
+          "outputs": "资产引用",
+          "tests": []
+        },
+        {
+          "id": "reference",
+          "label": "资产引用读取",
+          "file": "src/context_assets.rs",
+          "name": "reference",
+          "module": "",
+          "role": "shared",
+          "responsibility": "查找本会话资产并校验冻结边界。",
+          "inputs": "会话、asset_id、边界",
+          "outputs": "资产引用",
+          "tests": []
+        },
+        {
+          "id": "read",
+          "label": "原版本读取",
+          "file": "src/context_assets.rs",
+          "name": "read",
+          "module": "",
+          "role": "entry",
+          "responsibility": "根据引用读取完整性校验后的原版本。",
+          "inputs": "asset_id、字符范围",
+          "outputs": "原始快照或分页内容",
+          "tests": []
+        },
+        {
+          "id": "refresh",
+          "label": "刷新请求解析",
+          "file": "src/context_assets.rs",
+          "name": "refresh_request",
+          "module": "",
+          "role": "unit",
+          "responsibility": "仅为可刷新文件资产构造当前文件读取请求。",
+          "inputs": "文件资产引用",
+          "outputs": "当前文件读取请求",
+          "tests": []
+        },
+        {
+          "id": "retain",
+          "label": "保留资产选择",
+          "file": "src/context_assets.rs",
+          "name": "retained",
+          "module": "",
+          "role": "unit",
+          "responsibility": "执行 AI 明确的保留、片段或仅引用决定。",
+          "inputs": "已加载消息、AI 资产计划",
+          "outputs": "保留的消息",
+          "tests": []
+        },
+        {
+          "id": "lookup",
+          "label": "公共资产索引读取",
+          "file": "src/context_assets.rs",
+          "name": "lookup",
+          "module": "",
+          "role": "shared",
+          "responsibility": "从资产索引读取本会话的稳定引用，不读取或刷新外部文件。",
+          "inputs": "数据库连接、会话、asset_id",
+          "outputs": "资产引用或缺失",
+          "tests": []
+        }
+      ]
+    },
+    {
+      "id": "visual",
+      "parent": "agent",
+      "title": "普通视觉工具",
+      "summary": "主 Agent 调用普通工具，视觉模型仅接收问题与指定原图，结果作为原生工具返回。",
+      "nodes": [
+        {
+          "id": "route",
+          "label": "主 Agent 工具循环",
+          "file": "src/single_agent.rs",
+          "name": "run_loop",
+          "module": "",
+          "role": "entry",
+          "responsibility": "在原生工具调用分支中执行视觉分析，再把原始结果交回主 Agent。",
+          "inputs": "问题、图像引用",
+          "outputs": "视觉工具结果",
+          "tests": [
+            "single_agent::tests::image_analysis_is_a_native_tool_exchange_without_context_handoff"
+          ]
+        },
+        {
+          "id": "execute",
+          "label": "视觉分析",
+          "file": "src/image_analysis.rs",
+          "name": "execute",
+          "module": "",
+          "role": "shared",
+          "responsibility": "读取指定原图，使用独立配置调用视觉模型并记录请求。",
+          "inputs": "当前任务、原图 ID、问题",
+          "outputs": "原始模型分析与请求引用",
+          "tests": [
+            "single_agent::tests::image_analysis_is_a_native_tool_exchange_without_context_handoff"
+          ]
+        }
+      ]
+    }
+  ]
+}

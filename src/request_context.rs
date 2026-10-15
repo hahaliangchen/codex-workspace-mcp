@@ -172,6 +172,10 @@ pub struct Trace {
 }
 
 impl Trace {
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
     /// Reference to the durable context-request event created for this exact input.
     pub fn history_reference(&self) -> Value {
         self.metadata["history_reference"].clone()
@@ -183,7 +187,13 @@ impl Trace {
         self.metadata["status"] = json!(status);
         self.metadata["elapsed_ms"] = json!(self.started.elapsed().as_millis() as u64);
         self.metadata["outcome"] = extra;
-        persist_outcome(self.root.clone(), self.task_id.clone(), self.id, self.metadata.clone()).await?;
+        persist_outcome(
+            self.root.clone(),
+            self.task_id.clone(),
+            self.id,
+            self.metadata.clone(),
+        )
+        .await?;
         self.finished = true;
         Ok(())
     }
@@ -252,18 +262,35 @@ async fn save_outcome(root: PathBuf, task_id: String, id: i64, metadata: Value) 
 /// Original input is retained; no response is fabricated.
 pub(crate) fn recover_interrupted(conn: &mut Connection, task: &str) -> Result<()> {
     let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_request_contexts')",[],|r|r.get(0))?;
-    if !exists { return Ok(()); }
+    if !exists {
+        return Ok(());
+    }
     let pending = conn.prepare("SELECT id,metadata FROM agent_request_contexts WHERE task_id=?1 AND json_extract(metadata,'$.status')='pending'")?
         .query_map([task],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    for (id,raw) in pending {
-        let mut metadata:Value=serde_json::from_str(&raw)?;
-        metadata["status"]=json!("interrupted");
-        metadata["outcome"]=json!({"error":"Host restarted before a complete model response was saved; delivery and completion are unknown."});
-        tx.execute("UPDATE agent_request_contexts SET metadata=?1 WHERE id=?2",params![metadata.to_string(),id])?;
-        crate::agent_service::append_event_tx(&tx,task,"debug/context_end",&json!({"id":id}),None)?;
-        if metadata["request_flow"]==true {
-            crate::agent_service::append_event_tx(&tx,task,"flow/node_state",&json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":"interrupted","context_id":id}),None)?;
+    for (id, raw) in pending {
+        let mut metadata: Value = serde_json::from_str(&raw)?;
+        metadata["status"] = json!("interrupted");
+        metadata["outcome"] = json!({"error":"Host restarted before a complete model response was saved; delivery and completion are unknown."});
+        tx.execute(
+            "UPDATE agent_request_contexts SET metadata=?1 WHERE id=?2",
+            params![metadata.to_string(), id],
+        )?;
+        crate::agent_service::append_event_tx(
+            &tx,
+            task,
+            "debug/context_end",
+            &json!({"id":id}),
+            None,
+        )?;
+        if metadata["request_flow"] == true {
+            crate::agent_service::append_event_tx(
+                &tx,
+                task,
+                "flow/node_state",
+                &json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":"interrupted","context_id":id}),
+                None,
+            )?;
         }
     }
     tx.commit()?;
@@ -296,7 +323,9 @@ pub async fn record(
         }
         Some("organizer") => json!({"history_reader":true,"provides_worker_view":true}),
         Some("agent") => json!({"history_reader":true,"shared_task_context":true}),
-        Some("context_agent") => json!({"history_reader":true,"purpose":"context_organization","business_execution":false,"recursive_subagents":false}),
+        Some("context_agent") => {
+            json!({"history_reader":true,"purpose":"context_organization","business_execution":false,"recursive_subagents":false})
+        }
         _ => Value::Null,
     };
     metadata["tools"] = json!(

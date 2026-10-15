@@ -246,6 +246,8 @@ function fillModelOptions(providerId, listId) {
   } catch { /* Draft model lines are validated on save. */ }
 }
 
+const useRoutes = [["visual-tool", "visual_tool"], ["context-agent", "context_agent"]];
+
 function renderRoutes() {
   if (!view.draft) return;
   fillSelect('main-provider', view.draft.orchestrator_provider);
@@ -256,6 +258,15 @@ function renderRoutes() {
   byId('subagent-override').open = Boolean(view.draft.expert_provider || view.draft.expert_model);
   fillModelOptions(view.draft.orchestrator_provider, 'main-model-options');
   fillModelOptions(view.draft.expert_provider, 'expert-model-options');
+  for (const [prefix,key] of useRoutes) {
+    const config=view.draft[key] || {};
+    fillSelect(`${prefix}-provider`,config.provider);
+    byId(`${prefix}-provider`).options[0].textContent='跟随主 Agent';
+    byId(`${prefix}-model`).value=config.model || '';
+    byId(`${prefix}-effort`).value=config.reasoning_effort || '';
+    byId(`${prefix}-window`).value=config.context_window ?? '';
+    fillModelOptions(config.provider || view.draft.orchestrator_provider,`${prefix}-models`);
+  }
 }
 
 function adopt(data) {
@@ -280,6 +291,8 @@ async function save() {
   try {
     const payload = {
       revision: view.revision,
+      visual_tool: view.draft.visual_tool || {},
+      context_agent: view.draft.context_agent || {},
       providers: view.draft.providers.map((provider) => ({
         id: provider.id.trim(), url: provider.url.trim(), api_type: provider.api_type, display_name: provider.display_name || null,
         models: parseModels(provider.models_text),
@@ -352,6 +365,16 @@ function initialize(ctx) {
   ctx.listen(byId('main-model'), 'input', () => { view.draft.orchestrator_model = byId('main-model').value; });
   ctx.listen(byId('expert-model'), 'input', () => { view.draft.expert_model = byId('expert-model').value; });
   ctx.listen(byId('enable-subagent'), 'change', () => { view.draft.enable_subagent = byId('enable-subagent').checked; });
+
+  for (const [prefix,key] of useRoutes) {
+    for (const [suffix,field] of [['provider','provider'],['model','model'],['effort','reasoning_effort'],['window','context_window']]) {
+      ctx.listen(byId(`${prefix}-${suffix}`),suffix==='model'||suffix==='window'?'input':'change',()=>{
+        const value=byId(`${prefix}-${suffix}`).value;
+        view.draft[key]={...(view.draft[key]||{}),[field]:value ? (field==='context_window'?Number(value):value) : null};
+        if(field==='provider')fillModelOptions(value||view.draft.orchestrator_provider,`${prefix}-models`);
+      });
+    }
+  }
   ctx.listen(byId('save-settings'), 'click', save);
   load().catch((error) => { status(error.message, true); byId('save-settings').disabled = true; });
 }

@@ -33,7 +33,7 @@
 
 启动时，内核按作用域树挂载 `workspace`、`model-settings`、`tools`，并在 `tools` 下挂载文件工具、工作记忆、代码索引和 `agent-tasks`。插件声明依赖的服务；缺少依赖时拒绝启动。服务与事件监听归所属插件管理，卸载时按子节点优先、注册逆序撤销；仍有外部插件依赖时拒绝卸载。
 
-任务执行实际读取插件工具目录来生成模型可调用工具，并调用对应插件注册的处理器。`GET /agent/plugins` 返回当前作用域树、服务、依赖和最近生命周期事件；设置页的「插件树」提供只读视图。Rust 侧当前是内置插件，任务事件的 SQLite 持久历史仍由任务服务负责；`/agent` 的浏览器端已接入 Cordis 核心和页面插槽，第三方动态插件尚未接入。
+任务执行实际读取插件工具目录来生成模型可调用工具，并调用对应插件注册的处理器。`GET /agent/plugins` 返回当前作用域树、服务、依赖和最近生命周期事件；设置页的「插件树」提供只读视图。Rust 侧当前是内置插件，任务事件的 SQLite 持久历史仍由任务服务负责；`/agent` 的浏览器端已接入 Cordis 核心和页面插槽，本地技能包支持运行中安装、重载和移除，独立程序工具通过 JSON-RPC 接入。
 
 ### 单 Agent 任务与上下文子 Agent
 
@@ -45,7 +45,7 @@
 
 每次子 Agent 调用最多 64 次模型请求；上下文变大时可调用 `checkpoint_context` 原样保存阶段结论和后续阅读计划，换成自己的小窗口继续。该方法不会再启动子 Agent。达到轮数上限或压缩失败时，主 Agent 上下文不替换，部分工作仍保存。
 
-每次实际模型请求都生成唯一 Flow 节点，子 Agent 节点关联发起它的主 Agent 请求。请求全文在发送前保存；响应、状态和节点完成状态一起保存，成功保存后才执行模型返回的工具调用。上下文面板可查每次实际输入、完整输出和节点关系。
+主 Agent 和压缩子 Agent 的每次实际模型请求都生成唯一 Flow 节点，子 Agent 节点关联发起它的主 Agent 请求。请求全文在发送前保存；响应、状态和节点完成状态一起保存，成功保存后才执行模型返回的工具调用。上下文面板可查每次实际输入、完整输出和节点关系。
 
 ## 日志策略
 
@@ -54,6 +54,7 @@ AI Proxy 日志统一走 `proxy_log`，外部模块不再自己实现文件日�
 - 文件日志：启动时创建 `logs/` 目录，并为本次进程启动生成一个 `YYYYMMDD_HHMM.log` 文件；同一分钟内重启发生重名时追加 `_2`、`_3` 后缀，避免覆盖或混写旧日志
 - 数据库日志：结构化记录继续写入 SQLite，便于 `query_logs` 查询
 - 输入诊断：Responses input 只向本次启动日志写入限长摘要；工具输出只记录 call_id/长度，避免完整历史在文件日志中重复膨胀
+- 模型传输诊断：主 Agent 和上下文子 Agent 按请求 ID 记录发送、响应头、首字节、解码和失败阶段，由 `proxy_log` 写入 `logs/model-requests-YYYY-MM-DD.jsonl`；不写入认证头或对话正文。字段和排查方法见[模型请求阶段日志](docs/model_request_diagnostics.md)
 - 历史保留：SQLite 原始会话记录按 24 小时清理，单条内容超限会截断
 - 异步写入：当前使用 `std::sync::mpsc` 后台线程落盘和入库，正常运行可避免请求线程阻塞；如果进程突然崩溃，队列尾部少量日志可能来不及写入
 
@@ -66,6 +67,16 @@ AI Proxy 日志统一走 `proxy_log`，外部模块不再自己实现文件日�
 容量通知会说明正文是否真正交付。放不下的工具结果完整保存，返回精确历史引用；由 AI 决定分段读取或先压缩。宿主不擅自摘要、裁剪或在超限时启动另一个 Agent。若实际请求仍超限，明确失败并保留当前窗口。子 Agent 必须读完当前材料及用户要求、提供有效来源、满足容量要求才能提交；这些检查不能保证摘要的语义质量。
 
 服务中断后，先恢复已保存的工具结果；没有结果的调用明确标记完成情况未知，不自动重复执行。旧会话首次续聊按原顺序导入带来源的历史文本，旧角色间未闭合的原生工具对不会阻断导入。旧会话全文若已超限仍会明确报错，需要另行整理迁移。
+
+### 视觉与压缩配置
+
+设置 → 视觉与压缩可分别指定提供商、模型、推理档位和最大上下文 tokens。每个留空项跟随当前主 Agent，未填写整个配置也沿用主 Agent；较旧客户端遗漏这些字段时保留已保存的覆盖项，显式清空则恢复继承。配置保存在 profile 的 `codex-workspace-generation.yml`，字段为 `visual_tool` 和 `context_agent`。压缩子 Agent 使用独立窗口预算，并预留 24,576 tokens；例如 500k 最大窗口对应 475,424 输入预算。结果提交仍按主窗口校验，源历史和资产交接规则不变。
+
+### 图像分析工具
+
+主 Agent 使用 `analyze_images({artifact_ids, question})` 对保存的图片进行视觉分析，最多两张，按参数顺序传原图。工具使用设置中的“视觉分析工具”路由（应用提供方的模型映射）；未配置的项跟随主 Agent。问题和必要背景由调用 AI 提供；工具请求只有这一条用户消息与原图，不继承主窗口或历史，也没有浏览器/递归工具权限。
+
+返回的 `analysis` 是模型原始正文，按普通原生工具返回进入主窗口，并得到稳定资产引用。宿主不改写结论、插入额外用户消息、切换主模型或修改/压缩/释放上下文。`browser_screenshot` 负责截图，`view_image` 仍只负责选图；视觉检查由主 Agent 显式调用分析工具。模型原始请求与响应保存为 `actor=tool` 的诊断记录，不创建执行角色或子 Agent 窗口。取消、超时、截断和空返回作为工具错误处理。
 
 ### 资产引用与 AI 控制的加载状态
 
@@ -270,7 +281,7 @@ Agent 与设置页的监听地址可通过 `AGENT_BIND` 指定，默认 `127.0.0
 
 页面可以新建对话（先 `POST /agent/sessions` 建空会话，再发送第一条消息），查看流式模型回复和工具步骤，切换轨迹表格与时间轴，停止运行中的任务，并在刷新后打开历史任务。选择已结束的主任务后，可以直接发送下一条消息；新轮次沿用该任务的用户消息、模型回复和工具结果，轨迹追加到同一个任务 ID。运行中的任务和子代理轨迹不接受跟进消息。输入框支持 `/` 技能建议和 `@` 工作区文件引用；提交时，Rust 会将被引用文件的有界内容快照附进模型上下文，旧轮次继续使用当时的快照。
 
-`frontend/src/dsh/` 从 DeepSeek Harness（commit `46a7f68`，MIT，见其中 `LICENSE` 与 `SOURCE.md`）复制了 Cordis 核心及其原许可证、`ui-slots` 和 `ui-renderer` 的浏览器端完整源码，以及 `ui-primitives`、`store`、`workspace-path`、主题样式、语言包、ui-chat / ui-tool / ui-conversation 的 CSS 模块和 `ReasoningRow`。Vite 从本地 Cordis 源码构建；TypeScript 使用固定版本 `@deepseek-ai/cordis@4.0.4` 的公开类型。`frontend/src/cordis/` 启动 Cordis 与原版 UI renderer，注册 Rust 任务 API 服务、页面 root，以及侧栏、聊天、轨迹、输入框子插槽。`frontend/src/components/` 是沿用 DSH 样式的 React 页面组件，数据经 HTTP/SSE 对接 Rust。DSH 的动态插件加载器、Remote RPC 和完整业务 UI 插件仍未移植。
+`frontend/src/dsh/` 从 DeepSeek Harness（commit `46a7f68`，MIT，见其中 `LICENSE` 与 `SOURCE.md`）复制了 Cordis 核心及其原许可证、`ui-slots` 和 `ui-renderer` 的浏览器端完整源码，以及 `ui-primitives`、`store`、`workspace-path`、主题样式、语言包、ui-chat / ui-tool / ui-conversation 的 CSS 模块和 `ReasoningRow`。Vite 从本地 Cordis 源码构建；TypeScript 使用固定版本 `@deepseek-ai/cordis@4.0.4` 的公开类型。`frontend/src/cordis/` 启动 Cordis 与原版 UI renderer，注册 Rust 任务 API 服务、页面 root，以及侧栏、聊天、轨迹、输入框子插槽。`frontend/src/components/` 是沿用 DSH 样式的 React 页面组件，数据经 HTTP/SSE 对接 Rust。技能插件由 Rust 的本地包加载器装配，独立进程使用 JSON-RPC，内外置前端模块均使用 Cordis 的 name/inject/apply 与作用域贡献注册，页面可共用 React 或提供 HTML。DSH 的 npm/JavaScript 插件和完整远程服务协议不属于这个 Rust 技能包格式。
 
 设置页「子代理」开关默认关闭。启用后，主代理可自行调用一次 `spawn_subagent`，子代理默认使用与主代理相同的提供商和模型，也可选配单独的模型路由；子代理复用本项目文件工具、代码索引和记忆系统，不能继续派生。父子任务各自保存事件，页面可从委派结果打开子任务轨迹。取消父任务时也会取消正在运行的子任务。
 
@@ -495,3 +506,20 @@ from whether the implementation passed; missing imports do not prove correctness
 Organizer 读取按原始时间顺序传来的方法调用、分配回执、Worker 原始返回、Observer 消息和请求失败。Worker 保留本节点的完整调用参数与工具返回；不再把这些消息加工成另一份事实摘要或源码节选。Observer 只在执行结束后复盘一次，读取当前任务的原始过程，包括请求超时与恢复；节点创建和 Worker 迭代不触发观察。独立只读 Organizer 查询可以同轮返回多个结果。
 
 角色间传递保留原始文本、调用参数和返回内容，宿主不加 “Worker returned”“Observer message”等正文标签，不把字段重排成 `[字段名]`，不改写 Observer 原始回复；来源与状态作为独立的 `Source` 头随原文传递。API 必需的 role、name、tool_call_id 与图像协议用于路由；宿主从历史数组按原顺序筛选消息；来源状态随原文传递，使用原始事件序号关联，不为装配另造执行编号，也不在协议名称中附加消息序号。结构化原始数据按 JSON 序列化，原生文本保留空白和换行。接近 256k 上限（预留模型输出和后续消息空间）时，Organizer 或 Observer 进入同角色的 `context_selection` 请求阶段，使用 `read_session_history` 检索当前任务必要的历史原文，再用 `select_context` 选取已有引用。这个阶段只读历史，不执行业务工具或派发任务。宿主恢复选中的完整原文，按原历史数组顺序装配，不按 assistant/user 角色截取后缀，不生成替代摘要。当前指令保留；SQLite 的 `agent_context_windows` 保存选择引用和读取边界。Organizer 的后续计划作为原文事件写入共享历史，窗口只保存该事件引用，并在恢复时按历史顺序原样装回；宿主不改写计划或替 Organizer 制定计划。后续新消息追加，重新超限才再选择，服务重启后仍能恢复。Worker 超限由 Organizer 选择它本次调用已经获得的执行消息，保留原始命令、明确输入以及成对的原生工具调用/返回，不加入 Observer 建议。选择视图明确区分“历史池完整”和“模型已读完整”；选择阶段的每次实际请求同样进入完整请求日志。单条必要原文或当前指令自身超限时明确报错，不静默截短。截图不自动触发附图或 Observer 截图；Worker 显式调用 `view_image` 才请求图像输入，能力不足的原始返回仍正常传递。
+
+## 按功能查看代码 Flow
+
+会话顶部 **技能页面 → 代码 Flow** 按功能分级展示当前方法调用关系。根目录 [code-flow.json](code-flow.json) 声明职责、公共入口、方法绑定和测试入口；宿主只提取源码证据，不自动判断耦合或重复实现。人和 AI 的 `read_code_flow` 工具使用同一个图读取器。首版支持 Rust，并明确保留边界、歧义和未解析调用。详见 [代码 Flow 首版说明](docs/code_flow_v1.md)。
+
+历史数据访问已收敛到 `session_history/store.rs`：压缩读取原始要求、引用校验、恢复、资产补回和界面历史读取共用该访问层，原始事件按编号升序返回。
+
+
+## 技能插件包
+
+技能包把提示词、工具和页面放在自己的目录中。宿主不根据用户关键词选技能；Agent 用 `list_skills` 查看名称和说明，再显式调用 `read_skill`。成功交付原始正文后才向后续模型请求提供专用工具。主 Agent 的启用状态按用户轮次隔离，`unload_skill` 可提前隐藏工具。包停用或重载后，旧的激活版本失效，必须重新读取技能。
+
+左侧主导航的“技能页面”无需已有对话或模型配置，支持输入本地目录安装，以及启用、停用、重载和移除包。移除只注销贡献，不删除包文件。配置保存在当前 DSH profile 下的 `skill-packages.json`；也可通过 `DSH_SKILL_PACKAGES_DIR` 指定启动扫描目录。同一路径只加载一次。包格式、独立程序的 JSON-RPC 协议和页面接口见 [技能插件包接口](docs/skill_packages.md)。本地独立程序工具和 HTML 页面无需重新编译宿主；内置源码位于 `src/builtin_plugins/` 和 `frontend/src/builtin_plugins/`，共享项目构建；外置即使下载到项目中也仍由安装器按外置身份加载。两者遵循相同声明、依赖、贡献注册与清理规则。
+
+MCP `initialize` 返回 `Mcp-Session-Id`，后续 POST/GET/DELETE 应携带该头。每个客户端会话独立激活技能，默认工具列表不带代码 Flow 等包工具。`read_skill` 加载后，服务通过 GET SSE 发送 `notifications/tools/list_changed`，客户端应刷新 `tools/list`；`unload_skill`、重置和包生命周期变化也发送通知。新任务边界可调用 `reset_skill_activation`，结束时 DELETE `/mcp`。MCP 不提供用户轮次信号，服务不会根据消息猜测边界。未携带会话头的旧客户端仍可使用基础工具，但不能启用包工具。
+
+聊天附件支持选择、拖拽和粘贴图片，并使用持久引用在多轮中读取资料及调用视觉分析。AI PPT SVG 版只开放首批八种扩展名，协议兼容范围、解析边界及测试见[会话附件](docs/attachments.md)。

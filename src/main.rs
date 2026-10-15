@@ -6,7 +6,9 @@ mod agent_service;
 mod agent_web;
 mod ai_proxy;
 mod architecture_agent;
+mod attachments;
 mod browser_control;
+mod builtin_plugins;
 mod code_map;
 mod composer_catalog;
 mod context_assets;
@@ -19,13 +21,18 @@ mod flow_tree;
 mod format_translate;
 mod go_index;
 mod http_probe;
+mod image_analysis;
 mod index_refresh;
 mod mcp;
 mod memory;
+mod model_settings;
 mod model_stream;
+mod model_transport;
 mod observer_service;
-mod plugin_builtin;
+mod plugin_protocol;
 mod plugin_runtime;
+mod plugin_sessions;
+mod ppt_sessions;
 mod program_execution;
 mod project_process;
 mod proxy_log;
@@ -36,6 +43,7 @@ mod rust_index;
 mod sandbox_diagnostic;
 mod session_history;
 mod single_agent;
+mod skill_packages;
 mod skills;
 mod source_read;
 mod symbol_description;
@@ -68,7 +76,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
 use crate::{
-    mcp::{handle_mcp, handle_mcp_get},
+    mcp::{handle_mcp, handle_mcp_delete, handle_mcp_get},
     tools::Workspace,
 };
 
@@ -91,10 +99,18 @@ fn build_app(workspace: Arc<Workspace>) -> Router {
 
     Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/mcp", get(handle_mcp_get).post(handle_mcp))
+        .route(
+            "/mcp",
+            get(handle_mcp_get)
+                .post(handle_mcp)
+                .delete(handle_mcp_delete),
+        )
         .with_state(workspace)
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::permissive()
+                .expose_headers([axum::http::HeaderName::from_static("mcp-session-id")]),
+        )
 }
 
 async fn run_server(listener: TcpListener, workspace: Arc<Workspace>) -> anyhow::Result<()> {
