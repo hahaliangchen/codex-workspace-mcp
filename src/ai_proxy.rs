@@ -41,6 +41,9 @@ struct ProviderConfig {
     /// raw pass-through — no request/response format conversion.
     #[serde(default = "default_api_type")]
     api_type: String,
+    /// Upstream model id -> declared `maxTokens` in the DSH model entry.
+    #[serde(skip)]
+    max_output_tokens: HashMap<String, usize>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -172,6 +175,7 @@ pub(crate) fn apply_agent_config(
                     url: provider.url.clone(),
                     api_key: provider.api_key.clone(),
                     models: provider.model_map.clone(),
+                    max_output_tokens: provider.max_output_tokens.clone(),
                 },
             )
         })
@@ -459,6 +463,16 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
                         .map(|id| (id.to_owned(), id.to_owned()))
                 })
                 .collect();
+            let max_output_tokens = models
+                .iter()
+                .filter_map(|v| {
+                    Some((
+                        v.get("id")?.as_str()?.to_owned(),
+                        usize::try_from(v.get("maxTokens")?.as_u64()?).ok()?,
+                    ))
+                })
+                .filter(|(_, n)| *n > 0)
+                .collect();
             let reference = entry
                 .get("apiKeyEnv")
                 .and_then(Value::as_str)
@@ -479,6 +493,7 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
                         .and_then(Value::as_str)
                         .unwrap_or("openai-completions")
                         .to_owned(),
+                    max_output_tokens,
                     extra: entry
                         .get("displayName")
                         .and_then(Value::as_str)
@@ -1060,6 +1075,7 @@ fn save_settings(
             api_key_ref: None,
             model_map: HashMap::new(),
             api_type: default_api_type(),
+            max_output_tokens: HashMap::new(),
             extra: HashMap::new(),
         });
         provider.url = url.as_str().trim_end_matches('/').to_owned();
@@ -2476,6 +2492,7 @@ mod tests {
                 .map(|(client, upstream)| (client.to_string(), upstream.to_string()))
                 .collect(),
             api_type: "openai".to_string(),
+            max_output_tokens: HashMap::new(),
             extra: HashMap::new(),
         }
     }
@@ -2628,7 +2645,7 @@ mod tests {
         let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
         let path = root.join("profiles/web/cordis.patch.yml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        write_yaml_atomic(&path,&json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m"}]}}}},{"id":"agent-default-model","config":{"provider":"test","model":"m"}}])).unwrap();
+        write_yaml_atomic(&path,&json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m","maxTokens":65536}]}}}},{"id":"agent-default-model","config":{"provider":"test","model":"m"}}])).unwrap();
         write_yaml_atomic(
             &credentials_path(&path),
             &json!({"version":1,"refs":{},"records":{}}),
@@ -2640,6 +2657,8 @@ mod tests {
             .unwrap();
         let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.context_agent.context_window, Some(500000));
+        // Saving settings keeps the model entry, so its declared limit survives.
+        assert_eq!(loaded.providers["test"].max_output_tokens["m"], 65536);
         assert_eq!(
             loaded.visual_tool.reasoning_effort.as_deref(),
             Some("medium")

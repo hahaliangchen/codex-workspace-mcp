@@ -15,7 +15,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const INPUT_BUDGET: usize = crate::context_window::MAX_TOKENS - 24_576;
+const INPUT_BUDGET: usize =
+    crate::context_window::MAX_TOKENS - crate::model_settings::OUTPUT_RESERVE;
 const SUMMARY_BUDGET: usize = 24_000;
 const PAGE_CHARS: usize = 24_000;
 const CONTEXT_ROUNDS: usize = 64;
@@ -81,6 +82,8 @@ struct Session<'a> {
 enum LoopResult {
     Answer,
     Context(Value),
+    /// A context subagent replied with text instead of submit_context.
+    Ended,
     Limit,
 }
 
@@ -264,10 +267,9 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         wire.push(json!({"role":"system","content":format!("Authenticated PPT project binding: {project}. If positive, continue this project and never initialize or switch to another project. If zero, initialize a new PPT project when needed. The host enforces this binding.")}));
     }
     let occupied = estimate(&json!({"messages":wire,"tools":definitions}));
-    wire.push(json!({"role":"system","content":format!("Context capacity: estimated {occupied} input tokens; input budget {}. {}", s.input_budget,
-        if s.mode == Mode::Main {"Use compress_context before running out of space. Oversized tool results remain available by history reference."}
-        else {"Use checkpoint_context to preserve partial analysis and unread ranges before running out of space. Recursive compression is unavailable."})}));
-    let mut body = json!({"model":s.model,"stream":true,"max_tokens":8192,"messages":wire,"tools":definitions,"parallel_tool_calls":false});
+    wire.push(json!({"role":"system","content":format!("Context capacity: estimated {occupied} input tokens; input budget {}.", s.input_budget)}));
+    let mut body = json!({"model":s.model,"stream":true,"messages":wire,"tools":definitions,"parallel_tool_calls":false});
+    body["max_tokens"] = json!(output_tokens(s, &body));
     if let Some(effort) = &s.state.reasoning_effort {
         body["reasoning_effort"] = json!(effort);
     }
@@ -275,6 +277,9 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         body["service_tier"] = json!("fast");
     }
     body
+}
+fn output_tokens(s: &Session<'_>, body: &Value) -> usize {
+    crate::model_settings::output_tokens(s.state, s.model, s.input_budget, estimate(body))
 }
 async fn model_round(
     s: &Session<'_>,
@@ -327,6 +332,8 @@ async fn model_round(
         estimate(&body) <= s.input_budget,
         "INPUT_OVER_CAPACITY: context remains saved; no request sent. Use smaller material pages or a context checkpoint before reaching capacity."
     );
+    // Image delivery can change the input size; size the output afterwards.
+    body["max_tokens"] = json!(output_tokens(s, &body));
     let trace = crate::request_context::record(s.state.workspace.root(), s.task,
         json!({"actor":s.mode.actor(),"stage":if s.mode==Mode::Main{"execution"}else{"context_organization"},
             "turn":s.turn,"step":step,"nodeId":node,"request_id":s.turn,"request_flow":true,
@@ -798,9 +805,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                 );
                 return Ok(LoopResult::Answer);
             }
-            w.messages.push(json!({"role":"user","content":"Context organization is not complete until submit_context succeeds. Continue reading, checkpoint, or submit the structured result."}));
-            save(s, w).await?;
-            continue;
+            // The reply is already saved; the host does not answer it.
+            return Ok(LoopResult::Ended);
         }
         let mut ids = BTreeSet::new();
         ensure!(
@@ -887,6 +893,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                             ensure!(estimate(&request(s,&proposed,&definitions))+4096 < s.input_budget,"COMPACTED_CONTEXT_OVER_CAPACITY: original context retained; explicitly release unneeded bodies or choose smaller excerpts");
                             replacement=Some((material.id.clone(),summary,retained));
                             Ok(json!({"organized":true,"material_id":material.id,"context_scope":child.scope}))
+                        } else if matches!(result,LoopResult::Ended) {
+                            anyhow::bail!("CONTEXT_AGENT_ENDED_WITHOUT_SUBMIT: the context subagent replied with text instead of submit_context; its reply and partial analysis are saved in {}; main context was not replaced",child.scope)
                         } else { anyhow::bail!("CONTEXT_ROUND_LIMIT: partial analysis is saved in {}; main context was not replaced",child.scope) }
                     },
                     "list_context_assets" => Ok(crate::context_assets::catalog(&w.messages)),
@@ -1013,8 +1021,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             }
             if !fits {
                 delivery = json!({"error_code":"MATERIAL_OVER_CAPACITY","event_seq":seq,"task_id":s.task,"original_saved":true,
-                    "asset_reference":asset_reference,
-                    "instruction":"The complete result is saved but was not delivered. Read smaller asset/history pages, or explicitly release assets/checkpoint/compress before retrieving it. Existing loaded assets were not removed."});
+                    "asset_reference":asset_reference,"delivered":false,"loaded_assets_unchanged":true});
             } else if s.mode == Mode::Context && call.name == "read_context_material" && !is_error {
                 let start = result["char_offset"].as_u64().unwrap() as usize;
                 w.material_ranges.push((
@@ -1709,6 +1716,7 @@ mod tests {
         requirement: i64,
         main_round: usize,
         checkpointed: bool,
+        child_text_only: bool,
     }
     fn summary(requirement: i64) -> Value {
         json!({"original_purpose":"检查 PPT 前两页", "current_goal":"继续第二页视觉检查",
@@ -1734,6 +1742,15 @@ mod tests {
             s.main_round += 1;
             if s.main_round == 1 {
                 call("compress_context", json!({"reason":"上下文过长"}), n)
+            } else if s.child_text_only {
+                let last = messages.iter().rev().find(|m| m["role"] == "tool").unwrap();
+                assert!(
+                    last["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("CONTEXT_AGENT_ENDED_WITHOUT_SUBMIT")
+                );
+                json!({"role":"assistant","content":"压缩未完成，继续使用原上下文。"})
             } else {
                 assert!(messages.iter().any(|m| {
                     m["name"] == "context_summary"
@@ -1753,6 +1770,11 @@ mod tests {
                     .iter()
                     .any(|t| t["function"]["name"] == "compress_context")
             );
+            if s.child_text_only {
+                return Json(
+                    json!({"choices":[{"message":{"role":"assistant","content":"我整理好了。"},"finish_reason":"stop"}]}),
+                );
+            }
             let initial: Value =
                 serde_json::from_str(messages[1]["content"].as_str().unwrap()).unwrap();
             s.requirement = initial["requirement_event_seqs"][0].as_i64().unwrap();
@@ -1997,6 +2019,54 @@ mod tests {
             serde_json::from_str::<Value>(&summary_record).unwrap()["result"],
             summary(script.lock().unwrap().requirement)
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn context_subagent_text_reply_returns_tool_error_without_host_message() {
+        let (root, state, script, server) = setup().await;
+        script.lock().unwrap().child_text_only = true;
+        run_task(
+            state,
+            "task".into(),
+            "fake".into(),
+            "整理上下文".into(),
+            3,
+            CancellationToken::new(),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        let requests = script.lock().unwrap().requests.clone();
+        // main compress call, one child reply, main answer: the host never
+        // answers the child's text with a message of its own.
+        assert_eq!(requests.len(), 3);
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let child: String = conn
+            .query_row(
+                "SELECT state FROM agent_runtime_windows WHERE scope LIKE 'context:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let child: Value = serde_json::from_str(&child).unwrap();
+        let last = child["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert_eq!(last["content"], "我整理好了。");
+        let main: String = conn
+            .query_row(
+                "SELECT state FROM agent_runtime_windows WHERE scope='main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!main.contains("context_summary"));
+        for body in &requests {
+            let capacity = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(capacity.starts_with("Context capacity:") && !capacity.contains("Use "));
+        }
         server.abort();
     }
     #[tokio::test]

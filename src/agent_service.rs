@@ -91,6 +91,8 @@ pub struct AgentProviderRoute {
     pub url: String,
     pub api_key: String,
     pub models: HashMap<String, String>,
+    /// Output limits declared per upstream model id (`maxTokens`).
+    pub max_output_tokens: HashMap<String, usize>,
 }
 
 #[derive(Clone)]

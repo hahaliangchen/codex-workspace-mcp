@@ -4,6 +4,28 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub const OUTPUT_RESERVE: usize = 24_576;
+/// Used when the DSH model entry does not declare `maxTokens`.
+pub const DEFAULT_MAX_OUTPUT: usize = 32_768;
+
+/// The model's declared output limit, bounded by what the window has left
+/// after `input` tokens. Input budgets already leave OUTPUT_RESERVE free, so
+/// a request within budget always receives at least that much.
+pub fn output_tokens(
+    state: &AgentServiceState,
+    model: &str,
+    input_budget: usize,
+    input: usize,
+) -> usize {
+    let declared = state
+        .provider_routes
+        .get(&state.provider_name)
+        .and_then(|route| route.max_output_tokens.get(model))
+        .copied()
+        .unwrap_or(DEFAULT_MAX_OUTPUT);
+    declared
+        .min((input_budget + OUTPUT_RESERVE).saturating_sub(input))
+        .max(1)
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelSettings {
     pub provider: Option<String>,
@@ -84,6 +106,7 @@ mod tests {
                 models: [("alias".into(), "mapped-model".into())]
                     .into_iter()
                     .collect(),
+                max_output_tokens: [("mapped-model".into(), 64_000)].into_iter().collect(),
             },
         );
         let routed = ModelSettings {
@@ -97,6 +120,18 @@ mod tests {
         assert_eq!(routed.default_model, "mapped-model");
         assert_eq!(routed.api_key, "fixture-key");
         assert_ne!(main.provider_name, routed.provider_name);
+        assert_eq!(
+            output_tokens(&routed, "mapped-model", 231_424, 1_000),
+            64_000
+        );
+        assert_eq!(
+            output_tokens(&routed, "mapped-model", 231_424, 231_424),
+            OUTPUT_RESERVE
+        );
+        assert_eq!(
+            output_tokens(&routed, "undeclared", 231_424, 1_000),
+            DEFAULT_MAX_OUTPUT
+        );
 
         let inherited = ModelSettings::default()
             .resolve(&main, "turn-model")
