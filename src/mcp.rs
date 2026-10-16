@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::{error, info, warn};
 
-use crate::architecture_agent::AnalyzeArchitectureRequest;
 use crate::go_index::{
     IndexGoWorkspaceRequest, ListGoSymbolsRequest, ReadGoSymbolRequest, SearchGoSymbolsRequest,
 };
@@ -790,7 +789,7 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         );
     }
 
-    if crate::worker_read_cache::is_source_read(name) {
+    if crate::source_read::is_source_read(name) {
         let workspace = Workspace::new(workspace.root())?;
         let tool_name = name.to_owned();
         let source_args = arguments.clone();
@@ -979,14 +978,6 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
             })
             .await??
         }
-        "expert_code_surgery" => {
-            let request = serde_json::from_value::<crate::expert_surgery::ExpertCodeSurgeryRequest>(
-                arguments,
-            )?;
-            let response =
-                crate::expert_surgery::run_expert_code_surgery(workspace, request.clone()).await?;
-            serde_json::to_value(response)?
-        }
         "record_work_memory" => {
             serde_json::to_value(workspace.record_work_memory(serde_json::from_value::<
                 RecordWorkMemoryRequest,
@@ -1016,13 +1007,6 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
                 serde_json::from_value::<SearchArchitectureMemoryRequest>(arguments)?,
             )?)?
         }
-        "analyze_architecture_memory" => serde_json::to_value(
-            crate::architecture_agent::analyze_architecture(
-                workspace,
-                serde_json::from_value::<AnalyzeArchitectureRequest>(arguments)?,
-            )
-            .await?,
-        )?,
         "record_symbol_business_context" => {
             serde_json::to_value(workspace.record_symbol_business_context(
                 serde_json::from_value::<RecordSymbolBusinessContextRequest>(arguments)?,
@@ -1038,46 +1022,14 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
                 serde_json::from_value::<SearchSymbolBusinessContextRequest>(arguments)?,
             )?)?
         }
-        // Skills 按需懒加载：列出所有可用技能（名称+一句话描述）
-        "list_skills" => {
-            let mut skills = serde_json::to_value(crate::skills::list_skills())?;
-            if let Some(packages) = crate::skill_packages::root_skills() {
-                skills
-                    .as_array_mut()
-                    .unwrap()
-                    .extend(packages.as_array().unwrap().iter().cloned());
-            }
-            skills
-        }
-        // Skills 按需懒加载：读取指定技能的完整 SKILL.md 内容
+        "list_skills" => crate::skill_packages::root_skills().unwrap_or_else(|| json!([])),
         "read_skill" => {
-            let skill_name = arguments.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(result) = crate::skill_packages::root_read(skill_name) {
-                result?
-            } else {
-                let content = crate::skills::read_skill(skill_name)?;
-                json!({"skill":skill_name,"content":content})
-            }
-        }
-        "analyze_image" => {
-            let image_ref = arguments
-                .get("image_ref")
-                .or_else(|| arguments.get("image_key"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("latest");
-            let focus_instruction = arguments.get("focus_instruction").and_then(|v| v.as_str());
-
-            let raw_data = crate::vision_preprocess::resolve_visible_image_ref(Some(image_ref))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "当前可见上下文中找不到可重新分析的原始图片。请基于已有图像分析报告回答；如果用户需要新的视觉检查，请让用户重新上传图片。"
-                    )
-                })?;
-
-            let result =
-                crate::agent::analyze_image_via_vision_agent(&raw_data, focus_instruction).await?;
-
-            serde_json::to_value(result)?
+            let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
+            crate::skill_packages::root_read(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Skill '{name}' not found. Call list_skills to see available skills."
+                )
+            })??
         }
         _ => anyhow::bail!("unknown tool: {name}"),
     };
@@ -1197,45 +1149,8 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "expert_code_surgery",
-            "description": "Invoke the stateless top-model code surgery helper for one indexed code symbol. It uses AST to locate the target symbol context, queries the expert model for a rewritten code block, and returns the rewritten code block. It does not perform writes, conflict resolution, or verification check. The caller (the orchestrator) is responsible for applying the replacement using `replace_range` and executing verification tools.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root", "symbol_id", "instruction"],
-                "properties": {
-                    "workspace_root": {
-                        "type": "string",
-                        "description": "Absolute project directory containing the symbol index."
-                    },
-                    "language": {
-                        "type": "string",
-                        "enum": ["rust", "typescript", "python", "go"],
-                        "description": "Language-specific symbol provider to use. If omitted, the runtime infers it from the symbol_id prefix and falls back to rust for legacy calls."
-                    },
-                    "symbol_id": {
-                        "type": "string",
-                        "description": "Exact symbol id from the matching search/list/read symbol tool for the chosen language."
-                    },
-                    "instruction": {
-                        "type": "string",
-                        "description": "Precise rewrite command for the target symbol. Include verified constraints and intended behavior; do not include chat history."
-                    },
-                    "related_symbol_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "default": [],
-                        "description": "Optional explicit readonly symbol ids from the same language provider to include as relationship context. These blocks help the expert understand callers/callees/types, but only symbol_id may be replaced."
-                    },
-                    "architecture_query": {
-                        "type": "string",
-                        "description": "Optional feature/area query used to select durable architecture memory for the fixed prefix."
-                    }
-                }
-            }
-        },
-        {
             "name": "write_file",
-            "description": "Create a UTF-8 file or replace its complete contents inside the selected workspace. Existing files REQUIRE expected_code_hash from the latest source read or notebook retrieval. Prefer edit_file for localized changes. Returns changed, created, code_hash and index_refresh; a failed index refresh does not undo a saved file.",
+            "description": "Create a UTF-8 file or replace its complete contents inside the selected workspace. Existing files REQUIRE expected_code_hash from the latest source read. Prefer edit_file for localized changes. Returns changed, created, code_hash and index_refresh; a failed index refresh does not undo a saved file.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -1247,7 +1162,7 @@ pub fn tool_definitions() -> Value {
                     "path": { "type": "string" },
                     "content": { "type": "string" },
                     "create_parent_dirs": { "type": "boolean", "default": true },
-                    "expected_code_hash": {"type":"string","description":"Required when path already exists. Use the code_hash returned by a current source read or notebook retrieval."}
+                    "expected_code_hash": {"type":"string","description":"Required when path already exists. Use the code_hash returned by a current source read."}
                 }
             }
         },
@@ -1267,7 +1182,7 @@ pub fn tool_definitions() -> Value {
                     "end_line": { "type": "integer", "minimum":1 },
                     "replacement": { "type": "string" },
                     "expected_old_text": { "type": "string", "description":"Exact selected source excluding its final line delimiter; required unless expected_code_hash is provided." },
-                    "expected_code_hash": { "type":"string","description":"Current file version from a source read or notebook retrieval." }
+                    "expected_code_hash": { "type":"string","description":"Current file version from a source read." }
                 }
             }
         },
@@ -1601,21 +1516,6 @@ pub fn tool_definitions() -> Value {
             }
         },
         {
-            "name": "analyze_architecture_memory",
-            "description": "Ask the configured cheap architecture model to analyze a user task plus verified code/index evidence, then return a structured feature/logic map. Use when no useful architecture memory exists or a large change needs refreshed boundaries. Set record=true only after the provided evidence is grounded in actual code/index results.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["workspace_root", "query"],
-                "properties": {
-                    "workspace_root": { "type": "string", "description": "Absolute workspace root." },
-                    "query": { "type": "string", "description": "User task or architecture question to map to project logic." },
-                    "focus": { "type": "string", "description": "Optional narrower feature/logic focus." },
-                    "evidence": { "type": "array", "items": { "type": "string" }, "default": [], "description": "Verified snippets from architecture memory, symbol index results, read_*_symbol output, or short code excerpts. Do not pass whole-project source." },
-                    "record": { "type": "boolean", "default": false, "description": "When true, upsert the returned analysis into architecture memory." }
-                }
-            }
-        },
-        {
             "name": "record_symbol_business_context",
             "description": "Save a reusable responsibility after reading a definition or module. Ordinary symbol searches will match this description and its task-wording keywords. Supply a symbol_id or file_path + qualified_name; scope=file describes a whole source module. Pass expected_code_hash from the read result to reject changed source. Optional: do not add reads or annotation calls merely to complete an inventory.",
             "inputSchema": {
@@ -1670,7 +1570,7 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "list_skills",
-            "description": "List all available Codex skills with their names and one-line descriptions. Call this first before specialized tasks (presentations, documents, spreadsheets, images) to discover if a matching skill exists.",
+            "description": "List all available skill packages with their names and one-line descriptions. Call this first before specialized tasks (presentations, documents, spreadsheets, images) to discover if a matching skill exists.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -1698,59 +1598,6 @@ pub fn tool_definitions() -> Value {
             "name": "reset_skill_activation", "description": "Begin a new task or user turn by clearing loaded package tools in this MCP session. MCP has no automatic user-turn signal; call explicitly at the boundary.",
             "inputSchema": {"type":"object","properties":{}}
         },
-        {
-            "name": "spawn_subagent",
-            "description": "Spawn a specialized sub-agent with its own clean context in the background to handle a specific code analysis or search sub-task. Use this to save token context size of the main agent.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["role", "task"],
-                "properties": {
-                    "role": {
-                        "type": "string",
-                        "description": "The job description / role of the sub-agent (e.g. 'Rust File Parser', 'CSS Style Fixer')."
-                    },
-                    "task": {
-                        "type": "string",
-                        "description": "The specific task instructions for the sub-agent to fulfill."
-                    }
-                }
-            }
-        },
-        {
-            "name": "query_logs",
-            "description": "Query the structured API and tool execution logs in SQLite from the past 24 hours. Helpful for diagnosing redundant tool calls or connection errors. Results include conversation_id when available.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "default": 50,
-                        "description": "Max log rows to return."
-                    },
-                    "query": {
-                        "type": "string",
-                        "description": "Optional SQLite WHERE clause filter (e.g. 'action = \"ERROR\"', 'conversation_id = \"previous_response_id:abc\"', or 'message LIKE \"%search%\"')."
-                    }
-                }
-            }
-        },
-        {
-            "name": "analyze_image",
-            "description": "Analyze an image that is still visible in the current request context. Use this only when the current user explicitly asks to re-check an image/screenshot or needs fresh visual inspection. If no original image is visible, ask the user to upload it again.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "image_ref": {
-                        "type": "string",
-                        "description": "Optional visible image reference. Use 'latest' by default, or a 1-based index like '1' for the first visible image in the current context."
-                    },
-                    "focus_instruction": {
-                        "type": "string",
-                        "description": "Optional instructions to tell the vision agent what to focus on or re-examine (e.g., 'focus on the bottom-right text')."
-                    }
-                }
-            }
-        }
     ]);
     definitions
         .as_array_mut()
@@ -1770,7 +1617,7 @@ pub fn tool_definitions() -> Value {
         .extend(crate::browser_control::definitions());
     for tool in definitions.as_array_mut().into_iter().flatten() {
         let name = tool["name"].as_str().unwrap_or("");
-        if crate::worker_read_cache::is_source_read(name) {
+        if crate::source_read::is_source_read(name) {
             tool["description"] = json!(format!(
                 "{} Source pages preserve original bytes and line delimiters; complete/next_start_line identify pagination. max_chars defaults to 24000, max 60000. Reads are bounded to 16 MiB; force_read bypasses snapshot caching.",
                 tool["description"].as_str().unwrap_or("")

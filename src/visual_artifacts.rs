@@ -30,7 +30,6 @@ pub enum ImageCapability {
 pub struct VisualSettings {
     pub capabilities:
         std::collections::HashMap<String, std::collections::HashMap<String, ImageCapability>>,
-    pub fallback: Option<VisualRoute>,
 }
 #[derive(Clone, Debug)]
 pub struct VisualRoute {
@@ -246,80 +245,6 @@ pub fn authorize(item: &Value, context: &VisualContext) -> Result<()> {
     );
     Ok(())
 }
-fn seal_visual_service_result(
-    mut result: Value,
-    manifest: &Value,
-    context: &VisualContext,
-    goal: &str,
-) -> Result<Value> {
-    ensure!(
-        result.is_object(),
-        "visual service response must be a JSON object"
-    );
-    let assessment = result["assessment"]
-        .as_str()
-        .context("visual service assessment is required")?;
-    ensure!(
-        matches!(assessment, "pass" | "issue" | "uncertain"),
-        "visual service returned an invalid assessment"
-    );
-    ensure!(
-        result["checked_goal"].as_str() == Some(goal),
-        "visual service checked_goal must match the requested goal"
-    );
-    ensure!(
-        result["request_trace_id"] == manifest["request_trace_id"],
-        "visual service result must cite the host request_trace_id"
-    );
-    let expected_ids = manifest["images"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|image| image["artifact_id"].clone())
-        .collect::<Vec<_>>();
-    ensure!(
-        result["artifact_ids"] == json!(expected_ids),
-        "visual service artifact_ids must match the supplied images in order"
-    );
-    ensure!(
-        result["expected_visible_result"]
-            .as_str()
-            .is_some_and(|value| !value.trim().is_empty()),
-        "visual service expected_visible_result is required"
-    );
-    for field in ["observed_facts", "issues", "limitations"] {
-        ensure!(
-            result[field].as_array().is_some(),
-            "visual service {field} must be an array"
-        );
-    }
-    for fact in result["observed_facts"].as_array().unwrap() {
-        ensure!(
-            fact["artifact_id"].as_str().is_some_and(|id| expected_ids
-                .iter()
-                .any(|expected| expected.as_str() == Some(id)))
-                && fact["region"]
-                    .as_str()
-                    .is_some_and(|value| !value.trim().is_empty())
-                && fact["fact"]
-                    .as_str()
-                    .is_some_and(|value| !value.trim().is_empty()),
-            "each visual service observation must cite a supplied artifact_id, region, and visible fact"
-        );
-    }
-    if matches!(assessment, "pass" | "issue") {
-        ensure!(
-            !result["observed_facts"].as_array().unwrap().is_empty(),
-            "visual service pass/issue requires at least one image-bound observation"
-        );
-    }
-    let id = new_id();
-    result["visual_service_result_id"] = json!(id);
-    result["identity"] = context.identity.clone();
-    result["request_trace_id"] = manifest["request_trace_id"].clone();
-    result["host_validation"] = json!({"validated":true,"request_trace_id":manifest["request_trace_id"],"artifact_ids":expected_ids});
-    Ok(result)
-}
 pub fn index(root: &Path, task: &str, node: &str, request: usize) -> Result<Vec<Value>> {
     if !root.is_dir() || task.is_empty() {
         return Ok(vec![]);
@@ -532,7 +457,6 @@ pub async fn prepare_request(
             .map(|image| image["artifact_id"].clone())
             .collect::<Vec<_>>()
     );
-    let mut image_blocks = Vec::new();
     let mut images = retained;
     let mut unavailable = retained_unavailable;
     for id in ids.iter().take(MAX_IMAGES) {
@@ -542,8 +466,7 @@ pub async fn prepare_request(
             id,
             context.original_artifact_ids.contains(id),
         ) {
-            Ok((block, sent)) => {
-                image_blocks.push(block);
+            Ok((_, sent)) => {
                 if !images
                     .iter()
                     .any(|image| image["artifact_id"] == sent["artifact_id"])
@@ -557,18 +480,6 @@ pub async fn prepare_request(
     manifest["images"] = json!(images);
     manifest["unavailable"] = json!(unavailable);
     manifest["omitted_by_image_budget"] = json!(ids.len().saturating_sub(MAX_IMAGES));
-    manifest["status"] = json!(if images.is_empty() {
-        "unavailable"
-    } else if capability == ImageCapability::Supported {
-        "direct"
-    } else if capability == ImageCapability::Unsupported && state.visual.fallback.is_some() {
-        "fallback"
-    } else if capability == ImageCapability::Unknown {
-        "unknown_capability"
-    } else {
-        "unavailable"
-    });
-    let blocks = image_blocks;
     let messages = body["messages"]
         .as_array_mut()
         .context("image request requires messages")?;
@@ -576,99 +487,6 @@ pub async fn prepare_request(
         manifest["status"] = json!("unavailable");
     } else if capability == ImageCapability::Supported {
         manifest["status"] = json!("direct");
-    } else if capability == ImageCapability::Unsupported && state.visual.fallback.is_some() {
-        let route = state.visual.fallback.as_ref().unwrap();
-        let vision_body = json!({"model":route.model,"stream":false,"max_tokens":1600,"messages":[
-            {"role":"user","content":blocks}]});
-        let mut fallback_metadata = manifest.clone();
-        fallback_metadata["actor"] = json!("visual_service");
-        fallback_metadata["model_route"] = json!({"provider":route.provider,"model":route.model});
-        fallback_metadata["model"] = json!(route.model);
-        if context.identity["runtime"] == "single_agent" {
-            fallback_metadata["request_flow"] = json!(true);
-            fallback_metadata["nodeId"] = json!(format!("visual_request_{}", new_id()));
-            // The main request has not been sent yet. Link to its existing
-            // predecessor, avoiding a parent node for a request never sent.
-            fallback_metadata["parent_node_id"] = context.identity["preparation_parent"].clone();
-            fallback_metadata["turn"] = json!(context.turn);
-            fallback_metadata["request_id"] = context.identity["request_id"].clone();
-        }
-        let trace = crate::request_context::record(
-            state.workspace.root(),
-            context.task_id(),
-            fallback_metadata.clone(),
-            &vision_body,
-        )
-        .await;
-        ensure!(context.identity["runtime"] != "single_agent" || trace.is_some(),
-            "Cannot persist visual model input; request was not sent");
-        let started = std::time::Instant::now();
-        let mut raw_service_response = Value::Null;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-            let response = state
-                .client
-                .post(format!(
-                    "{}/chat/completions",
-                    route.url.trim_end_matches('/')
-                ))
-                .bearer_auth(&route.api_key)
-                .header("x-codex-visual-dispatch", "task-owned")
-                .json(&vision_body)
-                .send()
-                .await?;
-            let response = crate::visual_probe::successful_response(response).await?;
-            let raw = response.text().await?;
-            raw_service_response = json!(raw);
-            let response: Value = serde_json::from_str(&raw)?;
-            let raw = response
-                .pointer("/choices/0/message/content")
-                .and_then(Value::as_str)
-                .context("visual service returned no text")?;
-            let result: Value = serde_json::from_str(
-                raw.trim()
-                    .trim_start_matches("```json")
-                    .trim_end_matches("```")
-                    .trim(),
-            )?;
-            Ok::<_, anyhow::Error>(result)
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("visual service timed out"))
-        .and_then(|r| r);
-        let result =
-            result.and_then(|result| seal_visual_service_result(result, &manifest, context, goal));
-        let outcome = json!({"duration_ms":started.elapsed().as_millis(),
-            "error":result.as_ref().err().map(|error|format!("{error:#}")),"response":raw_service_response});
-        let status = if result.is_ok(){"completed"}else{"failed"};
-        if context.identity["runtime"] == "single_agent" {
-            trace.context("visual model input log missing")?.finish_checked(status,outcome).await?;
-        } else {
-            crate::request_context::finish(trace,status,outcome).await;
-        }
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                json!({"assessment":"unavailable","limitations":[format!("{error:#}")],"host_validation":{"validated":false}})
-            }
-        };
-        let validated = result["host_validation"]["validated"] == true;
-        manifest["status"] = json!(if validated { "fallback" } else { "unavailable" });
-        manifest["visual_service_result_id"] = if validated {
-            result["visual_service_result_id"].clone()
-        } else {
-            Value::Null
-        };
-        manifest["visual_service_result_validated"] = json!(validated);
-        manifest["visual_service_response"] = raw_service_response;
-        manifest["visual_service_result"] = result.clone();
-        manifest["visual_service_route"] = fallback_metadata["model_route"].clone();
-        crate::agent_service::emit(
-            state.workspace.root(),
-            context.task_id(),
-            "visual/service_result",
-            json!({"manifest":manifest,"result":result,"elapsed_ms":started.elapsed().as_millis()}),
-        )
-        .await?;
     } else {
         manifest["status"] = json!(if capability == ImageCapability::Unknown {
             "unknown_capability"
@@ -684,8 +502,8 @@ pub async fn prepare_request(
             .map(|image| image["artifact_id"].clone())
             .collect::<Vec<_>>();
         manifest["image_input_unavailable"] = json!({"reason":if capability==ImageCapability::Unknown {
-            if state.visual.fallback.is_some() {"image capability of this model is unknown; the configured fallback is used only after explicit image rejection"}else{"image capability of this model is unknown and no fallback visual service is configured"}
-        }else{"this model does not accept images and no fallback visual service is configured"},
+            "image capability of this model is unknown"
+        }else{"this model does not accept images"},
             "captured_artifact_ids":captured});
     }
     if !ids.is_empty() {
@@ -780,7 +598,7 @@ pub fn validate_check(
         let request = request
             .context("visual result must cite a successfully received image request_trace_id")?;
         ensure!(
-            matches!(request["status"].as_str(), Some("direct" | "fallback")) && !ids.is_empty(),
+            matches!(request["status"].as_str(), Some("direct")) && !ids.is_empty(),
             "visual pass/issue requires actual image input, not DOM/capture status"
         );
         ensure!(
@@ -801,41 +619,6 @@ pub fn validate_check(
                     && ids.iter().any(|id| id == &fact["artifact_id"]),
                 "each observed fact must cite a selected artifact_id and describe visible evidence"
             );
-        }
-        if request["status"] == "fallback" {
-            let service = &request["visual_service_result"];
-            ensure!(
-                request["visual_service_result_validated"] == true
-                    && service["host_validation"]["validated"] == true
-                    && service["identity"] == context.identity
-                    && service["request_trace_id"] == request["request_trace_id"],
-                "fallback pass/issue requires a host-validated visual service result"
-            );
-            ensure!(
-                check["visual_service_result_id"] == service["visual_service_result_id"]
-                    && request["visual_service_result_id"] == service["visual_service_result_id"],
-                "fallback result must cite its validated visual_service_result_id"
-            );
-            ensure!(
-                service["assessment"] == assessment,
-                "fallback assessment must preserve the visual service conclusion"
-            );
-            ensure!(
-                check["expected_visible_result"] == service["expected_visible_result"],
-                "fallback expected_visible_result must come from the validated visual service result"
-            );
-            for fact in check["observed_facts"].as_array().unwrap() {
-                ensure!(
-                    service["observed_facts"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|source| source["artifact_id"] == fact["artifact_id"]
-                            && source["region"] == fact["region"]
-                            && source["fact"] == fact["fact"]),
-                    "fallback Worker facts must be present in the validated visual service result"
-                );
-            }
         }
     }
     let mut result = check.clone();
@@ -860,8 +643,6 @@ pub fn validate_check(
         result["visual_request"] = request.clone();
         result["capability"] = request["capability"].clone();
         result["image_input_unavailable"] = request["image_input_unavailable"].clone();
-        result["visual_service_route"] = request["visual_service_route"].clone();
-        result["visual_service_result_id"] = request["visual_service_result_id"].clone();
     }
     let id = new_id();
     result["check_id"] = json!(id);

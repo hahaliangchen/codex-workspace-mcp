@@ -4,7 +4,10 @@ import type { FlowNodeData } from './model.ts'
 export type VisualRecord = Record<string, unknown>
 export function visualMatchesNode(identity: VisualRecord, node: FlowNodeData): boolean {
   const raw = node.id.replace(/^turn_\d+:/, '').replace(/^request_\d+:/, '')
-  return identity.work_id === (node.workUnit?.id ?? raw) &&
+  if (identity.runtime === 'single_agent') {
+    return identity.node_id === raw && identity.request_id === node.requestId
+  }
+  return identity.work_id === raw &&
     identity.request_id === node.requestId && identity.revision === node.revision && identity.plan_revision === node.planRevision
 }
 export function visualRecords(events: readonly AgentEvent[], node?: FlowNodeData): { artifacts: VisualRecord[]; checks: VisualRecord[]; dispatches: VisualRecord[] } {

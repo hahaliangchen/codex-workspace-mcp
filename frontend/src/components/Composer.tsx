@@ -70,11 +70,9 @@ export function Composer({
   modelName = '',
   reasoningEffort,
   fastMode = false,
-  subagentEnabled = false,
   settings,
   onSelectModel,
   onSetGenerationOptions,
-  onToggleSubagent,
   onOpenSettings,
   onSubmit,
   onStop,
@@ -91,11 +89,9 @@ export function Composer({
   modelName?: string | undefined
   reasoningEffort?: string | null | undefined
   fastMode?: boolean | undefined
-  subagentEnabled?: boolean | undefined
   settings?: SettingsData | undefined
   onSelectModel?: ((providerId: string, modelId: string) => Promise<void>) | undefined
   onSetGenerationOptions?: ((reasoningEffort: string, fastMode: boolean) => Promise<void>) | undefined
-  onToggleSubagent?: (() => Promise<void>) | undefined
   onOpenSettings?: ((tab?: SettingsTab) => void) | undefined
   onSubmit: (text: string, permissionMode: DshPermissionMode, attachment?: AttachmentSubmission) => Promise<boolean>
   onStop: (() => void) | undefined
@@ -622,18 +618,7 @@ export function Composer({
                 )}
               </button>
 
-              {subagentEnabled && (
-                <Tooltip label="子代理委派已激活" side="top" delayMs={500}>
-                  <button
-                    type="button"
-                    className={codexCss.permPill}
-                    style={{ color: '#2563eb' }}
-                    onClick={() => { if (onToggleSubagent !== undefined) void onToggleSubagent() }}
-                  >
-                    <span>子代理</span>
-                  </button>
-                </Tooltip>
-              )}
+
             </div>
 
             <div className={codexCss.rightControls}>

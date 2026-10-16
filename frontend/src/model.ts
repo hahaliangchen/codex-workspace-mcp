@@ -17,7 +17,6 @@ export type ChatItem =
   | { readonly kind: 'turn'; readonly key: string; readonly turn: number }
   | { readonly kind: 'user'; readonly key: string; readonly text: string; readonly time: number; readonly attachments?:readonly {name:string;url:string;image:boolean}[] }
   | { readonly kind: 'assistant'; readonly key: string; readonly text: string; readonly reasoning: string; readonly time: number; readonly streaming: boolean; readonly turn: number; readonly step: number }
-  | { readonly kind: 'progress'; readonly key: string; readonly purpose: string; readonly knownConditions: readonly string[]; readonly nextAction: string; readonly time: number }
   | { readonly kind: 'observer'; readonly key: string; readonly summary: string; readonly suggestions: readonly string[]; readonly time: number }
   | { readonly kind: 'retrospective'; readonly key: string; readonly text: string; readonly time: number }
   | {
@@ -29,7 +28,6 @@ export type ChatItem =
     readonly time: number
     readonly result: ToolResult | undefined
   }
-  | { readonly kind: 'subagent'; readonly key: string; readonly childTaskId: string; readonly prompt: string }
   | { readonly kind: 'turn-end'; readonly key: string; readonly reason: TurnEndReason; readonly durationMs?: number | undefined; readonly time?: number | undefined }
 
 type Block = { readonly type?: unknown; readonly text?: unknown; readonly content?: unknown }
@@ -116,24 +114,13 @@ export function callIdOfResult(event: AgentEvent): string | undefined {
 /** Project an ordered event log into transcript rows; tool results attach to their call. */
 export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[] {
   const results = new Map<string, ToolResult>()
-  const assessments = new Map<number, { goalAchieved: boolean; unresolved: readonly string[] }>()
   for (const event of events) {
-    if (event.type === 'organizer/decision') {
-      const decision = event.data.decision as Record<string, unknown> | undefined
-      if (decision && (decision.action === 'finish' || decision.action === 'blocked')) {
-        assessments.set(numberOf(event.data.turn) ?? 1, {
-          goalAchieved: typeof decision.achieved === 'boolean' ? decision.achieved : decision.action === 'finish',
-          unresolved: Array.isArray(decision.unresolved) ? decision.unresolved.filter((item): item is string => typeof item === 'string') : [],
-        })
-      }
-    }
     if (event.type !== 'tool/result') continue
     const id = callIdOfResult(event)
     if (id !== undefined) results.set(id, resultOf(event))
   }
   const items: ChatItem[] = []
   let turnStartTime: number | undefined
-  let currentTurn = 1
 
   for (const event of events) {
     const key = `${event.type}:${event.seq}`
@@ -141,7 +128,6 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
       case 'turn/start': {
         turnStartTime = event.time
         const turn = numberOf(event.data.turn) ?? 1
-        currentTurn = turn
         if (turn > 1) items.push({ kind: 'turn', key, turn })
         break
       }
@@ -191,19 +177,6 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
         }
         break
       }
-      case 'worker/progress': {
-        const knownConditions = Array.isArray(event.data.knownConditions)
-          ? event.data.knownConditions.filter((value): value is string => typeof value === 'string')
-          : []
-        items.push({
-          kind: 'progress', key,
-          purpose: stringOf(event.data.purpose) ?? '',
-          knownConditions,
-          nextAction: stringOf(event.data.nextAction) ?? '',
-          time: event.time,
-        })
-        break
-      }
       case 'observer/plan_review':
       case 'observer/progress_review': {
         const suggestions = Array.isArray(event.data.suggestions)
@@ -247,23 +220,13 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
         })
         break
       }
-      case 'subagent/start': {
-        const childTaskId = stringOf(event.data.child_task_id)
-        if (childTaskId !== undefined) {
-          items.push({ kind: 'subagent', key, childTaskId, prompt: stringOf(event.data.prompt) ?? '' })
-        }
-        break
-      }
       case 'turn/end': {
         const durationMs = turnStartTime !== undefined ? Math.max(0, event.time - turnStartTime) : undefined
         const reason = reasonOf(event.data.reason)
-        const assessment = assessments.get(numberOf(event.data.turn) ?? currentTurn)
         items.push({
           kind: 'turn-end',
           key,
-          reason: reason.kind === 'completed' ? { ...reason,
-            goalAchieved: reason.goalAchieved ?? assessment?.goalAchieved,
-            unresolved: reason.unresolved ?? assessment?.unresolved } : reason,
+          reason,
           durationMs,
           time: event.time,
         })
@@ -286,7 +249,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
     items.push({
       kind: 'turn-end',
       key: `synthetic:turn-end:${task.task_id}`,
-      reason: task.status === 'completed' ? { kind: 'completed', ...assessments.get(currentTurn) } : { kind: 'aborted' },
+      reason: task.status === 'completed' ? { kind: 'completed' } : { kind: 'aborted' },
       durationMs,
       time: task.updated_at,
     })
@@ -428,10 +391,9 @@ export interface TrajectoryRow {
 export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
   const calls = new Map<string, AgentEvent>()
   for (const event of events) {
-    if (event.type === 'tool/call') calls.set(stringOf(event.data.callId) ?? '', event)
+    if (event.type === 'tool/call' || event.type === 'context/tool_call') calls.set(stringOf(event.data.callId) ?? '', event)
   }
-  return events.filter((event) => event.type !== 'assistant/delta' && event.type !== 'observer/config' && !event.type.startsWith('debug/')
-    && (event.type !== 'organizer/progress' || terminalOrganizerPhases.has(String(event.data.phase)))).map((event) => {
+  return events.filter((event) => event.type !== 'assistant/delta' && event.type !== 'observer/config' && !event.type.startsWith('debug/')).map((event) => {
     const data = event.data
     const base = {
       key: `${event.type}:${event.seq}`,
@@ -454,15 +416,10 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         return { ...base, detail: assistantDisplay(textOf(messageOf(event).content), '').text }
       case 'visual/input_result':
         return { ...base, name: '视觉输入结果', detail: textOf(messageOf(event).content) }
+      case 'context/tool_call':
       case 'tool/call':
         return { ...base, name: stringOf(data.name), detail: argumentsOf(data.arguments) }
-      case 'organizer/progress': {
-        const phase = stringOf(data.phase) ?? ''
-        const progress: FlowOrganizerProgress = { phase, turn: numberOf(data.turn) ?? 0, time: event.time, elapsedMs: numberOf(data.elapsed_ms),
-          responseHeadersMs: numberOf(data.response_headers_ms), firstChunkMs: numberOf(data.first_chunk_ms), firstDeltaMs: numberOf(data.first_delta_ms),
-          firstToolDeltaMs: numberOf(data.first_tool_delta_ms), receivedBytes: numberOf(data.received_bytes) }
-        return { ...base, name: organizerPhaseLabel(phase), detail: organizerProgressTimings(progress), durationMs: progress.elapsedMs, failed: phase !== 'completed' }
-      }
+      case 'context/tool_result':
       case 'tool/result': {
         const result = resultOf(event)
         const call = calls.get(callIdOfResult(event) ?? '')
@@ -507,14 +464,6 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         const identity = (data.identity ?? {}) as Record<string, unknown>
         const result = (data.result ?? {}) as Record<string, unknown>
         return { ...base, name: stringOf(data.stage), detail: `${String(identity.work_id ?? '')}@${String(identity.revision ?? '')} · ${String(data.status ?? 'unassessed')}\n${String(result.summary ?? result.message ?? '')}`, failed: data.status === 'failed' || data.status === 'timeout' }
-      }
-      case 'worker/work_state': {
-        const state = typeof data.state === 'object' && data.state !== null ? data.state as Record<string, unknown> : {}
-        const files = typeof state.files === 'object' && state.files !== null ? Object.keys(state.files) : []
-        return { ...base, name: '工作记录', detail: [
-          `已读取：${files.join(', ')}`, ...observerStringList(state.open_questions).map(question => `待确认：${question}`),
-          `下一步：${stringOf(state.next_action) ?? ''}`,
-        ].join('\n') }
       }
       case 'observer/plan_review':
       case 'observer/progress_review': {
@@ -578,10 +527,6 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
         return { ...base, name: 'unavailable', detail: stringOf(data.message) ?? 'Observer unavailable; action continued', failed: true }
       case 'observer/cancelled':
         return { ...base, name: 'cancelled', detail: 'Observer review cancelled with the task' }
-      case 'subagent/start':
-        return { ...base, detail: stringOf(data.prompt) ?? '', childTaskId: stringOf(data.child_task_id) }
-      case 'subagent/end':
-        return { ...base, detail: stringOf(data.status) ?? '', childTaskId: stringOf(data.child_task_id) }
       case 'turn/end': {
         const reason = reasonOf(data.reason)
         return { ...base, detail: reason.kind === 'error' ? reason.message : '', failed: reason.kind === 'error' }
@@ -633,7 +578,7 @@ export interface FlowNodeReview {
 
 export function reviewMatchesNode(review: FlowNodeReview, node: FlowNodeData): boolean {
   const raw = node.id.replace(/^turn_\d+:/, '').replace(/^request_\d+:/, '')
-  return review.identity.work_id === (node.workUnit?.id ?? raw) &&
+  return review.identity.work_id === raw &&
     (node.requestId === undefined ? review.turn === node.turn : review.identity.request_id === node.requestId) &&
     (node.revision === undefined || review.identity.revision === node.revision) &&
     (node.planRevision === undefined || review.identity.plan_revision === node.planRevision)
@@ -667,46 +612,6 @@ export interface FlowObserverRetrospective {
   readonly message?: string | undefined
 }
 
-export interface FlowProgressReport {
-  readonly findings: readonly string[]
-  readonly openQuestions: readonly string[]
-  readonly observerResponses: readonly string[]
-  readonly step?: number | undefined
-  readonly purpose: string
-  readonly knownConditions: readonly string[]
-  readonly nextAction: string
-}
-
-export interface FlowWorkUnit {
-  readonly id: string
-  readonly nodeId?: string | undefined
-  readonly status: 'ready' | 'running' | 'done'
-  readonly done: boolean
-  readonly goal: string
-  readonly doneWhen: string
-  readonly upstreamIds: readonly string[]
-  readonly checks: readonly string[]
-  readonly completedChecks: readonly string[]
-  readonly failedChecks?: readonly string[] | undefined
-  readonly outputSummary?: string | undefined
-  readonly outcome?: string | undefined
-  readonly expectationMet?: boolean | undefined
-}
-
-export interface FlowRewindRecord {
-  readonly id: string
-  readonly sourceNode: string
-  readonly sourceWorkId?: string | undefined
-  readonly sourceRevision?: number | undefined
-  readonly targetNode: string
-  readonly targetWorkId?: string | undefined
-  readonly targetRevision?: number | undefined
-  readonly reason: string
-  readonly timestamp?: number | undefined
-  readonly planRevision?: number | undefined
-  readonly invalidatedTasks?: readonly string[] | undefined
-}
-
 export interface FlowNodeData {
   [key: string]: unknown
   readonly id: string
@@ -715,13 +620,6 @@ export interface FlowNodeData {
   readonly status: FlowNodeStatus
   readonly description?: string | undefined
   readonly parentId?: string | undefined
-  readonly isMainTask?: boolean | undefined
-  readonly objective?: string | undefined
-  readonly doneWhen?: string | undefined
-  readonly workUnit?: FlowWorkUnit | undefined
-  readonly constraints?: readonly string[] | undefined
-  readonly result?: { readonly summary: string; readonly materialIds: readonly number[]; readonly outcome?: string | undefined; readonly goalAchieved?: boolean | undefined; readonly expectationMet?: boolean | undefined; readonly limitations?: readonly string[] | undefined } | undefined
-  readonly progress: readonly FlowProgressReport[]
   readonly tools: readonly FlowToolExecution[]
   readonly consults: readonly FlowObserverConsult[]
   readonly files: readonly string[]
@@ -730,7 +628,6 @@ export interface FlowNodeData {
   readonly revision?: number | undefined
   readonly requestId?: number | undefined
   readonly planRevision?: number | undefined
-  readonly invalidatedByPlanRevision?: number | undefined
 }
 
 export interface FlowEdgeData {
@@ -739,69 +636,17 @@ export interface FlowEdgeData {
   readonly target: string
   readonly label?: string | undefined
   readonly animated?: boolean | undefined
-  readonly rewind?: boolean | undefined
-  readonly deprecated?: boolean | undefined
-}
-
-export type OrganizerPhase = 'waiting_response' | 'waiting_first_delta' | 'reasoning' | 'receiving_decision' | 'completed' | 'failed' | 'cancelled' | 'timeout'
-
-const organizerPhaseLabels: Record<OrganizerPhase, string> = {
-  waiting_response: '等待响应',
-  waiting_first_delta: '已连接，等待首个增量',
-  reasoning: '正在推理',
-  receiving_decision: '正在接收决策',
-  completed: '决策已完成',
-  failed: '决策请求失败',
-  cancelled: '已取消',
-  timeout: '请求超时',
-}
-
-const terminalOrganizerPhases = new Set<string>(['completed', 'failed', 'cancelled', 'timeout'])
-
-export function organizerPhaseLabel(phase: string): string {
-  return organizerPhaseLabels[phase as OrganizerPhase] ?? phase
-}
-
-/** Latest Organizer request state; all times are milliseconds after the request started, null when not received. */
-export interface FlowOrganizerProgress {
-  readonly phase: string
-  readonly turn: number
-  readonly step?: number | undefined
-  readonly nodeId?: string | undefined
-  readonly time: number
-  readonly elapsedMs?: number | undefined
-  readonly responseHeadersMs?: number | undefined
-  readonly firstChunkMs?: number | undefined
-  readonly firstDeltaMs?: number | undefined
-  readonly firstToolDeltaMs?: number | undefined
-  readonly receivedBytes?: number | undefined
-  readonly reasoningChars?: number | undefined
-  readonly toolArgumentBytes?: number | undefined
-}
-
-export function organizerProgressTimings(progress: FlowOrganizerProgress): string {
-  const ms = (label: string, value: number | undefined) => `${label} ${value === undefined ? '—' : `${value}ms`}`
-  return [ms('响应头', progress.responseHeadersMs), ms('首块', progress.firstChunkMs), ms('首增量', progress.firstDeltaMs),
-    ms('首个工具增量', progress.firstToolDeltaMs), ms('已用', progress.elapsedMs),
-    `接收 ${progress.receivedBytes ?? 0} 字节`].join(' · ')
 }
 
 export interface FlowState {
-  readonly organizerProgress?: FlowOrganizerProgress | undefined
   readonly nodeReviews: readonly FlowNodeReview[]
-  readonly currentWork?: FlowWorkUnit | undefined
   readonly nodes: readonly FlowNodeData[]
   readonly edges: readonly FlowEdgeData[]
   readonly activeNodeId?: string | undefined
   readonly observerEnabled?: boolean | undefined
   readonly observerNotes: readonly FlowObserverNote[]
   readonly observerRetrospective?: FlowObserverRetrospective | undefined
-  readonly organizedMode: 'direct' | 'dag' | 'tree'
   readonly organizedTurn: number
-  readonly activePath: readonly string[]
-  readonly unfinishedTree: boolean
-  readonly planRevision?: number | undefined
-  readonly rewindRecords?: readonly FlowRewindRecord[] | undefined
 }
 
 function observerStringList(value: unknown): string[] {
@@ -863,13 +708,6 @@ function createFlowNode(
   status: FlowNodeStatus
   description?: string | undefined
   parentId?: string | undefined
-  isMainTask?: boolean | undefined
-  objective?: string | undefined
-  doneWhen?: string | undefined
-  workUnit?: FlowWorkUnit | undefined
-  constraints?: string[] | undefined
-  result?: { summary: string; materialIds: number[]; outcome?: string | undefined; goalAchieved?: boolean | undefined; expectationMet?: boolean | undefined; limitations?: readonly string[] | undefined } | undefined
-  progress: FlowProgressReport[]
   tools: FlowToolExecution[]
   consults: FlowObserverConsult[]
   files: Set<string>
@@ -878,7 +716,6 @@ function createFlowNode(
   revision?: number | undefined
   requestId?: number | undefined
   planRevision?: number | undefined
-  invalidatedByPlanRevision?: number | undefined
 } {
   return {
     id,
@@ -886,7 +723,6 @@ function createFlowNode(
     kind,
     status,
     description,
-    progress: [],
     tools: [],
     consults: [],
     files: new Set<string>(),
@@ -895,79 +731,24 @@ function createFlowNode(
 }
 
 export function flowState(events: readonly AgentEvent[]): FlowState {
-  let currentWork: FlowWorkUnit | undefined
   let currentTurn = 1
-  let currentPlanRevision = 1
-  const rewindRecordsMap = new Map<string, FlowRewindRecord>()
   let taskLabel = ''
   let observerEnabled: boolean | undefined
   const observerNotes: FlowObserverNote[] = []
   const nodeReviews = new Map<string, FlowNodeReview>()
   let observerRetrospective: FlowObserverRetrospective | undefined
-  let organizerProgress: FlowOrganizerProgress | undefined
   const nodeKey = (id: string, turn = currentTurn) => 'turn_' + turn + ':' + id
   const nodeMap = new Map<string, ReturnType<typeof createFlowNode>>()
   const edges: FlowEdgeData[] = []
   const callsToNode = new Map<string, string>()
-  const nodeToWorkMap = new Map<string, string>()
   let activeNodeId: string | undefined
-  let organizedMode: FlowState['organizedMode'] = 'direct'
-  let activePath: string[] = []
-  let unfinishedTree = false
-  const treeTurns = new Set<number>()
-  const treeFields = (node: ReturnType<typeof createFlowNode>, raw: Record<string, unknown>, turn: number) => {
-    node.isMainTask = raw.is_main_task === true || node.isMainTask
-    node.requestId = numberOf(raw.request_id) ?? node.requestId
-    const parent = stringOf(raw.parent_id)
-    if (parent) {
-      const mappedParent = nodeToWorkMap.get(nodeKey(parent, turn)) ?? parent
-      node.parentId = nodeKey(mappedParent, turn)
-    }
-    node.objective = stringOf(raw.objective) ?? node.objective
-    node.doneWhen = stringOf(raw.done_when) ?? node.doneWhen
-    node.constraints = observerStringList(raw.constraints)
-    const result = raw.result as Record<string, unknown> | null | undefined
-    node.result = result && typeof result.summary === 'string' ? { summary: result.summary,
-      materialIds: Array.isArray(result.material_ids) ? result.material_ids.filter((id): id is number => typeof id === 'number') : [],
-      outcome: stringOf(result.outcome),
-      goalAchieved: typeof result.goal_achieved === 'boolean' ? result.goal_achieved : undefined,
-      expectationMet: typeof result.expectation_met === 'boolean' ? result.expectation_met : undefined,
-      limitations: observerStringList(result.limitations) } : undefined
-  }
-
-  const flowEvents: readonly AgentEvent[] = events.flatMap(event => {
-    if (event.type !== 'flow/session') return [event]
-    const data = event.data
-    const state = data.scheduler as Record<string, unknown> | undefined
-    const plan = data.flow_plan as Record<string, unknown> | undefined
-    const planNodes = (Array.isArray(plan?.nodes) ? plan.nodes : []).map((raw: Record<string, unknown>) => ({ ...raw,
-      status: raw.status === 'running' && (raw.work_id === state?.current || raw.is_main_task === true) ? 'paused' : raw.status,
-    }))
-    return [
-      { ...event, type: 'scheduler/state', data: { turn: data.turn, state } },
-      { ...event, type: 'flow/plan', data: { ...plan, nodes: planNodes, turn: data.turn, active_node_id: '', replaceCurrentTurn: true } },
-    ]
-  })
-  for (const event of flowEvents) {
+  for (const event of events) {
     const data = event.data || {}
     const turn = numberOf(data.turn) ?? currentTurn
     switch (event.type) {
       case 'turn/start':
         currentTurn = Math.max(currentTurn, turn)
-        currentWork = undefined
-        organizerProgress = undefined
-        organizedMode = 'direct'; activePath = []; unfinishedTree = false
-        break
-      case 'organizer/start':
-        organizerProgress = { phase: 'waiting_response', turn, step: numberOf(data.step), nodeId: stringOf(data.nodeId), time: event.time }
-        break
-      case 'organizer/progress':
-        organizerProgress = {
-          phase: stringOf(data.phase) ?? 'waiting_response', turn, step: numberOf(data.step), nodeId: stringOf(data.nodeId), time: event.time,
-          elapsedMs: numberOf(data.elapsed_ms), responseHeadersMs: numberOf(data.response_headers_ms), firstChunkMs: numberOf(data.first_chunk_ms),
-          firstDeltaMs: numberOf(data.first_delta_ms), firstToolDeltaMs: numberOf(data.first_tool_delta_ms), receivedBytes: numberOf(data.received_bytes),
-          reasoningChars: numberOf(data.reasoning_chars), toolArgumentBytes: numberOf(data.tool_argument_bytes),
-        }
+        activeNodeId = undefined
         break
       case 'user/message': {
         currentTurn = Math.max(currentTurn, turn)
@@ -1059,285 +840,6 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         }
         break
       }
-      case 'flow/plan': {
-        currentTurn = Math.max(currentTurn, turn)
-        organizedMode = data.mode === 'tree' ? 'tree' : data.mode === 'direct' ? 'direct' : 'dag'
-        if (organizedMode === 'tree') treeTurns.add(turn)
-        activePath = observerStringList(data.active_path).map(id => nodeKey(id, turn))
-        if (typeof data.plan_revision === 'number') {
-          currentPlanRevision = data.plan_revision
-        }
-        if (Array.isArray(data.rewind_records)) {
-          for (const raw of data.rewind_records) {
-            if (raw && typeof raw === 'object') {
-              const rec = raw as Record<string, unknown>
-              const id = stringOf(rec.id) ?? ''
-              if (id && !rewindRecordsMap.has(id)) {
-                rewindRecordsMap.set(id, {
-                  id,
-                  sourceNode: stringOf(rec.source_node) ?? '',
-                  sourceWorkId: stringOf(rec.source_work_id),
-                  sourceRevision: numberOf(rec.source_revision) ?? 1,
-                  targetNode: stringOf(rec.target_node) ?? '',
-                  targetWorkId: stringOf(rec.target_work_id),
-                  targetRevision: numberOf(rec.target_revision) ?? 1,
-                  reason: stringOf(rec.reason) ?? '',
-                  timestamp: numberOf(rec.timestamp) ?? 0,
-                  planRevision: numberOf(rec.plan_revision) ?? 1,
-                  invalidatedTasks: observerStringList(rec.invalidated_tasks),
-                })
-              }
-            }
-          }
-        }
-        const rawNodes = Array.isArray(data.nodes) ? data.nodes : []
-        const plannedIds = new Set(rawNodes
-          .filter((raw): raw is Record<string, unknown> => !!raw && typeof raw === 'object')
-          .map(raw => stringOf(raw.id) ?? stringOf(raw.work_id))
-          .filter((id): id is string => !!id))
-        const prefix = 'turn_' + turn + ':'
-        if (data.replaceCurrentTurn === true) {
-          for (const [id, node] of nodeMap) {
-            if (node.turn === turn && !plannedIds.has(id.slice(prefix.length))) {
-              if (node.status !== 'deprecated') {
-                nodeMap.delete(id)
-              }
-            }
-          }
-          for (let index = edges.length - 1; index >= 0; index -= 1) {
-            if (edges[index]?.id.startsWith(prefix) && !edges[index]?.deprecated && !edges[index]?.rewind) {
-              edges.splice(index, 1)
-            }
-          }
-          if (activeNodeId?.startsWith(prefix) && !plannedIds.has(activeNodeId.slice(prefix.length))) {
-            activeNodeId = undefined
-          }
-        } else if (data.replaceEdgesCurrentTurn === true) {
-          for (let index = edges.length - 1; index >= 0; index -= 1) {
-            if (edges[index]?.id.startsWith(prefix) && !edges[index]?.deprecated && !edges[index]?.rewind) {
-              edges.splice(index, 1)
-            }
-          }
-        }
-        for (const raw of rawNodes) {
-          if (!raw || typeof raw !== 'object') continue
-          const rawNode = raw as Record<string, unknown>
-          const rawId = stringOf(rawNode.id) ?? stringOf(rawNode.work_id) ?? ('node_' + (nodeMap.size + 1))
-          const rawNodeId = stringOf(rawNode.node_id)
-          const isDeprecated = rawNode.status === 'deprecated' || (rawNode.invalidated_by_plan_revision !== null && rawNode.invalidated_by_plan_revision !== undefined)
-          if (rawNodeId && rawId) {
-            const key = nodeKey(rawNodeId, turn)
-            if (!nodeToWorkMap.has(key) || !isDeprecated) {
-              nodeToWorkMap.set(key, rawId)
-            }
-          }
-          const id = nodeKey(rawId, turn)
-          const previous = nodeMap.get(id)
-          const node = previous ?? createFlowNode(id, turn)
-          node.title = stringOf(rawNode.title) ?? node.title
-          node.kind = stringOf(rawNode.kind) ?? node.kind
-          node.description = stringOf(rawNode.description) ?? node.description
-          node.status = flowStatus(rawNode.status ?? node.status)
-          node.revision = numberOf(rawNode.revision) ?? node.revision
-          node.planRevision = numberOf(rawNode.plan_revision) ?? node.planRevision
-          node.invalidatedByPlanRevision = numberOf(rawNode.invalidated_by_plan_revision) ?? node.invalidatedByPlanRevision
-          treeFields(node, rawNode, turn)
-          nodeMap.set(id, node)
-          if (node.status === 'running') activeNodeId = id
-        }
-        const rawEdges = Array.isArray(data.edges) ? data.edges : []
-        for (const raw of rawEdges) {
-          if (!raw || typeof raw !== 'object') continue
-          const edge = raw as Record<string, unknown>
-          const source = stringOf(edge.source)
-          const target = stringOf(edge.target)
-          if (!source || !target) continue
-          const id = nodeKey(stringOf(edge.id) ?? ('e_' + source + '_' + target), turn)
-          const existing = edges.findIndex(item => item.id === id)
-          const isRewind = edge.rewind === true
-          const isDeprecated = edge.deprecated === true
-          const nextEdge: FlowEdgeData = {
-            id,
-            source: nodeKey(source, turn),
-            target: nodeKey(target, turn),
-            label: stringOf(edge.label),
-            animated: isRewind ? true : !isDeprecated,
-            rewind: isRewind,
-            deprecated: isDeprecated,
-          }
-          if (existing >= 0) edges[existing] = nextEdge
-          else edges.push(nextEdge)
-        }
-        if (data.active_node_id !== undefined) activeNodeId = stringOf(data.active_node_id) ? nodeKey(String(data.active_node_id), turn) : undefined
-        break
-      }
-      case 'organizer/assignment': {
-        const order = data.order as Record<string, unknown> | undefined
-        if (!order) break
-        const id = nodeKey(stringOf(order.id) ?? stringOf(order.node_id) ?? 'direct', turn)
-        const node = nodeMap.get(id) ?? createFlowNode(id, turn)
-        node.title = (numberOf(order.revision) ?? 1) > 1 ? `${stringOf(order.goal)} (r${order.revision})` : (stringOf(order.goal) ?? node.title)
-        node.objective = stringOf(order.goal)
-        node.description = node.objective
-        node.doneWhen = stringOf(order.done_when)
-        node.constraints = observerStringList(order.constraints)
-        node.revision = numberOf(order.revision) ?? node.revision
-        node.planRevision = numberOf(order.plan_revision) ?? node.planRevision
-        node.status = 'running'
-        nodeMap.set(id, node); activeNodeId = id
-        break
-      }
-      case 'scheduler/rewind': {
-        const rewind = data.rewind as Record<string, unknown> | undefined
-        if (rewind) {
-          const id = stringOf(rewind.id) ?? ('rewind_' + rewindRecordsMap.size)
-          rewindRecordsMap.set(id, {
-            id,
-            sourceNode: stringOf(rewind.source_node) ?? '',
-            sourceWorkId: stringOf(rewind.source_work_id),
-            sourceRevision: numberOf(rewind.source_revision) ?? 1,
-            targetNode: stringOf(rewind.target_node) ?? '',
-            targetWorkId: stringOf(rewind.target_work_id),
-            targetRevision: numberOf(rewind.target_revision) ?? 1,
-            reason: stringOf(rewind.reason) ?? '',
-            timestamp: numberOf(rewind.timestamp) ?? event.time,
-            planRevision: numberOf(rewind.plan_revision) ?? 1,
-            invalidatedTasks: observerStringList(rewind.invalidated_tasks),
-          })
-        }
-        break
-      }
-      case 'flow/request_archived': {
-        const firstTurn = numberOf(data.started_turn) ?? turn - 1
-        const ids = new Set(observerStringList(data.node_ids))
-        const abandoned = new Set<string>()
-        for (const [id, node] of nodeMap) {
-          if (node.turn === undefined || node.turn < firstTurn || node.turn >= turn) continue
-          if (!ids.has(id.slice(('turn_' + node.turn + ':').length))) continue
-          node.status = 'deprecated'
-          node.invalidatedByPlanRevision = numberOf(data.plan_revision)
-          abandoned.add(id)
-        }
-        for (let index = 0; index < edges.length; index += 1) {
-          const edge = edges[index]!
-          if (abandoned.has(edge.source) || abandoned.has(edge.target)) {
-            edges[index] = { ...edge, deprecated: true, animated: false }
-          }
-        }
-        break
-      }
-      case 'scheduler/state': {
-        const state = data.state as Record<string, unknown> | undefined
-        if (typeof state?.plan_revision === 'number') {
-          currentPlanRevision = state.plan_revision
-        }
-        const frames = state?.frames as Record<string, Record<string, unknown>> | undefined
-        // F03: Select best workId for each nodeId avoiding deprecated/invalidated overwriting active
-        const bestFramesForNode = new Map<string, { workId: string, revision: number, isInvalidated: boolean, sequence: number }>()
-        for (const frame of Object.values(frames ?? {})) {
-          const order = frame.order as Record<string, unknown> | undefined
-          if (!order) continue
-          const rawOrderId = stringOf(order.id)
-          const rawNodeId = stringOf(order.node_id)
-          if (!rawOrderId || !rawNodeId) continue
-          const isInvalidated = frame.invalidated_by_plan_revision !== null && frame.invalidated_by_plan_revision !== undefined
-          const revision = numberOf(order.revision) ?? 1
-          const sequence = numberOf(frame.sequence) ?? 0
-          const key = nodeKey(rawNodeId, turn)
-          const existing = bestFramesForNode.get(key)
-          if (!existing) {
-            bestFramesForNode.set(key, { workId: rawOrderId, revision, isInvalidated, sequence })
-          } else {
-            if (existing.isInvalidated && !isInvalidated) {
-              bestFramesForNode.set(key, { workId: rawOrderId, revision, isInvalidated, sequence })
-            } else if (existing.isInvalidated === isInvalidated) {
-              if (revision > existing.revision || (revision === existing.revision && sequence > existing.sequence)) {
-                bestFramesForNode.set(key, { workId: rawOrderId, revision, isInvalidated, sequence })
-              }
-            }
-          }
-        }
-        for (const [key, best] of bestFramesForNode.entries()) {
-          nodeToWorkMap.set(key, best.workId)
-        }
-        for (const frame of Object.values(frames ?? {})) {
-          const order = frame.order as Record<string, unknown> | undefined
-          if (!order) continue
-          const checked = frame.checked as Record<string, unknown> | undefined
-          const output = frame.output as Record<string, unknown> | undefined
-          const work: FlowWorkUnit = {
-            id: stringOf(order.id) ?? '',
-            nodeId: stringOf(order.node_id),
-            status: frame.status === 'done' ? 'done' : frame.status === 'running' ? 'running' : 'ready',
-            done: frame.status === 'done', goal: stringOf(order.goal) ?? '', doneWhen: stringOf(order.done_when) ?? '',
-            upstreamIds: observerStringList(order.upstream_ids), checks: observerStringList(order.checks),
-            completedChecks: Object.keys(checked ?? {}), outputSummary: stringOf(output?.summary),
-            outcome: stringOf(output?.outcome), expectationMet: typeof output?.expectation_met === 'boolean' ? output.expectation_met : undefined,
-            failedChecks: Object.keys((frame.check_errors as Record<string, unknown> | undefined) ?? {}),
-          }
-          if (order.id === state?.current) currentWork = work
-          const id = nodeKey(stringOf(order.id) ?? stringOf(order.node_id) ?? 'direct', turn)
-          const node = nodeMap.get(id) ?? createFlowNode(id, turn, work.goal, 'worker')
-          node.workUnit = work
-          node.requestId = numberOf(state?.request_started_turn) ?? node.requestId
-          node.objective = work.goal
-          node.description = work.goal
-          node.doneWhen = work.doneWhen
-          node.constraints = observerStringList(order.constraints)
-          node.revision = numberOf(order.revision) ?? node.revision
-          node.planRevision = numberOf(order.plan_revision) ?? node.planRevision
-          node.invalidatedByPlanRevision = numberOf(frame.invalidated_by_plan_revision) ?? node.invalidatedByPlanRevision
-          const isInvalidated = frame.invalidated_by_plan_revision !== null && frame.invalidated_by_plan_revision !== undefined
-          if (!treeTurns.has(turn)) {
-            node.title = (numberOf(order.revision) ?? 1) > 1 ? `${work.goal} (r${order.revision})` : (work.goal || node.title)
-            node.status = isInvalidated ? 'deprecated' : work.done ? 'done' : work.status === 'running' ? 'running' : 'ready'
-            if (work.outputSummary) node.result = { summary: work.outputSummary, materialIds: [], outcome: work.outcome,
-              expectationMet: work.expectationMet }
-          } else if (isInvalidated) {
-            node.status = 'deprecated'
-          }
-          nodeMap.set(id, node)
-          if (order.id === state?.current) activeNodeId = (work.done || node.status === 'deprecated') ? undefined : id
-        }
-        break
-      }
-      case 'flow/tree_state': {
-        currentTurn = Math.max(currentTurn, turn); organizedMode = 'tree'; treeTurns.add(turn)
-        const state = data.state as Record<string, unknown> | undefined
-        if (!state) break
-        const rawNodes = state.nodes as Record<string, Record<string, unknown>> | undefined
-        for (const raw of Object.values(rawNodes ?? {})) {
-          const rawId = stringOf(raw.id)
-          if (!rawId) continue
-          const mappedWorkId = nodeToWorkMap.get(nodeKey(rawId, turn))
-          const effectiveId = mappedWorkId ?? rawId
-          const id = nodeKey(effectiveId, turn)
-          const node = nodeMap.get(id) ?? createFlowNode(id, turn)
-          // Deprecated instances preserve their own state and must not be overwritten by tree state
-          if (node.status === 'deprecated') {
-            treeFields(node, raw, turn)
-            nodeMap.set(id, node)
-            continue
-          }
-          if (!mappedWorkId) {
-            node.title = stringOf(raw.title) ?? node.title
-            node.kind = stringOf(raw.kind) ?? node.kind
-            node.status = flowStatus(raw.status)
-          }
-          treeFields(node, raw, turn)
-          nodeMap.set(id, node)
-        }
-        const active = stringOf(data.active_node_id) ?? stringOf(state.active)
-        const mappedActive = active ? (nodeToWorkMap.get(nodeKey(active, turn)) ?? active) : undefined
-        activeNodeId = mappedActive ? nodeKey(mappedActive, turn) : undefined
-        const rawPath = observerStringList(data.active_path)
-        activePath = rawPath.map(id => {
-          const mapped = nodeToWorkMap.get(nodeKey(id, turn)) ?? id
-          return nodeKey(mapped, turn)
-        })
-        if (data.ended === true) unfinishedTree = data.root_finished !== true
-        break
-      }
       case 'flow/node_state': {
         currentTurn = Math.max(currentTurn, turn)
         const rawId = stringOf(data.id)
@@ -1347,50 +849,6 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           node.status = flowStatus(data.status)
           if (node.status === 'running') activeNodeId = id
         }
-        break
-      }
-      case 'worker/progress': {
-        currentTurn = Math.max(currentTurn, turn)
-        const rawWorkId = stringOf(data.workId)
-        const rawNodeId = stringOf(data.nodeId)
-        const mappedWorkId = rawNodeId ? nodeToWorkMap.get(nodeKey(rawNodeId, turn)) : undefined
-        const effectiveWorkId = rawWorkId ?? mappedWorkId
-        const workKey = effectiveWorkId ? nodeKey(effectiveWorkId, turn) : undefined
-        const nodeKeyVal = rawNodeId ? nodeKey(rawNodeId, turn) : undefined
-        const id = workKey ?? nodeKeyVal ?? nodeKey('worker', turn)
-        let node = (workKey ? nodeMap.get(workKey) : undefined) ?? (nodeKeyVal ? nodeMap.get(nodeKeyVal) : undefined)
-        if (!node) {
-          node = createFlowNode(id, turn, '工作者步骤', 'step', undefined, 'running')
-          nodeMap.set(id, node)
-        }
-        if (effectiveWorkId && rawNodeId) {
-          nodeToWorkMap.set(nodeKey(rawNodeId, turn), effectiveWorkId)
-        }
-        if (!treeTurns.has(turn)) node.status = 'running'
-        if (data.revision !== undefined) node.revision = numberOf(data.revision) ?? node.revision
-        if (data.planRevision !== undefined) node.planRevision = numberOf(data.planRevision) ?? node.planRevision
-        const known = Array.isArray(data.knownConditions)
-          ? data.knownConditions.filter((item): item is string => typeof item === 'string')
-          : typeof data.knownConditions === 'string' ? [data.knownConditions] : []
-        node.progress.push({
-          step: numberOf(data.step),
-          purpose: stringOf(data.purpose) ?? '',
-          knownConditions: known,
-          openQuestions: observerStringList(data.openQuestions),
-          findings: Array.isArray(data.findings) ? data.findings.flatMap(item => {
-            if (typeof item !== 'object' || item === null) return []
-            const finding = item as Record<string, unknown>
-            const text = stringOf(finding.text)
-            return text ? [`${text}${observerStringList(finding.files).length ? ` · ${observerStringList(finding.files).join(', ')}` : ''}`] : []
-          }) : [],
-          observerResponses: Array.isArray(data.observerResponses) ? data.observerResponses.flatMap(item => {
-            if (typeof item !== 'object' || item === null) return []
-            const response = item as Record<string, unknown>
-            return [`${stringOf(response.id) ?? ''} · ${stringOf(response.disposition) ?? ''}：${stringOf(response.reason) ?? ''}`]
-          }) : [],
-          nextAction: stringOf(data.nextAction) ?? '',
-        })
-        if (!treeTurns.has(turn)) activeNodeId = id
         break
       }
       case 'flow/node_add': {
@@ -1404,7 +862,11 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           node.kind = stringOf(rawNode.kind) ?? node.kind
           node.description = stringOf(rawNode.description) ?? node.description
           node.status = flowStatus(rawNode.status ?? node.status)
-          treeFields(node, rawNode, turn)
+          const parent = stringOf(rawNode.parent_id)
+          node.parentId = parent ? nodeKey(parent, turn) : node.parentId
+          node.requestId = numberOf(rawNode.request_id) ?? node.requestId
+          node.revision = numberOf(rawNode.revision) ?? node.revision
+          node.planRevision = numberOf(rawNode.plan_revision) ?? node.planRevision
           nodeMap.set(id, node)
           if (node.status === 'running') activeNodeId = id
         }
@@ -1454,12 +916,12 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const argsStr = argumentsOf(data.arguments)
         const flowNodeId = stringOf(data.flowNodeId)
         const targetId = flowNodeId
-          ? nodeKey(nodeToWorkMap.get(nodeKey(flowNodeId, turn)) ?? flowNodeId, turn)
-          : activeNodeId ?? nodeKey('worker', turn)
+          ? nodeKey(flowNodeId, turn)
+          : activeNodeId ?? nodeKey('agent', turn)
         if (callId) callsToNode.set(callId, targetId)
         let targetNode = nodeMap.get(targetId)
         if (!targetNode) {
-          targetNode = createFlowNode(targetId, turn, taskLabel || '执行任务', 'worker', taskLabel, 'running')
+          targetNode = createFlowNode(targetId, turn, taskLabel || '执行任务', 'agent', taskLabel, 'running')
           nodeMap.set(targetId, targetNode)
         }
         targetNode.tools.push({ id: callId, name, input: argsStr })
@@ -1489,77 +951,29 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         currentTurn = Math.max(currentTurn, turn)
         const reason = reasonOf(data.reason)
         for (const node of nodeMap.values()) {
-          if (node.turn !== turn || node.status === 'deprecated') continue
-          if (node.isMainTask) {
-            if (node.result?.goalAchieved !== true) node.status = 'paused'
-          } else if (reason.kind === 'completed' && !treeTurns.has(turn) && !node.workUnit) {
-            if (node.status === 'running') node.status = 'done'
-            else if (node.status === 'ready' || node.status === 'pending') node.status = 'skipped'
-          } else if (reason.kind === 'error' && node.id === activeNodeId) {
-            node.status = 'failed'
-          } else if (reason.kind === 'aborted' && node.id === activeNodeId) {
-            node.status = 'interrupted'
+          if (node.turn !== turn) continue
+          if (node.status === 'running') {
+            node.status = reason.kind === 'error' ? 'failed'
+              : reason.kind === 'aborted' ? 'interrupted' : 'done'
+          } else if (reason.kind === 'completed' && node.status === 'ready') {
+            node.status = 'skipped'
           }
-        }
-        if (treeTurns.has(turn)) {
-          const root = Array.from(nodeMap.values()).find(node => node.turn === turn && !node.parentId)
-          unfinishedTree = !!root && !['done', 'completed', 'skipped'].includes(root.status)
-          // Preserve explicit node statuses when a run ends; final text is not completion.
         }
         activeNodeId = undefined
         break
       }
     }
   }
-
   if (nodeMap.size === 0) {
     const ended = [...events].reverse().find(event => event.type === 'turn/end')
     const reason = ended ? reasonOf(ended.data.reason) : undefined
-    const status: FlowNodeStatus = reason?.kind === 'completed'
-      ? 'done'
-      : reason?.kind === 'error' ? 'failed'
-        : reason?.kind === 'aborted' ? 'interrupted'
-          : events.some(event => event.type === 'turn/start') ? 'running' : 'ready'
-    const id = nodeKey('worker', currentTurn)
-    const node = createFlowNode(
-      id,
-      currentTurn,
-      taskLabel ? (taskLabel.length > 52 ? taskLabel.slice(0, 52) + '…' : taskLabel) : '工作者任务',
-      'worker',
-      taskLabel || undefined,
-      status,
-    )
-    nodeMap.set(id, node)
+    const status: FlowNodeStatus = reason?.kind === 'completed' ? 'done'
+      : reason?.kind === 'error' ? 'failed' : reason?.kind === 'aborted' ? 'interrupted'
+        : events.some(event => event.type === 'turn/start') ? 'running' : 'ready'
+    const id = nodeKey('agent', currentTurn)
+    nodeMap.set(id, createFlowNode(id, currentTurn, taskLabel || 'Agent 任务', 'agent', taskLabel, status))
     if (status === 'running') activeNodeId = id
   }
-
-  const nodes: FlowNodeData[] = Array.from(nodeMap.values()).map(node => ({
-    id: node.id,
-    title: node.title,
-    kind: node.kind,
-    status: node.status,
-    description: node.description,
-    parentId: node.parentId,
-    isMainTask: node.isMainTask,
-    objective: node.objective,
-    doneWhen: node.doneWhen,
-    workUnit: node.workUnit,
-    constraints: node.constraints,
-    result: node.result,
-    progress: node.progress,
-    tools: node.tools,
-    consults: node.consults,
-    files: Array.from(node.files),
-    turn: node.turn,
-    step: node.step,
-    revision: node.revision,
-    requestId: node.requestId,
-    planRevision: node.planRevision,
-    invalidatedByPlanRevision: node.invalidatedByPlanRevision,
-  }))
-  return { nodes, edges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, organizerProgress, currentWork,
-    organizedMode, organizedTurn: currentTurn, activePath, unfinishedTree,
-    planRevision: currentPlanRevision,
-    rewindRecords: Array.from(rewindRecordsMap.values()),
-  }
+  const nodes: FlowNodeData[] = [...nodeMap.values()].map(node => ({ ...node, files: [...node.files] }))
+  return { nodes, edges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, organizedTurn: currentTurn }
 }

@@ -1,12 +1,12 @@
 import type {AttachmentSubmission} from './components/Attachments'
-import type { PermissionMode, ResumeTarget } from './api'
+import type { PermissionMode } from './api'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { acceptsPrompt, type AgentInfo, type SettingsData, type Task } from './api.ts'
 import { useAgentApi } from './cordis/react.tsx'
 import { t } from './i18n.ts'
 import { useSession } from './useSession.ts'
 
-export type SettingsTab = 'general' | 'models' | 'observer' | 'subagent' | 'tools' | 'plugins'
+export type SettingsTab = 'general' | 'models' | 'observer' | 'tools' | 'plugins'
 
 function routeTaskId(): string | undefined {
   const match = /^#\/tasks\/(.+)$/.exec(location.hash)
@@ -209,9 +209,6 @@ export function useAgentWorkspace() {
         orchestrator_model: modelId,
         reasoning_effort: defaultEffort,
         fast_mode: false,
-        expert_provider: latest.expert_provider,
-        expert_model: latest.expert_model,
-        enable_subagent: latest.enable_subagent,
         observer_enabled: latest.observer_enabled,
         observer_provider: latest.observer_provider,
         observer_model: latest.observer_model,
@@ -224,38 +221,6 @@ export function useAgentWorkspace() {
       setNotice(messageOf(cause))
     }
   }, [api, refreshTasks, session.reload, settings, taskId])
-
-  const toggleSubagent = useCallback(async (): Promise<void> => {
-    try {
-      const latest = settings ?? await api.getSettings()
-      const updated = await api.saveSettings({
-        revision: latest.revision,
-        providers: latest.providers.map(p => ({
-          id: p.id,
-          display_name: p.display_name ?? null,
-          url: p.url,
-          api_type: p.api_type,
-          models: p.models,
-          model_capabilities: p.model_capabilities,
-        })),
-        orchestrator_provider: latest.orchestrator_provider,
-        orchestrator_model: latest.orchestrator_model,
-        reasoning_effort: latest.reasoning_effort ?? '',
-        fast_mode: latest.fast_mode,
-        expert_provider: latest.expert_provider,
-        expert_model: latest.expert_model,
-        enable_subagent: !latest.enable_subagent,
-        observer_enabled: latest.observer_enabled,
-        observer_provider: latest.observer_provider,
-        observer_model: latest.observer_model,
-      })
-      setSettings(updated)
-      const latestInfo = await api.info()
-      setInfo(latestInfo)
-    } catch (cause) {
-      setNotice(messageOf(cause))
-    }
-  }, [api, settings])
 
   const setGenerationOptions = useCallback(async (reasoningEffort: string, fastMode: boolean): Promise<void> => {
     setSelectedEffortOverride(reasoningEffort || null)
@@ -283,9 +248,6 @@ export function useAgentWorkspace() {
         orchestrator_model: latest.orchestrator_model,
         reasoning_effort: reasoningEffort,
         fast_mode: fastMode,
-        expert_provider: latest.expert_provider,
-        expert_model: latest.expert_model,
-        enable_subagent: latest.enable_subagent,
         observer_enabled: latest.observer_enabled,
         observer_provider: latest.observer_provider,
         observer_model: latest.observer_model,
@@ -311,7 +273,6 @@ export function useAgentWorkspace() {
   const fastMode = selectedFastModeOverride !== undefined
     ? selectedFastModeOverride
     : (task?.fast_mode ?? settings?.fast_mode ?? false)
-  const subagentEnabled = info?.subagent_enabled ?? settings?.enable_subagent ?? true
 
   const pendingSession=useRef<Promise<string>|null>(null)
   const uploadedAttachments=useRef(new Map<File,{task:string;receiptId:string}>())
@@ -345,21 +306,6 @@ export function useAgentWorkspace() {
     }
   }, [api, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
 
-  const [resumeBusy, setResumeBusy] = useState(false)
-  const resumeNode = useCallback(async (target: ResumeTarget | undefined, title = ''): Promise<boolean> => {
-    if (!taskId || running || resumeBusy) return false
-    setResumeBusy(true); setNotice(undefined)
-    try {
-      await api.prompt(taskId, target ? `继续任务：${title}` : '继续', {
-        resume_target: target, model: modelName ?? undefined,
-        reasoning_effort: reasoningEffort || undefined, fast_mode: fastMode,
-      })
-      refreshTasks(); session.reload()
-      return true
-    } catch (cause) { setNotice(messageOf(cause)); return false }
-    finally { setResumeBusy(false) }
-  }, [api, taskId, running, resumeBusy, modelName, reasoningEffort, fastMode, refreshTasks, session.reload])
-
   const stop = useCallback(() => {
     if (taskId === undefined) return
     api.cancel(taskId).then(
@@ -384,13 +330,13 @@ export function useAgentWorkspace() {
   return {
     info, settings, tasks, allTasks, taskId, task, parent, parentId, session,
     ready, isChild, running, heroPhase, composerNote,
-    modelName, reasoningEffort, fastMode, subagentEnabled,
+    modelName, reasoningEffort, fastMode,
     workspaces, activeWorkspace, selectWorkspace, addWorkspace,
     folderDialogOpen, openFolderDialog, closeFolderDialog,
     canContinue: ready && task !== undefined && acceptsPrompt(task),
     settingsOpen, settingsTab, setSettingsTab,
-    openSettings, closeSettings, saveSettings, refreshInfoAndSettings, selectModel, toggleSubagent, setGenerationOptions,
-    openTask, submit, stop, interruptNode, resumeNode, resumeBusy,
+    openSettings, closeSettings, saveSettings, refreshInfoAndSettings, selectModel, setGenerationOptions,
+    openTask, submit, stop, interruptNode,
   }
 }
 

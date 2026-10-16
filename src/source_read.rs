@@ -174,7 +174,7 @@ pub fn needs_index_refresh(root: &Path, language: &str, file: &str) -> bool {
 }
 
 /// Full-line display page, preserving CRLF and the final delimiter. The
-/// caller keeps original requested bounds for notebook material capture.
+/// callers retain the original requested bounds for source provenance.
 pub fn page(result: &mut Value, args: &Value) -> io::Result<()> {
     let Some(content) = result["content"].as_str().map(str::to_owned) else {
         return Ok(());
@@ -309,97 +309,14 @@ pub fn page(result: &mut Value, args: &Value) -> io::Result<()> {
     Ok(())
 }
 
-/// Keep a valid JSON envelope even if an unusually large tool result needs
-/// abbreviation. The original is retained in the task's tool/result event.
-pub fn bounded(result: &Value, limit: usize, call_id: &str) -> String {
-    let raw = result.to_string();
-    if raw.chars().count() <= limit {
-        return raw;
-    }
-    json!({"truncated":true,"original_chars":raw.chars().count(),"tool_call_id":call_id,"notebook_material":result["notebook_material"],
-        "path":result.get("path").or_else(||result.pointer("/symbol/file_path")),"code_hash":result.get("code_hash").or_else(||result.pointer("/description/code_hash")),"start_line":result["start_line"],"end_line":result["end_line"],
-        "complete":false,"next_start_line":result["next_start_line"],"error":result["error"],"excerpt":raw.chars().take(limit/4).collect::<String>(),
-        "retrieve":"Use recall_work with tool_call_ids to recover the original tool result, or include_material=true with the notebook material id for exact source. Excerpt is abbreviated JSON text, not complete source."}).to_string()
-}
-pub fn query_fingerprint(result: &Value) -> String {
-    let mut value = result.clone();
-    if let Some(index) = value.get_mut("index").and_then(Value::as_object_mut) {
-        index.remove("checked_at_unix");
-        index.remove("changed_files_last_check");
-        index.remove("removed_files_last_check");
-    }
-    if let Some(object) = value.as_object_mut() {
-        object.remove("generated_at_unix");
-    }
-    crate::symbol_description::content_hash(value.to_string().as_bytes())
-}
-pub fn result_page(value: &Value, args: &Value) -> io::Result<Value> {
-    let budget = args["max_chars"]
-        .as_u64()
-        .unwrap_or(24_000)
-        .clamp(1000, 60_000) as usize;
-    let offset = args["result_offset"].as_u64().unwrap_or(0) as usize;
-    let explicit = args["result_field"].as_str();
-    if explicit.is_none() && value.to_string().chars().count() <= budget {
-        return Ok(json!({"result":value,"complete":true,"next_offset":null}));
-    }
-    let automatic = value.as_object().and_then(|object| {
-        object
-            .iter()
-            .filter(|(_, value)| value.is_array())
-            .max_by_key(|(_, value)| value.to_string().len())
-            .map(|(key, _)| key.as_str())
-    });
-    let Some(field) = explicit.or(automatic) else {
-        return Ok(
-            json!({"complete":false,"available_fields":value.as_object().map(|object|object.keys().collect::<Vec<_>>()),"guidance":"Choose result_field (field name or JSON pointer) to retrieve a bounded part of this historical result."}),
-        );
-    };
-    let selected = if field.starts_with('/') {
-        value.pointer(field)
-    } else {
-        value.get(field)
-    }
-    .ok_or_else(|| io::Error::other("result_field not found"))?;
-    if let Some(items) = selected.as_array() {
-        if offset > items.len() {
-            return Err(io::Error::other("result_offset is outside the array"));
-        }
-        let mut page = Vec::new();
-        let mut chars = 0;
-        for item in &items[offset..] {
-            let size = item.to_string().chars().count() + 1;
-            if chars + size > budget {
-                break;
-            }
-            chars += size;
-            page.push(item.clone());
-        }
-        if page.is_empty() && offset < items.len() {
-            return Ok(
-                json!({"result_field":field,"complete":false,"guidance":"The item exceeds this page budget. Select a narrower JSON pointer, such as /matches/0/text."}),
-            );
-        }
-        let next = offset + page.len();
-        return Ok(
-            json!({"result_field":field,"result":page,"offset":offset,"total_items":items.len(),"complete":next==items.len(),"next_offset":if next<items.len(){Some(next)}else{None},"omitted_fields":value.as_object().map(|object|object.keys().filter(|key|key.as_str()!=field).collect::<Vec<_>>())}),
-        );
-    }
-    if let Some(text) = selected.as_str() {
-        let total = text.chars().count();
-        if offset > total {
-            return Err(io::Error::other("result_offset is outside the string"));
-        }
-        let piece = text.chars().skip(offset).take(budget).collect::<String>();
-        let next = offset + piece.chars().count();
-        return Ok(
-            json!({"result_field":field,"result":piece,"offset":offset,"offset_unit":"Unicode characters","total_chars":total,"complete":next==total,"next_offset":if next<total{Some(next)}else{None}}),
-        );
-    }
-    if selected.to_string().chars().count() > budget {
-        return Ok(
-            json!({"result_field":field,"complete":false,"guidance":"Select a narrower JSON pointer for this object."}),
-        );
-    }
-    Ok(json!({"result_field":field,"result":selected,"complete":true,"next_offset":null}))
+pub fn is_source_read(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_file_lines"
+            | "read_ts_symbol"
+            | "read_rust_symbol"
+            | "read_go_symbol"
+            | "read_python_symbol"
+    )
 }

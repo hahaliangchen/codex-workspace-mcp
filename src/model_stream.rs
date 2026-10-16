@@ -587,3 +587,36 @@ mod tests {
         assert_eq!(stream_error_code(&error), Some("ARGUMENTS_TOO_LARGE"));
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+pub fn tool_calls(assistant_message: &Value) -> Vec<ToolCall> {
+    assistant_message
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let function = item.get("function")?;
+            let name = function.get("name").and_then(|v| v.as_str())?.to_string();
+            Some(ToolCall {
+                call_id: item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name,
+                arguments: function
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("{}")
+                    .to_string(),
+            })
+        })
+        .collect()
+}

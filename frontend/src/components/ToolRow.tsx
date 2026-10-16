@@ -3,7 +3,7 @@ import clsx from 'clsx'
 import {
   DiffBlock, DisclosureRow, IconCordisPluginOutlineRegular,
   IconDatabaseOutlineRegular,
-  IconFlatListOutlineRegular, IconUsersOutlineRegular,
+  IconFlatListOutlineRegular,
   IconWorkspaceTreeOutlineRegular, ReadBlock, SearchBlock, TerminalBlock,
   TextShimmer, diffTotals, languageForPath,
   type DiffBlockLabels, type DiffHunk, type ReadBlockLabels, type ReadBlockLine,
@@ -63,7 +63,6 @@ function iconFor(name: string): ReactNode {
     )
   }
   if (/symbol|index/.test(name)) return <IconWorkspaceTreeOutlineRegular size={14} />
-  if (name === 'spawn_subagent') return <IconUsersOutlineRegular size={14} />
   if (/memory|architecture|business/.test(name)) return <IconDatabaseOutlineRegular size={14} />
   if (/list/.test(name)) return <IconFlatListOutlineRegular size={14} />
   return <IconCordisPluginOutlineRegular size={14} />
@@ -76,7 +75,6 @@ function titleFor(name: string): string {
   if (/read|view_file/.test(name)) return '读取了文件'
   if (/search|grep/.test(name)) return '搜索了代码'
   if (/symbol|index/.test(name)) return '检索了符号'
-  if (name === 'spawn_subagent') return '启动了子任务'
   if (/list|find/.test(name)) return '浏览了目录'
   if (/memory|architecture|business/.test(name)) return '读取了工作区记忆'
   return name

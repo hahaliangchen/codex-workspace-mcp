@@ -794,7 +794,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         ensure!(!s.cancel.is_cancelled(), "cancelled");
         let prefix_len = w.messages.len();
         let (node, message) = model_round(s, w, step, &definitions).await?;
-        let calls = crate::format_translate::collect_all_tool_calls_from_openai_chat(&message);
+        let calls = crate::model_stream::tool_calls(&message);
         if calls.is_empty() {
             if s.mode == Mode::Main {
                 ensure!(
@@ -1350,7 +1350,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         state.api_key = "PRIVATE_API_KEY".into();
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('transport-test','test','fake','running',0,0)",[]).unwrap();
@@ -1472,7 +1472,7 @@ mod tests {
                 socket.write_all(wire.as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             });
-            let state = agent_service::tests::flow_test_state(root.path(), address);
+            let state = agent_service::tests::test_state(root.path(), address);
             agent_service::open_db(root.path()).unwrap().execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('transport-test','test','fake','running',0,0)",[]).unwrap();
             assert!(diagnostic_round(&state, "fake", 1).await.is_err());
             let rows = diagnostic_rows(root.path());
@@ -1525,7 +1525,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         state.tool_catalog = Some(catalog);
         run_task(
             state.clone(),
@@ -1626,7 +1626,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         state.tool_catalog = Some(catalog);
         agent_service::open_db(root.path()).unwrap().execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
         run_task(
@@ -1886,7 +1886,7 @@ mod tests {
             .route("/v1/chat/completions", post(scripted))
             .with_state(script.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         // Legacy observer configuration must not start an extra role.
         state.observer_enabled = true;
         let conn = agent_service::open_db(root.path()).unwrap();
@@ -2283,7 +2283,7 @@ mod tests {
             Json(json!({"choices":[{"message":{"role":"assistant","content":"image received"},"finish_reason":"stop"}]}))
         }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         state
             .visual
             .capabilities
@@ -2360,7 +2360,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         let staged_state =
-            agent_service::tests::flow_test_state(root.path(), "127.0.0.1:9".parse().unwrap());
+            agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
         let mut staged_db = agent_service::open_db(root.path()).unwrap();
         staged_db.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
         let upload =
@@ -2425,7 +2425,7 @@ mod tests {
             }
         }));
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut state = agent_service::tests::flow_test_state(root.path(), address);
+        let mut state = agent_service::tests::test_state(root.path(), address);
         state.visual_tool_settings.model = Some("gpt-6.1-sol".into());
         state.visual_tool_settings.reasoning_effort = Some("medium".into());
         let conn = agent_service::open_db(root.path()).unwrap();

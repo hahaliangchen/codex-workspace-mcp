@@ -666,8 +666,7 @@ mod tests {
             let root =
                 std::env::temp_dir().join(format!("attachments-{}", agent_service::uuid_like()));
             std::fs::create_dir_all(&root).unwrap();
-            let state =
-                agent_service::tests::flow_test_state(&root, "127.0.0.1:9".parse().unwrap());
+            let state = agent_service::tests::test_state(&root, "127.0.0.1:9".parse().unwrap());
             let c = agent_service::open_db(&root).unwrap();
             for task in ["a", "b"] {
                 c.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,'','fake','draft',0,0)",[task]).unwrap();

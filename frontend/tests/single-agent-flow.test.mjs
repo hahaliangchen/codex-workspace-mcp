@@ -26,3 +26,23 @@ test('each model request retains parent, tools and outcome after reload', () => 
   assert.equal(child.tools[0].output, '完整原文')
   assert.ok(state.edges.some(e => e.source === 'turn_1:main' && e.target === 'turn_1:child'))
 })
+
+test('a new turn keeps prior request outcomes and cancellation closes only the current requests', () => {
+  const events = [
+    event('turn/start', {}),
+    event('flow/node_add', { node: { id: 'main', kind: 'agent', status: 'running', request_id: 1 } }),
+    event('flow/node_state', { id: 'main', status: 'failed' }),
+    event('turn/end', { reason: { kind: 'error' } }),
+    event('turn/start', { turn: 2 }),
+    event('flow/node_add', { turn: 2, node: { id: 'main', kind: 'agent', status: 'running', request_id: 2 } }),
+    event('flow/node_add', { turn: 2, node: { id: 'child', kind: 'context_agent', status: 'running', parent_id: 'main', request_id: 2 } }),
+    event('turn/end', { turn: 2, reason: { kind: 'aborted' } }),
+  ]
+  const state = flowState(JSON.parse(JSON.stringify(events)))
+  assert.equal(state.nodes.length, 3)
+  assert.equal(state.nodes.find(n => n.id === 'turn_1:main').status, 'failed')
+  assert.equal(state.nodes.find(n => n.id === 'turn_2:main').status, 'interrupted')
+  assert.equal(state.nodes.find(n => n.id === 'turn_2:child').parentId, 'turn_2:main')
+  assert.equal(state.nodes.find(n => n.id === 'turn_2:child').status, 'interrupted')
+  assert.equal(state.activeNodeId, undefined)
+})

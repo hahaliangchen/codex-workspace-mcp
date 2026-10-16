@@ -4,54 +4,8 @@ import type { FlowNodeData } from '../model.ts'
 import styles from './TaskNode.module.css'
 
 const KIND_META: Record<string, { label: string; className: string; accentClass: string; icon: string }> = {
-  worker: {
-    label: '任务',
-    className: styles.kindCoding ?? '',
-    accentClass: styles.accentCoding ?? '',
-    icon: '🔵',
-  },
-  goal: {
-    label: '总目标',
-    className: styles.kindPlan ?? '',
-    accentClass: styles.accentPlan ?? '',
-    icon: '⚪',
-  },
-  research: {
-    label: '探索',
-    className: styles.kindResearch ?? '',
-    accentClass: styles.accentResearch ?? '',
-    icon: '🟣',
-  },
-  coding: {
-    label: '实施',
-    className: styles.kindCoding ?? '',
-    accentClass: styles.accentCoding ?? '',
-    icon: '🔵',
-  },
-  verify: {
-    label: '验证',
-    className: styles.kindVerify ?? '',
-    accentClass: styles.accentVerify ?? '',
-    icon: '🟢',
-  },
-  issue: {
-    label: '问题',
-    className: styles.kindIssue ?? '',
-    accentClass: styles.accentIssue ?? '',
-    icon: '🟡',
-  },
-  gate: {
-    label: '审查',
-    className: styles.kindGate ?? '',
-    accentClass: styles.accentGate ?? '',
-    icon: '🔴',
-  },
-  plan: {
-    label: '规划',
-    className: styles.kindPlan ?? '',
-    accentClass: styles.accentPlan ?? '',
-    icon: '⚪',
-  },
+  agent: { label: '主 Agent', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔵' },
+  context_agent: { label: '上下文子 Agent', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '🟣' },
 }
 
 function formatNodeId(id: string): string {
@@ -91,7 +45,7 @@ export const TaskNode = memo(function TaskNode({
   data,
   selected,
 }: NodeProps<Node<FlowNodeData>>) {
-  const meta = data.isMainTask ? { label: '主任务', className: styles.kindPlan ?? '', accentClass: styles.accentPlan ?? '', icon: '⚪' } : KIND_META[data.kind] || {
+  const meta = KIND_META[data.kind] || {
     label: data.kind || '步骤',
     className: styles.kindPlan ?? '',
     accentClass: styles.accentPlan ?? '',
@@ -102,23 +56,8 @@ export const TaskNode = memo(function TaskNode({
   const isSkipped = data.status === 'skipped'
   const isInterrupted = data.status === 'interrupted'
   const isFailed = data.status === 'failed'
-  const isDeprecated = data.status === 'deprecated'
 
   const renderStatus = () => {
-    if (isDeprecated) {
-      return (
-        <span
-          className={styles.statusIcon}
-          style={{ color: '#9ca3af', fontSize: '11px', fontWeight: 600 }}
-          title={data.invalidatedByPlanRevision ? `已废弃（在 Plan Rev ${data.invalidatedByPlanRevision} 回溯时退出执行集合）` : '已废弃'}
-        >
-          已废弃
-        </span>
-      )
-    }
-    if (data.status === 'waiting_children') return <span className={styles.statusIcon} title="等待子问题，父任务尚未完成">⏳</span>
-    if (data.status === 'paused') return <span className={styles.statusIcon} title="待继续">⏸</span>
-    if (data.status === 'blocked') return <span className={styles.statusIcon} title="受阻，等待解决">⚠</span>
     if (isRunning) {
       return <div className={styles.spinner} title="进行中" />
     }
@@ -127,7 +66,7 @@ export const TaskNode = memo(function TaskNode({
         <span
           className={styles.statusIcon}
           style={{ color: '#9ca3af' }}
-          title="执行已结束；整体目标由组织者根据验收证据判定"
+          title="本次模型请求已结束"
         >
           ↩
         </span>
@@ -172,11 +111,11 @@ export const TaskNode = memo(function TaskNode({
   const fileCount = data.files ? data.files.length : 0
   const toolCount = data.tools ? data.tools.length : 0
   const consultCount = data.consults ? data.consults.length : 0
-  const displayDesc = cleanDescription(data.objective ?? data.description)
+  const displayDesc = cleanDescription(data.description)
 
   return (
     <div
-      className={`${styles.nodeWrapper} ${isDeprecated ? styles.deprecated : meta.accentClass} ${
+      className={`${styles.nodeWrapper} ${meta.accentClass} ${
         selected ? styles.selected : ''
       } ${isRunning ? styles.running : ''}`}
       data-node-id={data.id}

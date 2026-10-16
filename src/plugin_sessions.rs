@@ -185,8 +185,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let (runtime, catalog) = crate::skill_packages::test_runtime();
         let scope = catalog.packages.catalog()[0]["scope"].clone();
-        let mut state =
-            agent_service::tests::flow_test_state(&root, "127.0.0.1:1".parse().unwrap());
+        let mut state = agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
         state.tool_catalog = Some(catalog);
         let created = body(
             handle(

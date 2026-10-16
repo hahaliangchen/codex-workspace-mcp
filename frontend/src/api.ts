@@ -8,12 +8,6 @@ export interface SkillPackage {
 
 export type PermissionMode = 'read_only' | 'workspace_write' | 'full_access'
 
-export interface ResumeTarget {
-  readonly work_id: string
-  readonly revision: number
-  readonly request_id: number
-}
-
 export interface RequestContextMeta {
   readonly id: number
   readonly actor: string
@@ -53,38 +47,6 @@ export interface RequestContext {
   readonly metadata: RequestContextMeta
   readonly body: { readonly messages: readonly Record<string, unknown>[]; readonly tools?: readonly unknown[]; readonly [key: string]: unknown }
 }
-export interface NotebookMaterial {
-  readonly id: number
-  readonly path: string
-  readonly symbol: string
-  readonly start_line: number
-  readonly end_line: number
-  readonly node_id: string
-  readonly turn: number
-  readonly file_hash: string
-  readonly status: string
-}
-export interface FindingHistoryPage {
-  readonly items: readonly { readonly seq: number; readonly time: number; readonly record: Record<string, unknown> }[]
-  readonly has_more: boolean
-  readonly next_before: number | null
-}
-export interface NotebookSource {
-  readonly id: number
-  readonly status: string
-  readonly available: boolean
-  readonly content?: string
-  readonly start_line?: number
-  readonly end_line?: number
-  readonly complete?: boolean
-  readonly next_start_line?: number | null
-  readonly start_column?: number
-  readonly next_column?: number | null
-  readonly partial_line?: boolean
-  readonly byte_exact?: boolean
-  readonly descriptor: NotebookMaterial
-}
-
 export interface ChangedFile {
   readonly path: string
   readonly added: number
@@ -135,8 +97,6 @@ export interface AgentInfo {
   readonly ready: boolean
   readonly workspace: string
   readonly model: string
-  readonly subagent_enabled: boolean
-  readonly subagent_model: string
 }
 
 export type ProviderApiType = 'openai-completions' | 'openai-responses' | 'anthropic-messages'
@@ -179,18 +139,12 @@ export interface ModelUseSettings {
 export interface SettingsData {
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
-  readonly visual_fallback_enabled?: boolean
-  readonly visual_provider?: string | null
-  readonly visual_model?: string | null
   readonly revision: string
   readonly providers: readonly ProviderConfig[]
   readonly orchestrator_provider: string | null
   readonly orchestrator_model: string | null
   readonly reasoning_effort: string | null
   readonly fast_mode: boolean
-  readonly expert_provider: string | null
-  readonly expert_model: string | null
-  readonly enable_subagent: boolean
   readonly observer_enabled: boolean
   readonly observer_provider: string | null
   readonly observer_model: string | null
@@ -210,18 +164,12 @@ export interface SaveProviderInput {
 export interface SaveSettingsInput {
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
-  readonly visual_fallback_enabled?: boolean
-  readonly visual_provider?: string | null
-  readonly visual_model?: string | null
   readonly revision: string
   readonly providers: readonly SaveProviderInput[]
   readonly orchestrator_provider: string | null
   readonly orchestrator_model: string | null
   readonly reasoning_effort: string
   readonly fast_mode: boolean
-  readonly expert_provider: string | null
-  readonly expert_model: string | null
-  readonly enable_subagent: boolean
   readonly observer_enabled: boolean
   readonly observer_provider: string | null
   readonly observer_model: string | null
@@ -331,14 +279,11 @@ export const api = {
   setContextDebug: (id: string, enabled: boolean) => put<{ enabled: boolean }>(`${task(id)}/context-debug`, { enabled }),
   requestContexts: (id: string, before?: number) => request<{ items: readonly RequestContextMeta[]; has_more: boolean }>(`${task(id)}/request-contexts${before === undefined ? '' : `?before=${before}`}`, { cache: 'no-store' }),
   requestContext: (id: string, requestId: number) => request<RequestContext>(`${task(id)}/request-contexts/${requestId}`, { cache: 'no-store' }),
-  notebook: (id: string) => request<{ materials: readonly NotebookMaterial[]; work: Record<string, unknown> }>(`${task(id)}/notebook`, { cache: 'no-store' }),
-  findingHistory: (id: string, before?: number) => request<FindingHistoryPage>(`${task(id)}/notebook/history${before === undefined ? '' : `?before=${before}`}`, { cache: 'no-store' }),
-  notebookMaterial: (id: string, material: number, start?: number, column?: number) => request<NotebookSource>(`${task(id)}/notebook/materials/${material}${start === undefined ? '' : `?start_line=${start}${column === undefined ? '' : `&start_column=${column}`}`}`, { cache: 'no-store' }),
   changes: (id: string, turn: number) => request<ChangesSummary>(`${task(id)}/changes/${turn}`),
   changeDiff: (id: string, turn: number, index: number, path?: string) => request<FileDiff>(`${task(id)}/changes/${turn}/files/${index}${path === undefined ? '' : `?path=${encodeURIComponent(path)}`}`, { cache: 'no-store' }),
   undoChanges: (id: string, turn: number) => post<ChangesSummary>(`${task(id)}/changes/${turn}/undo`, {}),
   createSession: async () => (await post<{ task_id: string }>('/agent/sessions')).task_id,
-  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; resume_target?: ResumeTarget | undefined; content?: readonly unknown[]; requestId?: string }) =>
+  prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; content?: readonly unknown[]; requestId?: string }) =>
     post<{ task_id: string }>(`${task(id)}/messages`, { prompt, ...options }),
   cancel: (id: string) => request<unknown>(task(id), { method: 'DELETE' }),
   interruptNode: (id: string, nodeId: string) =>

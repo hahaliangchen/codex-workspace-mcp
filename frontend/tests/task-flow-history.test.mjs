@@ -18,10 +18,9 @@ test('execution result is pending acceptance and the original specific gap is vi
   assert.match(items[1].text, /交回 Organizer/)
 })
 
-test('ended runs retain the Organizer assessment without claiming goal completion', () => {
+test('ended runs retain only their explicit assessment without inferring goal completion', () => {
   const events = [event('turn/start', { turn: 1 }),
-    event('organizer/decision', { turn: 1, decision: { action: 'blocked', achieved: false, unresolved: ['视觉验收未完成'] } }),
-    event('turn/end', { turn: 1, reason: { kind: 'completed' } })]
+    event('turn/end', { turn: 1, reason: { kind: 'completed', goal_achieved: false, unresolved: ['视觉验收未完成'] } })]
   const reason = chatItems(JSON.parse(JSON.stringify(events))).find(item => item.kind === 'turn-end').reason
   assert.equal(reason.kind, 'completed')
   assert.equal(reason.goalAchieved, false)
@@ -58,16 +57,15 @@ test('six task stages retain their tools and failures after a completed history 
   const events = [event('turn/start', { turn: 1 })]
   const nodes = []
   for (let i = 0; i < goals.length; i++) {
-    nodes.push({ id: `task_${i}`, node_id: `work_task_${i}`, kind: 'worker', title: goals[i], request_id: 1, revision: 1, plan_revision: 1, status: 'running' })
-    events.push(event('flow/plan', { turn: 1, mode: 'dag', nodes: structuredClone(nodes), active_node_id: `task_${i}` }))
-    events.push(event('tool/call', { turn: 1, flowNodeId: `work_task_${i}`, callId: `call_${i}`, name: tools[i], arguments: '{}' }))
+    nodes.push({ id: `task_${i}`, kind: 'agent', title: goals[i], request_id: 1, status: 'running' })
+    events.push(event('flow/node_add', { turn: 1, node: nodes[i] }))
+    events.push(event('tool/call', { turn: 1, flowNodeId: `task_${i}`, callId: `call_${i}`, name: tools[i], arguments: '{}' }))
     events.push(event('tool/result', { turn: 1, toolCallId: `call_${i}`, message: { toolCallId: `call_${i}`, isError: i === 5, content: [{ type: 'text', text: i === 5 ? 'original diagnostic error' : 'actual tool result' }] } }))
-    nodes[i].status = 'done'
+    events.push(event('flow/node_state', { turn: 1, id: `task_${i}`, status: 'done' }))
   }
-  events.push(event('flow/plan', { turn: 1, mode: 'dag', nodes, active_node_id: '' }))
   events.push(event('turn/end', { turn: 1, reason: { kind: 'completed' } }))
   const reloaded = flowState(JSON.parse(JSON.stringify(events)))
-  assert.equal(reloaded.nodes.length, 6, 'tool routing must not create extra Worker nodes')
+  assert.equal(reloaded.nodes.length, 6, 'tool routing must not create extra request nodes')
   assert.deepEqual(reloaded.nodes.map(n => n.title), goals)
   assert.deepEqual(reloaded.nodes.map(n => n.tools[0].name), tools)
   assert.equal(reloaded.nodes.every(n => n.status === 'done'), true)

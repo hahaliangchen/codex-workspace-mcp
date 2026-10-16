@@ -288,34 +288,11 @@ pub fn is_execution(name: &str) -> bool {
         "run_program" | "install_dependencies" | "run_project_script" | "stop_project_process"
     )
 }
-pub fn is_check(name: &str) -> bool {
-    matches!(
-        name,
-        "run_program"
-            | "install_dependencies"
-            | "run_project_script"
-            | "get_project_process"
-            | "http_probe"
-    )
-}
 pub fn may_change_files(name: &str) -> bool {
     matches!(
         name,
         "run_program" | "install_dependencies" | "run_project_script"
     )
-}
-pub fn normalize_args(root: &Path, args: &mut Value) -> Result<()> {
-    ensure!(args.is_object(), "tool arguments must be an object");
-    ensure!(
-        args.get("project_path")
-            .is_none_or(|value| value.is_string()),
-        "project_path must be a string"
-    );
-    if args.get("project_path").is_some() {
-        let (_, relative) = project(root, args["project_path"].as_str().unwrap_or("."))?;
-        args["project_path"] = json!(relative);
-    }
-    Ok(())
 }
 pub fn check_key(name: &str, args: &Value) -> String {
     if name == "http_probe" {

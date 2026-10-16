@@ -96,7 +96,7 @@ mod tests {
         let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
         std::fs::create_dir_all(&root).unwrap();
         let mut main =
-            crate::agent_service::tests::flow_test_state(&root, "127.0.0.1:1".parse().unwrap());
+            crate::agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
         main.reasoning_effort = Some("high".into());
         main.provider_routes.insert(
             "alternate".into(),

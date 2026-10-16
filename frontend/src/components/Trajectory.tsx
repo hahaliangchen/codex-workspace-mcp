@@ -18,7 +18,7 @@ type SpanKind = 'user' | 'message' | 'tool' | 'subtool' | 'system'
 function spanKindOf(row: TrajectoryRow): SpanKind {
   if (row.type === 'user/message') return 'user'
   if (row.type === 'assistant/message') return 'message'
-  if (row.type.startsWith('subagent/')) return 'subtool'
+  if (row.type.startsWith('context/tool_')) return 'subtool'
   if (row.type.startsWith('tool/')) return 'tool'
   return 'system'
 }
@@ -52,8 +52,8 @@ function kindBadgeOf(row: TrajectoryRow): { label: string; className: string } {
     case 'observer/error':
     case 'observer/cancelled':
       return { label: 'OBS', className: tableCss.contextGreen ?? '' }
-    case 'subagent/start':
-    case 'subagent/end':
+    case 'context/tool_call':
+    case 'context/tool_result':
       return { label: 'SUB', className: tableCss.subtoolAmber ?? '' }
     case 'turn/start':
     case 'turn/end':
@@ -77,7 +77,6 @@ function titleOf(row: TrajectoryRow): string {
     case 'observer/node_review': return 'Observer · 节点决策与路径复盘'
     case 'observer/advice_unanswered': return 'Observer · 尚未回应'
     case 'observer/inbox_state': return 'Observer · 意见状态'
-    case 'worker/work_state': return 'Worker · 工作记录'
     case 'observer/brief': return 'Observer · 任务范围'
     case 'observer/review': return `Observer · ${row.name ?? 'review'}`
     case 'observer/plan_review': return 'Observer · 计划建议'
@@ -88,8 +87,8 @@ function titleOf(row: TrajectoryRow): string {
     case 'observer/cancelled': return 'Observer 检查已取消'
     case 'step/end': return t('trajectory.stepEnd', { step: row.step ?? '' })
     case 'turn/end': return t('trajectory.turnEnd', { turn })
-    case 'subagent/start': return t('trajectory.subagentStart')
-    case 'subagent/end': return t('trajectory.subagentEnd')
+    case 'context/tool_call': return row.name ?? '上下文子 Agent · 工具调用'
+    case 'context/tool_result': return row.name ?? '上下文子 Agent · 工具结果'
     default: return row.type
   }
 }
@@ -109,7 +108,7 @@ export function Trajectory({ events, onOpenTask }: {
   const filteredRows = useMemo(() => {
     const q = query.trim().toLowerCase()
     return allRows.filter((row) => {
-      if (onlyTools && !row.type.startsWith('tool/') && !row.type.startsWith('subagent/') && !row.type.startsWith('observer/')) {
+      if (onlyTools && !row.type.startsWith('tool/') && !row.type.startsWith('context/tool_') && !row.type.startsWith('observer/')) {
         return false
       }
       if (q === '') return true

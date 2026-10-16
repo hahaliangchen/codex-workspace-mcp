@@ -19,9 +19,8 @@ use tokio::{
     sync::{Mutex, RwLock},
 };
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::info;
 
-use crate::format_translate;
 use crate::{builtin_plugins, plugin_runtime};
 
 // ---------------------------------------------------------------------------
@@ -86,8 +85,6 @@ fn default_api_type() -> String {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct AiProxyConfig {
     #[serde(default)]
-    enable_subagent: bool,
-    #[serde(default)]
     default_provider: Option<String>,
     #[serde(default)]
     orchestrator_provider: Option<String>,
@@ -99,10 +96,6 @@ pub(crate) struct AiProxyConfig {
     fast_mode: bool,
     #[serde(default)]
     model_capabilities: HashMap<String, HashMap<String, ModelCapabilities>>,
-    #[serde(default)]
-    expert_provider: Option<String>,
-    #[serde(default)]
-    expert_model: Option<String>,
     #[serde(default = "observer_enabled_by_default")]
     observer_enabled: bool,
     #[serde(default)]
@@ -110,15 +103,9 @@ pub(crate) struct AiProxyConfig {
     #[serde(default)]
     observer_model: Option<String>,
     #[serde(default)]
-    visual_fallback_enabled: bool,
-    #[serde(default)]
     visual_tool: crate::model_settings::ModelSettings,
     #[serde(default)]
     context_agent: crate::model_settings::ModelSettings,
-    #[serde(default)]
-    visual_provider: Option<String>,
-    #[serde(default)]
-    visual_model: Option<String>,
     #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
     #[serde(flatten)]
@@ -127,25 +114,6 @@ pub(crate) struct AiProxyConfig {
 
 fn observer_enabled_by_default() -> bool {
     true
-}
-
-impl AiProxyConfig {
-    fn resolve_expert_provider(&self) -> Option<crate::expert_surgery::ExpertProvider> {
-        if !self.enable_subagent {
-            return None;
-        }
-        // Legacy code-surgery routing is separate from the standalone task subagent.
-        // Inheriting the task model must not silently expose another tool here.
-        let provider_name = self.expert_provider.as_deref()?;
-        let provider = self.providers.get(provider_name)?;
-        let model = self.expert_model.clone()?;
-
-        Some(crate::expert_surgery::ExpertProvider {
-            url: provider.url.trim_end_matches('/').to_string(),
-            api_key: provider.api_key.clone(),
-            model,
-        })
-    }
 }
 
 pub(crate) fn apply_agent_config(
@@ -190,31 +158,6 @@ pub(crate) fn apply_agent_config(
         .clone()
         .or_else(|| main.and_then(|p| p.model_map.values().next().cloned()))
         .unwrap_or_default();
-    let subagent = config
-        .expert_provider
-        .as_deref()
-        .and_then(|name| config.providers.get(name))
-        .filter(|provider| provider.api_type == "openai-completions")
-        .or(main);
-    state.expert_provider_name = config
-        .expert_provider
-        .clone()
-        .unwrap_or_else(|| main_name.to_owned());
-    state.expert_provider_url = subagent.map(|p| p.url.clone()).unwrap_or_default();
-    state.expert_api_key = subagent.map(|p| p.api_key.clone()).unwrap_or_default();
-    state.expert_model = config
-        .expert_model
-        .clone()
-        .or_else(|| config.orchestrator_model.clone())
-        .or_else(|| subagent.and_then(|p| p.model_map.values().next().cloned()))
-        .unwrap_or_default();
-    state.subagent_inherits_model =
-        config.expert_provider.is_none() && config.expert_model.is_none();
-    state.enable_subagent = config.enable_subagent
-        && main.is_some()
-        && subagent.is_some()
-        && !state.expert_model.is_empty();
-
     let observer_name = config.observer_provider.as_deref().unwrap_or(main_name);
     let observer = config
         .providers
@@ -252,30 +195,6 @@ pub(crate) fn apply_agent_config(
             )
         })
         .collect();
-    state.visual.fallback = if config.visual_fallback_enabled {
-        config
-            .visual_provider
-            .as_ref()
-            .zip(config.visual_model.as_ref())
-            .and_then(|(provider, model)| {
-                let route = config.providers.get(provider)?;
-                (route.api_type == "openai-completions"
-                    && state.visual.capability(provider, model)
-                        == crate::visual_artifacts::ImageCapability::Supported)
-                    .then(|| crate::visual_artifacts::VisualRoute {
-                        provider: provider.clone(),
-                        model: route
-                            .model_map
-                            .get(model)
-                            .cloned()
-                            .unwrap_or_else(|| model.clone()),
-                        url: route.url.clone(),
-                        api_key: route.api_key.clone(),
-                    })
-            })
-    } else {
-        None
-    };
 }
 
 pub(crate) fn dsh_config_path() -> std::path::PathBuf {
@@ -511,26 +430,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         config.orchestrator_model = main.get("model").and_then(Value::as_str).map(str::to_owned);
         config.default_provider = config.orchestrator_provider.clone();
     }
-    if let Some(selection) = plugin_config(&patch, "subagent-model-selection-settings") {
-        config.enable_subagent = selection
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if let Some(route) = selection
-            .get("allowedModels")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-        {
-            let provider = route.get("provider").and_then(Value::as_str);
-            let model = route.get("model").and_then(Value::as_str);
-            if provider != config.orchestrator_provider.as_deref()
-                || model != config.orchestrator_model.as_deref()
-            {
-                config.expert_provider = provider.map(str::to_owned);
-                config.expert_model = model.map(str::to_owned);
-            }
-        }
-    }
     let observer = read_yaml(&observer_settings_path(config_path), json!({}))?;
     config.observer_enabled = observer
         .get("enabled")
@@ -553,11 +452,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         .get("fast_mode")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    config.visual_fallback_enabled = generation["visual_fallback_enabled"]
-        .as_bool()
-        .unwrap_or(false);
-    config.visual_provider = generation["visual_provider"].as_str().map(str::to_owned);
-    config.visual_model = generation["visual_model"].as_str().map(str::to_owned);
     config.visual_tool =
         serde_json::from_value(generation.get("visual_tool").cloned().unwrap_or(json!({})))?;
     config.context_agent = serde_json::from_value(
@@ -603,46 +497,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
     Ok(config)
 }
 
-pub(crate) struct DshRoute {
-    pub name: String,
-    pub url: String,
-    pub api_key: String,
-    pub model: String,
-}
-
-pub(crate) fn selected_route(expert: bool) -> anyhow::Result<DshRoute> {
-    let config = load_config(&dsh_config_path())?;
-    if expert {
-        anyhow::ensure!(
-            config.enable_subagent,
-            "DSH subagent model selection is disabled"
-        );
-    }
-    let (name, model) = if expert {
-        (
-            config.expert_provider.or(config.orchestrator_provider),
-            config.expert_model.or(config.orchestrator_model),
-        )
-    } else {
-        (config.orchestrator_provider, config.orchestrator_model)
-    };
-    let name = name.ok_or_else(|| anyhow::anyhow!("DSH model provider is not configured"))?;
-    let provider = config
-        .providers
-        .get(&name)
-        .ok_or_else(|| anyhow::anyhow!("DSH provider {name} is unavailable"))?;
-    anyhow::ensure!(
-        provider.api_type == "openai-completions",
-        "this Rust agent requires an OpenAI Chat Completions route"
-    );
-    Ok(DshRoute {
-        name,
-        url: provider.url.clone(),
-        api_key: provider.api_key.clone(),
-        model: model.ok_or_else(|| anyhow::anyhow!("DSH model is not configured"))?,
-    })
-}
-
 fn disk_revision(config_path: &Path) -> anyhow::Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for path in [
@@ -682,14 +536,10 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         "orchestrator_model": config.orchestrator_model,
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
-        "expert_provider": config.expert_provider,
-        "expert_model": config.expert_model,
-        "enable_subagent": config.enable_subagent,
         "observer_enabled": config.observer_enabled,
         "observer_provider": config.observer_provider,
         "observer_model": config.observer_model,
-        "visual_fallback_enabled":config.visual_fallback_enabled,"visual_provider":config.visual_provider,"visual_model":config.visual_model,
-        "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+                "visual_tool":config.visual_tool,"context_agent":config.context_agent,
     })
 }
 
@@ -774,10 +624,6 @@ struct SettingsEdit {
     reasoning_effort: Option<String>,
     #[serde(default)]
     fast_mode: Option<bool>,
-    expert_provider: Option<String>,
-    expert_model: Option<String>,
-    #[serde(default)]
-    enable_subagent: bool,
     #[serde(default)]
     observer_enabled: Option<bool>,
     #[serde(default)]
@@ -785,15 +631,9 @@ struct SettingsEdit {
     #[serde(default)]
     observer_model: Option<String>,
     #[serde(default)]
-    visual_fallback_enabled: Option<bool>,
-    #[serde(default)]
     visual_tool: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     context_agent: Option<crate::model_settings::ModelSettings>,
-    #[serde(default)]
-    visual_provider: Option<String>,
-    #[serde(default)]
-    visual_model: Option<String>,
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
@@ -1100,19 +940,11 @@ fn save_settings(
     config.model_capabilities = model_capabilities;
     config.orchestrator_provider = nonempty(request.orchestrator_provider);
     config.orchestrator_model = nonempty(request.orchestrator_model);
-    config.expert_provider = nonempty(request.expert_provider);
-    config.expert_model = nonempty(request.expert_model);
-    config.enable_subagent = request.enable_subagent;
     if let Some(enabled) = request.observer_enabled {
         config.observer_enabled = enabled;
     }
     config.observer_provider = nonempty(request.observer_provider);
     config.observer_model = nonempty(request.observer_model);
-    if let Some(enabled) = request.visual_fallback_enabled {
-        config.visual_fallback_enabled = enabled;
-        config.visual_provider = nonempty(request.visual_provider);
-        config.visual_model = nonempty(request.visual_model);
-    }
     for (edit, target) in [
         (request.visual_tool, &mut config.visual_tool),
         (request.context_agent, &mut config.context_agent),
@@ -1144,24 +976,6 @@ fn save_settings(
     if let Some(fast_mode) = request.fast_mode {
         config.fast_mode = fast_mode;
     }
-    if config.visual_fallback_enabled {
-        let capability = config
-            .visual_provider
-            .as_ref()
-            .and_then(|provider| config.model_capabilities.get(provider))
-            .and_then(|models| {
-                config
-                    .visual_model
-                    .as_ref()
-                    .and_then(|model| models.get(model))
-            });
-        anyhow::ensure!(
-            capability.is_some_and(
-                |cap| cap.image_input == crate::visual_artifacts::ImageCapability::Supported
-            ),
-            "visual fallback requires an explicitly configured image-supported route"
-        );
-    }
     let selected_capability = config
         .orchestrator_provider
         .as_ref()
@@ -1188,13 +1002,9 @@ fn save_settings(
         config.reasoning_effort = None;
         config.fast_mode = false;
     }
-    for name in [
-        &config.orchestrator_provider,
-        &config.expert_provider,
-        &config.observer_provider,
-    ]
-    .into_iter()
-    .flatten()
+    for name in [&config.orchestrator_provider, &config.observer_provider]
+        .into_iter()
+        .flatten()
     {
         anyhow::ensure!(
             config.providers.contains_key(name),
@@ -1206,16 +1016,11 @@ fn save_settings(
         "choose both a main-agent provider and model"
     );
     anyhow::ensure!(
-        config.expert_provider.is_some() == config.expert_model.is_some(),
-        "choose both a subagent provider and model"
-    );
-    anyhow::ensure!(
         config.observer_provider.is_some() == config.observer_model.is_some(),
         "choose both an observer provider and model"
     );
     for (provider, model) in [
         (&config.orchestrator_provider, &config.orchestrator_model),
-        (&config.expert_provider, &config.expert_model),
         (&config.observer_provider, &config.observer_model),
     ] {
         if let (Some(provider), Some(model)) = (provider, model) {
@@ -1225,19 +1030,9 @@ fn save_settings(
             );
         }
     }
-    if config.enable_subagent {
-        anyhow::ensure!(
-            config.orchestrator_provider.is_some() && config.orchestrator_model.is_some(),
-            "configure the main model before enabling subagent"
-        );
-    }
-    for name in [
-        &config.orchestrator_provider,
-        &config.expert_provider,
-        &config.observer_provider,
-    ]
-    .into_iter()
-    .flatten()
+    for name in [&config.orchestrator_provider, &config.observer_provider]
+        .into_iter()
+        .flatten()
     {
         anyhow::ensure!(
             config.providers[name].api_type == "openai-completions",
@@ -1352,37 +1147,6 @@ fn save_settings(
         entries
             .retain(|entry| entry.get("id").and_then(Value::as_str) != Some("agent-default-model"));
     }
-    let mut subagent = plugin_config(&patch, "subagent")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let item = subagent
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("subagent config is not a mapping"))?;
-    item.insert("maxDepth".into(), json!(1));
-    item.insert("maxActiveSubagents".into(), json!(1));
-    set_plugin_config(&mut patch, "subagent", subagent)?;
-    let allowed = match (
-        config
-            .expert_provider
-            .as_ref()
-            .or(config.orchestrator_provider.as_ref()),
-        config
-            .expert_model
-            .as_ref()
-            .or(config.orchestrator_model.as_ref()),
-    ) {
-        (Some(provider), Some(model)) => json!([{"provider":provider,"model":model}]),
-        _ => json!([]),
-    };
-    let mut selection = plugin_config(&patch, "subagent-model-selection-settings")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let item = selection
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("subagent model selection config is not a mapping"))?;
-    item.insert("enabled".into(), json!(config.enable_subagent));
-    item.insert("allowedModels".into(), allowed);
-    set_plugin_config(&mut patch, "subagent-model-selection-settings", selection)?;
     let secret_path = credentials_path(config_path);
     let observer_path = observer_settings_path(config_path);
     let original_observer = read_yaml(&observer_path, json!({}))?;
@@ -1397,8 +1161,7 @@ fn save_settings(
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
         "model_capabilities": config.model_capabilities,
-        "visual_fallback_enabled":config.visual_fallback_enabled,"visual_provider":config.visual_provider,"visual_model":config.visual_model,
-        "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+                "visual_tool":config.visual_tool,"context_agent":config.context_agent,
     });
     if disk_revision(config_path)? != request.revision {
         return Ok(Err(
@@ -1583,7 +1346,6 @@ struct AiProxyState {
     config_path: std::path::PathBuf,
     settings_write: Arc<Mutex<()>>,
     client: Client,
-    workspace: Arc<crate::tools::Workspace>,
     runtime: Arc<plugin_runtime::PluginRuntime>,
 }
 
@@ -1815,404 +1577,6 @@ async fn skill_page_asset(
     }
 }
 
-async fn current_config(state: &AiProxyState) -> AiProxyConfig {
-    let path = state.config_path.clone();
-    if let Ok(Ok(latest)) = tokio::task::spawn_blocking(move || load_config(&path)).await {
-        *state.config.write().await = latest.clone();
-        latest
-    } else {
-        state.config.read().await.clone()
-    }
-}
-
-/// Resolve a client-visible model name → (provider config, upstream model name).
-/// Looks up the model in the default provider's model_map; if not found,
-/// passes the model name through to the default provider as-is.
-fn resolve_model<'a>(
-    config: &'a AiProxyConfig,
-    model: &str,
-) -> Result<(&'a ProviderConfig, String), Response> {
-    let default = config.default_provider.as_deref().unwrap_or("");
-    let provider = config.providers.get(default).ok_or_else(|| {
-        error!(provider = %default, "default provider not found");
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("default provider not found: {}", default)})),
-        )
-            .into_response()
-    })?;
-
-    let upstream = provider
-        .model_map
-        .get(model)
-        .cloned()
-        .unwrap_or_else(|| model.to_owned());
-    Ok((provider, upstream))
-}
-
-/// Resolve the DSH default model for the stateful Agent Runtime.
-fn resolve_orchestrator_model<'a>(
-    config: &'a AiProxyConfig,
-    client_model: &str,
-) -> Result<(&'a ProviderConfig, String), Response> {
-    if config.orchestrator_provider.is_none() && config.orchestrator_model.is_none() {
-        return resolve_model(config, client_model);
-    }
-
-    let provider_name = config
-        .orchestrator_provider
-        .as_deref()
-        .or(config.default_provider.as_deref())
-        .unwrap_or("");
-    let provider = config.providers.get(provider_name).ok_or_else(|| {
-        error!(provider = %provider_name, "orchestrator provider not found");
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("orchestrator provider not found: {}", provider_name)})),
-        )
-            .into_response()
-    })?;
-    let upstream = config
-        .orchestrator_model
-        .clone()
-        .or_else(|| provider.model_map.get(client_model).cloned())
-        .unwrap_or_else(|| client_model.to_owned());
-    Ok((provider, upstream))
-}
-
-/// Truncate body for logging (keep first ~2000 chars).
-pub(crate) fn fmt_body(b: &[u8]) -> String {
-    let s = String::from_utf8_lossy(b);
-    if s.len() > 2000 {
-        format!("{}… ({} bytes)", &s[..2000], s.len())
-    } else {
-        s.to_string()
-    }
-}
-
-pub(crate) fn conversation_id_from_body(_body: &Value, workspace_root: &Path) -> String {
-    format!(
-        "workspace:{}",
-        sanitize_conversation_id(&workspace_root.to_string_lossy())
-    )
-}
-
-fn sanitize_conversation_id(id: &str) -> String {
-    let mut out = String::new();
-    for ch in id.chars().take(120) {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "unknown".to_owned()
-    } else {
-        out
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
-
-/// GET /v1/models — list exposed model IDs from the default provider's model_map.
-async fn list_models(State(state): State<AiProxyState>) -> impl IntoResponse {
-    let config = current_config(&state).await;
-    let default_p = config
-        .default_provider
-        .as_deref()
-        .and_then(|d| config.providers.get(d));
-
-    let models: Vec<Value> = default_p
-        .map(|p| {
-            p.model_map
-                .keys()
-                .map(|id| {
-                    json!({
-                        "id": id,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": "ai-proxy"
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Json(json!({
-        "object": "list",
-        "data": models
-    }))
-}
-
-/// POST /v1/chat/completions — OpenAI-compatible endpoint.
-async fn chat_completions(
-    State(state): State<AiProxyState>,
-    headers: HeaderMap,
-    Json(mut body): Json<Value>,
-) -> Response {
-    let config = current_config(&state).await;
-    let client_model = match body.get("model").and_then(|v| v.as_str()) {
-        Some(m) => m.to_owned(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "missing model field"})),
-            )
-                .into_response();
-        }
-    };
-
-    let task_visual = headers
-        .get("x-codex-visual-dispatch")
-        .and_then(|value| value.to_str().ok())
-        == Some("task-owned");
-    if !task_visual {
-        crate::vision_preprocess::set_visible_images_from_body(&body);
-    }
-    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
-    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    if !task_visual {
-        crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
-    }
-
-    info!("=== /v1/chat/completions  model={}", client_model);
-
-    let (provider, mut upstream_model) = match resolve_model(&config, &client_model) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-
-    if had_image_input && !task_visual {
-        let old_model = upstream_model.clone();
-        upstream_model = crate::vision_preprocess::adjust_model_for_vision(&upstream_model);
-        if old_model != upstream_model {
-            info!(
-                "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
-                old_model, upstream_model
-            );
-        }
-    }
-
-    info!(
-        "   resolved: provider={} upstream_model={}",
-        provider.url, upstream_model
-    );
-
-    body["model"] = json!(upstream_model);
-
-    // Normalize role="developer" to "system" for upstream compatibility
-    if let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) {
-        for msg in &mut *messages {
-            if let Some(role) = msg.get_mut("role") {
-                if role.as_str() == Some("developer") {
-                    *role = json!("system");
-                }
-            }
-        }
-        format_translate::clean_unmatched_tool_calls(messages);
-    }
-
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    info!(
-        "   chat completions body: {}",
-        fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
-    );
-
-    let upstream_url = format!("{}/chat/completions", provider.url);
-    crate::upstream::forward_to_upstream(
-        &state.client,
-        &upstream_url,
-        &provider.api_key,
-        &body,
-        is_stream,
-        &client_model,
-    )
-    .await
-}
-
-/// POST /v1/messages — Anthropic Messages API endpoint.
-async fn messages(
-    State(state): State<AiProxyState>,
-    headers: HeaderMap,
-    Json(mut body): Json<Value>,
-) -> Response {
-    let config = current_config(&state).await;
-    let task_visual = headers
-        .get("x-codex-visual-dispatch")
-        .and_then(|value| value.to_str().ok())
-        == Some("task-owned");
-    if !task_visual {
-        crate::vision_preprocess::set_visible_images_from_body(&body);
-    }
-    let had_image_input = crate::vision_preprocess::has_latest_user_image_input(&body);
-    let mut image_stats = crate::vision_preprocess::ImageProcessStats::default();
-    if !task_visual {
-        crate::vision_preprocess::process_latest_user_images(&mut body, &mut image_stats).await;
-    }
-    let raw_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-
-    info!("=== /v1/messages  model={}", raw_model);
-    info!(
-        "   anthropic body: {}",
-        fmt_body(serde_json::to_string(&body).unwrap_or_default().as_bytes())
-    );
-
-    let (provider, mut upstream_model) = match resolve_model(&config, raw_model) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-
-    if had_image_input && !task_visual {
-        let old_model = upstream_model.clone();
-        upstream_model = crate::vision_preprocess::adjust_model_for_vision(&upstream_model);
-        if old_model != upstream_model {
-            info!(
-                "   [DYNAMIC ROUTING] Image detected. Switched model from {} to {}",
-                old_model, upstream_model
-            );
-        }
-    }
-
-    info!(
-        "   resolved: provider={} upstream_model={}",
-        provider.url, upstream_model
-    );
-
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let is_anthropic_provider = provider.api_type == "anthropic-messages";
-
-    let (forward_body, upstream_url) = if is_anthropic_provider {
-        // Anthropic-native upstream: forward raw, no conversion.
-        let mut raw_body = body.clone();
-        raw_body["model"] = json!(upstream_model);
-        info!("   anthropic native forward, url={}", provider.url);
-        (raw_body, provider.url.clone())
-    } else {
-        // OpenAI-compatible upstream: convert Anthropic → OpenAI.
-        let mut openai_body = format_translate::anthropic_to_openai(&body);
-        openai_body["model"] = json!(upstream_model);
-        info!(
-            "   openai body: {}",
-            fmt_body(
-                serde_json::to_string(&openai_body)
-                    .unwrap_or_default()
-                    .as_bytes()
-            )
-        );
-        let url = format!("{}/chat/completions", provider.url);
-        (openai_body, url)
-    };
-
-    let resp = crate::upstream::forward_to_upstream(
-        &state.client,
-        &upstream_url,
-        &provider.api_key,
-        &forward_body,
-        is_stream,
-        raw_model,
-    )
-    .await;
-
-    // For non-streaming OpenAI providers, convert response back to Anthropic.
-    if !is_stream && !is_anthropic_provider && resp.status().is_success() {
-        let status = resp.status();
-        let body_bytes = match axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await {
-            Ok(b) => b,
-            Err(e) => {
-                error!(%e, "failed to read response body for Anthropic conversion");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": format!("response read: {e}")})),
-                )
-                    .into_response();
-            }
-        };
-
-        info!("   openai resp body: {}", fmt_body(&body_bytes));
-
-        match serde_json::from_slice::<Value>(&body_bytes) {
-            Ok(openai_resp) => {
-                let anthropic_resp = format_translate::openai_to_anthropic(&openai_resp, raw_model);
-                info!(
-                    "   anthropic resp: {}",
-                    fmt_body(
-                        serde_json::to_string(&anthropic_resp)
-                            .unwrap_or_default()
-                            .as_bytes()
-                    )
-                );
-                (
-                    status,
-                    [("content-type", "application/json")],
-                    Json(anthropic_resp),
-                )
-                    .into_response()
-            }
-            Err(e) => {
-                error!(%e, "failed to parse upstream OpenAI response");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": format!("parse upstream: {e}")})),
-                )
-                    .into_response()
-            }
-        }
-    } else {
-        resp
-    }
-}
-
-/// POST /v1/responses — OpenAI Responses API endpoint for Codex.
-async fn responses(State(state): State<AiProxyState>, Json(body): Json<Value>) -> Response {
-    let config = current_config(&state).await;
-    let conversation_id = conversation_id_from_body(&body, state.workspace.root());
-    let client_model = match body.get("model").and_then(|v| v.as_str()) {
-        Some(m) => m.to_owned(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "missing model field"})),
-            )
-                .into_response();
-        }
-    };
-
-    let (provider, upstream_model) = match resolve_orchestrator_model(&config, &client_model) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-
-    let expert_provider = config.resolve_expert_provider();
-    crate::responses::logging::log_request_body(&conversation_id, &body, &client_model).await;
-    info!("   responses request entering local agent runtime with orchestrator model");
-    crate::agent_runtime::run_responses_agent(
-        state.client.clone(),
-        state.workspace.clone(),
-        provider.url.clone(),
-        provider.api_key.clone(),
-        body,
-        upstream_model,
-        client_model,
-        expert_provider,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
-
 pub async fn run(
     listener: TcpListener,
     config_path: &Path,
@@ -2232,7 +1596,7 @@ pub async fn run(
     let log_dir = workspace.root().join("logs");
     crate::proxy_log::init(log_dir)?;
 
-    info!("========== AI Proxy started ==========");
+    info!("========== Agent service started ==========");
     info!("config: {} total model mappings", total_maps);
 
     let runtime = Arc::new(plugin_runtime::PluginRuntime::new());
@@ -2276,21 +1640,7 @@ pub async fn run(
         .route("/agent/logo.png", get(crate::agent_web::star_png))
         .route("/agent/favicon.png", get(crate::agent_web::favicon_png))
         .route("/agent/favicon.ico", get(crate::agent_web::favicon_png))
-        .route("/agent/classic", get(crate::agent_web::classic_page))
-        .route("/agent/app.css", get(crate::agent_web::app_css))
-        .route("/agent/app.js", get(crate::agent_web::app_js))
-        .route(
-            "/agent/browser-runtime.js",
-            get(crate::agent_web::browser_runtime_js),
-        )
         .route("/agent/settings", get(crate::agent_web::settings_page))
-        .route("/agent/settings.css", get(crate::agent_web::settings_css))
-        .route("/agent/settings.js", get(crate::agent_web::settings_js))
-        .route("/agent/dsh-base.css", get(crate::agent_web::dsh_base_css))
-        .route(
-            "/agent/dsh-design.css",
-            get(crate::agent_web::dsh_design_css),
-        )
         .route("/agent/info", get(crate::agent_web::info))
         .route(
             "/agent/workspace/files",
@@ -2353,20 +1703,8 @@ pub async fn run(
             get(crate::request_context::get),
         )
         .route(
-            "/agent/tasks/{task_id}/notebook",
-            get(crate::task_notebook::list),
-        )
-        .route(
             "/agent/tasks/{task_id}/visual-artifacts/{id}/image",
             get(crate::visual_artifacts::image_route),
-        )
-        .route(
-            "/agent/tasks/{task_id}/notebook/history",
-            get(crate::task_notebook::history),
-        )
-        .route(
-            "/agent/tasks/{task_id}/notebook/materials/{id}",
-            get(crate::task_notebook::get),
         )
         .route(
             "/agent/tasks/{task_id}/flow/nodes/{node_id}/interrupt",
@@ -2396,15 +1734,10 @@ pub async fn run(
         config_path: config_path.to_path_buf(),
         settings_write: Arc::new(Mutex::new(())),
         client,
-        workspace,
         runtime: runtime.clone(),
     };
 
     let app = Router::new()
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/messages", post(messages))
-        .route("/v1/responses", post(responses))
         .route("/star.png", get(crate::agent_web::star_png))
         .route("/logo.png", get(crate::agent_web::star_png))
         .route("/favicon.png", get(crate::agent_web::favicon_png))
@@ -2458,7 +1791,7 @@ pub async fn run(
         .layer(CorsLayer::permissive());
 
     let addr = listener.local_addr()?;
-    info!(%addr, "AI proxy starting");
+    info!(%addr, "Agent service starting");
 
     let served = axum::serve(listener, app).await;
     runtime.shutdown()?;
@@ -2469,118 +1802,6 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn conversation_id_uses_workspace_as_context_boundary() {
-        let body = json!({
-            "conversation": "conv_123",
-            "previous_response_id": "resp_456"
-        });
-
-        let id = conversation_id_from_body(&body, Path::new("D:/workspace"));
-
-        assert_eq!(id, "workspace:D:_workspace");
-    }
-
-    fn provider(url: &str, models: &[(&str, &str)]) -> ProviderConfig {
-        ProviderConfig {
-            url: url.to_string(),
-            api_key: "test-key".to_string(),
-            api_key_ref: None,
-            model_map: models
-                .iter()
-                .map(|(client, upstream)| (client.to_string(), upstream.to_string()))
-                .collect(),
-            api_type: "openai".to_string(),
-            max_output_tokens: HashMap::new(),
-            extra: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn orchestrator_routing_keeps_legacy_model_when_not_configured() {
-        let config = AiProxyConfig {
-            enable_subagent: false,
-            default_provider: Some("default".to_string()),
-            orchestrator_provider: None,
-            orchestrator_model: None,
-            reasoning_effort: None,
-            fast_mode: false,
-            model_capabilities: HashMap::new(),
-            expert_provider: None,
-            expert_model: None,
-            observer_enabled: false,
-            observer_provider: None,
-            observer_model: None,
-            visual_fallback_enabled: false,
-            visual_tool: Default::default(),
-            context_agent: Default::default(),
-            visual_provider: None,
-            visual_model: None,
-            providers: [(
-                "default".to_string(),
-                provider(
-                    "https://default.example/v1",
-                    &[("gpt-5-codex", "pro-model")],
-                ),
-            )]
-            .into_iter()
-            .collect(),
-            extra: HashMap::new(),
-        };
-
-        let (provider, model) = resolve_orchestrator_model(&config, "gpt-5-codex").unwrap();
-
-        assert_eq!(provider.url, "https://default.example/v1");
-        assert_eq!(model, "pro-model");
-    }
-
-    #[test]
-    fn orchestrator_routing_uses_configured_cheap_model() {
-        let config = AiProxyConfig {
-            enable_subagent: false,
-            default_provider: Some("default".to_string()),
-            orchestrator_provider: Some("cheap".to_string()),
-            orchestrator_model: Some("deepseek-v4-flash".to_string()),
-            reasoning_effort: None,
-            fast_mode: false,
-            model_capabilities: HashMap::new(),
-            expert_provider: None,
-            expert_model: None,
-            observer_enabled: false,
-            observer_provider: None,
-            observer_model: None,
-            visual_fallback_enabled: false,
-            visual_tool: Default::default(),
-            context_agent: Default::default(),
-            visual_provider: None,
-            visual_model: None,
-            providers: [
-                (
-                    "default".to_string(),
-                    provider(
-                        "https://default.example/v1",
-                        &[("gpt-5-codex", "pro-model")],
-                    ),
-                ),
-                (
-                    "cheap".to_string(),
-                    provider(
-                        "https://cheap.example/v1",
-                        &[("gpt-5-codex", "cheap-mapped")],
-                    ),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            extra: HashMap::new(),
-        };
-
-        let (provider, model) = resolve_orchestrator_model(&config, "gpt-5-codex").unwrap();
-
-        assert_eq!(provider.url, "https://cheap.example/v1");
-        assert_eq!(model, "deepseek-v4-flash");
-    }
 
     #[test]
     fn image_probe_evidence_is_persisted_and_bound_to_the_saved_route() {

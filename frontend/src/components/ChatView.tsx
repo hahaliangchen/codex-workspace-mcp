@@ -79,19 +79,6 @@ function Item({
         <strong>Observer 复盘</strong>
         <SmoothMarkdown text={item.text} labels={markdownLabels(t)} />
       </div>
-    case 'progress':
-      return (
-        <div className={css.progressReport}>
-          <strong>
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flex: 'none', color: 'var(--codex-amber-circle, #d97706)' }}>
-              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-            </svg>
-            当前目的：{item.purpose || '未填写'}
-          </strong>
-          {item.knownConditions.length > 0 && <span>已知：{item.knownConditions.join('；')}</span>}
-          {item.nextAction && <span>接下来：{item.nextAction}</span>}
-        </div>
-      )
     case 'observer':
       return (
         <div className={css.observerAdvice}>
@@ -115,14 +102,6 @@ function Item({
           stopped={turnClosed}
           onOpenChild={onOpenTask}
         />
-      )
-    case 'subagent':
-      return (
-        <button type="button" className={css.subagent} onClick={() => { onOpenTask(item.childTaskId) }}>
-          <span className={css.subagentTitle}>{t('app.subagentStarted')}</span>
-          <span className={css.subagentPrompt}>{item.prompt}</span>
-          <span className={css.subagentLink}>{t('app.viewSubagent')}</span>
-        </button>
       )
     case 'turn-end':
       return <TurnEnd reason={item.reason} durationMs={item.durationMs} />
@@ -356,7 +335,7 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
         return
       }
 
-      if (item.kind === 'tool' || item.kind === 'subagent' || item.kind === 'progress' || item.kind === 'observer') {
+      if (item.kind === 'tool' || item.kind === 'observer') {
         if (!currentTurn) {
           currentTurn = {
             key: `turn:${item.key}`,

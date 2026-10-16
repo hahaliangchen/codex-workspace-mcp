@@ -1,11 +1,8 @@
 #![recursion_limit = "512"]
 
-mod agent;
-mod agent_runtime;
 mod agent_service;
 mod agent_web;
 mod ai_proxy;
-mod architecture_agent;
 mod attachments;
 mod browser_control;
 mod builtin_plugins;
@@ -15,10 +12,7 @@ mod context_assets;
 mod context_rebuild;
 mod context_window;
 mod database;
-mod expert_surgery;
 mod file_edit;
-mod flow_tree;
-mod format_translate;
 mod go_index;
 mod http_probe;
 mod image_analysis;
@@ -38,33 +32,20 @@ mod project_process;
 mod proxy_log;
 mod python_index;
 mod request_context;
-mod responses;
 mod rust_index;
-mod sandbox_diagnostic;
 mod session_history;
 mod single_agent;
 mod skill_packages;
-mod skills;
 mod source_read;
 mod symbol_description;
 mod symbol_index_state;
-mod symbol_provider;
 mod symbol_query;
-mod task_notebook;
-mod tool_prepare;
 mod tools;
 mod ts_index;
-mod upstream;
-mod vision_preprocess;
 mod visual_artifacts;
 mod visual_probe;
 #[cfg(test)]
 mod visual_tests;
-mod work_executor;
-mod work_organizer;
-mod work_scheduler;
-mod worker_read_cache;
-mod worker_work_state;
 mod workspace_changes;
 
 use std::{env, fmt as std_fmt, net::SocketAddr, path::PathBuf, sync::Arc};
@@ -141,9 +122,6 @@ async fn main() -> anyhow::Result<()> {
     let workspace = Arc::new(Workspace::new(workspace_root)?);
     info!(root = %workspace.root().display(), "workspace initialized");
 
-    // Initialize database background write queue
-    let _ = crate::database::init_db_writer(workspace.root());
-
     // Start the local agent and settings UI even before a model is configured.
     let ai_config_path = ai_proxy::dsh_config_path();
     let ai_config_path = if ai_config_path.is_absolute() {
@@ -155,17 +133,17 @@ async fn main() -> anyhow::Result<()> {
         let agent_bind = env::var("AGENT_BIND").unwrap_or_else(|_| "127.0.0.1:3001".to_string());
         match TcpListener::bind(&agent_bind).await {
             Ok(listener) => {
-                info!(path = %ai_config_path.display(), bind = %agent_bind, "AI proxy starting");
+                info!(path = %ai_config_path.display(), bind = %agent_bind, "Agent service starting");
                 let workspace_for_proxy = workspace.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
                         ai_proxy::run(listener, &ai_config_path, workspace_for_proxy).await
                     {
-                        error!(%e, "AI proxy exited with error");
+                        error!(%e, "Agent service exited with error");
                     }
                 });
             }
-            Err(e) => warn!(%e, bind = %agent_bind, "could not start AI proxy"),
+            Err(e) => warn!(%e, bind = %agent_bind, "could not start Agent service"),
         }
     }
 

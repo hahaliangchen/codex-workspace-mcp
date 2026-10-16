@@ -343,10 +343,6 @@ impl Workspace {
         &self.root
     }
 
-    pub fn with_selected_root(&self, workspace_root: &str) -> Result<Self> {
-        self.with_root(Some(workspace_root))
-    }
-
     pub fn workspace_info(&self, request: WorkspaceInfoRequest) -> Result<WorkspaceInfo> {
         let Some(workspace_root) = request.workspace_root.as_deref() else {
             return Err(ToolError::WorkspaceRootRequired);
@@ -635,7 +631,7 @@ impl Workspace {
         let path = crate::file_edit::workspace_path(&workspace.root, &request.path)?;
         let original = crate::file_edit::snapshot(&path)?;
         if original.is_some() && request.expected_code_hash.is_none() {
-            return Err(ToolError::WritePreconditionRequired("overwriting an existing file requires expected_code_hash from a source read or notebook retrieval; use edit_file for focused edits".into()));
+            return Err(ToolError::WritePreconditionRequired("overwriting an existing file requires expected_code_hash from a source read; use edit_file for focused edits".into()));
         }
         crate::file_edit::check_hash(original.as_deref(), request.expected_code_hash.as_deref())?;
         if let Some(parent) = path.parent() {

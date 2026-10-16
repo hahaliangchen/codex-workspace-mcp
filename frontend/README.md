@@ -30,7 +30,8 @@ npm install
 npm run build
 ```
 
-The build writes `dist/`, which Rust serves at `/agent`. For frontend work,
+The build writes `dist/`, which Rust serves at `/agent` and `/agent/settings`.
+Both routes require the build; there is no embedded classic-page fallback. For frontend work,
 `npm run dev` serves `/agent/` with task API requests proxied to port 3001.
 
 ## Scope

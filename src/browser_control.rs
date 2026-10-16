@@ -2141,17 +2141,24 @@ mod tests {
             before,
             "reconnection must preserve uploaded File, page state and navigation origin"
         );
-        let history = crate::session_history::task_process(&root, context.task_id(), 1)
-            .await
+        // The agent recovers the original connection through its history tool.
+        let websocket = opened["browser_connection"]["websocket_url"]
+            .as_str()
             .unwrap();
+        let history = crate::session_history::read(
+            &root,
+            context.task_id(),
+            &json!({"query":websocket,"role":"tool"}),
+        )
+        .await
+        .unwrap();
         assert!(
-            serde_json::to_string(&crate::session_history::process_messages(&history).unwrap())
+            history["records"]
+                .as_array()
                 .unwrap()
-                .contains(
-                    opened["browser_connection"]["websocket_url"]
-                        .as_str()
-                        .unwrap()
-                )
+                .iter()
+                .any(|record| record["content"].as_str().unwrap().contains(websocket)),
+            "{history}"
         );
         // The same returned record also works explicitly without a live cache.
         forget_runtime(&root, context.task_id()).await;

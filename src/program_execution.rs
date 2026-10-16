@@ -71,15 +71,6 @@ pub fn check_key(args: &Value) -> String {
     format!("program:{program}:{project}:{}", Value::Array(arguments))
 }
 
-pub fn normalize_args(root: &Path, args: &mut Value) -> Result<()> {
-    ensure!(args.is_object(), "run_program arguments must be an object");
-    if let Some(project) = args.get("project_path").and_then(Value::as_str) {
-        let (_, relative) = resolve_project_path(root, project)?;
-        args["project_path"] = json!(relative);
-    }
-    Ok(())
-}
-
 pub async fn execute(workspace: &crate::tools::Workspace, args: &Value) -> Result<Value> {
     execute_cancellable(workspace, args, &CancellationToken::new()).await
 }

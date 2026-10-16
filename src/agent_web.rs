@@ -1,12 +1,11 @@
-//! Browser UI for the standalone Rust agent: the DSH-based `frontend/` build,
-//! with the embedded classic page as a fallback.
+//! Browser UI for the standalone Rust agent, served from the frontend build.
 
 use std::path::PathBuf;
 
 use axum::{
     Json,
     extract::State,
-    http::header,
+    http::{StatusCode, header},
     response::{Html, IntoResponse, Response},
 };
 use serde_json::json;
@@ -23,68 +22,15 @@ pub fn web_dir() -> PathBuf {
 pub async fn page() -> Response {
     match tokio::fs::read_to_string(web_dir().join("index.html")).await {
         Ok(html) => ([(header::CACHE_CONTROL, "no-cache")], Html(html)).into_response(),
-        Err(_) => classic_page().await.into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Agent frontend is not built. Run npm install and npm run build in frontend/, or set AGENT_WEB_DIR to the built frontend directory.",
+        ).into_response(),
     }
-}
-
-pub async fn classic_page() -> Html<&'static str> {
-    Html(include_str!("../web/agent.html"))
-}
-
-pub async fn app_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/agent.css"),
-    )
-}
-
-pub async fn app_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/agent.js"),
-    )
-}
-
-pub async fn browser_runtime_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/browser-runtime.js"),
-    )
 }
 
 pub async fn settings_page() -> Response {
-    match tokio::fs::read_to_string(web_dir().join("index.html")).await {
-        Ok(html) => ([(header::CACHE_CONTROL, "no-cache")], Html(html)).into_response(),
-        Err(_) => Html(include_str!("../web/settings.html")).into_response(),
-    }
-}
-
-pub async fn settings_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/settings.css"),
-    )
-}
-
-pub async fn settings_js() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("../web/settings.js"),
-    )
-}
-
-pub async fn dsh_base_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/vendor/dsh-base.css"),
-    )
-}
-
-pub async fn dsh_design_css() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_str!("../web/vendor/dsh-design-platform.css"),
-    )
+    page().await
 }
 
 pub async fn info(State(state): State<AgentServiceState>) -> impl IntoResponse {
@@ -96,8 +42,6 @@ pub async fn info(State(state): State<AgentServiceState>) -> impl IntoResponse {
         "ready": ready,
         "workspace": state.workspace.root().display().to_string(),
         "model": state.default_model,
-        "subagent_enabled": state.enable_subagent,
-        "subagent_model": state.expert_model,
     }))
 }
 

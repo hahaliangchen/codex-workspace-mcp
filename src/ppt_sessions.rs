@@ -447,7 +447,7 @@ mod tests {
         .await
         .unwrap();
         remote::mount_user_template(&runtime, &catalog.packages, package).unwrap();
-        let mut state = crate::agent_service::tests::flow_test_state(&root, address);
+        let mut state = crate::agent_service::tests::test_state(&root, address);
         state.tool_catalog = Some(catalog.clone());
         let alice = value(
             handle(

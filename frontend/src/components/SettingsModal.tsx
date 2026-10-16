@@ -12,7 +12,6 @@ import {
   IconPlusOutlineRegular,
   IconSearchOutlineRegular,
   IconSettingsOutlineRegular,
-  IconUsersOutlineRegular,
   StateDot,
   Switch,
 } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -51,9 +50,6 @@ interface DraftProvider {
 interface DraftSettings {
   visual_tool: ModelUseSettings
   context_agent: ModelUseSettings
-  visual_fallback_enabled: boolean
-  visual_provider: string
-  visual_model: string
   revision: string
   providers: DraftProvider[]
   orchestrator_provider: string
@@ -63,9 +59,6 @@ interface DraftSettings {
   observer_enabled: boolean
   observer_provider: string
   observer_model: string
-  expert_provider: string
-  expert_model: string
-  enable_subagent: boolean
 }
 
 function parseModels(lines: string): string[] {
@@ -108,12 +101,6 @@ function toDraft(data: SettingsData): DraftSettings {
     observer_enabled: Boolean(data.observer_enabled),
     observer_provider: data.observer_provider ?? '',
     observer_model: data.observer_model ?? '',
-    expert_provider: data.expert_provider ?? '',
-    expert_model: data.expert_model ?? '',
-    enable_subagent: Boolean(data.enable_subagent),
-    visual_fallback_enabled: Boolean(data.visual_fallback_enabled),
-    visual_provider: data.visual_provider ?? '',
-    visual_model: data.visual_model ?? '',
   }
 }
 
@@ -257,15 +244,9 @@ export function SettingsModal({
         orchestrator_model: draft.orchestrator_model || null,
         reasoning_effort: selectedCapability?.reasoning_efforts.includes(draft.reasoning_effort) ? draft.reasoning_effort : '',
         fast_mode: Boolean(selectedCapability?.fast_mode && draft.fast_mode),
-        expert_provider: draft.expert_provider || null,
-        expert_model: draft.expert_model || null,
-        enable_subagent: draft.enable_subagent,
         observer_enabled: draft.observer_enabled,
         observer_provider: draft.observer_provider || null,
         observer_model: draft.observer_model || null,
-        visual_fallback_enabled: draft.visual_fallback_enabled,
-        visual_provider: draft.visual_provider || null,
-        visual_model: draft.visual_model || null,
       })
       setDraft(toDraft(saved))
       setStatusMsg({ text: '设置已保存并立即对新任务生效。', error: false })
@@ -336,8 +317,6 @@ export function SettingsModal({
       providers: nextProviders,
       orchestrator_provider: draft.orchestrator_provider === provider.id ? (nextProviders[0]?.id ?? '') : draft.orchestrator_provider,
       orchestrator_model: draft.orchestrator_provider === provider.id ? '' : draft.orchestrator_model,
-      expert_provider: draft.expert_provider === provider.id ? '' : draft.expert_provider,
-      expert_model: draft.expert_provider === provider.id ? '' : draft.expert_model,
       observer_provider: draft.observer_provider === provider.id ? '' : draft.observer_provider,
       observer_model: draft.observer_provider === provider.id ? '' : draft.observer_model,
     })
@@ -378,15 +357,6 @@ export function SettingsModal({
   )
   const mainCapability = mainProviderObj?.model_capabilities[draft?.orchestrator_model ?? '']
 
-  const expertProviderObj = useMemo(
-    () => draft?.providers.find(p => p.id === draft.expert_provider),
-    [draft],
-  )
-  const expertModels = useMemo(
-    () => (expertProviderObj ? parseModels(expertProviderObj.models_text) : []),
-    [expertProviderObj],
-  )
-
   const observerProviderObj = useMemo(
     () => draft?.providers.find(p => p.id === draft.observer_provider),
     [draft],
@@ -403,7 +373,6 @@ export function SettingsModal({
     { id: 'models', label: '模型与提供商', icon: <IconDatabaseOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'observer', label: 'Observer', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'tools', label: '视觉与压缩', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
-    { id: 'subagent', label: '子代理', icon: <IconUsersOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'plugins', label: '插件状态', icon: <IconCordisPluginOutlineRegular className={rootCss.navIcon} size={18} /> },
   ]
 
@@ -502,12 +471,6 @@ export function SettingsModal({
             {activeTab === 'models' && draft !== null && (
               <div className={modelsCss.section}>
                 <h2 className={modelsCss.title}>模型与提供商</h2>
-                <details className={modelsCss.rowCard}>
-                  <summary>视觉服务降级 · {draft.visual_fallback_enabled ? '已启用' : '关闭'}</summary>
-                  <label className={modelsCss.field}><span>仅当前角色明确不支持图片时启用配置的视觉服务</span><input type="checkbox" checked={draft.visual_fallback_enabled} onChange={e => updateDraft({ visual_fallback_enabled: e.target.checked })} /></label>
-                  <label className={modelsCss.field}><span>视觉服务提供商</span><select className={modelsCss.input} value={draft.visual_provider} onChange={e => updateDraft({ visual_provider: e.target.value, visual_model: '' })}><option value="">请选择</option>{draft.providers.map(provider => <option key={provider._draftId} value={provider.id}>{provider.display_name || provider.id}</option>)}</select></label>
-                  <label className={modelsCss.field}><span>支持图片的模型</span><select className={modelsCss.input} value={draft.visual_model} onChange={e => updateDraft({ visual_model: e.target.value })}><option value="">请选择</option>{Object.entries(draft.providers.find(p => p.id === draft.visual_provider)?.model_capabilities ?? {}).filter(([, cap]) => cap.image_input === 'supported').map(([model]) => <option key={model} value={model}>{model}</option>)}</select></label>
-                </details>
                 <p className={modelsCss.intro}>
                   配置模型提供商端点、API 协议及模型目录。API 密钥安全存储在本地凭据文件中，不会在前端回显。
                 </p>
@@ -888,80 +851,6 @@ export function SettingsModal({
                   )
                 })}
               </section>
-            )}
-
-            {activeTab === 'subagent' && draft !== null && (
-              <div className={modelsCss.section}>
-                <h2 className={modelsCss.title}>子代理 (Subagent)</h2>
-                <p className={modelsCss.intro}>
-                  允许主代理将独立子任务委派给子代理并行深入调查或修改，并在子代理完成后汇总结果。
-                </p>
-
-                <div className={modelsCss.rowCard}>
-                  <div className={modelsCss.rowHead}>
-                    <div className={modelsCss.rowIdentity}>
-                      <span className={modelsCss.rowName}>启用子代理自主委派</span>
-                      <span className={modelsCss.rowTag}>Subagent</span>
-                    </div>
-                    <div className={modelsCss.rowActions}>
-                      <Switch
-                        checked={draft.enable_subagent}
-                        label="启用子代理"
-                        onChange={(checked) => { updateDraft({ enable_subagent: checked }) }}
-                      />
-                    </div>
-                  </div>
-                  <p className={modelsCss.advancedHint}>
-                    启用后，主代理可通过 `spawn_subagent` 工具派生子任务；你也可以在会话视图与轨迹视图中随时检视子代理步骤。
-                  </p>
-                </div>
-
-                <div className={clsx(subagentCss.section, modelsCss.setupCard)}>
-                  <div className={modelsCss.editorHeader}>
-                    <span className={modelsCss.editorTitle}>子代理专用模型（可选）</span>
-                    <span className={modelsCss.editorRoute}>留空时默认继承主代理提供商与模型</span>
-                  </div>
-                  <div className={modelsCss.modelAdvanced}>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>子代理提供商</span>
-                      <select
-                        className={clsx(modelsCss.input, modelsCss.selectInput)}
-                        style={{ maxWidth: '100%' }}
-                        value={draft.expert_provider}
-                        onChange={(e) => {
-                          const nextProviderId = e.target.value
-                          const prov = draft.providers.find(p => p.id === nextProviderId)
-                          const firstModel = prov ? parseModels(prov.models_text)[0] ?? '' : ''
-                          updateDraft({
-                            expert_provider: nextProviderId,
-                            expert_model: firstModel,
-                          })
-                        }}
-                      >
-                        <option value="">跟随主代理 ({draft.orchestrator_provider || '未设置'})</option>
-                        {draft.providers.map(p => (
-                          <option key={p._draftId} value={p.id}>
-                            {p.display_name || p.id} ({p.id})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>子代理模型 ID</span>
-                      <input
-                        className={modelsCss.input}
-                        list="dsh-expert-model-list"
-                        placeholder={draft.orchestrator_model || '跟随主代理模型'}
-                        value={draft.expert_model}
-                        onChange={(e) => { updateDraft({ expert_model: e.target.value }) }}
-                      />
-                      <datalist id="dsh-expert-model-list">
-                        {expertModels.map(m => <option key={m} value={m} />)}
-                      </datalist>
-                    </label>
-                  </div>
-                </div>
-              </div>
             )}
 
             {activeTab === 'observer' && draft !== null && (

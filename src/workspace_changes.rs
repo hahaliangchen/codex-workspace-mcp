@@ -590,41 +590,6 @@ pub async fn undo_turn(
     if let Ok(Ok(ref summary)) = result {
         let _ =
             crate::agent_service::emit(&root, &task, "workspace/changes", summary.clone()).await;
-        let saved_root = root.clone();
-        let saved_task = task.clone();
-        let snapshot = summary.clone();
-        let updated = tokio::task::spawn_blocking(move || -> Result<Option<Value>> {
-            let conn = connection(&saved_root)?;
-            let previous = crate::session_history::load_events(
-                &conn,
-                &saved_task,
-                &crate::session_history::EventQuery {
-                    kinds: &["worker/work_state"],
-                    newest: Some(1),
-                    ..Default::default()
-                },
-            )?
-            .pop()
-            .map(|event| event.raw);
-            let Some(previous) = previous else {
-                return Ok(None);
-            };
-            let value: Value = serde_json::from_str(&previous)?;
-            let mut state: crate::worker_work_state::WorkState =
-                serde_json::from_value(value["state"].clone())?;
-            state.notify_revert(&snapshot);
-            Ok(Some(state.snapshot()))
-        })
-        .await;
-        if let Ok(Ok(Some(state))) = updated {
-            let _ = crate::agent_service::emit(
-                &root,
-                &task,
-                "worker/work_state",
-                json!({"turn":turn,"state":state,"source":"user_undo"}),
-            )
-            .await;
-        }
     }
     response(result)
 }

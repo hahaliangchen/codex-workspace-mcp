@@ -53,3 +53,12 @@ test('failed image requests retain selected pictures and the original provider r
   assert.equal(records.artifacts[0].artifact_id, 'rejected')
   assert.equal(records.checks.length, 0)
 })
+
+test('single-Agent images belong to their exact model request without Worker scheduling metadata', () => {
+  const node = { id: 'turn_2:request-main', requestId: 2 }
+  const current = artifact('request-image', { runtime: 'single_agent', request_id: 2, node_id: 'request-main' })
+  const other = artifact('other-image', { runtime: 'single_agent', request_id: 2, node_id: 'request-other' })
+  const events = [current, other].map(value => ({ type: 'tool/result', data: { meta: { result: { visual_artifact: value } } } }))
+  assert.deepEqual(visualRecords(events, node).artifacts.map(a => a.artifact_id), ['request-image'])
+  assert.equal(visualRecords(events, { ...node, requestId: 1 }).artifacts.length, 0)
+})

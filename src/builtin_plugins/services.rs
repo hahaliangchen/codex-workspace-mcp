@@ -333,12 +333,7 @@ impl Plugin for AgentTasksPlugin {
             reasoning_effort: None,
             fast_mode: false,
             permission_mode: crate::agent_service::PermissionMode::default(),
-            enable_subagent: false,
-            expert_provider_name: String::new(),
-            expert_provider_url: String::new(),
-            expert_api_key: String::new(),
-            expert_model: String::new(),
-            subagent_inherits_model: true,
+
             observer_enabled: false,
             observer_provider: String::new(),
             observer_provider_url: String::new(),

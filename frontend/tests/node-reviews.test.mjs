@@ -8,7 +8,7 @@ const { flowState, reviewMatchesNode } = await import('data:text/javascript;base
 const event = (type, data) => ({ type, time: 0, data })
 const identity = (request_id, revision = 1, plan_revision = 1) => ({ request_id, work_id: 'same', node_id: 'n', revision, plan_revision })
 const review = (id, identity, status, turn = 1) => event('observer/node_review', { review_id: id, identity, status, turn, stage: 'handoff', result: { assessment: status === 'completed' ? 'uncertain' : undefined, summary: 'original version' } })
-const plan = (turn, request_id, revision, plan_revision) => [event('turn/start', { turn }), event('flow/plan', { turn, active_node_id: 'same', nodes: [{ id: 'same', node_id: 'n', request_id, revision, plan_revision, status: 'running' }] }), event('scheduler/state', { turn, state: { request_started_turn: request_id, current: 'same', frames: { same: { status: 'running', order: { id: 'same', node_id: 'n', revision, plan_revision, goal: 'new work' } } } } })]
+const plan = (turn, request_id, revision, plan_revision) => [event('turn/start', { turn }), event('flow/node_add', { turn, node: { id: 'same', request_id, revision, plan_revision, status: 'running' } })]
 
 test('review status updates deduplicate without creating execution nodes or changing highlight', () => {
   const state = flowState([...plan(1, 1, 1, 1), review('a', identity(1), 'pending'), review('a', identity(1), 'reviewing'), review('a', identity(1), 'unassessed')])

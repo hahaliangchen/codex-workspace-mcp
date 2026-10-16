@@ -1,5 +1,4 @@
 pub mod api;
-pub mod diagnostic;
 pub mod parser;
 mod read_details;
 pub mod resolve;

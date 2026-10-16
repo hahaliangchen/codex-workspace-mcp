@@ -46,11 +46,10 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
           modelName: workspace.modelName ?? undefined,
           reasoningEffort: workspace.reasoningEffort ?? undefined,
           fastMode: workspace.fastMode,
-          subagentEnabled: workspace.subagentEnabled,
+
           settings: workspace.settings,
           onSelectModel: workspace.selectModel,
           onSetGenerationOptions: workspace.setGenerationOptions,
-          onToggleSubagent: workspace.toggleSubagent,
           onOpenSettings: workspace.openSettings,
           onSubmit: workspace.submit,
           onStop: undefined,
@@ -215,8 +214,7 @@ export function ConversationPage({
                 : tab === 'skill-pages'
                 ? <SkillPagesView workspaceRoot={workspace.activeWorkspace ?? workspace.info?.workspace ?? ''} />
                 : tab === 'flow'
-                ? <FlowView key={workspace.taskId} events={session.events} task={task} running={running} onInterruptNode={interruptNode}
-                    onResumeNode={workspace.resumeNode} resumeDisabled={!ready || !canContinue || workspace.resumeBusy || isChild} />
+                ? <FlowView key={workspace.taskId} events={session.events} task={task} running={running} onInterruptNode={interruptNode} />
                 : renderSlot('agent.trajectory', { events: session.events, onOpenTask: openTask })}
             </div>
           </div>
@@ -247,11 +245,10 @@ export function ConversationPage({
                   modelName: workspace.modelName ?? undefined,
                   reasoningEffort: workspace.reasoningEffort ?? undefined,
                   fastMode: workspace.fastMode,
-                  subagentEnabled: workspace.subagentEnabled,
+
                   settings: workspace.settings,
                   onSelectModel: workspace.selectModel,
                   onSetGenerationOptions: workspace.setGenerationOptions,
-                  onToggleSubagent: workspace.toggleSubagent,
                   onOpenSettings: workspace.openSettings,
                   onSubmit: submit,
                   onStop: stop,
