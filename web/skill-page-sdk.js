@@ -23,6 +23,7 @@
     });
   }
   window.skillPackage = Object.freeze({
+    models: () => request('session', { operation: 'models', arguments: {} }),
     workspace: () => request('workspace'),
     callTool: (name, args = {}) => request('tool', { name, arguments: args }),
     session: (operation, args = {}) => request('session', { operation, arguments: args }),

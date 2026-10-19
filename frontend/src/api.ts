@@ -104,6 +104,7 @@ export type ProviderApiType = 'openai-completions' | 'openai-responses' | 'anthr
 export const REASONING_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 
 export interface ModelCapabilities {
+  readonly tool_calling?: boolean | null
   readonly image_input?: 'supported' | 'unsupported' | 'unknown'
   readonly image_probe?: {
     readonly status: string
@@ -119,6 +120,7 @@ export interface ModelCapabilities {
 }
 
 export interface ProviderConfig {
+  readonly prefix_system_messages?: boolean
   readonly id: string
   readonly display_name?: string | null
   readonly url: string
@@ -135,8 +137,29 @@ export interface ModelUseSettings {
   readonly reasoning_effort?: string | null
   readonly context_window?: number | null
 }
+export interface ModelRef { readonly provider:string; readonly model:string }
+
+export interface CatalogModel {
+  readonly provider: string
+  readonly id: string
+  readonly name: string
+  readonly provider_name: string
+  readonly enabled: boolean
+  readonly available_for_agent: boolean
+  readonly api_type: ProviderApiType
+  readonly context_window: number | null
+  readonly max_output_tokens: number | null
+  readonly capabilities: Omit<ModelCapabilities, 'image_probe'> & { readonly tool_calling: boolean | null }
+  readonly verification: { readonly image_input: string; readonly checked_at: number | null }
+}
+export interface ModelCatalog {
+  readonly version: number
+  readonly models: readonly CatalogModel[]
+  readonly defaults: Readonly<Record<'agent' | 'visual_tool' | 'context_agent' | 'observer', ModelUseSettings>>
+}
 
 export interface SettingsData {
+  readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
   readonly revision: string
@@ -151,6 +174,7 @@ export interface SettingsData {
 }
 
 export interface SaveProviderInput {
+  readonly prefix_system_messages?: boolean
   readonly id: string
   readonly display_name?: string | null
   readonly url: string
@@ -162,6 +186,7 @@ export interface SaveProviderInput {
 }
 
 export interface SaveSettingsInput {
+  readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
   readonly revision: string
@@ -252,6 +277,7 @@ function patch<T>(path: string, body?: unknown): Promise<T> {
 const task = (id: string): string => `/agent/tasks/${encodeURIComponent(id)}`
 
 export const api = {
+  models: () => request<ModelCatalog>('/agent/models'),
   upload: (id:string,file:File,signal:AbortSignal,onProgress:(percent:number)=>void) => new Promise<{receiptId:string;file:AttachmentRef}>((resolve,reject)=>{
     const xhr=new XMLHttpRequest();xhr.open('POST',`/api/session/uploadFileBinary?sessionId=${encodeURIComponent(id)}&name=${encodeURIComponent(file.name)}`);xhr.setRequestHeader('Content-Type','application/octet-stream');
     const abort=()=>xhr.abort();signal.addEventListener('abort',abort,{once:true});

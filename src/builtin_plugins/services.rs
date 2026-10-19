@@ -324,6 +324,7 @@ impl Plugin for AgentTasksPlugin {
         let mut state = AgentServiceState {
             workspace,
             client: self.0.clone(),
+            model_client: crate::model_transport::client()?,
             provider_url: String::new(),
             api_key: String::new(),
             provider_name: String::new(),

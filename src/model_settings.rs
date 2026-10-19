@@ -33,6 +33,30 @@ pub struct ModelSettings {
     pub reasoning_effort: Option<String>,
     pub context_window: Option<usize>,
 }
+
+/// Generation defaults belong to the plugin, independent of its model allowlist.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginGeneration {
+    pub reasoning_effort: Option<String>,
+    pub visual_reasoning_effort: Option<String>,
+}
+impl PluginGeneration {
+    pub fn normalize(&mut self) -> Result<()> {
+        for effort in [
+            &mut self.reasoning_effort,
+            &mut self.visual_reasoning_effort,
+        ] {
+            let mut settings = ModelSettings {
+                reasoning_effort: effort.take(),
+                ..Default::default()
+            };
+            settings.normalize()?;
+            *effort = settings.reasoning_effort;
+        }
+        Ok(())
+    }
+}
 impl ModelSettings {
     pub fn normalize(&mut self) -> Result<()> {
         for value in [
@@ -76,6 +100,14 @@ impl ModelSettings {
             state.model_map = route.models.clone();
         }
         let model = self.model.as_deref().unwrap_or(main_model);
+        // Dedicated uses resolve registered references, never arbitrary upstream IDs.
+        if !main.provider_routes.is_empty() {
+            ensure!(
+                state.model_map.contains_key(model)
+                    || state.model_map.values().any(|id| id == model),
+                "dedicated task model is not in the selected provider's catalog"
+            );
+        }
         state.default_model = state
             .model_map
             .get(model)
@@ -98,15 +130,21 @@ mod tests {
         let mut main =
             crate::agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
         main.reasoning_effort = Some("high".into());
+        main.model_map = ["turn-model", "gpt-6.1-sol"]
+            .into_iter()
+            .map(|m| (m.into(), m.into()))
+            .collect();
         main.provider_routes.insert(
             "alternate".into(),
             crate::agent_service::AgentProviderRoute {
+                prefix_system_messages: false,
                 url: "http://alternate.example/v1".into(),
                 api_key: "fixture-key".into(),
                 models: [("alias".into(), "mapped-model".into())]
                     .into_iter()
                     .collect(),
                 max_output_tokens: [("mapped-model".into(), 64_000)].into_iter().collect(),
+                context_request_options: Default::default(),
             },
         );
         let routed = ModelSettings {
@@ -148,6 +186,14 @@ mod tests {
         let child = config.resolve(&main, "turn-model").unwrap();
         assert_eq!(child.default_model, "gpt-6.1-sol");
         assert_eq!(child.reasoning_effort.as_deref(), Some("low"));
+        assert!(
+            ModelSettings {
+                model: Some("unlisted".into()),
+                ..Default::default()
+            }
+            .resolve(&main, "turn-model")
+            .is_err()
+        );
         assert_eq!(config.input_budget(231424), 475424);
         assert_eq!(main.reasoning_effort.as_deref(), Some("high"));
         assert_ne!(main.default_model, child.default_model);

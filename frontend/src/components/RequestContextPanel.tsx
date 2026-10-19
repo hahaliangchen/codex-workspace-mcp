@@ -155,7 +155,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
         const rev = (item as unknown as { revision?: number }).revision
         const revLabel = rev && rev > 1 ? ` (r${rev})` : ''
         const displayId = (item as unknown as { workId?: string }).workId || item.nodeId || '未分配节点'
-        return <option key={item.id} value={item.id}>{item.actor === 'agent' ? 'Agent · 执行' : item.actor === 'context_agent' ? '上下文整理子 Agent' : item.actor === 'worker' ? 'Worker · 执行调用' : item.actor === 'organizer' ? 'Organizer · 任务决策' : item.actor === 'observer' ? 'Observer · 结束复盘' : item.actor} · 第 {item.turn} 轮 / 步骤 {item.step} · {item.stage} · {displayId}{revLabel}{item.review_id ? ` · 复盘 ${item.review_id}` : ''} · {statuses[item.status] ?? item.status}</option>
+        return <option key={item.id} value={item.id}>{item.actor === 'agent' ? 'Agent · 执行' : item.actor === 'context_agent' ? '上下文整理子 Agent' : item.actor === 'asset_reviewer' ? '资产整理' : item.actor === 'worker' ? 'Worker · 执行调用' : item.actor === 'organizer' ? 'Organizer · 任务决策' : item.actor === 'observer' ? 'Observer · 结束复盘' : item.actor} · 第 {item.turn} 轮 / 步骤 {item.step} · {item.stage} · {displayId}{revLabel}{item.review_id ? ` · 复盘 ${item.review_id}` : ''} · {statuses[item.status] ?? item.status}</option>
       })}
     </select>
     {!visible.length && <p className={css.hint}>尚无已记录的请求。旧请求无法补回；节点切换后下一次请求才使用新节点上下文。</p>}

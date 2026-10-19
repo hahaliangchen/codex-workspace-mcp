@@ -18,6 +18,7 @@ import {
   type FlowObserverNote,
 } from '../model.ts'
 import { useTaskDuration } from '../useTaskDuration.ts'
+import { layoutAgentFlow } from '../flowLayout.ts'
 import { TaskNode } from './TaskNode.tsx'
 import { RequestContextPanel } from './RequestContextPanel.tsx'
 import { VisualMaterials } from './VisualMaterials.tsx'
@@ -90,53 +91,16 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
     return () => window.removeEventListener('keydown', close)
   }, [selectedNodeId, showRequests])
 
-  // Topological layout for the DAG
+  // Stable execution-window columns, with dependency edges preserved.
   const { nodes, edges } = useMemo(() => {
     const currentNodes = flow.nodes.filter(node => node.turn === flow.organizedTurn)
     const nodeOrder = new Map(currentNodes.map((node, index) => [node.id, index]))
     const currentEdges = flow.edges.filter(edge => nodeOrder.has(edge.source) && nodeOrder.has(edge.target))
-    const indegree = new Map(currentNodes.map(node => [node.id, 0]))
-    const children = new Map<string, string[]>()
-    for (const edge of currentEdges) {
-      indegree.set(edge.target, (indegree.get(edge.target) ?? 0) + 1)
-      const outgoing = children.get(edge.source) ?? []
-      outgoing.push(edge.target)
-      children.set(edge.source, outgoing)
-    }
-    const queue = currentNodes.filter(node => indegree.get(node.id) === 0).map(node => node.id)
-    const depth = new Map(queue.map(id => [id, 0]))
-    for (let cursor = 0; cursor < queue.length; cursor += 1) {
-      const source = queue[cursor]
-      if (!source) continue
-      for (const target of children.get(source) ?? []) {
-        depth.set(target, Math.max(depth.get(target) ?? 0, (depth.get(source) ?? 0) + 1))
-        const nextIndegree = (indegree.get(target) ?? 1) - 1
-        indegree.set(target, nextIndegree)
-        if (nextIndegree === 0) queue.push(target)
-      }
-    }
-    const fallbackDepth = Math.max(0, ...depth.values()) + 1
-    for (const node of currentNodes) {
-      if (!depth.has(node.id)) depth.set(node.id, fallbackDepth)
-    }
-    const byDepth = new Map<number, string[]>()
-    for (const node of currentNodes) {
-      const level = depth.get(node.id) ?? 0
-      const row = byDepth.get(level) ?? []
-      row.push(node.id)
-      byDepth.set(level, row)
-    }
-    const positions: Record<string, { x: number; y: number }> = {}
-    for (const [level, ids] of byDepth) {
-      ids.sort((left, right) => (nodeOrder.get(left) ?? 0) - (nodeOrder.get(right) ?? 0))
-      ids.forEach((id, index) => {
-        positions[id] = { x: 60 + index * 380, y: 50 + level * 250 }
-      })
-    }
+    const positions = layoutAgentFlow(currentNodes, currentEdges)
     const flowNodes: Node[] = currentNodes.map((n) => ({
       id: n.id,
       type: 'taskNode',
-      position: positions[n.id] || { x: 60, y: 100 },
+      position: positions.get(n.id) ?? { x: 60, y: 100 },
       data: n,
       selected: n.id === selectedNodeId,
     }))
@@ -144,6 +108,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
     const flowEdges: Edge[] = currentEdges.map(e => ({
       id: e.id, source: e.source, target: e.target, type: 'smoothstep',
       sourceHandle: 'source-bottom', targetHandle: 'target-top',
+      pathOptions: { stepPosition: positions.get(e.source)?.x === positions.get(e.target)?.x ? 0.5 : 0.25 },
       label: e.label, style: { stroke: '#64748b', strokeWidth: 2 },
     }))
 
@@ -191,7 +156,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
           <span className={styles.flowIcon}>↗</span>
           <div className={styles.flowSummaryText}>
             <strong>Agent 请求流程</strong>
-            <span className={styles.flowSubtext}>每个节点对应一次模型请求，压缩子 Agent 关联发起请求</span>
+            <span className={styles.flowSubtext}>每列对应一个任务分支，每个节点对应一次模型请求；上下文压缩单独分支显示</span>
           </div>
         </div>
 

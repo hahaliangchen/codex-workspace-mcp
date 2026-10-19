@@ -91,6 +91,14 @@ pub async fn execute(
             (project > 0 && found["project_id"].as_u64() == Some(project)) || known,
             "task belongs to a different PPT project"
         );
+    } else if independent_skill_read(raw, &args) {
+        ensure!(
+            args["project_id"].as_u64().is_none_or(|id| id == project),
+            "tool targets a different PPT project"
+        );
+        if project > 0 {
+            args["project_id"] = json!(project);
+        }
     } else {
         ensure!(project > 0, "initialize the PPT project first");
         ensure!(
@@ -99,13 +107,14 @@ pub async fn execute(
         );
         args["project_id"] = json!(project);
     }
-    if project > 0 {
+    if project > 0 && !independent_skill_read(raw, &args) {
         sync_attachments(state, task, project, &connection).await?;
     }
     let result = connection.call(raw, args).await?;
-    if result["status"] == "accepted"
-        && let Some(job) = result["task_id"].as_str()
-    {
+    // Failed submissions can still have committed a remote task before the
+    // database connection broke. Keep ownership so recovery can query it even
+    // while init_project has not bound this conversation to a project yet.
+    if let Some(job) = result["task_id"].as_str().filter(|id| !id.is_empty()) {
         crate::agent_service::open_db(state.workspace.root())?.execute(
             "INSERT OR IGNORE INTO ppt_session_jobs VALUES (?1,?2,?3)",
             params![task, job, raw],
@@ -134,6 +143,22 @@ pub async fn execute(
         sync_attachments(state, task, project, &connection).await?;
     }
     Ok(Some(result))
+}
+
+fn independent_skill_read(tool: &str, args: &Value) -> bool {
+    match tool {
+        "read_file" | "list_dir" => args["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("skill:")),
+        "read_files" => args["paths"].as_array().is_some_and(|paths| {
+            !paths.is_empty()
+                && paths.len() <= 8
+                && paths
+                    .iter()
+                    .all(|path| path.as_str().is_some_and(|s| s.starts_with("skill:")))
+        }),
+        _ => false,
+    }
 }
 pub async fn request(
     runtime: &PluginRuntime,
@@ -230,6 +255,10 @@ async fn handle(
         .get("ppt-master")
         .copied()
         .context("PPT plugin disabled")?;
+    if method == "session" && args["method"] == "models" {
+        args["package_scope"] = json!(scope);
+        return crate::plugin_sessions::handle(state, "ppt-master", args).await;
+    }
     if method == "session" && matches!(args["method"].as_str(), Some("open" | "create")) {
         let project = args["project_id"].as_u64().unwrap_or(0);
         if project > 0 {
@@ -401,18 +430,19 @@ mod tests {
         let seen = calls.clone();
         let imports = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
         let imported = imports.clone();
+        let init_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app=Router::new().route("/api/ppt/{method}",post(move|Path(method):Path<String>,h:HeaderMap,Json(body):Json<Value>| {
-            let seen=seen.clone();let imports=imported.clone(); async move {
+            let seen=seen.clone();let imports=imported.clone(); let init_calls=init_calls.clone(); async move {
                 let user=if h["authorization"]=="Bearer alice"{1}else{2};
                 let args=&body["payload"]["args"];
                 let result=match method.as_str() {
-                    "handshake"=>json!({"version":1,"user_id":user,"connection_id":format!("c{user}"),"state":"awaiting_confirmation","plugin":{"id":"ppt-master","title":"PPT","attachment_extensions":["png","jpg","jpeg","webp","pdf","docx","txt","md"],"skill":"skill:SKILL.md","pages":[],"tools":[{"name":"init_project","description":"Initialize PPT","inputSchema":{"type":"object","properties":{}}},{"name":"write_file","description":"Write SVG","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]}}),
+                    "handshake"=>json!({"version":1,"user_id":user,"connection_id":format!("c{user}"),"state":"awaiting_confirmation","plugin":{"id":"ppt-master","title":"PPT","attachment_extensions":["png","jpg","jpeg","webp","pdf","docx","txt","md"],"skill":"skill:SKILL.md","pages":[],"tools":[{"name":"init_project","description":"Initialize PPT","inputSchema":{"type":"object","properties":{}}},{"name":"write_file","description":"Write SVG","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},{"name":"read_files","description":"Batch read","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}]}}),
                     "confirm"=>json!({"state":"ready"}),
                     "identity"=>json!({"user_id":user}),
                     "importAttachment"=>{assert_eq!(user,1);assert_eq!(args["project_id"],7);imports.lock().unwrap().push(args.clone());json!({"path":"sources/brief.md"})},
                     "project"=>json!({"project_id":args["project_id"],"slides":[]}),
-                    "call"=>{seen.lock().unwrap().push(json!({"user":user,"args":args})); if args["tool"]=="init_project" {json!({"status":"accepted","task_id":"init-job"})} else {json!({"status":"succeeded","project_id":args["project_id"]})}},
-                    "task"=>json!({"tool":"init_project","status":"succeeded","project_id":11,"result":{"status":"succeeded","data":{"project_id":11}}}),
+                    "call"=>{seen.lock().unwrap().push(json!({"user":user,"args":args})); if args["tool"]=="init_project" {if init_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst)==0 {json!({"status":"retryable_error","retryable":true,"task_id":"lost-ack-job"})} else {json!({"status":"accepted","task_id":"init-job"})}} else {json!({"status":"succeeded","project_id":args["project_id"]})}},
+                    "task"=>if args["task_id"]=="lost-ack-job" {json!({"tool":"init_project","status":"failed","project_id":0,"result":{"status":"retryable_error","retryable":true}})} else {json!({"tool":"init_project","status":"succeeded","project_id":11,"result":{"status":"succeeded","data":{"project_id":11}}})},
                     _=>panic!("unexpected method {method}"),
                 };
                 Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":result}}))
@@ -449,6 +479,9 @@ mod tests {
         remote::mount_user_template(&runtime, &catalog.packages, package).unwrap();
         let mut state = crate::agent_service::tests::test_state(&root, address);
         state.tool_catalog = Some(catalog.clone());
+        state.config = Some(Arc::new(tokio::sync::RwLock::new(serde_json::from_value(json!({
+            "providers":{"test":{"url":"http://private/v1","api_key":"secret","model_map":{"m":"m"}}}
+        })).unwrap())));
         let alice = value(
             handle(
                 &runtime,
@@ -474,6 +507,30 @@ mod tests {
         )
         .await;
         assert_ne!(alice["subject"], bob["subject"]);
+        let models = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "session",
+                headers("alice"),
+                json!({"connection_handle":alice["connection_handle"],"method":"models"}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(models["models"][0]["id"], "m");
+        assert!(
+            handle(
+                &runtime,
+                state.clone(),
+                "session",
+                HeaderMap::new(),
+                json!({"connection_handle":alice["connection_handle"],"method":"models"})
+            )
+            .await
+            .is_err()
+        );
         let a=value(handle(&runtime,state.clone(),"session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"method":"open","project_id":7})).await.unwrap()).await;
         let b=value(handle(&runtime,state.clone(),"session",headers("bob"),json!({"connection_handle":bob["connection_handle"],"method":"open","project_id":9})).await.unwrap()).await;
         let task = a["task_id"].as_str().unwrap();
@@ -589,6 +646,79 @@ mod tests {
         )
         .await;
         let fresh_task = fresh["task_id"].as_str().unwrap();
+        let definition = catalog
+            .packages
+            .tools(&std::collections::BTreeSet::from(["ppt-master".to_owned()]))
+            .into_iter()
+            .find(|d| d["function"]["name"] == "ppt_master__read_files")
+            .unwrap();
+        assert!(
+            !definition["function"]["parameters"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("project_id"))
+        );
+        assert_eq!(
+            execute(
+                &state,
+                fresh_task,
+                "ppt_master__read_files",
+                json!({"paths":["skill:references/strategist.md"]})
+            )
+            .await
+            .unwrap()
+            .unwrap()["status"],
+            "succeeded"
+        );
+        assert!(
+            execute(
+                &state,
+                fresh_task,
+                "ppt_master__read_files",
+                json!({"paths":["skill:references/strategist.md","templates/01.svg"]})
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            execute(
+                &state,
+                fresh_task,
+                "ppt_master__read_files",
+                json!({"project_id":7,"paths":["skill:references/strategist.md"]})
+            )
+            .await
+            .is_err()
+        );
+        // A lost database acknowledgement can return a task ID before there is
+        // a project binding. This conversation must still be able to query it.
+        let lost_ack = execute(&state, fresh_task, "ppt_master__init_project", json!({}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lost_ack["status"], "retryable_error");
+        let recovered = execute(
+            &state,
+            fresh_task,
+            "ppt_master__task",
+            json!({"task_id":"lost-ack-job"}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered["status"], "failed");
+        assert_eq!(project(&root, fresh_task).unwrap(), Some(0));
+        assert!(
+            execute(
+                &state,
+                fresh_task,
+                "ppt_master__task",
+                json!({"task_id":"unknown-job"})
+            )
+            .await
+            .is_err()
+        );
+
         assert_eq!(
             execute(&state, fresh_task, "ppt_master__init_project", json!({}))
                 .await

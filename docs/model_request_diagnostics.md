@@ -36,7 +36,19 @@ tail -f logs/model-requests-$(date -u +%F).jsonl
 | `response_validation` | HTTP 读取和解码完成，但模型缺少结束标志、输出截断或被过滤 |
 | `event_persistence` | 把模型增量写入宿主历史时失败，应检查本机数据库/磁盘 |
 | `waiting` | 每 15 秒记录当前阶段及最后收包时间，区分等待响应头与流中途停滞 |
+| `awaiting_headers` 超时 | 180 秒内未收到完整响应头；底层连接另有 30 秒上限 |
+| `first_output` 超时 | 收到响应头后，180 秒内没有有效模型增量；仅 SSE 心跳不会延长等待 |
+| `output_idle` 超时 | 最后一个正文、思考或工具参数增量之后，连续 180 秒没有有效进展 |
 | `finished` | 本次最终状态、失败阶段和分类错误链；成功时阶段为 `completed` |
+
+模型请求没有固定总时长限制。`prepared.detail.timeout_policy` 记录连接、响应头、首输出及
+空闲预算；`total_ms` 为 `null`。流持续输出时刷新空闲时间；主 Agent、上下文整理和视觉分析
+使用同一策略，并使用不带 300 秒总超时的独立 HTTP 客户端。用户取消仍立即中止请求。
+
+`last_byte_ms` 仅表示网络收包；`last_progress_ms` 表示模型有效进展，二者可用于识别只有
+心跳、没有生成的连接。普通 JSON 回包无法逐 token 解码，按实际响应体增长刷新空闲。
+`decoder` 持续保存正文/思考字符数、工具调用数和参数字节数，即使超时或取消也保留已知计数，
+不写入这些内容的原文。`error_chain.kind=model_timeout` 给出具体阶段与本阶段等待上限。
 
 `error_chain` 记录 reqwest 的 timeout/connect/request/body/decode 标志、IO 错误类型、
 系统错误号和已识别的网络原因，例如 `incomplete_http_message`。未知来源写成
@@ -47,4 +59,4 @@ HTTP 200 也不能单独证明模型调用完成，必须一起检查最终状�
 若失败在响应头之前，本机日志能缩小范围，但要确定是网关、上游还是中间代理主动断连，
 仍需要对照网关日志或网络证据。
 
-本次仅补充诊断，不自动重试，也不会为了诊断额外调用真实模型。
+诊断不自动重试，也不会为了诊断额外调用真实模型。

@@ -8,6 +8,36 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+/// Some Chat Completions templates accept system instructions only in the prefix.
+/// This changes the wire projection, never the durable conversation order.
+pub fn prefix_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut system = Vec::new();
+    let mut conversation = Vec::new();
+    for message in messages {
+        if message["role"] == "system" {
+            system.push(message["content"].clone());
+        } else {
+            conversation.push(message);
+        }
+    }
+    if system.is_empty() {
+        return conversation;
+    }
+    let content = if system.iter().all(Value::is_string) {
+        json!(
+            system
+                .iter()
+                .map(|c| c.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        )
+    } else {
+        json!(system.into_iter().flat_map(|c|match c {Value::Array(a)=>a,other=>vec![json!({"type":"text","text":other.as_str().map(str::to_owned).unwrap_or_else(||other.to_string())})]}).collect::<Vec<_>>())
+    };
+    conversation.insert(0, json!({"role":"system","content":content}));
+    conversation
+}
+
 #[derive(Debug)]
 pub struct StreamError {
     pub code: &'static str,
@@ -327,12 +357,16 @@ impl ChatStream {
         {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let entry = self.tools.entry(index).or_default();
+            let mut grew = false;
             if let Some(id) = call
                 .get("id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
             {
-                entry.id = id.to_owned();
+                if entry.id != id {
+                    entry.id = id.to_owned();
+                    grew = true;
+                }
             }
             if let Some(function) = call.get("function") {
                 if let Some(name) = function
@@ -343,10 +377,12 @@ impl ChatStream {
                     // Some providers repeat the full name on every fragment.
                     if entry.name != name {
                         entry.name.push_str(name);
+                        grew = true;
                     }
                 }
                 if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                     entry.arguments.push_str(arguments);
+                    grew |= !arguments.is_empty();
                     if entry.arguments.len() > self.limits.max_tool_argument_bytes {
                         return fail(
                             "ARGUMENTS_TOO_LARGE",
@@ -358,9 +394,9 @@ impl ChatStream {
                     }
                 }
             }
-            delta.tool_call = true;
-            model_delta = true;
-            if self.first_tool_delta_ms.is_none() {
+            delta.tool_call |= grew;
+            model_delta |= grew;
+            if grew && self.first_tool_delta_ms.is_none() {
                 self.first_tool_delta_ms = Some(self.elapsed_ms());
             }
         }
@@ -479,6 +515,34 @@ impl ChatStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_or_repeated_tool_metadata_is_not_generation_progress() {
+        let mut stream = ChatStream::new(LIMITS, Instant::now());
+        let first = stream
+            .push(tool_event(0, Some("write_file"), "").as_bytes())
+            .unwrap();
+        assert!(first.tool_call);
+        let repeated = stream
+            .push(tool_event(0, Some("write_file"), "").as_bytes())
+            .unwrap();
+        assert!(repeated.is_empty());
+        let arguments = stream
+            .push(tool_event(0, None, "{\"content\":").as_bytes())
+            .unwrap();
+        assert!(arguments.tool_call);
+    }
+
+    #[test]
+    fn prefix_system_projection_preserves_tool_pairs_and_instruction_order() {
+        let messages=serde_json::json!([
+            {"role":"system","content":"policy"},{"role":"user","content":"request"},
+            {"role":"assistant","tool_calls":[{"id":"a"}]},{"role":"tool","tool_call_id":"a","content":"result"},
+            {"role":"system","content":"capacity"}
+        ]).as_array().unwrap().clone();
+        let projected = super::prefix_system_messages(messages.clone());
+        assert_eq!(projected[0]["content"], "policy\n\ncapacity");
+        assert_eq!(&projected[1..], &messages[1..4]);
+    }
     use super::*;
 
     const LIMITS: Limits = Limits {

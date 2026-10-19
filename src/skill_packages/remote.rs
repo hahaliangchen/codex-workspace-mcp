@@ -31,6 +31,13 @@ impl Connection {
     pub fn url(&self) -> &str {
         &self.config.url
     }
+    pub fn resource_url(&self, project: u64, path: &str) -> Result<String> {
+        let mut url = reqwest::Url::parse(&format!("{}/resource", self.config.url))?;
+        url.query_pairs_mut()
+            .append_pair("project_id", &project.to_string())
+            .append_pair("path", path);
+        Ok(url.into())
+    }
     pub async fn call(&self, raw: &str, mut args: Value) -> Result<Value> {
         if matches!(raw, "project" | "task" | "cancel" | "events") {
             return self.rpc(&format!("ppt/{raw}"), args).await;
@@ -290,17 +297,26 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
             "object tool schema required"
         );
         definition["name"] = json!(name);
-        if !matches!(
-            raw.as_str(),
-            "init_project" | "project" | "task" | "cancel" | "events"
-        ) {
-            definition["inputSchema"]["properties"]["project_id"] = json!({"type":"integer","minimum":1,"description":"PPT project ID, never a filesystem path"});
+        let page = definition["executor"] == "page";
+        ensure!(
+            definition["executor"].is_null() || page || definition["executor"] == "service",
+            "unknown tool executor"
+        );
+        // Page tools act on what the page has open; they take no service project.
+        if !page
+            && !matches!(
+                raw.as_str(),
+                "init_project" | "project" | "task" | "cancel" | "events"
+            )
+        {
+            let skill_read = matches!(raw.as_str(), "read_file" | "read_files" | "list_dir");
+            definition["inputSchema"]["properties"]["project_id"] = json!({"type":"integer","minimum":1,"description":if skill_read {"PPT project ID. Omit for skill: resources before initialization completes; required for project files."} else {"PPT project ID, never a filesystem path"}});
             let required = definition["inputSchema"]["required"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
             let mut required = required;
-            if !required.contains(&json!("project_id")) {
+            if !skill_read && !required.contains(&json!("project_id")) {
                 required.push(json!("project_id"));
             }
             definition["inputSchema"]["required"] = json!(required);
@@ -316,6 +332,7 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
     let mut native = NativeContributions::default();
     for (name, raw, definition) in mapped {
         let connection = remote.clone();
+        let page_tool = definition["executor"] == "page";
         native.tools.insert(
             name,
             NativeTool {
@@ -324,7 +341,10 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
                 handler: Arc::new(move |_, _, mut args| {
                     let connection = connection.clone();
                     let raw = raw.clone();
+                    let page = page_tool;
                     Box::pin(async move {
+                        // The Agent loop routes page tools to the task's page before this.
+                        ensure!(!page, "this tool runs in the plugin page of an open task");
                         ensure!(
                             !connection.require_binding,
                             "PPT tools require an authenticated user session"

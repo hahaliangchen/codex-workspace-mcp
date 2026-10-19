@@ -66,17 +66,21 @@ impl PermissionMode {
 
 #[derive(Clone, Debug)]
 pub struct AgentProviderRoute {
+    pub prefix_system_messages: bool,
     pub url: String,
     pub api_key: String,
     pub models: HashMap<String, String>,
     /// Output limits declared per upstream model id (`maxTokens`).
     pub max_output_tokens: HashMap<String, usize>,
+    /// Model-specific template options for context work only, from the catalog.
+    pub context_request_options: HashMap<String, Value>,
 }
 
 #[derive(Clone)]
 pub struct AgentServiceState {
     pub workspace: Arc<crate::tools::Workspace>,
     pub client: Client,
+    pub model_client: Client,
     pub provider_url: String,
     pub api_key: String,
     pub provider_name: String,
@@ -1789,9 +1793,17 @@ pub async fn slash_commands(State(state): State<AgentServiceState>) -> impl Into
 pub async fn continue_task(
     State(state): State<AgentServiceState>,
     Path(task_id): Path<String>,
-    Json(request): Json<ContinueTaskRequest>,
+    Json(mut request): Json<ContinueTaskRequest>,
 ) -> impl IntoResponse {
     let mut state = state.with_latest_config().await;
+    if let Err(error) = crate::model_catalog::prepare_turn(&mut state, &task_id, &mut request).await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response();
+    }
     if state.plugin_cancel.is_cancelled() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1901,6 +1913,7 @@ pub async fn continue_task(
             let fast_mode = req_fast.unwrap_or(saved_fast_mode != 0);
             (target_model, provider_name, reasoning_effort, fast_mode)
         };
+        let reasoning_effort=reasoning_effort.filter(|e|!e.is_empty());
         if let Err(e)=crate::attachments::admit(&tx,&root,&read_id,turn,&attachment_prompt,&attachment_content,attachment_request_id.as_deref(),attachment_policy.as_deref()) {
             return Ok(ResumeLoad::InvalidAttachment(e.to_string()));
         }
@@ -2411,6 +2424,7 @@ fn spawn_supervised_task(
             Err(error) => Some(format!("task worker stopped unexpectedly: {error}")),
         };
         if let Some(message) = failure {
+            crate::collaboration_jobs::cancel_all(state.workspace.root(), &task_id);
             tracing::error!(task_id = %task_id, error = %message, "agent task failed");
             let root = state.workspace.root();
             if let Err(error) = emit(root, &task_id, "turn/end",
@@ -2466,6 +2480,9 @@ pub(crate) async fn consume_model_stream_observed(
         let delta = accumulator.push(&chunk)?;
         if let Some(log) = diagnostics {
             log.delta(&delta);
+            // Keep decoded counts even when the outer deadline/cancellation
+            // drops this future before a complete tool call is delivered.
+            log.decoded(&accumulator.stats());
         }
         delta_text.push_str(&delta.text);
         delta_reasoning.push_str(&delta.reasoning);
@@ -2709,6 +2726,7 @@ pub(crate) mod tests {
         AgentServiceState {
             workspace: Arc::new(crate::tools::Workspace::new(root.to_path_buf()).unwrap()),
             client: Client::new(),
+            model_client: crate::model_transport::client().unwrap(),
             provider_url: format!("http://{address}/v1"),
             api_key: "fake".into(),
             provider_name: String::new(),

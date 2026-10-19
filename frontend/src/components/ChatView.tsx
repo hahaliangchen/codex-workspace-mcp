@@ -74,6 +74,23 @@ function Item({
       )
     case 'assistant':
       return <AssistantMessage text={item.text} reasoning={item.reasoning} streaming={item.streaming} />
+    case 'subagent': {
+      const process = chatItems(item.events)
+      const hasReport = process.some(child => child.kind === 'assistant' && child.text === item.report)
+      const label = item.review.startsWith('accepted') ? '主 Agent 已验收'
+        : item.review.startsWith('needs_work') ? '需要补齐'
+        : item.review.startsWith('unresolved') ? '存在未解决项'
+        : item.status === 'running' ? '执行中'
+        : item.status === 'completed' ? '已返回 · 待验收' : `${item.status} · 待处理`
+      return <details className={css.delegateCard} data-agent-id={item.agentId}>
+        <summary><strong>{item.name}</strong><span>{label}</span></summary>
+        <div className={css.delegateProcess}>
+          {process.map(child => <Item key={child.key} item={child} turnClosed={item.status !== 'running'} slashNames={slashNames} onOpenTask={onOpenTask} />)}
+        </div>
+        {item.report && !hasReport && <SmoothMarkdown text={item.report} labels={markdownLabels(t)} />}
+        {item.review && <p className={css.turnNote}>{item.review}</p>}
+      </details>
+    }
     case 'retrospective':
       return <div className={css.observerAdvice}>
         <strong>Observer 复盘</strong>
@@ -255,6 +272,7 @@ function AssistantTurnView({
 }
 
 type ChatNode =
+  | { kind: 'subagent'; item: ChatItem & { kind: 'subagent' } }
   | { kind: 'user'; item: ChatItem & { kind: 'user' } }
   | { kind: 'retrospective'; item: ChatItem & { kind: 'retrospective' } }
   | { kind: 'assistant-turn'; turn: AssistantTurnData }
@@ -326,6 +344,12 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
       if (item.kind === 'user') {
         flushTurn()
         list.push({ kind: 'user', item })
+        return
+      }
+
+      if (item.kind === 'subagent') {
+        flushTurn()
+        list.push({ kind: 'subagent', item })
         return
       }
 

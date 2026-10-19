@@ -26,6 +26,8 @@ test('Cordis page services isolate owners and use the same scoped methods as the
       assert.deepEqual(calls[0], ['session', 'ppt-master', { task_id: 'task-ppt', prompt: '改标题', package_scope: 3, method: 'prompt' }])
       assert.equal(calls[1][1], 'other')
       assert.equal(calls[2][2].method, 'project')
+      await services[0].models()
+      assert.deepEqual(calls[3], ['session','ppt-master',{ method:'models',package_scope:3 }])
       await assert.rejects(services[0].session('run_program'), /方法不可用/)
       await assert.rejects(services[0].service('call'), /方法不可用/)
       await assert.rejects(services[0].callTool('other__read'), /不属于/)

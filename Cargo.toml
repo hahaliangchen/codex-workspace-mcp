@@ -37,6 +37,9 @@ base64 = "0.22.1"
 sha2 = "0.10.9"
 image = { version = "0.25.9", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 

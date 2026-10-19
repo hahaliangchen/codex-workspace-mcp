@@ -23,6 +23,8 @@ import {
   type PluginsSnapshot,
   type ProviderApiType,
   type SettingsData,
+  type SkillPackage,
+  type ModelRef,
 } from '../api.ts'
 import appearanceCss from '../dsh/settings/AppearanceRow.module.css'
 import modelsCss from '../dsh/settings/ModelsSection.module.css'
@@ -33,6 +35,7 @@ import { getThemeMode, setThemeMode, type ThemeMode } from '../theme.ts'
 import type { SettingsTab } from '../useAgentWorkspace.ts'
 
 interface DraftProvider {
+  prefix_system_messages:boolean
   _draftId: string
   _new: boolean
   id: string
@@ -48,6 +51,7 @@ interface DraftProvider {
 }
 
 interface DraftSettings {
+  plugin_models: Record<string,readonly ModelRef[]>
   visual_tool: ModelUseSettings
   context_agent: ModelUseSettings
   revision: string
@@ -78,6 +82,7 @@ function parseModels(lines: string): string[] {
 function toDraft(data: SettingsData): DraftSettings {
   return {
     revision: data.revision,
+    plugin_models: {...data.plugin_models},
     visual_tool: data.visual_tool ?? {},
     context_agent: data.context_agent ?? {},
     providers: data.providers.map((p, index) => ({
@@ -87,6 +92,7 @@ function toDraft(data: SettingsData): DraftSettings {
       display_name: p.display_name ?? '',
       url: p.url,
       api_type: p.api_type,
+      prefix_system_messages:Boolean(p.prefix_system_messages),
       models_text: (p.models ?? []).join('\n'),
       model_capabilities: { ...p.model_capabilities },
       has_api_key: Boolean(p.has_api_key),
@@ -139,6 +145,7 @@ export function SettingsModal({
   const [discoveredModels, setDiscoveredModels] = useState<Record<string, string[]>>({})
   const [discoverFilter, setDiscoverFilter] = useState('')
   const [pluginsData, setPluginsData] = useState<PluginsSnapshot | null>(null)
+  const [packages,setPackages]=useState<SkillPackage[]>([])
   const [pluginQuery, setPluginQuery] = useState('')
   const [expandedPlugins, setExpandedPlugins] = useState<Record<string, boolean>>({})
 
@@ -159,6 +166,7 @@ export function SettingsModal({
   }, [openProviderId])
 
   const loadPlugins = useCallback(() => {
+    void api.skillPackages().then(data=>setPackages(data.packages)).catch(()=>{})
     api.getPlugins().then(
       data => { setPluginsData(data) },
       (err: unknown) => {
@@ -224,6 +232,7 @@ export function SettingsModal({
           display_name: p.display_name.trim() || null,
           url: p.url.trim(),
           api_type: p.api_type,
+          prefix_system_messages:p.prefix_system_messages,
           models,
           model_capabilities: Object.fromEntries(models.flatMap(model => {
             const capability = p.model_capabilities[model]
@@ -237,6 +246,7 @@ export function SettingsModal({
         ?.model_capabilities[draft.orchestrator_model]
       const saved = await api.saveSettings({
         revision: draft.revision,
+        plugin_models: draft.plugin_models,
         visual_tool: draft.visual_tool,
         context_agent: draft.context_agent,
         providers: providersPayload,
@@ -294,6 +304,7 @@ export function SettingsModal({
       display_name: '',
       url: 'https://api.deepseek.com/v1',
       api_type: 'openai-completions',
+      prefix_system_messages:false,
       models_text: 'deepseek-chat\ndeepseek-reasoner',
       model_capabilities: {},
       has_api_key: false,
@@ -655,6 +666,9 @@ export function SettingsModal({
                             </div>
 
                             <label className={modelsCss.field}>
+                              <span><input type="checkbox" checked={provider.prefix_system_messages} onChange={e=>updateProvider(provider._draftId,{prefix_system_messages:e.target.checked})}/> 系统消息集中到开头（适用于要求此前缀的模型服务）</span>
+                            </label>
+                            <label className={modelsCss.field}>
                               <span className={modelsCss.fieldLabel}>
                                 API 密钥
                                 {provider.has_api_key && !provider.clear_api_key && (
@@ -810,16 +824,31 @@ export function SettingsModal({
                     <span>添加模型提供商</span>
                   </button>
                 </div>
+                <h3>插件可用模型</h3>
+                <p className={modelsCss.intro}>未限制时可使用全部模型；开启限制后仅允许勾选的模型，主对话、视觉和压缩任务共同遵守。取消全部勾选会禁止该插件调用模型。</p>
+                {[...packages,...Object.keys(draft.plugin_models).filter(id=>!packages.some(p=>p.id===id)).map(id=>({id,title:`${id}（尚未连接）`}))].map(plugin=>{
+                  const selected=draft.plugin_models[plugin.id]
+                  const setModels=(models:readonly ModelRef[]|undefined)=>{const next={...draft.plugin_models};if(models===undefined)delete next[plugin.id];else next[plugin.id]=models;updateDraft({plugin_models:next})}
+                  return <div key={plugin.id} className={modelsCss.rowCard}>
+                    <h4>{plugin.title || plugin.id}</h4>
+                    <label><input type="checkbox" checked={selected!==undefined} onChange={e=>setModels(e.target.checked?draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=>({provider:p.id,model}))):undefined)}/> 限制 {plugin.id} 可用模型</label>
+                    {selected!==undefined&&draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=><label key={JSON.stringify([p.id,model])} style={{display:'block',marginTop:8}}>
+                      <input type="checkbox" checked={selected.some(r=>r.provider===p.id&&r.model===model)} onChange={e=>setModels(e.target.checked?[...selected,{provider:p.id,model}]:selected.filter(r=>r.provider!==p.id||r.model!==model))}/> {p.display_name||p.id} / {model}
+                    </label>))}
+                  </div>
+                })}
               </div>
             )}
 
             {activeTab === 'tools' && draft !== null && (
               <section className={modelsCss.section}>
                 <h2 className={modelsCss.title}>视觉与上下文压缩</h2>
-                <p className={modelsCss.intro}>每个留空的选项跟随主 Agent。设置不会改变主 Agent 的模型或窗口。</p>
+                <p className={modelsCss.intro}>专用任务从模型目录选择，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
                 {(['visual_tool', 'context_agent'] as const).map(kind => {
                   const config = draft[kind]
                   const provider = draft.providers.find(p => p.id === (config.provider || draft.orchestrator_provider))
+                  const capability = provider?.model_capabilities[config.model || draft.orchestrator_model]
+                  const levels = capability?.reasoning_efforts.length ? capability.reasoning_efforts : ['none','low','medium','high','xhigh','max']
                   const update = (patch: Partial<ModelUseSettings>) => updateDraft({ [kind]: { ...config, ...patch } })
                   return (
                     <div key={kind} className={modelsCss.rowCard}>
@@ -827,19 +856,22 @@ export function SettingsModal({
                       <p className={modelsCss.intro}>{kind === 'visual_tool' ? '分析已保存图片，结果通过普通工具返回。' : '只整理当前任务上下文，提交后继续由主 Agent 执行。'}</p>
                       <div className={modelsCss.modelAdvanced}>
                         <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>提供商</span>
-                          <select className={modelsCss.select} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null })}>
+                          <select className={modelsCss.select} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null, model: null, reasoning_effort: null })}>
                             <option value="">跟随主 Agent</option>
                             {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => <option key={p._draftId} value={p.id}>{p.display_name || p.id}</option>)}
                           </select>
                         </label>
                         <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>模型 ID</span>
-                          <input className={modelsCss.input} list={`${kind}-models`} placeholder="留空跟随主 Agent" value={config.model || ''} onChange={e => update({ model: e.target.value || null })} />
-                          <datalist id={`${kind}-models`}>{(provider ? parseModels(provider.models_text) : []).map(m => <option key={m} value={m} />)}</datalist>
+                          <select className={modelsCss.select} value={config.model || ''} onChange={e => update({ model: e.target.value || null, reasoning_effort: null })}>
+                            <option value="">跟随主 Agent</option>
+                            {config.model && !parseModels(provider?.models_text ?? '').includes(config.model) && <option value={config.model} disabled>{config.model}（未在模型目录中，请先添加）</option>}
+                            {(provider ? parseModels(provider.models_text) : []).map(m => <option key={m} value={m}>{m}</option>)}
+                          </select>
                         </label>
                         <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>推理档位</span>
                           <select className={modelsCss.select} value={config.reasoning_effort || ''} onChange={e => update({ reasoning_effort: e.target.value || null })}>
                             <option value="">跟随主 Agent</option>
-                            {['none','low','medium','high','xhigh','max'].map(level => <option key={level} value={level}>{({ none:'无', low:'轻度', medium:'中档', high:'高', xhigh:'更高', max:'最高' } as Record<string,string>)[level]}</option>)}
+                            {levels.map(level => <option key={level} value={level}>{({ none:'无', low:'轻度', medium:'中档', high:'高', xhigh:'更高', max:'最高' } as Record<string,string>)[level]}</option>)}
                           </select>
                         </label>
                         <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>最大上下文（tokens）</span>

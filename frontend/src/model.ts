@@ -14,6 +14,7 @@ export type TurnEndReason =
   | { readonly kind: 'error'; readonly message: string; readonly code: string | undefined }
 
 export type ChatItem =
+  | { readonly kind: 'subagent'; readonly key: string; readonly agentId: string; readonly name: string; readonly status: string; readonly events: readonly AgentEvent[]; readonly report: string; readonly review: string; readonly time: number }
   | { readonly kind: 'turn'; readonly key: string; readonly turn: number }
   | { readonly kind: 'user'; readonly key: string; readonly text: string; readonly time: number; readonly attachments?:readonly {name:string;url:string;image:boolean}[] }
   | { readonly kind: 'assistant'; readonly key: string; readonly text: string; readonly reasoning: string; readonly time: number; readonly streaming: boolean; readonly turn: number; readonly step: number }
@@ -113,6 +114,24 @@ export function callIdOfResult(event: AgentEvent): string | undefined {
 
 /** Project an ordered event log into transcript rows; tool results attach to their call. */
 export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[] {
+  events = [...events].sort((a, b) => a.seq - b.seq)
+  const delegates = new Map<string, { status: string; events: AgentEvent[]; report: string; review: string }>()
+  for (const event of events) {
+    const id = stringOf(event.data.agent_id)
+    if (!id || !event.type.startsWith('subagent/')) continue
+    const child = delegates.get(id) ?? { status: 'running', events: [], report: '', review: '' }
+    if (event.type === 'subagent/event' && typeof event.data.event_type === 'string') {
+      child.events.push({ ...event, type: event.data.event_type, data: event.data.event as Record<string, unknown> })
+    } else if (event.type === 'subagent/end') {
+      child.status = stringOf(event.data.status) ?? 'interrupted'
+      const result = event.data.result as Record<string, unknown> | undefined
+      child.report = [textOf(result?.report), stringOf(result?.error)].filter(Boolean).join('\n\n')
+    } else if (event.type === 'subagent/review') {
+      const review = event.data.review as Record<string, unknown> | undefined
+      child.review = `${stringOf(review?.decision) ?? ''}：${stringOf(review?.evidence) ?? ''}`
+    }
+    delegates.set(id, child)
+  }
   const results = new Map<string, ToolResult>()
   for (const event of events) {
     if (event.type !== 'tool/result') continue
@@ -125,6 +144,13 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
   for (const event of events) {
     const key = `${event.type}:${event.seq}`
     switch (event.type) {
+      case 'subagent/start': {
+        const agentId = stringOf(event.data.agent_id)
+        if (!agentId) break
+        const child = delegates.get(agentId)
+        items.push({ kind: 'subagent', key: `delegate:${agentId}`, agentId, name: stringOf(event.data.name) ?? '子任务', status: child?.status ?? 'running', events: child?.events ?? [], report: child?.report ?? '', review: child?.review ?? '', time: event.time })
+        break
+      }
       case 'turn/start': {
         turnStartTime = event.time
         const turn = numberOf(event.data.turn) ?? 1
@@ -620,6 +646,9 @@ export interface FlowNodeData {
   readonly status: FlowNodeStatus
   readonly description?: string | undefined
   readonly parentId?: string | undefined
+  readonly agentId?: string | undefined
+  readonly agentName?: string | undefined
+  readonly agentOrder?: number | undefined
   readonly tools: readonly FlowToolExecution[]
   readonly consults: readonly FlowObserverConsult[]
   readonly files: readonly string[]
@@ -708,6 +737,9 @@ function createFlowNode(
   status: FlowNodeStatus
   description?: string | undefined
   parentId?: string | undefined
+  agentId?: string | undefined
+  agentName?: string | undefined
+  agentOrder?: number | undefined
   tools: FlowToolExecution[]
   consults: FlowObserverConsult[]
   files: Set<string>
@@ -731,6 +763,9 @@ function createFlowNode(
 }
 
 export function flowState(events: readonly AgentEvent[]): FlowState {
+  events = events.map(event => event.type === 'subagent/event'
+    ? { ...event, type: String(event.data.event_type), data: { agent_id: event.data.agent_id, ...event.data.event as Record<string, unknown> } }
+    : event)
   let currentTurn = 1
   let taskLabel = ''
   let observerEnabled: boolean | undefined
@@ -741,11 +776,24 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
   const nodeMap = new Map<string, ReturnType<typeof createFlowNode>>()
   const edges: FlowEdgeData[] = []
   const callsToNode = new Map<string, string>()
+  const delegates = new Map<string, { id: string; name: string; order: number }>()
+  const delegatesByParent = new Map<string, string>()
+  const delegateCounts = new Map<number, number>()
   let activeNodeId: string | undefined
   for (const event of events) {
     const data = event.data || {}
     const turn = numberOf(data.turn) ?? currentTurn
     switch (event.type) {
+      case 'subagent/start': {
+        const id = stringOf(data.agent_id)
+        if (!id || delegates.has(id)) break
+        const order = delegateCounts.get(turn) ?? 0
+        delegates.set(id, { id, name: stringOf(data.name) ?? '任务分支', order })
+        delegateCounts.set(turn, order + 1)
+        const parent = stringOf(data.parent_node_id)
+        if (parent) delegatesByParent.set(nodeKey(parent, turn), id)
+        break
+      }
       case 'turn/start':
         currentTurn = Math.max(currentTurn, turn)
         activeNodeId = undefined
@@ -864,6 +912,12 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           node.status = flowStatus(rawNode.status ?? node.status)
           const parent = stringOf(rawNode.parent_id)
           node.parentId = parent ? nodeKey(parent, turn) : node.parentId
+          node.agentId = stringOf(rawNode.agent_id) ?? stringOf(data.agent_id)
+            ?? (node.kind === 'worker' && node.parentId ? delegatesByParent.get(node.parentId) : undefined)
+            ?? node.agentId
+          const delegate = node.agentId ? delegates.get(node.agentId) : undefined
+          node.agentName = delegate?.name ?? node.agentName
+          node.agentOrder = delegate?.order ?? node.agentOrder
           node.requestId = numberOf(rawNode.request_id) ?? node.requestId
           node.revision = numberOf(rawNode.revision) ?? node.revision
           node.planRevision = numberOf(rawNode.plan_revision) ?? node.planRevision
@@ -918,7 +972,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const targetId = flowNodeId
           ? nodeKey(flowNodeId, turn)
           : activeNodeId ?? nodeKey('agent', turn)
-        if (callId) callsToNode.set(callId, targetId)
+        if (callId) callsToNode.set(`${stringOf(data.agent_id) ?? 'main'}:${callId}`, targetId)
         let targetNode = nodeMap.get(targetId)
         if (!targetNode) {
           targetNode = createFlowNode(targetId, turn, taskLabel || '执行任务', 'agent', taskLabel, 'running')
@@ -932,7 +986,8 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
       case 'context/tool_result':
       case 'tool/result': {
         const callId = callIdOfResult(event) ?? ''
-        const targetId = callsToNode.get(callId) ?? activeNodeId
+        const flowNodeId = stringOf(data.flowNodeId)
+        const targetId = flowNodeId ? nodeKey(flowNodeId, turn) : callsToNode.get(`${stringOf(data.agent_id) ?? 'main'}:${callId}`) ?? activeNodeId
         const targetNode = targetId ? nodeMap.get(targetId) : undefined
         if (targetNode) {
           const result = resultOf(event)
@@ -975,5 +1030,13 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     if (status === 'running') activeNodeId = id
   }
   const nodes: FlowNodeData[] = [...nodeMap.values()].map(node => ({ ...node, files: [...node.files] }))
-  return { nodes, edges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, organizedTurn: currentTurn }
+  const nodesById = new Map(nodes.map(node => [node.id, node]))
+  const labeledEdges = edges.map(edge => {
+    const target = nodesById.get(edge.target)
+    if (target?.parentId !== edge.source) return edge
+    if (target.kind === 'worker') return { ...edge, label: target.agentName ? `派发 · ${target.agentName}` : '派发任务' }
+    if (target.kind === 'context_agent') return { ...edge, label: '上下文压缩' }
+    return edge
+  })
+  return { nodes, edges: labeledEdges, activeNodeId, observerEnabled, nodeReviews: [...nodeReviews.values()], observerNotes, observerRetrospective, organizedTurn: currentTurn }
 }

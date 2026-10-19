@@ -254,6 +254,24 @@ impl Registry {
             package.scope.is_some() && package.manifest.tools.iter().any(|tool| tool == name)
         })
     }
+    /// When an enabled plugin declares `name` with `"executor": "page"`, the
+    /// name its page knows the tool by (without the host's `plugin_id__` prefix):
+    /// the plugin's page runs it, not the host or the plugin's service.
+    pub fn page_tool(&self, name: &str) -> Option<String> {
+        self.entries.read().unwrap().values().find_map(|package| {
+            let declared = package.scope.is_some()
+                && package.native.as_ref().is_some_and(|native| {
+                    native
+                        .tools
+                        .get(name)
+                        .is_some_and(|tool| tool.definition["executor"] == "page")
+                });
+            declared.then(|| {
+                let prefix = format!("{}__", package.manifest.id.replace('-', "_"));
+                name.strip_prefix(&prefix).unwrap_or(name).to_owned()
+            })
+        })
+    }
     pub fn remote_tool(&self, name: &str) -> Option<Arc<remote::Connection>> {
         self.entries
             .read()

@@ -5,8 +5,89 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Instant,
+    time::Duration,
 };
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+pub struct TimeoutPolicy {
+    pub headers: Duration,
+    pub first_output: Duration,
+    pub idle: Duration,
+}
+impl Default for TimeoutPolicy {
+    fn default() -> Self {
+        Self {
+            headers: Duration::from_secs(180),
+            first_output: Duration::from_secs(180),
+            idle: Duration::from_secs(180),
+        }
+    }
+}
+
+/// Streaming requests have no wall-clock deadline. The progress watchdog owns
+/// waiting limits; unrelated HTTP calls retain their existing client policy.
+pub fn client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()?)
+}
+
+/// Stable per working window, independent of turn/request/prompt length. A
+/// replica router can preserve prefix-cache locality without seeing task IDs.
+pub fn affinity(task: &str, scope: &str) -> String {
+    crate::visual_artifacts::hash(json!([task, scope]).to_string().as_bytes())
+}
+
+#[derive(Debug)]
+struct ModelTimeout {
+    phase: &'static str,
+    limit_ms: u128,
+}
+impl std::fmt::Display for ModelTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model {} timeout: no progress within {} ms",
+            self.phase, self.limit_ms
+        )
+    }
+}
+impl std::error::Error for ModelTimeout {}
+
+/// Decode a model response without emitting execution-agent chat events.
+/// Context and vision requests still refresh the same progress watchdog.
+pub async fn consume_response(
+    response: reqwest::Response,
+    log: &ModelRequestLog,
+) -> anyhow::Result<crate::model_stream::Completed> {
+    use futures::StreamExt;
+    let mut decoder = crate::model_stream::ChatStream::new(
+        crate::model_stream::Limits::WORKER,
+        std::time::Instant::now(),
+    );
+    let mut bytes = response.bytes_stream();
+    while !decoder.received_done() {
+        log.phase("stream_read");
+        let Some(chunk) = bytes.next().await else {
+            log.eof();
+            break;
+        };
+        let chunk = chunk?;
+        log.chunk(chunk.len());
+        log.phase("stream_decode");
+        let delta = decoder.push(&chunk)?;
+        log.delta(&delta);
+        log.decoded(&decoder.stats());
+    }
+    log.phase("stream_decode");
+    let completed = decoder.finish()?;
+    let mut stats = completed.stats.clone();
+    stats["terminated"] = json!(completed.terminated);
+    log.decoded(&stats);
+    Ok(completed)
+}
 
 struct Progress {
     phase: &'static str,
@@ -14,6 +95,7 @@ struct Progress {
     first_byte_ms: Option<u64>,
     first_delta_ms: Option<u64>,
     last_byte_ms: Option<u64>,
+    last_progress_ms: Option<u64>,
     bytes: usize,
     chunks: usize,
     http: Value,
@@ -55,6 +137,7 @@ impl ModelRequestLog {
                 first_byte_ms: None,
                 first_delta_ms: None,
                 last_byte_ms: None,
+                last_progress_ms: None,
                 bytes: 0,
                 chunks: 0,
                 http: Value::Null,
@@ -86,7 +169,7 @@ impl ModelRequestLog {
                 "tool_call_count":message["tool_calls"].as_array().map_or(0,Vec::len),
                 "has_tool_call_id":message["tool_call_id"].is_string(),
             })).collect::<Vec<_>>(),
-            "timeout_ms":180_000,"attempt":1,
+            "timeout_policy":{"connect_ms":30_000,"headers_ms":180_000,"first_output_ms":180_000,"idle_ms":180_000,"total_ms":null},"attempt":1,
         }));
         log
     }
@@ -97,6 +180,52 @@ impl ModelRequestLog {
 
     pub fn phase(&self, phase: &'static str) {
         self.progress.lock().unwrap().phase = phase;
+    }
+
+    fn deadline(&self, policy: TimeoutPolicy) -> (Instant, &'static str, Duration) {
+        let p = self.progress.lock().unwrap();
+        let (since, phase, limit) = match (p.headers_ms, p.last_progress_ms) {
+            (None, _) => (0, "awaiting_headers", policy.headers),
+            (Some(headers), None) => (headers, "first_output", policy.first_output),
+            (Some(_), Some(last)) => (last, "output_idle", policy.idle),
+        };
+        (
+            self.started + Duration::from_millis(since) + limit,
+            phase,
+            limit,
+        )
+    }
+
+    pub async fn watch<T>(
+        &self,
+        pending: impl std::future::Future<Output = anyhow::Result<T>>,
+        cancel: &CancellationToken,
+        policy: TimeoutPolicy,
+    ) -> anyhow::Result<T> {
+        tokio::pin!(pending);
+        let mut heartbeat = tokio::time::interval_at(
+            Instant::now() + Duration::from_secs(15),
+            Duration::from_secs(15),
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let (deadline, _, _) = self.deadline(policy);
+            tokio::select! {
+                biased;
+                _=cancel.cancelled()=>return Err(anyhow::anyhow!("cancelled")),
+                result=&mut pending=>return result,
+                _=tokio::time::sleep_until(deadline)=>{
+                    // Polling the stream may have advanced progress after the
+                    // sleep was created. Never expire that newer deadline.
+                    let (current,phase,limit)=self.deadline(policy);
+                    if Instant::now()>=current {
+                        self.phase(phase);
+                        return Err(ModelTimeout {phase,limit_ms:limit.as_millis()}.into());
+                    }
+                },
+                _=heartbeat.tick()=>self.waiting(),
+            }
+        }
     }
 
     pub fn sending(&self) {
@@ -168,7 +297,9 @@ impl ModelRequestLog {
         }
         let mut progress = self.progress.lock().unwrap();
         let first = progress.first_delta_ms.is_none();
-        progress.first_delta_ms.get_or_insert(self.elapsed());
+        let elapsed = self.elapsed();
+        progress.first_delta_ms.get_or_insert(elapsed);
+        progress.last_progress_ms = Some(elapsed);
         drop(progress);
         if first {
             self.event("first_delta", json!({}));
@@ -176,8 +307,8 @@ impl ModelRequestLog {
     }
 
     pub fn decoded(&self, stats: &Value) {
-        // Usage, text, model-generated tool arguments, and error payloads are
-        // intentionally excluded from the shared diagnostic file.
+        // Raw text, model-generated arguments, usage and error payloads stay
+        // out of shared diagnostics. Numeric channel counts identify progress.
         let mut summary = serde_json::Map::new();
         for key in [
             "received_bytes",
@@ -186,13 +317,28 @@ impl ModelRequestLog {
             "keepalives",
             "first_chunk_ms",
             "first_delta_ms",
+            "first_tool_delta_ms",
+            "text_chars",
+            "reasoning_chars",
+            "tool_calls",
+            "tool_argument_bytes",
+            "received_done",
             "terminated",
         ] {
             if stats[key].is_number() || stats[key].is_boolean() {
                 summary.insert(key.into(), stats[key].clone());
             }
         }
-        self.progress.lock().unwrap().decoder = Value::Object(summary);
+        let mut progress = self.progress.lock().unwrap();
+        // Plain JSON fallback has no decodable token deltas until its closing
+        // brace. Count actual body growth there; SSE comments never reset idle.
+        if stats["response_format"] == "json"
+            && stats["received_bytes"].as_u64().unwrap_or(0)
+                > progress.decoder["received_bytes"].as_u64().unwrap_or(0)
+        {
+            progress.last_progress_ms = Some(self.elapsed());
+        }
+        progress.decoder = Value::Object(summary);
     }
 
     pub fn waiting(&self) {
@@ -222,6 +368,7 @@ impl ModelRequestLog {
             "phase":progress.phase,"elapsed_ms":self.elapsed(),"headers_ms":progress.headers_ms,
             "first_byte_ms":progress.first_byte_ms,"first_delta_ms":progress.first_delta_ms,
             "last_byte_ms":progress.last_byte_ms,"received_bytes":progress.bytes,
+            "last_progress_ms":progress.last_progress_ms,
             "chunks":progress.chunks,"http":progress.http,"decoder":progress.decoder,
         })
     }
@@ -240,6 +387,9 @@ impl ModelRequestLog {
 // strings can contain provider bodies, prompt fragments, or credential URLs.
 fn error_chain(error: &anyhow::Error) -> Vec<Value> {
     error.chain().take(12).map(|cause| {
+        if let Some(error)=cause.downcast_ref::<ModelTimeout>() {
+            return json!({"kind":"model_timeout","phase":error.phase,"limit_ms":error.limit_ms});
+        }
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
             return json!({"kind":"reqwest","timeout":error.is_timeout(),"connect":error.is_connect(),
                 "request":error.is_request(),"body":error.is_body(),"decode":error.is_decode(),
@@ -273,6 +423,18 @@ fn error_chain(error: &anyhow::Error) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replica_affinity_is_stable_and_separates_task_and_window() {
+        let main = affinity("private-task", "main");
+        assert_eq!(main, affinity("private-task", "main"));
+        assert_ne!(main, affinity("other-task", "main"));
+        assert_ne!(main, affinity("private-task", "delegate:child"));
+        assert_ne!(main, affinity("private-task", "context:material"));
+        assert_ne!(affinity("a:b", "c"), affinity("a", "b:c"));
+        assert_eq!(main.len(), 64);
+        assert!(main.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn transport_diagnostic_file_excludes_url_credentials_and_raw_errors() {
@@ -342,5 +504,165 @@ mod tests {
         log.phase("completed");
         assert_eq!(log.finish("completed", None)["status"], "completed");
         std::fs::remove_file(root).unwrap();
+    }
+    fn watchdog_log() -> (std::path::PathBuf, ModelRequestLog) {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "model-watchdog-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let log = ModelRequestLog::new(&root, json!({}), "http://model.test/v1", &json!({}));
+        (root, log)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn text_reasoning_and_tool_output_continue_past_three_and_five_minutes() {
+        let (root, log) = watchdog_log();
+        log.progress.lock().unwrap().headers_ms = Some(0);
+        let started = Instant::now();
+        let cancel = CancellationToken::new();
+        log.watch(
+            async {
+                for delta in [
+                    crate::model_stream::Delta {
+                        text: "answer".into(),
+                        ..Default::default()
+                    },
+                    crate::model_stream::Delta {
+                        reasoning: "thinking".into(),
+                        ..Default::default()
+                    },
+                    crate::model_stream::Delta {
+                        tool_call: true,
+                        ..Default::default()
+                    },
+                ] {
+                    tokio::time::sleep(Duration::from_secs(90)).await;
+                    log.delta(&delta);
+                }
+                tokio::time::sleep(Duration::from_secs(90)).await;
+                Ok(())
+            },
+            &cancel,
+            TimeoutPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(360));
+        assert_eq!(log.snapshot()["last_progress_ms"], 270_000);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_bytes_do_not_extend_first_output_or_output_idle_deadlines() {
+        for has_output in [false, true] {
+            let (root, log) = watchdog_log();
+            log.progress.lock().unwrap().headers_ms = Some(0);
+            if has_output {
+                log.delta(&crate::model_stream::Delta {
+                    text: "first".into(),
+                    ..Default::default()
+                });
+            }
+            let started = Instant::now();
+            let result = log
+                .watch(
+                    async {
+                        for _ in 0..6 {
+                            tokio::time::sleep(Duration::from_secs(45)).await;
+                            log.chunk(12); // SSE comments/empty events, no model delta.
+                        }
+                        Ok(())
+                    },
+                    &CancellationToken::new(),
+                    TimeoutPolicy::default(),
+                )
+                .await;
+            let error = result.unwrap_err();
+            assert_eq!(started.elapsed(), Duration::from_secs(180));
+            let expected = if has_output {
+                "output_idle"
+            } else {
+                "first_output"
+            };
+            assert_eq!(
+                error.downcast_ref::<ModelTimeout>().unwrap().phase,
+                expected
+            );
+            let summary = log.finish("failed", Some(&error));
+            assert_eq!(summary["error_chain"][0]["kind"], "model_timeout");
+            assert_eq!(summary["error_chain"][0]["phase"], expected);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_headers_times_out_and_cancellation_interrupts_active_output() {
+        let (root, log) = watchdog_log();
+        let error = log
+            .watch(
+                std::future::pending::<anyhow::Result<()>>(),
+                &CancellationToken::new(),
+                TimeoutPolicy::default(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ModelTimeout>().unwrap().phase,
+            "awaiting_headers"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+        let (root, log) = watchdog_log();
+        log.progress.lock().unwrap().headers_ms = Some(0);
+        let cancel = CancellationToken::new();
+        let stopping = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            stopping.cancel();
+        });
+        let started = Instant::now();
+        let result = log
+            .watch(
+                async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        log.delta(&crate::model_stream::Delta {
+                            tool_call: true,
+                            ..Default::default()
+                        });
+                    }
+                    #[allow(unreachable_code)]
+                    Ok(())
+                },
+                &cancel,
+                TimeoutPolicy::default(),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().to_string(), "cancelled");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn plain_json_body_growth_extends_idle_without_inventing_token_deltas() {
+        let (root, log) = watchdog_log();
+        log.progress.lock().unwrap().headers_ms = Some(0);
+        log.watch(
+            async {
+                for count in 1..=4 {
+                    tokio::time::sleep(Duration::from_secs(90)).await;
+                    log.decoded(&json!({"response_format":"json","received_bytes":count*128}));
+                }
+                Ok(())
+            },
+            &CancellationToken::new(),
+            TimeoutPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert!(log.snapshot()["first_delta_ms"].is_null());
+        assert_eq!(log.snapshot()["last_progress_ms"], 360_000);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -315,6 +315,9 @@ pub async fn record(
     metadata["status"] = json!("pending");
     metadata["record_kind"] = json!("model_input");
     metadata["context_access"] = match metadata["actor"].as_str() {
+        Some("worker") if metadata["agent_id"].is_string() => {
+            json!({"history_reader":true,"shared_task_context":true,"input_provider":"main_agent","recursive_subagents":false})
+        }
         Some("worker") => {
             json!({"history_reader":false,"input_provider":"organizer","observer_direct":false})
         }
@@ -325,6 +328,9 @@ pub async fn record(
         Some("agent") => json!({"history_reader":true,"shared_task_context":true}),
         Some("context_agent") => {
             json!({"history_reader":true,"purpose":"context_organization","business_execution":false,"recursive_subagents":false})
+        }
+        Some("asset_reviewer") => {
+            json!({"history_reader":false,"purpose":"asset_placement","asset_bodies_delivered":false,"business_execution":false,"recursive_subagents":false})
         }
         _ => Value::Null,
     };
@@ -382,11 +388,12 @@ pub async fn record(
             if let Some(previous) = db_meta["previous_node_id"].as_str() {
                 edges.push(json!({"source":previous,"target":node,"label":"next request"}));
             } else if let Some(parent) = db_meta["parent_node_id"].as_str() {
-                edges.push(json!({"source":parent,"target":node,"label":"context subagent"}));
+                let label = if db_meta["actor"] == "worker" { "task delegate" } else { "context subagent" };
+                edges.push(json!({"source":parent,"target":node,"label":label}));
             }
             crate::agent_service::append_event_tx(&tx,&db_id,"flow/node_add",&json!({"turn":db_meta["turn"],
                 "node":{"id":node,"kind":db_meta["actor"],"title":format!("{} · {}",db_meta["actor"].as_str().unwrap_or("agent"),id),
-                    "status":"running","parent_id":db_meta["parent_node_id"],"request_id":db_meta["request_id"],"context_id":id},
+                    "status":"running","parent_id":db_meta["parent_node_id"],"agent_id":db_meta["agent_id"],"request_id":db_meta["request_id"],"context_id":id},
                 "edges":edges}),None)?;
         }
         tx.commit()?;

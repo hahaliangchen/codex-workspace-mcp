@@ -63,6 +63,9 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
         "plugin page is unavailable or stale"
     );
     let root = state.workspace.root();
+    if args["method"] == "models" {
+        return Ok(Json(crate::model_catalog::for_plugin(&state, id).await?).into_response());
+    }
     if args["method"] == "open" {
         let conn = agent_service::open_db(root)?;
         let task: Option<String> = conn.query_row("SELECT p.task_id FROM plugin_sessions p JOIN agent_tasks t ON t.id=p.task_id WHERE p.plugin_id=?1 ORDER BY t.created_at DESC, t.rowid DESC LIMIT 1", [id], |r|r.get(0)).optional()?;
@@ -71,7 +74,8 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
         }
     }
     if args["method"] == "create" || args["method"] == "open" {
-        let latest = state.clone().with_latest_config().await;
+        let mut latest = state.clone().with_latest_config().await;
+        crate::model_catalog::restrict(&mut latest, id).await?;
         let task = format!("task_{}", agent_service::uuid_like());
         let mut conn = agent_service::open_db(root)?;
         let tx = conn.transaction()?;
@@ -97,6 +101,10 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
         )?)
         .into_response(),
         "prompt" => {
+            // The page that asks runs this task's page tools (see page_tools).
+            if let Some(page) = args["page_id"].as_str() {
+                crate::page_tools::claim(&task, page)?;
+            }
             let prompt = args["prompt"].as_str().unwrap_or("");
             ensure!(
                 !prompt.trim().is_empty()
@@ -113,7 +121,7 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
                 prompt.to_owned()
             };
             let input = serde_json::from_value(
-                json!({"prompt":prompt,"content":args["content"].as_array().cloned().unwrap_or_default(),"requestId":args["requestId"]}),
+                json!({"prompt":prompt,"content":args["content"].as_array().cloned().unwrap_or_default(),"requestId":args["requestId"],"provider":args["provider"],"model":args["model"]}),
             )?;
             agent_service::continue_task(State(state), Path(task), Json(input))
                 .await
@@ -138,6 +146,10 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
                                 "tool/result",
                                 "turn/start",
                                 "turn/end",
+                                "subagent/start",
+                                "subagent/event",
+                                "subagent/end",
+                                "subagent/review",
                             ],
                             ..Default::default()
                         },
@@ -156,6 +168,18 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
                 })
                 .await??;
             Json(json!({"events":events})).into_response()
+        }
+        "tool_calls" => {
+            let page = args["page_id"].as_str().context("page_id required")?;
+            let wait = std::time::Duration::from_millis(args["wait_ms"].as_u64().unwrap_or(0));
+            Json(crate::page_tools::poll(&task, page, wait).await?).into_response()
+        }
+        "tool_result" => {
+            let page = args["page_id"].as_str().context("page_id required")?;
+            let call = args["call_id"].as_str().context("call_id required")?;
+            ensure!(args["result"].is_object(), "result object required");
+            crate::page_tools::reply(&task, page, call, args["result"].clone())?;
+            Json(json!({"ok":true})).into_response()
         }
         "status" => agent_service::get_task(State(state), Path(task))
             .await
@@ -187,6 +211,30 @@ mod tests {
         let scope = catalog.packages.catalog()[0]["scope"].clone();
         let mut state = agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
         state.tool_catalog = Some(catalog);
+        state.config = Some(std::sync::Arc::new(tokio::sync::RwLock::new(serde_json::from_value(json!({
+            "providers":{"test":{"url":"http://private/v1","api_key":"secret","model_map":{"m":"m"}}}
+        })).unwrap())));
+        let models = body(
+            handle(
+                state.clone(),
+                "code-flow",
+                json!({"method":"models","package_scope":scope}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(models["models"][0]["id"], "m");
+        assert!(!models.to_string().contains("secret"));
+        assert!(
+            handle(
+                state.clone(),
+                "code-flow",
+                json!({"method":"models","package_scope":999})
+            )
+            .await
+            .is_err()
+        );
         let created = body(
             handle(
                 state.clone(),

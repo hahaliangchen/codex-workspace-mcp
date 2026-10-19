@@ -5,7 +5,9 @@ import styles from './TaskNode.module.css'
 
 const KIND_META: Record<string, { label: string; className: string; accentClass: string; icon: string }> = {
   agent: { label: '主 Agent', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔵' },
+  worker: { label: '任务分支', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔹' },
   context_agent: { label: '上下文子 Agent', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '🟣' },
+  asset_reviewer: { label: '资产整理', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '🟣' },
 }
 
 function formatNodeId(id: string): string {
@@ -159,8 +161,8 @@ export const TaskNode = memo(function TaskNode({
         <div className={styles.statusIcon}>{renderStatus()}</div>
       </div>
 
-      <div className={styles.title} title={data.title}>
-        {data.title}
+      <div className={styles.title} title={data.agentName ? `${data.agentName} · ${data.title}` : data.title}>
+        {data.agentName ? `${data.agentName} · ${data.title}` : data.title}
       </div>
 
       {displayDesc && (

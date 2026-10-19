@@ -100,6 +100,8 @@ export default {
 
 ## 生命周期与技能激活
 
+插件专用会话每轮模型请求显式说明当前轮次与工具可用状态。用户确认方案、追加修改等新轮次也须重新 `read_skill`，旧历史中的技能正文不能充当本轮激活。主 Agent 提前调用已安装但尚未激活的工具时返回 `SKILL_NOT_ACTIVE`，提示独立读取对应技能后再调用；权限拒绝、插件作用域拒绝和只读上下文子 Agent 限制分别报告，不把它们统称为子 Agent 递归错误。未激活的调用不会到达远程插件。
+
 - `GET /agent/skill-packages`：共同目录，包含来源 origin、依赖、作用域、工具和页面声明。
 - `POST /agent/skill-packages`，`{"path":"/absolute/package/path"}`：安装外置包，保存配置。
 - `POST /agent/skill-packages/{id}/enabled`，`{"enabled":false}`：共同启停接口，清理所属贡献。
@@ -112,7 +114,47 @@ Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文
 
 本实现参考本机 DSH 的 client/modules、ui-renderer、slots.register，以及 Cordis 的 Service、inject、plugin、effect 生命周期。协议与 Rust/前端适配器共享上述思想；DSH npm 包的完整配置和远程服务 wire 协议不是本插件清单。
 
+## 由插件页面执行的工具
+
+插件可以把一部分工具交给自己的页面执行：工具定义写 `"executor": "page"`（不写或写 `"service"` 表示由插件服务执行）。宿主不知道这些工具的具体内容，只负责转发：
+
+- Agent 调用这类工具时，宿主把调用交给发起这个任务的页面，等页面交回结果。页面通过插件会话的两个方法与宿主交互：
+  - `tool_calls`：`{task_id, page_id, wait_ms}`，领取待执行的调用，最多挂起 25 秒。
+  - `tool_result`：`{task_id, page_id, call_id, result}`，交回结果。
+  iframe 和 Cordis 页面都可以通过 `pluginHost.session` 使用这两个方法。
+- 发送 `prompt` 时带上 `page_id` 的页面，负责这个任务的页面工具；同一任务只认最后一个发送 prompt 的页面。其他页面也可以轮询，但领不到调用。任务还没有负责的页面时（例如宿主刚重启），由第一个来轮询的页面负责。
+- 调用已经排队、但负责的页面 45 秒没有来轮询，或者页面领走调用后 180 秒没有交回结果，工具就返回 `PAGE_CLOSED`，宿主结束这个任务：关闭页面即视为放弃任务。
+- 页面交回的结果格式为 `{ok, content: [{type: "text", text} | {type: "image", mimeType, data}]}`。图片存成任务的视觉素材，结果中给出 `artifact_id`；JSON 文本原样作为 `data` 传给 Agent。
+- 远程插件的页面工具不会被注入 `project_id`，也不会发送到插件服务；如果绕过 Agent 直接调用，宿主会拒绝。
+
+插件增加或修改页面工具，只需改插件自己的清单和页面，宿主不需要改动。实现见 `src/page_tools.rs`。
+
 ## 远程页面和插件会话
+
+### 统一模型目录
+
+宿主设置「模型与提供商 → 插件可用模型」维护授权，保存在 generation 配置的 `plugin_models` 中，格式为 `{"ppt-master":[{"provider":"qwen-local","model":"qwen3.8-27b"}]}`。未出现的插件默认可用全部模型；显式空数组禁止该插件调用模型。设置只允许引用已登记且 Agent 支持的模型，旧版客户端未提交该字段时保留已有授权。
+
+供应商可开启 `prefix_system_messages` 适配只接受开头系统消息的服务：请求时按原有顺序合并系统提示到前缀，普通消息和工具对保持顺序，持久化历史不变。该适配保存在宿主 generation 配置的 `provider_compatibility`，不向 DSH 的供应商清单增加协议外字段。
+
+插件查询目录已按授权过滤。新会话优先采用允许的全局默认模型，否则取授权列表中首个可用模型；旧会话的原模型被撤销后，下一轮自动选用允许的默认模型。前端显式提交未授权模型会被拒绝，不能通过一般任务接口绕过。视觉、压缩和 Observer 的专用模型同样受限制，原专用模型不在授权范围时跟随当前允许的主模型。运行时使用独立的配置投影，不修改全局路由或其他插件的设置。
+
+模型来源为 DSH profile 的 `llm-pi-ai.providers.*.models`，能力配置由宿主管理。
+主 Agent、视觉分析、上下文压缩和 Observer 都引用目录中的 `(provider, model)`。
+专用任务只保存模型引用及推理档位、任务上下文预算；不另存 URL、密钥或另一套模型定义。
+设置页从目录选择专用模型，保存时拒绝缺失引用；删除被引用的模型前须重新选择对应任务模型。
+运行时再次解析并检查引用，防止直接编辑配置后将未登记的模型传给专用任务。
+
+- 宿主页面：`GET /agent/models`。
+- Rust 插件：声明依赖 `model-catalog`，注入 `ModelCatalog` 后调用 `list().await`。
+- Cordis 页面：`ctx.pluginHost.models()`，等价于 `session('models')`。
+- iframe 页面：`skillPackage.models()`，通过同一个归属与作用域检查。
+- 独立 PPT 页面：认证后的 `/agent/ppt/session`，传 `connection_handle` 和 `method: "models"`，不要求先创建 PPT 会话。
+
+响应包含 `version`、`models` 和 `defaults`。模型按提供商和 ID 唯一标识，包含显示名、协议、当前 Agent 是否支持该协议、已声明的上下文/输出上限、视觉与推理能力。未知能力/上限保留 `unknown` 或 `null`；在目录中并不表示全部功能已通过实测。`verification` 只描述对应图片探测证据，不代表完整模型验证。
+`defaults.visual_tool` 等是模型引用；字段为空时跟随当前主 Agent。不会向插件返回供应商地址、凭据、凭据环境变量或探测响应正文。每次查询读取当前配置，目录修改不需要各插件分别维护列表。本接口提供只读查询，不授予插件修改全局模型设置的权限。
+
+这沿用 DSH 的提供商/模型标识和声明式目录；以上 HTTP/页面桥接接口是本项目适配层，不宣称等同于 DSH 全部 LLM wire API。
 
 `POST /agent/skill-packages/remote` 接收 `{url, token}`，其中 url 为 PPT 服务的
 `.../aiPpt/plugin`。使用 DSH Connection 包络进行 `ppt/handshake`、`ppt/confirm`；
@@ -171,3 +213,23 @@ Authorization。宿主使用 `PPT_PLUGIN_URL` 或已注册 PPT 服务地址，�
 ## 会话附件
 
 插件清单可声明 `attachment_extensions`，按文件扩展名列出允许的输入；缺省不接收附件。宿主按插件所有者在上传与消息接纳时校验，插件业务服务仍须检查实际格式与用户权限。模块及 iframe 通过注入的 `pluginHost.session('upload', ...)`、`session('attachment', ...)` 和既有 `prompt` 方法接入，与主聊天共享宿主存储和消息引用。具体 DSH 兼容范围、PPT SVG 版白名单和测试见[会话附件](attachments.md)。
+
+### 上下文自动整理
+
+宿主在主 Agent 每次模型请求前检查估算输入 token 数。默认软阈值为
+`min(96000, 输入预算 × 75%)`，达到后自动运行现有只读 context agent；
+专用任务模型沿用模型列表中的配置和插件允许范围。上下文模型阅读原始需求，
+决定摘要和资产保留方式，宿主不按消息角色、大小或年龄删改原始记录。
+摘要与工作窗口在同一事务内保存，原始历史、文件和资产引用保留。
+失败保留原窗口并延后重试；超过硬容量仍禁止发送。整理后的窗口若仍偏大，
+会留出后续增长量再重试，避免连续整理阻塞业务。
+界面接收 `context/compression_start`、`context/compression_end`、
+`context/compression_failed` 进度事件；事件记录前后估算量便于核对效果。
+
+### 请求前缀与 KV 缓存
+
+主 Agent 的逐轮上下文用量由宿主记录和监测，不拼进系统提示前缀；
+MAIN 运行角色提示也不写入变化的用户轮次编号。相同技能和项目内的增量请求
+保留固定系统前缀与既有历史，避免仅用量变化就让长历史的前缀缓存失效。
+只读 context agent 用于自身 checkpoint 的用量提示置于请求尾部，明确标记
+`runtime_context_capacity`，不进入持久化用户历史，也不提升为前缀系统消息。

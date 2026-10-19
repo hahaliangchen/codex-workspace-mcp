@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -43,12 +44,16 @@ struct ProviderConfig {
     /// Upstream model id -> declared `maxTokens` in the DSH model entry.
     #[serde(skip)]
     max_output_tokens: HashMap<String, usize>,
+    #[serde(skip)]
+    model_metadata: HashMap<String, Value>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ModelCapabilities {
+    #[serde(default)]
+    tool_calling: Option<bool>,
     #[serde(default)]
     reasoning_efforts: Vec<String>,
     #[serde(default)]
@@ -64,6 +69,7 @@ struct ModelCapabilities {
 fn built_in_capabilities(model: &str) -> ModelCapabilities {
     if model == "gpt-6-luna" {
         ModelCapabilities {
+            tool_calling: None,
             reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"]
                 .into_iter()
                 .map(str::to_owned)
@@ -107,6 +113,10 @@ pub(crate) struct AiProxyConfig {
     #[serde(default)]
     context_agent: crate::model_settings::ModelSettings,
     #[serde(default)]
+    plugin_models: HashMap<String, Vec<crate::model_catalog::ModelRef>>,
+    #[serde(default)]
+    plugin_generation: HashMap<String, crate::model_settings::PluginGeneration>,
+    #[serde(default)]
     providers: HashMap<String, ProviderConfig>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -140,10 +150,35 @@ pub(crate) fn apply_agent_config(
             (
                 name.clone(),
                 crate::agent_service::AgentProviderRoute {
+                    prefix_system_messages: provider
+                        .extra
+                        .get("prefixSystemMessages")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     url: provider.url.clone(),
                     api_key: provider.api_key.clone(),
                     models: provider.model_map.clone(),
                     max_output_tokens: provider.max_output_tokens.clone(),
+                    context_request_options: provider
+                        .extra
+                        .get("contextRequestOptions")
+                        .and_then(Value::as_object)
+                        .map(|models| {
+                            models
+                                .iter()
+                                .map(|(name, options)| {
+                                    (
+                                        provider
+                                            .model_map
+                                            .get(name)
+                                            .cloned()
+                                            .unwrap_or_else(|| name.clone()),
+                                        options.clone(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 },
             )
         })
@@ -413,11 +448,18 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
                         .unwrap_or("openai-completions")
                         .to_owned(),
                     max_output_tokens,
-                    extra: entry
-                        .get("displayName")
-                        .and_then(Value::as_str)
-                        .map(|name| HashMap::from([("displayName".to_owned(), json!(name))]))
-                        .unwrap_or_default(),
+                    model_metadata: models
+                        .iter()
+                        .filter_map(|m| Some((m["id"].as_str()?.to_owned(), m.clone())))
+                        .collect(),
+                    extra: [
+                        "displayName",
+                        "prefixSystemMessages",
+                        "contextRequestOptions",
+                    ]
+                    .into_iter()
+                    .filter_map(|key| Some((key.to_owned(), entry.get(key)?.clone())))
+                    .collect(),
                 },
             );
         }
@@ -444,6 +486,15 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     let generation = read_yaml(&generation_settings_path(config_path), json!({}))?;
+    for (id, provider) in &mut config.providers {
+        if let Some(prefix) =
+            generation["provider_compatibility"][id]["prefix_system_messages"].as_bool()
+        {
+            provider
+                .extra
+                .insert("prefixSystemMessages".into(), json!(prefix));
+        }
+    }
     config.reasoning_effort = generation
         .get("reasoning_effort")
         .and_then(Value::as_str)
@@ -462,6 +513,21 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
     )?;
     config.visual_tool.normalize()?;
     config.context_agent.normalize()?;
+    config.plugin_models = serde_json::from_value(
+        generation
+            .get("plugin_models")
+            .cloned()
+            .unwrap_or(json!({})),
+    )?;
+    config.plugin_generation = serde_json::from_value(
+        generation
+            .get("plugin_generation")
+            .cloned()
+            .unwrap_or(json!({})),
+    )?;
+    for policy in config.plugin_generation.values_mut() {
+        policy.normalize()?;
+    }
     config.model_capabilities = generation
         .get("model_capabilities")
         .cloned()
@@ -521,6 +587,7 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         .map(|(id, provider)| {
             json!({
                 "id": id, "url": provider.url, "api_type": provider.api_type,
+                "prefix_system_messages":provider.extra.get("prefixSystemMessages").and_then(Value::as_bool).unwrap_or(false),
                 "display_name": provider.extra.get("displayName").and_then(Value::as_str),
                 "api_key_env": provider.api_key_ref,
                 "models": provider.model_map.keys().collect::<Vec<_>>(), "has_api_key": !provider.api_key.is_empty(),
@@ -540,7 +607,186 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         "observer_provider": config.observer_provider,
         "observer_model": config.observer_model,
                 "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+        "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     })
+}
+
+/// Explicit projection: never expose URLs, credentials or raw probe responses.
+pub(crate) fn catalog_view(config: &AiProxyConfig) -> Value {
+    let mut models = Vec::new();
+    for (provider, route) in &config.providers {
+        for id in route.model_map.keys() {
+            let cap = config
+                .model_capabilities
+                .get(provider)
+                .and_then(|m| m.get(id))
+                .cloned()
+                .unwrap_or_else(|| built_in_capabilities(id));
+            let metadata = route.model_metadata.get(id);
+            let probe = cap.image_probe.as_ref().filter(|p| {
+                route.api_type == "openai-completions"
+                    && p["route_fingerprint"]
+                        == crate::visual_probe::route_fingerprint(&route.url, id)
+            });
+            models.push(json!({
+                "provider":provider, "id":id,
+                "name":metadata.and_then(|m|m["name"].as_str()).unwrap_or(id),
+                "provider_name":route.extra.get("displayName").and_then(Value::as_str).unwrap_or(provider),
+                "enabled":true, "available_for_agent":route.api_type == "openai-completions",
+                "api_type":route.api_type,
+                "context_window":metadata.and_then(|m|m["contextWindow"].as_u64()),
+                "max_output_tokens":route.max_output_tokens.get(id),
+                "capabilities":{
+                    "image_input":cap.image_input, "tool_calling":cap.tool_calling,
+                    "reasoning_efforts":cap.reasoning_efforts, "default_effort":cap.default_effort,
+                    "fast_mode":cap.fast_mode,
+                },
+                "verification":{
+                    "image_input":probe.and_then(|p|p["status"].as_str()).unwrap_or("unverified"),
+                    "checked_at":probe.and_then(|p|p["checked_at"].as_u64()),
+                },
+            }));
+        }
+    }
+    models.sort_by(|a, b| {
+        (a["provider"].as_str(), a["id"].as_str()).cmp(&(b["provider"].as_str(), b["id"].as_str()))
+    });
+    json!({"version":1,"models":models,"defaults":{
+        "agent":{"provider":config.orchestrator_provider,"model":config.orchestrator_model},
+        "visual_tool":config.visual_tool,"context_agent":config.context_agent,"plugin_generation":config.plugin_generation,
+        "observer":{"provider":config.observer_provider,"model":config.observer_model},
+    }})
+}
+
+pub(crate) fn restricted_config(
+    config: &AiProxyConfig,
+    plugin: &str,
+) -> anyhow::Result<AiProxyConfig> {
+    let mut config = config.clone();
+    if let Some(policy) = config.plugin_generation.get(plugin) {
+        if let Some(effort) = &policy.reasoning_effort {
+            config.reasoning_effort = Some(effort.clone());
+        }
+        if let Some(effort) = &policy.visual_reasoning_effort {
+            config.visual_tool.reasoning_effort = Some(effort.clone());
+        }
+    }
+    let config = &config;
+    let Some(allowed) = config.plugin_models.get(plugin) else {
+        return Ok(config.clone());
+    };
+    let permits = |provider: &str, model: &str| {
+        allowed
+            .iter()
+            .any(|r| r.provider == provider && r.model == model)
+    };
+    let mut scoped = config.clone();
+    scoped.providers.retain(|id, p| {
+        p.model_map.retain(|model, _| permits(id, model));
+        !p.model_map.is_empty() && p.api_type == "openai-completions"
+    });
+    let selected = config
+        .orchestrator_provider
+        .as_deref()
+        .zip(config.orchestrator_model.as_deref())
+        .filter(|(p, m)| {
+            scoped
+                .providers
+                .get(*p)
+                .is_some_and(|r| r.model_map.contains_key(*m))
+        })
+        .map(|(p, m)| crate::model_catalog::ModelRef {
+            provider: p.into(),
+            model: m.into(),
+        })
+        .or_else(|| {
+            allowed
+                .iter()
+                .find(|r| {
+                    scoped
+                        .providers
+                        .get(&r.provider)
+                        .is_some_and(|p| p.model_map.contains_key(&r.model))
+                })
+                .cloned()
+        })
+        .context("插件没有可用的授权模型，请在宿主设置中配置")?;
+    scoped.orchestrator_provider = Some(selected.provider.clone());
+    scoped.orchestrator_model = Some(selected.model.clone());
+    scoped.default_provider = Some(selected.provider.clone());
+    for role in [&mut scoped.visual_tool, &mut scoped.context_agent] {
+        if role.provider.is_some() || role.model.is_some() {
+            let p = role
+                .provider
+                .as_ref()
+                .or(config.orchestrator_provider.as_ref());
+            let m = role.model.as_ref().or(config.orchestrator_model.as_ref());
+            if p.zip(m).is_none_or(|(p, m)| {
+                !scoped
+                    .providers
+                    .get(p)
+                    .is_some_and(|r| r.model_map.contains_key(m))
+            }) {
+                *role = Default::default();
+            } else {
+                role.provider = p.cloned();
+                role.model = m.cloned();
+            }
+        }
+    }
+    if scoped
+        .observer_provider
+        .as_deref()
+        .zip(scoped.observer_model.as_deref())
+        .is_some_and(|(p, m)| {
+            !scoped
+                .providers
+                .get(p)
+                .is_some_and(|r| r.model_map.contains_key(m))
+        })
+    {
+        scoped.observer_provider = None;
+        scoped.observer_model = None;
+    }
+    let cap = scoped
+        .model_capabilities
+        .get(&selected.provider)
+        .and_then(|m| m.get(&selected.model));
+    scoped.reasoning_effort = config
+        .reasoning_effort
+        .clone()
+        .filter(|e| cap.is_some_and(|c| c.reasoning_efforts.contains(e)));
+    if let Some(effort) = config
+        .plugin_generation
+        .get(plugin)
+        .and_then(|p| p.visual_reasoning_effort.clone())
+    {
+        scoped.visual_tool.reasoning_effort = Some(effort);
+    }
+    scoped.fast_mode = config.fast_mode && cap.is_some_and(|c| c.fast_mode);
+    Ok(scoped)
+}
+
+pub(crate) fn plugin_catalog_view(config: &AiProxyConfig, plugin: &str) -> Value {
+    match restricted_config(config, plugin) {
+        Ok(scoped) => catalog_view(&scoped),
+        Err(_) => json!({"version":1,"models":[],"defaults":{}}),
+    }
+}
+
+async fn get_model_catalog(State(state): State<AiProxyState>) -> Response {
+    let catalog = crate::model_catalog::ModelCatalog {
+        config: state.config,
+        path: Some(state.config_path),
+    };
+    match catalog.list().await {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"could not load model catalog"})),
+        )
+            .into_response(),
+    }
 }
 
 fn trusted_settings_request(headers: &HeaderMap) -> bool {
@@ -598,6 +844,8 @@ async fn get_agent_settings(State(state): State<AiProxyState>, headers: HeaderMa
 
 #[derive(Deserialize)]
 struct ProviderEdit {
+    #[serde(default)]
+    prefix_system_messages: Option<bool>,
     id: String,
     url: String,
     #[serde(default)]
@@ -634,6 +882,10 @@ struct SettingsEdit {
     visual_tool: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     context_agent: Option<crate::model_settings::ModelSettings>,
+    #[serde(default)]
+    plugin_models: Option<HashMap<String, Vec<crate::model_catalog::ModelRef>>>,
+    #[serde(default)]
+    plugin_generation: Option<HashMap<String, crate::model_settings::PluginGeneration>>,
 }
 
 fn nonempty(value: Option<String>) -> Option<String> {
@@ -916,6 +1168,7 @@ fn save_settings(
             model_map: HashMap::new(),
             api_type: default_api_type(),
             max_output_tokens: HashMap::new(),
+            model_metadata: HashMap::new(),
             extra: HashMap::new(),
         });
         provider.url = url.as_str().trim_end_matches('/').to_owned();
@@ -926,6 +1179,11 @@ fn save_settings(
             .map(|model| (model.clone(), model))
             .collect();
         provider.api_type = draft.api_type;
+        if let Some(prefix) = draft.prefix_system_messages {
+            provider
+                .extra
+                .insert("prefixSystemMessages".into(), json!(prefix));
+        }
         match nonempty(draft.display_name) {
             Some(name) => {
                 provider.extra.insert("displayName".into(), json!(name));
@@ -953,17 +1211,80 @@ fn save_settings(
             edit.normalize()?;
             *target = edit;
         }
-        if let Some(provider) = &target.provider {
+        if target.provider.is_some() || target.model.is_some() {
+            let provider = target
+                .provider
+                .as_ref()
+                .or(config.orchestrator_provider.as_ref())
+                .context("choose a provider for the dedicated task")?;
+            let model = target
+                .model
+                .as_ref()
+                .or(config.orchestrator_model.as_ref())
+                .context("choose a model for the dedicated task")?;
+            let route = config
+                .providers
+                .get(provider)
+                .context("configured tool/compression provider is unavailable")?;
             anyhow::ensure!(
-                config
-                    .providers
-                    .get(provider)
-                    .is_some_and(|p| p.api_type == "openai-completions"),
-                "configured tool/compression provider is unavailable or incompatible"
+                route.api_type == "openai-completions",
+                "configured tool/compression provider is incompatible"
             );
+            anyhow::ensure!(
+                route.model_map.contains_key(model),
+                "dedicated task model {model} is not in provider {provider}'s catalog"
+            );
+            if let Some(cap) = config
+                .model_capabilities
+                .get(provider)
+                .and_then(|m| m.get(model))
+            {
+                anyhow::ensure!(
+                    cap.reasoning_efforts.is_empty()
+                        || target
+                            .reasoning_effort
+                            .as_ref()
+                            .is_none_or(|e| cap.reasoning_efforts.contains(e)),
+                    "dedicated task model does not support this reasoning effort"
+                );
+            }
         }
     }
     config.default_provider = config.orchestrator_provider.clone();
+    if let Some(policies) = request.plugin_models {
+        config.plugin_models = policies;
+    }
+    if let Some(mut policies) = request.plugin_generation {
+        for (id, policy) in &mut policies {
+            anyhow::ensure!(
+                !id.trim().is_empty(),
+                "plugin generation policy requires a plugin ID"
+            );
+            policy.normalize()?;
+        }
+        config.plugin_generation = policies;
+    }
+    for (plugin, models) in &config.plugin_models {
+        anyhow::ensure!(
+            !plugin.is_empty(),
+            "plugin model policy requires a plugin ID"
+        );
+        let mut unique = std::collections::HashSet::new();
+        for model in models {
+            anyhow::ensure!(
+                unique.insert(model.clone()),
+                "duplicate plugin model reference"
+            );
+            anyhow::ensure!(
+                config
+                    .providers
+                    .get(&model.provider)
+                    .is_some_and(|p| p.api_type == "openai-completions"
+                        && p.model_map.contains_key(&model.model)),
+                "插件 {plugin} 引用的模型未在可用模型目录中登记"
+            );
+        }
+    }
     if let Some(effort) = request.reasoning_effort {
         let effort = effort.trim();
         anyhow::ensure!(
@@ -1079,6 +1400,7 @@ fn save_settings(
             .ok_or_else(|| anyhow::anyhow!("provider {id} is not a mapping"))?;
         item.insert("baseURL".into(), json!(provider.url));
         item.insert("api".into(), json!(provider.api_type));
+        item.remove("prefixSystemMessages");
         if let Some(name) = provider.extra.get("displayName") {
             item.insert("displayName".into(), name.clone());
         } else {
@@ -1158,10 +1480,12 @@ fn save_settings(
     let generation_path = generation_settings_path(config_path);
     let original_generation = read_yaml(&generation_path, json!({}))?;
     let generation_settings = json!({
+        "provider_compatibility":config.providers.iter().map(|(id,p)|(id.clone(),json!({"prefix_system_messages":p.extra.get("prefixSystemMessages").and_then(Value::as_bool).unwrap_or(false)}))).collect::<HashMap<_,_>>(),
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
         "model_capabilities": config.model_capabilities,
                 "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+        "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     });
     if disk_revision(config_path)? != request.revision {
         return Ok(Err(
@@ -1612,6 +1936,10 @@ pub async fn run(
             config: config.clone(),
         })),
     )?;
+    runtime.mount(
+        plugin_runtime::ROOT,
+        crate::model_catalog::ModelCatalogPlugin,
+    )?;
     let tools_scope = runtime.mount(
         plugin_runtime::ROOT,
         builtin_plugins::ToolCatalogPlugin(client.clone()),
@@ -1746,6 +2074,7 @@ pub async fn run(
             "/agent/settings/data",
             get(get_agent_settings).put(put_agent_settings),
         )
+        .route("/agent/models", get(get_model_catalog))
         .route("/agent/settings/discover", post(discover_agent_models))
         .route("/agent/settings/probe-image", post(probe_agent_image_input))
         .route("/agent/plugins", get(plugin_tree))
@@ -1847,6 +2176,10 @@ mod tests {
         patch[0]["config"]["providers"]["test"]["baseURL"] = json!("https://second.example/v1");
         write_yaml_atomic(&path, &patch).unwrap();
         assert_eq!(
+            catalog_view(&load_config(&path).unwrap())["models"][0]["verification"]["image_input"],
+            "unverified"
+        );
+        assert_eq!(
             load_config(&path).unwrap().model_capabilities["test"]["m"].image_input,
             crate::visual_artifacts::ImageCapability::Unknown
         );
@@ -1866,18 +2199,91 @@ mod tests {
         let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
         let path = root.join("profiles/web/cordis.patch.yml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        write_yaml_atomic(&path,&json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m","maxTokens":65536}]}}}},{"id":"agent-default-model","config":{"provider":"test","model":"m"}}])).unwrap();
+        write_yaml_atomic(&path,&json!([{"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m","maxTokens":65536}],"contextRequestOptions":{"m":{"chat_template_kwargs":{"enable_thinking":false}}}}}}},{"id":"agent-default-model","config":{"provider":"test","model":"m"}}])).unwrap();
         write_yaml_atomic(
             &credentials_path(&path),
             &json!({"version":1,"refs":{},"records":{}}),
         )
         .unwrap();
-        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000}});
+        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m","gpt-6.1-sol"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000}});
+        payload["plugin_models"] =
+            json!({"ppt-master":[{"provider":"test","model":"gpt-6.1-sol"}]});
+        payload["plugin_generation"] =
+            json!({"ppt-master":{"reasoning_effort":"low","visual_reasoning_effort":"low"}});
         save_settings(&path, serde_json::from_value(payload.clone()).unwrap())
             .unwrap()
             .unwrap();
         let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.context_agent.context_window, Some(500000));
+        assert_eq!(
+            loaded.plugin_generation["ppt-master"]
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        let scoped = restricted_config(&loaded, "ppt-master").unwrap();
+        assert_eq!(scoped.visual_tool.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            loaded.visual_tool.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        let mut unrestricted = loaded.clone();
+        unrestricted.plugin_models.clear();
+        assert_eq!(
+            restricted_config(&unrestricted, "ppt-master")
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            restricted_config(&unrestricted, "unrelated")
+                .unwrap()
+                .reasoning_effort,
+            loaded.reasoning_effort
+        );
+        assert_eq!(
+            catalog_view(&scoped)["defaults"]["plugin_generation"]["ppt-master"]["reasoning_effort"],
+            "low"
+        );
+        assert_eq!(
+            loaded.providers["test"].extra["contextRequestOptions"]["m"]["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert_eq!(
+            plugin_catalog_view(&loaded, "ppt-master")["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut invalid = payload.clone();
+        invalid["revision"] = json!(disk_revision(&path).unwrap());
+        invalid["plugin_models"]["ppt-master"][0]["model"] = json!("unregistered");
+        assert!(
+            save_settings(&path, serde_json::from_value(invalid).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("未在可用模型目录中登记")
+        );
+        let mut invalid = payload.clone();
+        invalid["revision"] = json!(disk_revision(&path).unwrap());
+        invalid["providers"][0]["models"] = json!(["m"]);
+        assert!(
+            save_settings(&path, serde_json::from_value(invalid).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("not in provider")
+        );
+        let mut invalid = payload.clone();
+        invalid["revision"] = json!(disk_revision(&path).unwrap());
+        invalid["visual_tool"]["provider"] = json!("missing");
+        assert!(
+            save_settings(&path, serde_json::from_value(invalid).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("provider is unavailable")
+        );
         // Saving settings keeps the model entry, so its declared limit survives.
         assert_eq!(loaded.providers["test"].max_output_tokens["m"], 65536);
         assert_eq!(
@@ -1887,6 +2293,7 @@ mod tests {
         payload["revision"] = json!(disk_revision(&path).unwrap());
         payload.as_object_mut().unwrap().remove("visual_tool");
         payload.as_object_mut().unwrap().remove("context_agent");
+        payload.as_object_mut().unwrap().remove("plugin_models");
         save_settings(&path, serde_json::from_value(payload.clone()).unwrap())
             .unwrap()
             .unwrap();
@@ -1901,9 +2308,64 @@ mod tests {
             .unwrap()
             .unwrap();
         let cleared = load_config(&path).unwrap();
+        assert_eq!(
+            plugin_catalog_view(&cleared, "ppt-master")["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(cleared.context_agent, Default::default());
         assert_eq!(cleared.visual_tool, Default::default());
         assert_eq!(cleared.orchestrator_model.as_deref(), Some("m"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_catalog_projects_registered_models_and_keeps_credentials_private() {
+        let mut config: AiProxyConfig = serde_json::from_value(json!({
+            "orchestrator_provider":"route", "orchestrator_model":"m",
+            "visual_tool":{"provider":"route","model":"m"},
+            "providers":{"route":{"url":"https://private.example/v1","api_key":"secret-value","api_key_ref":"PRIVATE_ENV","model_map":{"m":"upstream-m"},"api_type":"openai-completions","displayName":"My route"}},
+            "model_capabilities":{"route":{"m":{"reasoning_efforts":["low","medium"],"image_input":"unknown","image_probe":{"status":"unverified","response_body":"private-response"}}}}
+        })).unwrap();
+        config
+            .providers
+            .get_mut("route")
+            .unwrap()
+            .model_metadata
+            .insert(
+                "m".into(),
+                json!({"name":"Visible model","contextWindow":500000}),
+            );
+        config
+            .providers
+            .get_mut("route")
+            .unwrap()
+            .max_output_tokens
+            .insert("m".into(), 65536);
+        let view = catalog_view(&config);
+        assert_eq!(view["models"].as_array().unwrap().len(), 1);
+        assert_eq!(view["models"][0]["name"], "Visible model");
+        assert_eq!(view["models"][0]["context_window"], 500000);
+        assert_eq!(view["models"][0]["max_output_tokens"], 65536);
+        assert_eq!(view["defaults"]["visual_tool"]["model"], "m");
+        let encoded = view.to_string();
+        for private in [
+            "private.example",
+            "secret-value",
+            "PRIVATE_ENV",
+            "private-response",
+            "upstream-m",
+        ] {
+            assert!(!encoded.contains(private));
+        }
+        config.providers.get_mut("route").unwrap().model_map.clear();
+        assert!(
+            catalog_view(&config)["models"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
