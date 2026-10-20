@@ -13,9 +13,15 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub const LIMIT: usize = 5;
+const LEASE_MS: i64 = 30_000;
 static RUNNING: OnceLock<Mutex<BTreeMap<String, (PathBuf, String, CancellationToken)>>> =
     OnceLock::new();
+static INSTANCE: OnceLock<String> = OnceLock::new();
 static CHANGED: Notify = Notify::const_new();
+fn instance() -> &'static str { INSTANCE.get_or_init(agent_service::uuid_like) }
+#[cfg(test)]
+pub(crate) fn test_instance() -> &'static str { instance() }
+fn now_ms() -> i64 { chrono::Utc::now().timestamp_millis() }
 fn running() -> &'static Mutex<BTreeMap<String, (PathBuf, String, CancellationToken)>> {
     RUNNING.get_or_init(Default::default)
 }
@@ -29,6 +35,12 @@ pub fn db(root: &Path) -> Result<rusqlite::Connection> {
       UNIQUE(task_id,call_id));
       CREATE INDEX IF NOT EXISTS idx_delegates_parent ON agent_delegates(task_id,status);",
     )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_delegate_executors(
+      agent_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until INTEGER NOT NULL,
+      cancel_requested INTEGER NOT NULL DEFAULT 0); ")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_resource_claims(
+      resource TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner TEXT NOT NULL,
+      owner_agent TEXT, expires_at INTEGER NOT NULL); ")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_delegate_assets(
       task_id TEXT NOT NULL, agent_id TEXT NOT NULL, asset_id TEXT NOT NULL,
@@ -94,8 +106,8 @@ pub fn tools() -> Vec<Value> {
     vec![
         function(
             "spawn_agent",
-            "Delegate one independent task. At most five task agents run per conversation; context compression does not consume these slots. Returns immediately. The host forks the current execution context, including confirmed requirements, loaded materials, execution receipts, active skills and asset references. Delegates need not reread material already present. Supply only the specific task, owned files/pages and acceptance criteria; do not repeat shared requirements, design specs or outlines. The optional context field is for assignment-specific exceptions or references only. Delegates inherit this conversation's model, permissions and plugin/project binding; they cannot create further delegates. You remain responsible for verifying their actual results.",
-            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000}}),
+            "Delegate one independent task. At most five task agents run per conversation; context compression does not consume these slots. Returns immediately. The host inherits the current execution context, including confirmed requirements, loaded materials, execution receipts, active skills and asset references. Large parents are projected to narrative and references, so include the asset_ids the delegate should read first and do not repeat shared requirements, design specs or outlines. Supply the specific task, owned files/pages and acceptance criteria; the optional context field is for assignment-specific exceptions or references only. Delegates inherit this conversation's model, permissions and plugin/project binding; they cannot create further delegates. You remain responsible for verifying their actual results.",
+            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Asset handles the delegate should read first. Bodies remain references in projected contexts."}}),
             json!(["name", "task"]),
         ),
         function(
@@ -106,10 +118,14 @@ pub fn tools() -> Vec<Value> {
         ),
         function(
             "review_agent_result",
-            "Record the MAIN agent's acceptance after checking a delegate's actual artifacts by reference. For code, personally inspect changed files/diffs, versions and relevant verification evidence. A child report or completed status is not proof of success. Use needs_work to reject and explicitly dispatch corrective work, or unresolved when blocked; describe the gap in the final answer. Every terminal delegate must be reviewed before final delivery.",
-            json!({"agent_id":{"type":"string"},"decision":{"type":"string","enum":["accepted","needs_work","unresolved"]},"evidence":{"type":"string","minLength":1,"maxLength":12000}}),
+            "Record the MAIN agent's acceptance. For accepted, cite successful main-agent tool/result event_seq values in evidence_refs; Git delegates must have an inspected diff and completed merge. The host verifies cited receipts, branch head and merge ancestry. Describe remaining issues for needs_work or unresolved. Every terminal delegate must be reviewed before final delivery.",
+            json!({"agent_id":{"type":"string"},"decision":{"type":"string","enum":["accepted","needs_work","unresolved"]},"evidence":{"type":"string","minLength":1,"maxLength":12000},"evidence_refs":{"type":"array","items":{"type":"integer"},"maxItems":64},"git_head":{"type":"string"}}),
             json!(["agent_id", "decision", "evidence"]),
         ),
+        function("inspect_agent_changes", "Inspect a completed Git delegate's branch diff against its starting commit. Use its returned head in merge_agent_result and review_agent_result.",
+            json!({"agent_id":{"type":"string"}}),json!(["agent_id"])),
+        function("merge_agent_result", "Merge a completed Git delegate branch into the main checkout after inspecting its diff. A conflict leaves the main checkout for explicit resolution; complete or abort the merge before review.",
+            json!({"agent_id":{"type":"string"},"expected_head":{"type":"string"}}),json!(["agent_id","expected_head"])),
         function(
             "cancel_agent",
             "Cancel one of this conversation's task agents. Already executed actions are not undone. Collect and review its outcome before final delivery.",
@@ -121,8 +137,63 @@ pub fn tools() -> Vec<Value> {
 pub fn is_tool(name: &str) -> bool {
     matches!(
         name,
-        "spawn_agent" | "wait_agents" | "review_agent_result" | "cancel_agent"
+        "spawn_agent" | "wait_agents" | "review_agent_result" | "cancel_agent" | "inspect_agent_changes" | "merge_agent_result"
     )
+}
+pub fn ensure_active(root: &Path, task: &str, id: &str) -> Result<()> {
+    let active: bool = db(root)?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_delegates d JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.id=?2 AND d.status='running' AND e.owner_id=?3 AND e.cancel_requested=0)",
+        params![task,id,instance()],|r|r.get(0))?;
+    ensure!(active,"DELEGATE_EXECUTOR_FENCED: delegate is no longer owned by this host");
+    Ok(())
+}
+pub struct ResourceClaim {
+    root: PathBuf,
+    resource: String,
+    owner: String,
+    release_on_drop: bool,
+}
+impl Drop for ResourceClaim {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            if let Ok(conn)=db(&self.root) {
+                let _=conn.execute("DELETE FROM agent_resource_claims WHERE resource=?1 AND owner=?2",
+                    params![self.resource,self.owner]);
+            }
+        }
+    }
+}
+pub fn resource_key(workspace: &Path, name: &str, args: &Value) -> Result<Option<String>> {
+    if matches!(name,"write_file"|"edit_file"|"replace_range") {
+        let path=args["path"].as_str().context("write path required")?;
+        return Ok(Some(format!("local:{}",crate::file_edit::workspace_path(workspace,path)?.display())));
+    }
+    if name=="ppt_master__write_file" {
+        let project=args["project_id"].as_u64().context("PPT project required")?;
+        let path=args["path"].as_str().context("PPT file path required")?;
+        return Ok(Some(format!("ppt:{project}:{path}")));
+    }
+    Ok(None)
+}
+pub fn claim_resource(root: &Path, task: &str, agent: Option<&str>, call_id: &str, resource: String) -> Result<ResourceClaim> {
+    let owner=agent.map(|id|format!("delegate:{id}")).unwrap_or_else(||format!("main:{task}:{call_id}"));
+    let mut conn=db(root)?;
+    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let previous=tx.query_row("SELECT owner,owner_agent,expires_at FROM agent_resource_claims WHERE resource=?1",[&resource],
+        |r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,i64>(2)?))).optional()?;
+    if let Some((other,other_agent,expiry))=previous {
+        if other!=owner {
+            let active=if let Some(id)=other_agent {
+                tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates d JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.id=?1 AND d.status='running' AND e.lease_until>?2)",
+                    params![id,now_ms()],|r|r.get::<_,bool>(0))?
+            } else {expiry>now_ms()};
+            ensure!(!active,"RESOURCE_WRITE_OWNERSHIP_CONFLICT: {resource} is owned by {other}");
+        }
+    }
+    tx.execute("INSERT INTO agent_resource_claims(resource,task_id,owner,owner_agent,expires_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(resource) DO UPDATE SET task_id=excluded.task_id,owner=excluded.owner,owner_agent=excluded.owner_agent,expires_at=excluded.expires_at",
+        params![resource,task,owner,agent,now_ms()+30*60*1000])?;
+    tx.commit()?;
+    Ok(ResourceClaim{root:root.to_path_buf(),resource,owner,release_on_drop:agent.is_none()})
 }
 pub fn specification(root: &Path, task: &str, id: &str) -> Result<Value> {
     let raw: String = db(root)?.query_row(
@@ -167,6 +238,23 @@ pub fn submit(
             .filter(|s| s.chars().count() <= 48000)
             .context("context must be a string (up to 48000 characters)")?,
     };
+    let asset_ids = match args.get("asset_ids") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => {
+            let items = value.as_array().context("asset_ids must be an array")?;
+            ensure!(items.len() <= 64, "asset_ids supports at most 64 entries");
+            items
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.chars().count() <= 200)
+                        .map(str::to_owned)
+                        .context("asset_ids entries must be non-empty strings up to 200 characters")
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
     reap(state.workspace.root(), task)?;
     let mut conn = db(state.workspace.root())?;
     // Hold the executor registry lock until the durable reservation is registered.
@@ -192,9 +280,18 @@ pub fn submit(
         "AGENT_CONCURRENCY_LIMIT: five delegates are already running; collect results before dispatching more"
     );
     let id = agent_service::uuid_like();
-    let (through, _) = crate::session_history::requirement_snapshot(&tx, task)?;
-    let spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"authority":"delegated_task_not_a_human_message"});
+    let git = if crate::plugin_sessions::owner(state.workspace.root(),task)?.is_none()
+        && !ban_execution && !matches!(state.permission_mode, agent_service::PermissionMode::ReadOnly) {
+        crate::delegate_git::prepare(state.workspace.root(), &id)?
+    } else { None };
+    let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
+    let spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
     tx.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,'running',?7)",params![id,task,turn,call,name,spec.to_string(),chrono::Utc::now().timestamp_millis()])?;
+    tx.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,?2,?3)",
+        params![id,instance(),now_ms()+LEASE_MS])?;
+    if let Some(assets) = shared_context.get("delegation_assets") {
+        remember_assets(&tx, task, &id, assets)?;
+    }
     agent_service::append_event_tx(
         &tx,
         task,
@@ -222,7 +319,7 @@ pub fn submit(
     );
     tokio::spawn(async move {
         let _guard = Guard(job.clone());
-        let outcome = tokio::spawn(crate::single_agent::run_delegate(
+        let mut execution = tokio::spawn(crate::single_agent::run_delegate(
             state.clone(),
             task.clone(),
             model,
@@ -232,8 +329,24 @@ pub fn submit(
             ban_execution,
             shared_context,
             child.clone(),
-        ))
-        .await;
+        ));
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+        let outcome = loop {
+            tokio::select! {
+                result = &mut execution => break result,
+                _ = heartbeat.tick() => {
+                    if let Ok(conn) = db(state.workspace.root()) {
+                        let cancel_requested = conn.query_row(
+                            "SELECT cancel_requested FROM agent_delegate_executors WHERE agent_id=?1 AND owner_id=?2",
+                            params![job,instance()], |r| r.get::<_,bool>(0)).unwrap_or(false);
+                        if cancel_requested { child.cancel(); }
+                        let updated = conn.execute("UPDATE agent_delegate_executors SET lease_until=?3 WHERE agent_id=?1 AND owner_id=?2 AND EXISTS (SELECT 1 FROM agent_delegates WHERE id=?1 AND status='running')",
+                            params![job,instance(),now_ms()+LEASE_MS]);
+                        if !matches!(updated,Ok(1)) { child.cancel(); }
+                    }
+                }
+            }
+        };
         let mut result = match outcome {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
@@ -243,10 +356,24 @@ pub fn submit(
                 json!({"status":"interrupted","error":format!("delegate executor stopped: {error}")})
             }
         };
+        if let Ok(spec) = specification(state.workspace.root(), &task, &job) {
+            match crate::delegate_git::finish(&spec) {
+                Ok(Some(git)) => result["git"] = git,
+                Ok(None) => {},
+                Err(error) => {
+                    result["status"] = json!("failed");
+                    result["error"] = json!(format!("could not snapshot delegate Git changes: {error:#}"));
+                }
+            }
+        }
         let mut persist = || -> Result<()> {
             let mut conn = db(state.workspace.root())?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             result["artifact_index"] = artifact_index(&tx, &task, &job)?;
+            let updated = tx.execute(
+                "UPDATE agent_delegates SET status=?3,result=?4 WHERE id=?1 AND status='running' AND EXISTS (SELECT 1 FROM agent_delegate_executors WHERE agent_id=?1 AND owner_id=?2)",
+                params![job,instance(),result["status"].as_str().unwrap_or("failed"),result.to_string()])?;
+            if updated == 0 { return Ok(()); }
             let seq = agent_service::append_event_tx(
                 &tx,
                 &task,
@@ -254,15 +381,8 @@ pub fn submit(
                 &json!({"agent_id":job,"turn":turn,"result":result,"status":result["status"]}),
                 Some("append"),
             )?;
-            tx.execute(
-                "UPDATE agent_delegates SET status=?2,result=?3,end_seq=?4 WHERE id=?1",
-                params![
-                    job,
-                    result["status"].as_str().unwrap_or("failed"),
-                    result.to_string(),
-                    seq
-                ],
-            )?;
+            tx.execute("UPDATE agent_delegates SET end_seq=?2 WHERE id=?1",params![job,seq])?;
+            tx.execute("DELETE FROM agent_resource_claims WHERE owner_agent=?1",[&job])?;
             discard_working_context(&tx, &task, &job)?;
             tx.commit()?;
             Ok(())
@@ -281,11 +401,12 @@ fn reap(root: &Path, task: &str) -> Result<()> {
     let mut conn = db(root)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let ids = tx
-        .prepare("SELECT id FROM agent_delegates WHERE task_id=?1 AND status='running'")?
-        .query_map([task], |r| r.get::<_, String>(0))?
+        .prepare("SELECT d.id,e.owner_id,e.lease_until FROM agent_delegates d LEFT JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.status='running'")?
+        .query_map([task], |r| Ok((r.get::<_, String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<i64>>(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in ids {
-        if !executors.contains_key(&id) {
+    for (id, owner, lease) in ids {
+        let local = owner.as_deref() == Some(instance());
+        if (local && !executors.contains_key(&id)) || (!local && lease.is_none_or(|until| until < now_ms())) {
             let result = json!({"status":"interrupted","error":"No live executor after restart. Inspect saved artifacts; the host did not replay the task.","artifact_index":artifact_index(&tx,task,&id)?});
             tx.execute(
                 "UPDATE agent_delegates SET status='interrupted',result=?2 WHERE id=?1",
@@ -302,6 +423,7 @@ fn reap(root: &Path, task: &str) -> Result<()> {
                 "UPDATE agent_delegates SET end_seq=?2 WHERE id=?1",
                 params![id, seq],
             )?;
+            tx.execute("DELETE FROM agent_resource_claims WHERE owner_agent=?1",[&id])?;
             discard_working_context(&tx, task, &id)?;
         }
     }
@@ -340,6 +462,50 @@ pub async fn wait(root: &Path, task: &str, cancel: &CancellationToken, millis: u
         tokio::select! {_=cancel.cancelled()=>anyhow::bail!("cancelled"),_=notified=>{},_=tokio::time::sleep_until(deadline)=>return Ok(())}
     }
 }
+fn terminal_git(root: &Path, task: &str, id: &str) -> Result<Value> {
+    let conn = db(root)?;
+    let (status,result): (String,Option<String>) = conn.query_row(
+        "SELECT status,result FROM agent_delegates WHERE task_id=?1 AND id=?2",params![task,id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(status != "running", "delegate is still running");
+    let spec = specification(root,task,id)?;
+    ensure!(spec["git"].is_object(), "delegate has no Git branch");
+    let recorded: Value=serde_json::from_str(result.as_deref().context("delegate result missing")?)?;
+    let head=recorded["git"]["head"].as_str().context("delegate Git snapshot missing")?;
+    ensure!(crate::delegate_git::diff(root,&spec)?["head"].as_str()==Some(head),
+        "delegate branch changed after its archived result");
+    Ok(spec)
+}
+pub fn inspect_changes(root: &Path, task: &str, id: &str) -> Result<Value> {
+    crate::delegate_git::diff(root,&terminal_git(root,task,id)?)
+}
+pub fn merge_result(root: &Path, task: &str, id: &str, head: &str) -> Result<Value> {
+    let spec = terminal_git(root,task,id)?;
+    ensure!(head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected_head must be a reviewed Git commit");
+    let inspected: bool = db(root)?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_task_events c JOIN agent_task_events r ON r.task_id=c.task_id AND r.kind='tool/result' AND json_extract(r.data,'$.message.toolCallId')=json_extract(c.data,'$.callId') WHERE c.task_id=?1 AND c.kind='tool/call' AND json_extract(c.data,'$.name')='inspect_agent_changes' AND json_extract(json_extract(c.data,'$.arguments'),'$.agent_id')=?2 AND json_extract(r.data,'$.meta.result.head')=?3 AND json_extract(r.data,'$.message.isError')=0)",
+        params![task,id,head],|r|r.get(0))?;
+    ensure!(inspected,"inspect the delegate branch diff before merging");
+    crate::delegate_git::merge(root,&spec,head)
+}
+fn checked_receipt(tx: &rusqlite::Transaction<'_>, task: &str, seq: i64, after: i64) -> Result<(String,Value)> {
+    ensure!(seq > after, "evidence event predates delegate completion");
+    let raw: String = tx.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND seq=?2 AND kind='tool/result'",
+        params![task,seq],|r|r.get(0)).context("evidence_refs must cite main Agent tool results")?;
+    let result: Value = serde_json::from_str(&raw)?;
+    ensure!(result["message"]["isError"] == false,"evidence receipt is a failed tool result");
+    let call_id = result["message"]["toolCallId"].as_str().context("evidence receipt has no call id")?;
+    let name: String = tx.query_row("SELECT json_extract(data,'$.name') FROM agent_task_events WHERE task_id=?1 AND kind='tool/call' AND seq<?2 AND json_extract(data,'$.callId')=?3 ORDER BY seq DESC LIMIT 1",
+        params![task,seq,call_id],|r|r.get(0)).context("evidence receipt has no main Agent tool call")?;
+    Ok((name,result["meta"]["result"].clone()))
+}
+fn fresh_local_read(root: &Path, value: &Value) -> Result<bool> {
+    let Some(path) = value["path"].as_str() else { return Ok(false); };
+    let Some(hash) = value["code_hash"].as_str() else { return Ok(false); };
+    let path = crate::file_edit::workspace_path(root,path)?;
+    let current = match std::fs::read(path) { Ok(bytes)=>bytes, Err(_)=>return Ok(false) };
+    Ok(crate::symbol_description::content_hash(&current)==hash)
+}
 pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
     let id = args["agent_id"].as_str().context("agent_id required")?;
     let decision = args["decision"]
@@ -350,9 +516,59 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
         .as_str()
         .filter(|s| !s.trim().is_empty() && s.chars().count() <= 12000)
         .context("acceptance evidence or unresolved gaps required")?;
+    let spec = specification(root,task,id)?;
     let mut conn = db(root)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let value = json!({"decision":decision,"evidence":evidence});
+    let refs = args["evidence_refs"].as_array().cloned().unwrap_or_default();
+    ensure!(refs.len() <= 64,"too many evidence_refs");
+    let (end_seq,child_result): (i64,String) = tx.query_row("SELECT end_seq,result FROM agent_delegates WHERE task_id=?1 AND id=?2 AND status!='running' AND delivered=1",
+        params![task,id],|r|Ok((r.get(0)?,r.get(1)?))).context("delegate unavailable: collect its terminal result before review")?;
+    let child_result: Value=serde_json::from_str(&child_result)?;
+    let mut receipts = Vec::new();
+    for seq in &refs {
+        receipts.push(checked_receipt(&tx,task,seq.as_i64().context("evidence_refs must be event sequence numbers")?,end_seq)?);
+    }
+    if decision == "accepted" {
+        ensure!(!receipts.is_empty(),"accepted review requires cited main Agent tool results");
+        if spec["git"].is_object() {
+            let head = args["git_head"].as_str().context("accepted Git review requires git_head from inspected diff")?;
+            ensure!(child_result["git"]["head"].as_str()==Some(head),
+                "reviewed Git commit differs from the delegate's archived result");
+            ensure!(receipts.iter().any(|(name,value)| name=="inspect_agent_changes" && value["head"].as_str()==Some(head) && value["branch"]==spec["git"]["branch"]),
+                "accepted Git review must cite the inspected branch diff");
+            ensure!(receipts.iter().any(|(name,value)| name=="merge_agent_result" && value["merged_head"].as_str()==Some(head)),
+                "accepted Git review must cite the merge result");
+            ensure!(crate::delegate_git::is_merged(root,&spec,head)?,"delegate commit is not present in the main branch");
+            let changed=crate::delegate_git::changed_paths(root,&spec)?;
+            let existing=changed.iter().filter(|path| root.join(path).is_file()).collect::<Vec<_>>();
+            if !existing.is_empty() {
+                ensure!(receipts.iter().any(|(name,value)|
+                    matches!(name.as_str(),"read_file"|"read_file_lines")
+                    && value["path"].as_str().is_some_and(|path|existing.iter().any(|changed|changed.as_str()==path))
+                    && fresh_local_read(root,value).unwrap_or(false)),
+                    "accepted Git review must cite a current read of an integrated changed file");
+            }
+        } else {
+            let output_paths=child_result["artifact_index"]["assets"].as_array().into_iter().flatten()
+                .filter(|asset| asset["source_tool"].as_str().is_some_and(|tool|matches!(tool,"write_file"|"edit_file"|"replace_range"|"ppt_master__write_file")))
+                .filter_map(|asset|asset["source_path"].as_str()).collect::<Vec<_>>();
+            let mut inspected = false;
+            for (name,value) in &receipts {
+                if name=="read_file" || name=="read_file_lines" {
+                    inspected |= value["path"].as_str().is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
+                        && fresh_local_read(root,value)?;
+                } else if name.ends_with("__read_file") {
+                    let path=value["data"]["path"].as_str().or_else(||value["path"].as_str());
+                    inspected |= path.is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
+                        && (value["data"]["revision"].is_number() || value["revision"].is_number());
+                } else if name=="analyze_images" {
+                    inspected |= value["status"]=="succeeded" || value["status"]=="completed";
+                }
+            }
+            ensure!(inspected,"accepted review must cite a current artifact inspection with a checked version");
+        }
+    }
+    let value = json!({"decision":decision,"evidence":evidence,"evidence_refs":refs,"git_head":args["git_head"]});
     let n=tx.execute("UPDATE agent_delegates SET review=?3 WHERE task_id=?1 AND id=?2 AND status!='running' AND delivered=1",params![task,id,value.to_string()])?;
     ensure!(
         n == 1,
@@ -370,6 +586,7 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
 }
 pub fn cancel_one(root: &Path, task: &str, id: &str) -> Result<Value> {
     specification(root, task, id)?;
+    db(root)?.execute("UPDATE agent_delegate_executors SET cancel_requested=1 WHERE agent_id=?1",[id])?;
     if let Some((path, parent, token)) = running().lock().unwrap().get(id) {
         ensure!(path == root && parent == task, "delegate scope denied");
         token.cancel();
@@ -377,6 +594,9 @@ pub fn cancel_one(root: &Path, task: &str, id: &str) -> Result<Value> {
     Ok(json!({"agent_id":id,"cancellation_requested":true}))
 }
 pub fn cancel_all(root: &Path, task: &str) {
+    if let Ok(conn) = db(root) {
+        let _ = conn.execute("UPDATE agent_delegate_executors SET cancel_requested=1 WHERE agent_id IN (SELECT id FROM agent_delegates WHERE task_id=?1 AND status='running')",[task]);
+    }
     for (path, parent, token) in running().lock().unwrap().values() {
         if path == root && parent == task {
             token.cancel();
@@ -387,6 +607,84 @@ pub fn cancel_all(root: &Path, task: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resource_claim_blocks_other_writers_until_delegate_finishes() {
+        let root=std::env::temp_dir().join(format!("delegate-claim-{}",agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn=db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        for id in ["a","b"] {
+            conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,'task',1,?1,?1,'{}','running',0)",[id]).unwrap();
+            conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,'host',?2)",params![id,now_ms()+LEASE_MS]).unwrap();
+        }
+        let first=claim_resource(&root,"task",Some("a"),"call","local:/project/file.rs".into()).unwrap();
+        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_err());
+        assert!(claim_resource(&root,"task",None,"main-call","local:/project/file.rs".into()).is_err());
+        drop(first);
+        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_err());
+        conn.execute("UPDATE agent_delegates SET status='completed' WHERE id='a'",[]).unwrap();
+        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_ok());
+        drop(conn);
+        let _=std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn accepted_git_review_requires_inspected_and_merged_commit_receipts() {
+        let parent=std::env::temp_dir().join(format!("delegate-review-{}",agent_service::uuid_like()));
+        let root=parent.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let git=|args:&[&str]| {
+            let output=std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init","-b","main"]);
+        std::fs::write(root.join("file.txt"),"before\n").unwrap();
+        git(&["add","-A"]);
+        git(&["-c","user.name=Test","-c","user.email=test@local","commit","-m","base"]);
+        let mut conn=db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('parent','test','fake','running',0,0)",[]).unwrap();
+        let worktree=crate::delegate_git::prepare(&root,"child").unwrap().unwrap();
+        let spec=json!({"git":worktree});
+        std::fs::write(crate::delegate_git::workspace(&root,&spec).unwrap().join("file.txt"),"after\n").unwrap();
+        let head=crate::delegate_git::finish(&spec).unwrap().unwrap()["head"].as_str().unwrap().to_owned();
+        let end={let tx=conn.transaction().unwrap();
+            let seq=agent_service::append_event_tx(&tx,"parent","subagent/end",&json!({"agent_id":"child"}),Some("append")).unwrap();
+            tx.commit().unwrap();seq};
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,result,delivered,end_seq,created_at) VALUES ('child','parent',1,'spawn','work',?1,'completed',?2,1,?3,0)",params![spec.to_string(),json!({"status":"completed","git":{"head":head},"artifact_index":{"assets":[]}}).to_string(),end]).unwrap();
+        let rejected=review(&root,"parent",&json!({"agent_id":"child","decision":"accepted","evidence":"looks fine"}));
+        assert!(rejected.is_err());
+        let record=|conn:&mut rusqlite::Connection,call:&str,name:&str,args:Value,result:Value| -> i64 {
+            let tx=conn.transaction().unwrap();
+            agent_service::append_event_tx(&tx,"parent","tool/call",&json!({"callId":call,"name":name,"arguments":args.to_string()}),None).unwrap();
+            let seq=agent_service::append_event_tx(&tx,"parent","tool/result",&json!({"message":{"toolCallId":call,"isError":false},"meta":{"result":result}}),None).unwrap();
+            tx.commit().unwrap();seq
+        };
+        let inspected=inspect_changes(&root,"parent","child").unwrap();
+        let inspect_seq=record(&mut conn,"inspect","inspect_agent_changes",json!({"agent_id":"child"}),inspected);
+        let merged=merge_result(&root,"parent","child",&head).unwrap();
+        let merge_seq=record(&mut conn,"merge","merge_agent_result",json!({"agent_id":"child","expected_head":head}),merged);
+        let bytes=std::fs::read(root.join("file.txt")).unwrap();
+        let read_seq=record(&mut conn,"read","read_file",json!({"path":"file.txt"}),
+            json!({"path":"file.txt","code_hash":crate::symbol_description::content_hash(&bytes),"content":"after\n"}));
+        let accepted=review(&root,"parent",&json!({"agent_id":"child","decision":"accepted","evidence":"Reviewed the branch diff, merged commit and integrated file","evidence_refs":[inspect_seq,merge_seq,read_seq],"git_head":head})).unwrap();
+        assert_eq!(accepted["review"]["decision"],"accepted");
+        let path=crate::delegate_git::workspace(&root,&spec).unwrap();
+        git(&["worktree","remove","--force",path.to_str().unwrap()]);
+        drop(conn);
+        let _=std::fs::remove_dir_all(parent);
+    }
+    #[test]
+    fn live_foreign_executor_is_not_reaped_and_expired_one_is() {
+        let root=std::env::temp_dir().join(format!("delegate-lease-{}",agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn=db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('parent','x','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('foreign','parent',1,'call','work','{}','running',0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('foreign','other-host',?1)",[now_ms()+LEASE_MS]).unwrap();
+        assert_eq!(statuses(&root,"parent").unwrap()[0]["status"],"running");
+        conn.execute("UPDATE agent_delegate_executors SET lease_until=?1 WHERE agent_id='foreign'",[now_ms()-1]).unwrap();
+        assert_eq!(statuses(&root,"parent").unwrap()[0]["status"],"interrupted");
+        let _=std::fs::remove_dir_all(root);
+    }
     #[tokio::test]
     async fn five_slots_exclude_compression_and_enforce_parent_cancellation_scope() {
         use axum::{Router, routing::post};
@@ -406,7 +704,7 @@ mod tests {
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_runtime_windows(task_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(task_id,scope));INSERT INTO agent_runtime_windows VALUES ('parent','context:compression','{}');").unwrap();
         let cancel = CancellationToken::new();
-        let args = json!({"name":"isolated task","task":"Do assigned work only","context":"shared constraints"});
+        let args = json!({"name":"isolated task","task":"Do assigned work only","context":"shared constraints","asset_ids":["asset-a","asset-b"]});
         let mut ids = Vec::new();
         for i in 0..5 {
             let result = submit(
@@ -424,6 +722,10 @@ mod tests {
             .unwrap();
             ids.push(result["agent_id"].as_str().unwrap().to_owned());
         }
+        let spec = specification(&root, "parent", &ids[0]).unwrap();
+        assert_eq!(spec["priority_asset_ids"], json!(["asset-a", "asset-b"]));
+        assert!(spec["requirement_event_seqs"].is_array());
+        assert_eq!(spec["delegation_projection"].as_bool(), Some(false));
         assert!(
             submit(
                 &state,

@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicU64,Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -2295,15 +2295,14 @@ pub async fn interrupt_flow_node(
 }
 
 pub(crate) fn uuid_like() -> String {
-    // Unique enough for task IDs while keeping this service dependency-free.
-    format!(
-        "{:x}{:x}",
-        now(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )
+    let mut bytes=[0u8;16];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return bytes.iter().map(|byte|format!("{byte:02x}")).collect();
+    }
+    static FALLBACK: AtomicU64=AtomicU64::new(0);
+    format!("{:08x}{:016x}{:08x}",std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64,
+        FALLBACK.fetch_add(1,Ordering::Relaxed) as u32)
 }
 
 async fn write_db_retry<F>(action: &str, write: F) -> anyhow::Result<()>

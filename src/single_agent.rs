@@ -21,7 +21,11 @@ const SUMMARY_BUDGET: usize = 24_000;
 const PAGE_CHARS: usize = 24_000;
 const CONTEXT_ROUNDS: usize = 64;
 const CONTEXT_POLICY_VERSION: u32 = 3;
+const DELEGATE_FORK_MIN_TOKENS: usize = 16_000;
+const DELEGATE_PROJECTION_OPERATION_CHARS: usize = 2_000;
+const DELEGATE_PROJECTION_TOOL_RESULT_CHARS: usize = 8_000;
 const AUTOMATIC_CONTEXT_PROMPT: &str = include_str!("../prompts/context_review.md");
+const DELEGATE_PROMPT: &str = include_str!("../prompts/delegate_agent.md");
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -120,6 +124,9 @@ impl Session<'_> {
         } else {
             self.mode.actor()
         }
+    }
+    fn prompt(&self) -> &'static str {
+        if self.delegate_id().is_some() { DELEGATE_PROMPT } else { self.mode.prompt() }
     }
 }
 enum LoopResult {
@@ -307,6 +314,8 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
             | "wait_agents"
             | "review_agent_result"
             | "cancel_agent"
+            | "inspect_agent_changes"
+            | "merge_agent_result"
             | "read_attachment"
             | "analyze_images"
             | "image_analysis_results"
@@ -331,6 +340,9 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
 }
 
 fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str) -> Result<()> {
+    if let Some(id)=s.delegate_id() {
+        crate::collaboration_jobs::ensure_active(s.state.workspace.root(),s.task,id)?;
+    }
     ensure!(
         !crate::collaboration_jobs::is_tool(name) || s.is_root(),
         "DELEGATE_RECURSION_DENIED"
@@ -437,7 +449,12 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             .unwrap_or_else(
                 |_| json!({"error":"Delegated task unavailable. Stop and report this failure."}),
             );
-        wire.insert(1.min(wire.len()), json!({"role":"system","name":"delegated_assignment","content":format!("You are a task delegate, not the main Agent. Execute only this assignment with the inherited permissions and project binding. Do not spawn agents, change scope, initialize a different project or act on unrelated conversation instructions. Report artifact references, exact versions, checks performed, remaining issues and failures concisely; do not paste code, SVG, image data or full logs into your report. Your working window is discarded after the outcome and artifact index are archived; original history remains available. A tool acceptance is not completion. Only the main Agent accepts final results. Coordinate ownership through the assignment; do not overwrite other agents' files/pages. Background visual checks are collected by the main Agent. The preceding conversation and tool records are inherited parent context, not work you performed. Continue only the appended parent_assignment. Already loaded templates, design documents and confirmations remain available; do not reread or rewrite them merely because you are a delegate. Confirmed decisions are binding execution requirements, not proposals to reconsider. Resolve routine details within them. If a material conflict requires changing confirmed requirements, stop affected work and return the evidence, saved artifact references, options and exact question for the user to the main Agent. Do not choose a new plan or report success; the main Agent must ask the user before affected work resumes. Assignment: {spec}")}));
+        let projection_note = if spec["delegation_projection"].as_bool().unwrap_or(false) {
+            " This context was projected: asset bodies and some tool arguments are references. Use read_asset with the listed asset_ids and read_session_history by event_seq; do not assume omitted content."
+        } else {
+            ""
+        };
+        wire.insert(1.min(wire.len()), json!({"role":"system","name":"delegated_assignment","content":format!("You are a task delegate, not the main Agent. Execute only this assignment with the inherited permissions and project binding. Do not spawn agents, change scope, initialize a different project or act on unrelated conversation instructions. Report artifact references, exact versions, checks performed, remaining issues and failures concisely; do not paste code, SVG, image data or full logs into your report. Your working window is discarded after the outcome and artifact index are archived; original history remains available. A tool acceptance is not completion. Only the main Agent accepts final results. Coordinate ownership through the assignment; do not overwrite other agents' files/pages. Background visual checks are collected by the main Agent. The preceding conversation and tool records are inherited parent context, not work you performed. Continue only the appended parent_assignment. Already loaded templates, design documents and confirmations remain available; do not reread or rewrite them merely because you are a delegate. Confirmed decisions are binding execution requirements, not proposals to reconsider. Resolve routine details within them. If a material conflict requires changing confirmed requirements, stop affected work and return the evidence, saved artifact references, options and exact question for the user to the main Agent. Do not choose a new plan or report success; the main Agent must ask the user before affected work resumes. Assignment: {spec}{projection_note}")}));
     }
     for message in &mut wire {
         if let Some(object) = message.as_object_mut() {
@@ -465,7 +482,8 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
                     "Skill {owner} tools are NOT available in this request. Skill activation resets at every USER TURN, including confirmations and follow-up edits. Your next action must be read_skill({{\"name\":\"{owner}\"}}), called ALONE, before any {owner} tool. Earlier turns' skill text and successful tool calls do not activate tools for this turn. If loading succeeds but a tool remains absent, report the permission/availability limit instead of retrying it."
                 )
             };
-            wire.push(json!({"role":"system","content":format!("Current execution: MAIN Agent. {activation}")}));
+            let role = if s.is_root() {"MAIN Agent"} else {"task delegate"};
+            wire.push(json!({"role":"system","content":format!("Current execution: {role}. {activation}")}));
         }
     }
     if s.plugin.as_deref() == Some("ppt-master")
@@ -930,6 +948,9 @@ async fn business_tool(
     call_id: &str,
 ) -> Result<Value> {
     ensure!(page_allows(s, name), "PLUGIN_SCOPE_DENIED: {name}");
+    if let Some(id)=s.delegate_id() {
+        crate::collaboration_jobs::ensure_active(s.state.workspace.root(),s.task,id)?;
+    }
     if name == "read_session_history" {
         let mut args = args;
         if s.mode == Mode::Context || s.delegate_id().is_some() || s.plugin.is_some() {
@@ -978,7 +999,23 @@ async fn business_tool(
                 )),
         "permission_denied: {name}"
     );
-    if crate::workspace_changes::is_mutation(name) {
+    let tool_workspace = if name == "view_image" { s.state.workspace.clone() } else {
+        let path = if let Some(id) = s.delegate_id() {
+            let spec=crate::collaboration_jobs::specification(s.state.workspace.root(),s.task,id)?;
+            crate::delegate_git::workspace(s.state.workspace.root(),&spec)?
+        } else if let Some(plugin)=crate::plugin_sessions::owner(s.state.workspace.root(),s.task)? {
+            crate::plugin_sessions::workspace_dir(s.state.workspace.root(),&plugin)?
+        } else { s.state.workspace.root().to_path_buf() };
+        std::sync::Arc::new(crate::tools::Workspace::new(path)?)
+    };
+    if s.delegate_id().is_some() && tool_workspace.root()!=s.state.workspace.root()
+        && crate::workspace_changes::is_mutation(name) && args["background"]==true {
+        anyhow::bail!("GIT_DELEGATE_BACKGROUND_WRITE_DENIED: finish foreground processes before the branch is snapshotted");
+    }
+    let _claim=if let Some(resource)=crate::collaboration_jobs::resource_key(tool_workspace.root(),name,&args)? {
+        Some(crate::collaboration_jobs::claim_resource(s.state.workspace.root(),s.task,s.delegate_id(),call_id,resource)?)
+    } else { None };
+    if crate::workspace_changes::is_mutation(name) && tool_workspace.root()==s.state.workspace.root() {
         crate::workspace_changes::execute_tracked(
             s.state.clone(),
             s.task.to_owned(),
@@ -988,11 +1025,15 @@ async fn business_tool(
             s.cancel.clone(),
         )
         .await
+    } else if crate::workspace_changes::is_mutation(name) {
+        // Git delegates keep their own branch diff; parent turn snapshots refer
+        // to the main checkout and must not record isolated worktree edits.
+        agent_service::execute_tool(tool_workspace,s.state.tool_catalog.as_deref(),name,args).await
     } else if crate::browser_control::is_tool(name) {
         let mut visual = visual_context(s, node)?;
         visual.source_tool_call_id = call_id.to_owned();
         visual.source_event_id = format!("{}:tool:{call_id}", s.task);
-        crate::browser_control::execute_scoped(&s.state.workspace, &visual, name, &args).await
+        crate::browser_control::execute_scoped(&tool_workspace, &visual, name, &args).await
     } else {
         if let Some(catalog) = &s.state.tool_catalog
             && let Some(page_name) = catalog.packages.page_tool(name)
@@ -1019,7 +1060,7 @@ async fn business_tool(
                     if name.starts_with("ppt_master__") && let (Some(project),Some(remote))=(args["project_id"].as_u64(),catalog.packages.remote_tool(name)) {
                         crate::ppt_sessions::sync_attachments(s.state,s.task,project,&remote).await?;
                     }
-                    catalog.execute(s.state.workspace.clone(), name, args).await
+                    catalog.execute(tool_workspace.clone(), name, args).await
                 } => result,
                 _ = s.cancel.cancelled() => Err(anyhow::anyhow!("task cancelled during skill tool execution")),
             }?;
@@ -1062,7 +1103,7 @@ async fn business_tool(
             return Ok(result);
         }
         agent_service::execute_tool(
-            s.state.workspace.clone(),
+            tool_workspace,
             s.state.tool_catalog.as_deref(),
             name,
             args,
@@ -1397,7 +1438,7 @@ async fn replace_context(
     definitions: &[Value],
 ) -> Result<()> {
     let mut messages = vec![
-        json!({"role":"system","content":Mode::Main.prompt()}),
+        json!({"role":"system","content":s.prompt()}),
         json!({"role":"system","name":"context_summary","content":summary.to_string()}),
     ];
     messages.extend(retained_assets);
@@ -1617,6 +1658,9 @@ async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
 
 async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<LoopResult> {
     for step in 1..=max_rounds {
+        if let Some(id)=s.delegate_id() {
+            crate::collaboration_jobs::ensure_active(s.state.workspace.root(),s.task,id)?;
+        }
         if s.is_root() {
             deliver_delegates(s, w).await?;
             deliver_visual_jobs(s, w).await?;
@@ -1697,7 +1741,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                 match call.name.as_str() {
                     "spawn_agent" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::submit(s.state,s.task,s.turn,&call.call_id,&node,s.model,&args,s.ban_execution,delegate_shared_context(w)?,s.cancel)
+                        let shared=prepare_delegate_context(s,w,&definitions).await?;
+                        crate::collaboration_jobs::submit(s.state,s.task,s.turn,&call.call_id,&node,s.model,&args,s.ban_execution,shared,s.cancel)
                     },
                     "wait_agents" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
@@ -1707,6 +1752,16 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     "review_agent_result" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
                         crate::collaboration_jobs::review(s.state.workspace.root(),s.task,&args)
+                    },
+                    "inspect_agent_changes" => {
+                        ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
+                        crate::collaboration_jobs::inspect_changes(s.state.workspace.root(),s.task,args["agent_id"].as_str().context("agent_id required")?)
+                    },
+                    "merge_agent_result" => {
+                        ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
+                        crate::collaboration_jobs::merge_result(s.state.workspace.root(),s.task,
+                            args["agent_id"].as_str().context("agent_id required")?,
+                            args["expected_head"].as_str().context("expected_head required")?)
                     },
                     "cancel_agent" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
@@ -1762,7 +1817,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         let deep=args["deep"].as_bool().unwrap_or(false);
                         let before=estimate(&request(s,&w.messages,&definitions));
                         let (material,summary,retained,scope)=organize_context(s,&w.messages[..prefix_len],&node,if deep {None}else{Some(before)},&w.active_skills).await?;
-                        let mut proposed=vec![json!({"role":"system","content":Mode::Main.prompt()}),json!({"role":"system","name":"context_summary","content":summary.to_string()})];
+                        let mut proposed=vec![json!({"role":"system","content":s.prompt()}),json!({"role":"system","name":"context_summary","content":summary.to_string()})];
                         proposed.extend(retained.iter().cloned());
                         proposed.extend_from_slice(&w.messages[prefix_len..]);
                         ensure!(estimate(&request(s,&proposed,&definitions))+4096 < s.input_budget,"COMPACTED_CONTEXT_OVER_CAPACITY: original context retained; explicitly release unneeded bodies or choose smaller excerpts");
@@ -1858,6 +1913,9 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     .map(|reference| crate::context_assets::delivered(&result, reference))
                     .unwrap_or_else(|| result.clone())
             };
+            if let Some(object) = delivery.as_object_mut() {
+                object.insert("event_seq".into(),json!(seq));
+            }
             if let (Some(previous), Some(current)) = (&refreshed_from, &asset_reference) {
                 delivery["refresh"] = json!({"previous_asset_id":previous["asset_id"],"current_asset_id":current["asset_id"],
                     "source_version_changed":if previous["source_version"].is_null() || current["source_version"].is_null(){Value::Null}else{json!(previous["source_version"]!=current["source_version"])}});
@@ -2015,6 +2073,160 @@ fn delegate_shared_context(parent: &Window) -> Result<Value> {
     Ok(serde_json::to_value(child)?)
 }
 
+fn delegate_fork_limit(input_budget: usize) -> usize {
+    (compact_threshold(input_budget) / 2).max(DELEGATE_FORK_MIN_TOKENS)
+}
+
+fn strip_projection_images(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if item["type"] == "image_url" {
+                    *item = json!({"type":"text","text":"[inline image data omitted from projected context; use the saved artifact or attachment reference]"});
+                } else {
+                    strip_projection_images(item);
+                }
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values_mut() {
+                strip_projection_images(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn limit_projection_payload(message: &mut Value) {
+    if let Some(operations) = message["operations"].as_array_mut() {
+        for operation in operations {
+            if let Some(arguments) = operation["arguments"]
+                .as_str()
+                .filter(|text| text.chars().count() > DELEGATE_PROJECTION_OPERATION_CHARS)
+            {
+                operation["arguments"] = json!(format!(
+                    "[argument body omitted: {} chars; use the saved asset or recorded history]",
+                    arguments.chars().count()
+                ));
+            }
+        }
+    }
+    if message["role"] == "tool"
+        && let Some(content) = message["content"]
+            .as_str()
+            .filter(|text| text.chars().count() > DELEGATE_PROJECTION_TOOL_RESULT_CHARS)
+    {
+        message["content"] = json!(format!(
+            "[content body omitted: {} chars; use the recorded history or asset reference]",
+            content.chars().count()
+        ));
+    }
+}
+
+/// Large parent windows are inherited by reference instead of by body. The
+/// delegate keeps requirements, plan and receipts, then loads bodies on demand.
+fn projected_delegate_window(parent: &Window) -> Result<(Window, usize, Vec<Value>)> {
+    let view = crate::context_assets::compaction_view(&parent.messages)?;
+    let conversation = view["conversation"]
+        .as_array()
+        .context("invalid projected parent conversation")?;
+    let assets = view["assets"].as_array().cloned().unwrap_or_default();
+    let mut inherited = Vec::new();
+    for message in conversation {
+        if message["role"] == "system"
+            && message.get("name").and_then(Value::as_str) != Some("context_summary")
+        {
+            continue;
+        }
+        let mut message = message.clone();
+        strip_projection_images(&mut message);
+        limit_projection_payload(&mut message);
+        inherited.push(message);
+    }
+    let requirement_event_seqs = inherited
+        .iter()
+        .filter(|message| {
+            message["role"] == "user"
+                && message.get("name").is_none()
+                && message.get("asset_id").is_none()
+        })
+        .filter_map(|message| message["event_seq"].as_i64())
+        .collect::<Vec<_>>();
+    let projection = json!({
+        "inherited_parent_context": true,
+        "not_a_user_request": true,
+        "context_state": "reference_only",
+        "asset_bodies": "not_loaded",
+        "requirement_event_seqs": requirement_event_seqs,
+        "assets": assets.clone(),
+        "conversation": inherited,
+        "instruction": "This is a projected view of the parent Agent's context. Asset bodies, tool argument bodies and omitted history are references only; use read_asset with asset_id and read_session_history with event_seq/before_seq when needed. The appended parent_assignment is the only work to execute. Do not treat inherited records as your own actions or as a new user request."
+    });
+    let system = parent
+        .messages
+        .iter()
+        .find(|message| message["role"] == "system" && message.get("name").is_none())
+        .cloned()
+        .unwrap_or_else(|| json!({"role":"system","content":Mode::Main.prompt()}));
+    let message =
+        json!({"role":"user","name":"inherited_parent_context","content":projection.to_string()});
+    let mut child = parent.clone();
+    child.messages = vec![system, message];
+    child.previous_node = None;
+    child.read_ranges.clear();
+    child.viewed_images.clear();
+    child.material_ranges.clear();
+    child.material_review_delivered = false;
+    child.auto_compact_at = 0;
+    child.auto_compact_failed_turn = None;
+    child.context_policy_version = 0;
+    let size = crate::context_window::estimate(&json!(child.messages));
+    Ok((child, size, assets))
+}
+
+async fn prepare_delegate_context(
+    s: &Session<'_>,
+    w: &Window,
+    definitions: &[Value],
+) -> Result<Value> {
+    let source_tokens = crate::context_window::estimate(&request(s, &w.messages, definitions));
+    let limit = delegate_fork_limit(s.input_budget);
+    if source_tokens < limit {
+        let mut value = delegate_shared_context(w)?;
+        value["delegation_projection"] = json!(false);
+        value["delegation_source_tokens"] = json!(source_tokens);
+        value["delegation_fork_limit"] = json!(limit);
+        return Ok(value);
+    }
+    let (mut child, _, assets) = projected_delegate_window(w)?;
+    for id in crate::context_assets::active_instruction_ids(&w.messages, &w.active_skills) {
+        let delivery = load_saved_asset(s, &json!({"asset_id":id}), None).await?;
+        let reference = delivery["asset_reference"].clone();
+        child.messages.push(crate::context_assets::tagged(
+            json!({"role":"user","name":"saved_asset","content":delivery.to_string()}),
+            &reference,
+        ));
+    }
+    let projected_tokens = crate::context_window::estimate(&json!(child.messages));
+    let hard = s.input_budget.saturating_mul(3) / 4;
+    ensure!(
+        projected_tokens < hard,
+        "DELEGATE_CONTEXT_PROJECTION_OVER_CAPACITY: projected context is estimated at {projected_tokens} tokens, above the {hard}-token delegation limit; compress the conversation or split the task before spawning"
+    );
+    let mut value = serde_json::to_value(child)?;
+    value["delegation_projection"] = json!(true);
+    value["delegation_source_tokens"] = json!(source_tokens);
+    value["delegation_projected_tokens"] = json!(projected_tokens);
+    value["delegation_fork_limit"] = json!(limit);
+    value["delegation_assets"] = json!(
+        assets
+            .into_iter()
+            .map(|asset| json!({"asset_reference": asset}))
+            .collect::<Vec<_>>()
+    );
+    Ok(value)
+}
+
 /// Boxed boundary makes the shared main/delegate tool loop non-recursive in its
 /// future type. Delegates cannot advertise or execute delegation tools.
 pub(crate) fn run_delegate(
@@ -2047,6 +2259,11 @@ pub(crate) fn run_delegate(
         };
         let mut w: Window =
             serde_json::from_value(shared_context).context("invalid inherited execution window")?;
+        if let Some(first) = w.messages.first_mut().filter(|m| m["role"]=="system") {
+            first["content"] = json!(DELEGATE_PROMPT);
+        } else {
+            w.messages.insert(0,json!({"role":"system","content":DELEGATE_PROMPT}));
+        }
         w.messages
             .push(json!({"role":"user","name":"parent_assignment",
             "content":specification.to_string()}));
@@ -2250,6 +2467,37 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::post};
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test]
+    async fn git_delegate_file_tool_writes_only_its_worktree() {
+        let root=TestRoot::new();
+        let git=|args:&[&str]| {
+            let output=std::process::Command::new("git").arg("-C").arg(root.path()).args(args).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init","-b","main"]);
+        std::fs::write(root.path().join("base.txt"),"base\n").unwrap();
+        git(&["add","-A"]);
+        git(&["-c","user.name=Test","-c","user.email=test@local","commit","-m","base"]);
+        let state=agent_service::tests::test_state(root.path(),"127.0.0.1:9".parse().unwrap());
+        let worktree=crate::delegate_git::prepare(root.path(),"worker").unwrap().unwrap();
+        let spec=json!({"git":worktree});
+        let conn=crate::collaboration_jobs::db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('worker','task',1,'call','work',?1,'running',0)",[spec.to_string()]).unwrap();
+        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('worker',?1,?2)",
+            rusqlite::params![crate::collaboration_jobs::test_instance(),chrono::Utc::now().timestamp_millis()+30_000]).unwrap();
+        let cancel=CancellationToken::new();
+        let session=Session{plugin:None,state:&state,task:"task",model:"fake",turn:1,cancel:&cancel,
+            ban_execution:false,mode:Mode::Main,scope:"delegate:worker".into(),parent:Some("main".into()),
+            material:None,input_budget:INPUT_BUDGET};
+        business_tool(&session,"node","write_file",json!({"path":"child.txt","content":"child\n"}),"write").await.unwrap();
+        assert!(!root.path().join("child.txt").exists());
+        assert_eq!(std::fs::read_to_string(crate::delegate_git::workspace(root.path(),&spec).unwrap().join("child.txt")).unwrap(),"child\n");
+        let path=crate::delegate_git::workspace(root.path(),&spec).unwrap();
+        git(&["worktree","remove","--force",path.to_str().unwrap()]);
+        let _=std::fs::remove_dir(path.parent().unwrap());
+    }
+
     #[test]
     fn delegate_shared_context_forks_loaded_material_and_confirmations() {
         let reference =
@@ -2312,12 +2560,118 @@ mod tests {
         assert_eq!(child.messages[5]["content"], "PAGE_1_SAVED_REVISION_2");
     }
 
+    #[test]
+    fn large_delegate_parent_is_projected_to_references() {
+        let reference = json!({"asset_id":"large-asset","source_path":"large.rs","bytes":240000});
+        let body = "A".repeat(240_000);
+        let mut parent = Window {
+            messages: vec![
+                json!({"role":"system","content":"MAIN_SYSTEM"}),
+                json!({"role":"user","content":"Keep the API stable"}),
+                json!({"role":"assistant","content":"Plan: inspect then delegate","tool_calls":[{"id":"read","function":{"name":"read_file","arguments":"{\"path\":\"large.rs\"}"}}]}),
+                crate::context_assets::tagged(
+                    json!({"role":"tool","tool_call_id":"read","content":body.clone()}),
+                    &reference,
+                ),
+            ],
+            read_ranges: BTreeMap::from([(1, vec![(0, 10)])]),
+            viewed_images: BTreeSet::from(["artifact".to_owned()]),
+            material_ranges: vec![(0, 10)],
+            material_review_delivered: true,
+            auto_compact_at: 123,
+            context_policy_version: CONTEXT_POLICY_VERSION,
+            ..Default::default()
+        };
+        let (child, size, assets) = projected_delegate_window(&parent).unwrap();
+        assert_eq!(assets[0]["asset_id"], "large-asset");
+        let text = serde_json::to_string(&child).unwrap();
+        assert!(!text.contains(&body));
+        for expected in [
+            "large-asset",
+            "large.rs",
+            "Keep the API stable",
+            "Plan: inspect",
+            "inherited_parent_context",
+        ] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+        assert!(child.messages.iter().all(|m| m["role"] != "tool"));
+        assert!(child.read_ranges.is_empty());
+        assert!(child.viewed_images.is_empty());
+        assert!(child.material_ranges.is_empty());
+        assert!(!child.material_review_delivered);
+        assert_eq!(child.context_policy_version, 0);
+        assert!(size < delegate_fork_limit(INPUT_BUDGET));
+        assert_eq!(child.active_skills, parent.active_skills);
+    }
+
+    #[tokio::test]
+    async fn large_parent_request_selects_projection_and_records_reference_mode() {
+        let root = TestRoot::new();
+        let state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
+        let cancel = CancellationToken::new();
+        let session = Session {
+            plugin: None,
+            state: &state,
+            task: "task",
+            model: "fake",
+            turn: 1,
+            cancel: &cancel,
+            ban_execution: true,
+            mode: Mode::Main,
+            scope: "main".into(),
+            parent: None,
+            material: None,
+            input_budget: INPUT_BUDGET,
+        };
+        let reference = json!({"asset_id":"large-asset","source_path":"large.rs","bytes":240000});
+        let body = "A".repeat(240_000);
+        let parent = Window {
+            messages: vec![
+                json!({"role":"system","content":"MAIN_SYSTEM"}),
+                json!({"role":"user","content":"Keep the API stable"}),
+                json!({"role":"assistant","content":"Plan: inspect then delegate"}),
+                crate::context_assets::tagged(
+                    json!({"role":"tool","tool_call_id":"read","content":body.clone()}),
+                    &reference,
+                ),
+            ],
+            ..Default::default()
+        };
+        let definitions = tools(&session, &parent);
+        let value = prepare_delegate_context(&session, &parent, &definitions)
+            .await
+            .unwrap();
+        assert_eq!(value["delegation_projection"].as_bool(), Some(true));
+        let source = value["delegation_source_tokens"].as_u64().unwrap();
+        let projected = value["delegation_projected_tokens"].as_u64().unwrap();
+        assert!(source > projected);
+        assert_eq!(
+            value["delegation_fork_limit"].as_u64().unwrap() as usize,
+            delegate_fork_limit(INPUT_BUDGET)
+        );
+        assert_eq!(
+            value["delegation_assets"][0]["asset_reference"]["asset_id"],
+            "large-asset"
+        );
+        let child: Window = serde_json::from_value(value).unwrap();
+        let text = serde_json::to_string(&child).unwrap();
+        assert!(!text.contains(&body));
+        assert!(text.contains("large-asset"));
+        assert!(text.contains("inherited_parent_context"));
+    }
+
     #[tokio::test]
     async fn delegated_tools_preserve_permission_plugin_scope_and_forbid_recursion() {
         let root = TestRoot::new();
         let mut state =
             agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
         state.permission_mode = agent_service::PermissionMode::ReadOnly;
+        let conn=crate::collaboration_jobs::db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('worker','task',1,'call','work','{}','running',0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('worker',?1,?2)",
+            rusqlite::params![crate::collaboration_jobs::test_instance(),chrono::Utc::now().timestamp_millis()+30_000]).unwrap();
         let cancel = CancellationToken::new();
         let mut session = Session {
             plugin: None,
@@ -2462,7 +2816,8 @@ mod tests {
                                     let inspection=messages.iter().find(|m|m["tool_call_id"]==inspect_id).unwrap();
                                     assert!(inspection["content"].as_str().unwrap().contains(&format!("{name} output")));
                                     if name=="fast" {assert!(!completions.iter().any(|v|v["name"]=="slow"));gate.notify_one();}
-                                    tool(&format!("review-{name}"),"review_agent_result",json!({"agent_id":completion["agent_id"],"decision":"accepted","evidence":format!("Main read and verified {name}.txt contents")}))
+                                    let read:Value=serde_json::from_str(inspection["content"].as_str().unwrap()).unwrap();
+                                    tool(&format!("review-{name}"),"review_agent_result",json!({"agent_id":completion["agent_id"],"decision":"accepted","evidence":format!("Main read and verified {name}.txt contents"),"evidence_refs":[read["event_seq"]]}))
                                 }
                             } else {tool(&format!("wait-{step}"),"wait_agents",json!({"wait_ms":30000}))}
                         }

@@ -20,6 +20,27 @@ pub fn owner(root: &std::path::Path, task: &str) -> Result<Option<String>> {
         )
         .optional()?)
 }
+/// Dedicated agent workspace for one plugin's chats, kept apart from the host
+/// project. Base: `PLUGIN_WORKSPACE_BASE`, else `<root>/.codex-workspace-mcp/plugins`.
+/// Deliverables (PPTs, templates) live in the plugin backend's object storage,
+/// not here; this directory only holds scratch files the agent writes.
+pub fn workspace_dir(root: &std::path::Path, plugin: &str) -> Result<std::path::PathBuf> {
+    ensure!(
+        !plugin.is_empty()
+            && plugin
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && plugin != "."
+            && plugin != "..",
+        "invalid plugin id"
+    );
+    let base = std::env::var_os("PLUGIN_WORKSPACE_BASE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join(".codex-workspace-mcp").join("plugins"));
+    let dir = base.join(plugin).join("workspace");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
 pub fn check(root: &std::path::Path, task: &str, plugin: &str) -> Result<()> {
     ensure!(
         owner(root, task)?.as_deref() == Some(plugin),
@@ -194,6 +215,18 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugin_workspace_is_per_plugin_and_rejects_traversal() {
+        let root = std::env::temp_dir().join(format!("plugin_ws_{}", agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let a = workspace_dir(&root, "ppt-master").unwrap();
+        let b = workspace_dir(&root, "code-flow").unwrap();
+        assert!(a.is_dir() && b.is_dir() && a != b);
+        assert!(a.starts_with(&root));
+        assert!(workspace_dir(&root, "../x").is_err());
+        assert!(workspace_dir(&root, "").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
     async fn body(response: Response) -> Value {
         serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), 1024 * 1024)

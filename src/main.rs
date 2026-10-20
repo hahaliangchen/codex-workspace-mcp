@@ -12,6 +12,7 @@ mod context_assets;
 mod context_rebuild;
 mod context_window;
 mod database;
+mod delegate_git;
 mod file_edit;
 mod go_index;
 mod http_probe;
