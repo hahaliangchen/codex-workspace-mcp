@@ -91,6 +91,8 @@ export interface Task {
   readonly created_at: number
   readonly updated_at: number
   readonly parent_task_id: string | null
+  /** Set for plugin page chats: pure conversations with no working directory. */
+  readonly plugin_id?: string | null
 }
 
 export interface AgentInfo {

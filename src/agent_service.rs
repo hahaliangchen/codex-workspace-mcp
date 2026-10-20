@@ -2236,8 +2236,8 @@ pub async fn list_tasks(
     let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = open_db(&root)?;
-        let mut stmt = conn.prepare("SELECT id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks ORDER BY updated_at DESC LIMIT ?1")?;
-        let rows = stmt.query_map([limit], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0})))?;
+        let mut stmt = conn.prepare("SELECT t.id,t.prompt,t.model,t.status,t.created_at,t.updated_at,t.parent_task_id,t.provider_name,t.reasoning_effort,t.fast_mode,p.plugin_id FROM agent_tasks t LEFT JOIN plugin_sessions p ON p.task_id=t.id ORDER BY t.updated_at DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0,"plugin_id":r.get::<_,Option<String>>(10)?})))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }).await;
     match result {

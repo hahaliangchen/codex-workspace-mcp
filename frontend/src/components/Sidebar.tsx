@@ -80,7 +80,7 @@ const DEFAULT_PROJECT_GROUPS: ProjectCategory[] = [
 ]
 
 export function Sidebar({
-  tasks,
+  tasks: rootTasks,
   allTasks,
   selectedId,
   activeTaskId,
@@ -129,6 +129,11 @@ export function Sidebar({
   const searchInputRef = useRef<HTMLInputElement>(null)
 
   const currentHighlightedId = activeTaskId ?? selectedId
+
+  // Plugin page chats are pure conversations: no working directory, so they
+  // never belong to a project folder.
+  const tasks = useMemo(() => rootTasks.filter(item => !item.plugin_id), [rootTasks])
+  const chatTasks = useMemo(() => rootTasks.filter(item => item.plugin_id), [rootTasks])
 
   // Build children map
   const childrenByParent = useMemo(() => {
@@ -444,6 +449,31 @@ export function Sidebar({
             <span>{showMoreProjects ? '收起显示' : '展开显示'}</span>
           </button>
         </div>
+
+        {/* Section: 聊天 (plugin conversations, no working directory) */}
+        {chatTasks.length > 0 && (
+          <div className={css.section} style={{ marginTop: 14 }}>
+            <div className={css.sectionHeader}>聊天</div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+              {chatTasks.map((task) => {
+                const isSelected = task.task_id === currentHighlightedId
+                const isRunning = task.status === 'running' || task.status === 'cancelling'
+                return (
+                  <button
+                    key={task.task_id}
+                    type="button"
+                    className={clsx(css.recentRow, isSelected && css.recentRowActive)}
+                    onClick={() => onSelect(task.task_id)}
+                    title={taskTitle(task)}
+                  >
+                    <span className={css.sessionTitle}>{taskTitle(task)}</span>
+                    {isRunning && <span className={css.runningSpinner} title="执行中" />}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Section: 最近 */}
         <div className={css.section} style={{ marginTop: 14 }}>
