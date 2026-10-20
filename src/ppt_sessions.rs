@@ -39,6 +39,20 @@ fn binding(root: &std::path::Path, task: &str) -> Result<Option<(String, u64)>> 
         )
         .optional()?)
 }
+/// Tell the PPT service which conversation built a project, so its history
+/// list can point at the Agent. Best effort: the host binding stays the
+/// source of truth for tool calls.
+async fn bind_chat(connection: &Connection, task: &str, project: u64) {
+    if project == 0 {
+        return;
+    }
+    if let Err(error) = connection
+        .rpc("ppt/bindChat", json!({"project_id":project,"task_id":task}))
+        .await
+    {
+        tracing::warn!(%error, task, project, "could not record PPT chat binding");
+    }
+}
 pub fn project(root: &std::path::Path, task: &str) -> Result<Option<u64>> {
     Ok(binding(root, task)?.map(|(_, id)| id))
 }
@@ -140,6 +154,7 @@ pub async fn execute(
             "UPDATE ppt_session_bindings SET project_id=?2 WHERE task_id=?1 AND project_id=0",
             params![task, project],
         )?;
+        bind_chat(&connection, task, project).await;
         sync_attachments(state, task, project, &connection).await?;
     }
     Ok(Some(result))
@@ -295,6 +310,7 @@ async fn handle(
             "INSERT INTO ppt_session_bindings VALUES (?1,?2,?3)",
             params![task, connection.subject, project],
         )?;
+        bind_chat(&connection, task, project).await;
         active()
             .write()
             .unwrap()
