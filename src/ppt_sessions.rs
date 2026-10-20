@@ -452,7 +452,7 @@ mod tests {
                 let user=if h["authorization"]=="Bearer alice"{1}else{2};
                 let args=&body["payload"]["args"];
                 let result=match method.as_str() {
-                    "handshake"=>json!({"version":1,"user_id":user,"connection_id":format!("c{user}"),"state":"awaiting_confirmation","plugin":{"id":"ppt-master","title":"PPT","attachment_extensions":["png","jpg","jpeg","webp","pdf","docx","txt","md"],"skill":"skill:SKILL.md","pages":[],"tools":[{"name":"init_project","description":"Initialize PPT","inputSchema":{"type":"object","properties":{}}},{"name":"write_file","description":"Write SVG","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},{"name":"read_files","description":"Batch read","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}]}}),
+                    "handshake"=>json!({"version":1,"user_id":user,"connection_id":format!("c{user}"),"state":"awaiting_confirmation","plugin":{"id":"ppt-master","title":"PPT","attachment_extensions":["png","jpg","jpeg","webp","pdf","docx","pptx","txt","md"],"skill":"skill:SKILL.md","pages":[],"tools":[{"name":"init_project","description":"Initialize PPT","inputSchema":{"type":"object","properties":{}}},{"name":"write_file","description":"Write SVG","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},{"name":"read_files","description":"Batch read","inputSchema":{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"}}},"required":["paths"]}}]}}),
                     "confirm"=>json!({"state":"ready"}),
                     "identity"=>json!({"user_id":user}),
                     "importAttachment"=>{assert_eq!(user,1);assert_eq!(args["project_id"],7);imports.lock().unwrap().push(args.clone());json!({"path":"sources/brief.md"})},
@@ -633,6 +633,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read["remote_path"], "sources/brief.md");
+        // An uploaded deck is read as text, and its pictures are carried into the project.
+        let deck = base64::engine::general_purpose::STANDARD.encode(std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/attachments/fixtures/sample.pptx")).unwrap());
+        let deck_up=value(handle(&runtime,state.clone(),"upload",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"name":"原稿.pptx","data":deck})).await.unwrap()).await;
+        let mut db = crate::agent_service::open_db(&root).unwrap();
+        let tx = db.transaction().unwrap();
+        crate::attachments::admit(&tx,&root,task,2,"Redo this deck",&[json!({"type":"file","receiptId":deck_up["receiptId"]})],Some("ppt-deck"),
+            Some(crate::attachments::PPT_EXTENSIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())).unwrap();
+        tx.commit().unwrap();
+        let deck_id = &deck_up["file"]["attachmentId"];
+        let text = crate::attachments::read(&state, task, &json!({"attachment_id":deck_id})).await.unwrap();
+        assert!(text["content"].as_str().unwrap().contains("图片 s1p1"));
+        let before = imports.lock().unwrap().len();
+        let moved = crate::attachments::read(&state, task, &json!({"attachment_id":deck_id,"slide":1})).await.unwrap();
+        assert_eq!(moved["pictures"][0]["id"], "s1p1");
+        assert_eq!(moved["pictures"][0]["src"], "project:sources/brief.md");
+        assert_eq!((moved["pictures"][0]["width_px"].as_u64(), moved["pictures"][0]["height_px"].as_u64()), (Some(40), Some(20)));
+        assert_eq!(moved["pictures"][0]["aspect_ratio"], 2.0);
+        let sent = imports.lock().unwrap();
+        assert_eq!(sent.len(), before + 1);
+        assert_eq!(sent[before]["mediaType"], "image/png");
+        assert!(sent[before]["name"].as_str().unwrap().starts_with("s1p1_"));
+        drop(sent);
+        assert!(crate::attachments::read(&state, task, &json!({"attachment_id":deck_id,"picture":"s2p1"})).await.is_err());
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1]["user"], 1);
