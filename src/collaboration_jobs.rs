@@ -520,6 +520,12 @@ fn fresh_local_read(root: &Path, value: &Value) -> Result<bool> {
     let current = match std::fs::read(path) { Ok(bytes)=>bytes, Err(_)=>return Ok(false) };
     Ok(crate::symbol_description::content_hash(&current)==hash)
 }
+fn native_page_inspection(name: &str, value: &Value) -> bool {
+    (name.ends_with("__get_outline") || name.ends_with("__render_slide"))
+        && value["status"] == "succeeded"
+        && value["document"]["revision"].as_u64().is_some_and(|revision| revision > 0)
+        && value["document"]["stable"] == true
+}
 pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
     let id = args["agent_id"].as_str().context("agent_id required")?;
     let decision = args["decision"]
@@ -571,7 +577,9 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
                 .filter_map(|asset|asset["source_path"].as_str()).collect::<Vec<_>>();
             let mut inspected = false;
             for (name,value) in &receipts {
-                if name=="read_file" || name=="read_file_lines" {
+                if native_page_inspection(name, value) {
+                    inspected = true;
+                } else if name=="read_file" || name=="read_file_lines" {
                     inspected |= value["path"].as_str().is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
                         && fresh_local_read(&files,value)?;
                 } else if name.ends_with("__read_file") {
@@ -624,6 +632,21 @@ pub fn cancel_all(root: &Path, task: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_ppt_inspections_require_a_successful_stable_saved_revision() {
+        let mut value = json!({"status":"succeeded","document":{"project_id":813,"revision":7,"stable":true}});
+        assert!(native_page_inspection("ppt_master__get_outline", &value));
+        assert!(native_page_inspection("ppt_master__render_slide", &value));
+        assert!(!native_page_inspection("ppt_master__apply_edits", &value));
+        value["document"]["stable"] = json!(false);
+        assert!(!native_page_inspection("ppt_master__get_outline", &value));
+        value["document"]["stable"] = json!(true);
+        value["document"]["revision"] = json!(0);
+        assert!(!native_page_inspection("ppt_master__render_slide", &value));
+        value["document"]["revision"] = json!(7);
+        value["status"] = json!("failed");
+        assert!(!native_page_inspection("ppt_master__render_slide", &value));
+    }
     #[test]
     fn polling_live_delegates_does_not_wait_for_a_database_writer() {
         let root = std::env::temp_dir().join(format!("delegate-poll-{}", agent_service::uuid_like()));

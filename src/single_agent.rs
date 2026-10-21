@@ -20,7 +20,7 @@ const INPUT_BUDGET: usize =
 const SUMMARY_BUDGET: usize = 24_000;
 const PAGE_CHARS: usize = 24_000;
 const CONTEXT_ROUNDS: usize = 64;
-const CONTEXT_POLICY_VERSION: u32 = 3;
+const CONTEXT_POLICY_VERSION: u32 = 4;
 const DELEGATE_FORK_MIN_TOKENS: usize = 16_000;
 const DELEGATE_PROJECTION_OPERATION_CHARS: usize = 2_000;
 const DELEGATE_PROJECTION_TOOL_RESULT_CHARS: usize = 8_000;
@@ -232,6 +232,14 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     tools.push(function("release_assets", "Explicitly replace selected asset bodies in this working context by their durable references. Original files/history stay saved. Must be called alone, after receiving the material in a model request. The host never releases an asset automatically.",
         json!({"asset_ids":{"type":"array","minItems":1,"items":{"type":"string"}},"reason":{"type":"string"}}),json!(["asset_ids","reason"])));
     tools.push(function("list_context_assets", "Inspect the asset references and loaded/reference-only states in your current context. Does not read asset files or alter context.",json!({}),json!([])));
+    if s.mode == Mode::Main && s.is_root() {
+        tools.push(function("read_task_board", "Read the durable main objective, constraints, deliverables and host execution status. Domain-neutral; not a chat transcript or inferred completion.",json!({}),json!([])));
+        tools.push(function("update_task_definition", "Propose a concise main task definition or change for human UI confirmation. This NEVER changes the active objective. Return awaiting_user_confirmation; do not treat it as approved. Only explicit main-task scope/constraint changes justify updates. Never append temporary steps, emotional remarks, status questions, raw transcripts or progress. Cite real user event sequences from read_session_history; preserve all still-effective constraints. This tool cannot confirm plans or mark work complete.",json!({
+            "expected_version":{"type":"integer","description":"Current definition version from read_task_board; omit only for first creation"},
+            "objective":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},
+            "completion_conditions":{"type":"array","items":{"type":"string"}},
+            "source_event_seqs":{"type":"array","items":{"type":"integer"}}}),json!(["objective","constraints","completion_conditions","source_event_seqs"])));
+    }
     if s.mode == Mode::Main {
         tools.push(function("list_skills", "List installed skill packages and their short applicability descriptions. Load only a skill useful for the current task; the host does not classify the request.",json!({}),json!([])));
         tools.push(function("read_skill", "Read a skill's original SKILL.md and enable its declared tools for this user turn after delivery. Does not change execution permissions or start another agent.",json!({"name":{"type":"string"}}),json!(["name"])));
@@ -312,7 +320,7 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
     };
     matches!(
         name,
-        "spawn_agent"
+        "read_task_board" | "update_task_definition" | "spawn_agent"
             | "wait_agents"
             | "review_agent_result"
             | "cancel_agent"
@@ -392,8 +400,16 @@ fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str)
 /// A page answers in the plugin tool result shape `{ok, content: [text | image]}`.
 /// Images become visual artifacts (the Agent inspects them by artifact_id, as
 /// with any other image) and JSON text is passed through as data.
-fn page_tool_result(s: &Session<'_>, node: &str, call_id: &str, name: &str, answer: Value) -> Result<Value> {
+async fn page_tool_result(s: &Session<'_>, node: &str, call_id: &str, name: &str, args: &Value, answer: Value) -> Result<Value> {
     use base64::Engine;
+    let source = if name == "ppt_master__render_slide" {
+        let (current, error) = current_ppt_project(s).await?;
+        let mut source = crate::visual_jobs::native_page_source(args, &answer["document"], &current);
+        if let Some(error) = error { source["source_binding_error"] = json!(error); }
+        source
+    } else {
+        json!({"source":"plugin_page","tool":name,"project_id":answer["document"]["project_id"],"source_revision":answer["document"]["revision"]})
+    };
     let mut data = Vec::new();
     let mut images = Vec::new();
     for part in answer["content"].as_array().map(Vec::as_slice).unwrap_or_default() {
@@ -414,7 +430,7 @@ fn page_tool_result(s: &Session<'_>, node: &str, call_id: &str, name: &str, answ
                 let image = crate::visual_artifacts::save(
                     s.state.workspace.root(),
                     &visual,
-                    json!({"source":"plugin_page","tool":name}),
+                    source.clone(),
                     &bytes,
                 )?;
                 images.push(json!({"artifact_id":image["artifact_id"],"mime_type":mime}));
@@ -423,13 +439,25 @@ fn page_tool_result(s: &Session<'_>, node: &str, call_id: &str, name: &str, answ
         }
     }
     let ok = answer["ok"].as_bool().unwrap_or(false);
+    let saved_revision = data.iter().find(|part| part["saved"] == true)
+        .and_then(|part| part["revision"].as_u64());
     let mut result = json!({
         "status": if ok { "succeeded" } else { "failed" },
         "data": if data.len() == 1 { data.pop().unwrap() } else { json!(data) },
     });
+    if let Some(document) = answer.get("document") {
+        result["document"] = document.clone();
+    }
     if let Some(first) = images.first() {
         result["artifact_id"] = first["artifact_id"].clone();
         result["images"] = json!(images);
+    }
+    if name.starts_with("ppt_master__") && let Some(revision) = saved_revision {
+        result["visual_evidence"] = json!({"saved_revision":revision,"revision_scope":"deck",
+            "message":"Earlier native PPTX visual checks apply only to their captured revision/hash. Any check from a different saved revision is superseded; render and inspect the current pages before claiming visual approval."});
+    }
+    if name.starts_with("ppt_master__") {
+        crate::ppt_plan::observe_page_result(s.state.workspace.root(),s.task,name,&result)?;
     }
     Ok(result)
 }
@@ -446,6 +474,27 @@ fn visual_context(s: &Session<'_>, node: &str) -> Result<crate::visual_artifacts
 }
 fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value {
     let mut wire = messages.to_vec();
+    // Host-owned requirements are reconstructed independently for every wire
+    // request. They are never written into the compressible Window/Material.
+    let mut anchor_error = match crate::main_task_anchor::message(
+        s.state.workspace.root(), s.task, s.material.as_ref().map(|material| material.through),
+    ) {
+        Ok(Some(anchor)) => {
+            let tokens = estimate(&anchor);
+            wire.insert(1.min(wire.len()), anchor);
+            (tokens.saturating_add(4096) > s.input_budget).then(|| format!(
+                "MAIN_TASK_ANCHOR_OVER_CAPACITY: {tokens} requirement tokens plus reserved process capacity exceed the {} input budget; task definition was not silently omitted", s.input_budget))
+        }
+        Ok(None) => None,
+        Err(error) => Some(format!("MAIN_TASK_ANCHOR_UNAVAILABLE: {error:#}; no model request may omit the main task requirements")),
+    };
+    if s.mode == Mode::Main && s.plugin.as_deref() == Some("ppt-master") {
+        match crate::ppt_task_state::message(s.state.workspace.root(), s.task) {
+            Ok(Some(state)) => wire.insert(1.min(wire.len()), state),
+            Ok(None) => {},
+            Err(error) => anchor_error = Some(format!("PPT_TASK_STATE_UNAVAILABLE: {error:#}; host state was not silently omitted")),
+        }
+    }
     if let Some(id) = s.delegate_id() {
         let spec = crate::collaboration_jobs::specification(s.state.workspace.root(), s.task, id)
             .unwrap_or_else(
@@ -532,6 +581,7 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         }
     }
     let mut body = json!({"model":s.model,"stream":true,"messages":wire,"tools":definitions,"parallel_tool_calls":false});
+    if let Some(error) = anchor_error { body["_host_task_anchor_error"] = json!(error); }
     body["max_tokens"] = json!(output_tokens(s, &body));
     if let Some(effort) = &s.state.reasoning_effort {
         body["reasoning_effort"] = json!(effort);
@@ -568,6 +618,9 @@ async fn model_round(
 ) -> Result<(String, Value)> {
     let node = format!("request_{}", agent_service::uuid_like());
     let mut body = request(s, &w.messages, definitions);
+    if let Some(error) = body.as_object_mut().unwrap().remove("_host_task_anchor_error") {
+        anyhow::bail!("{}", error.as_str().unwrap_or("main task anchor unavailable"));
+    }
     if w.material_review_delivered {
         body["max_tokens"] = json!(4096.min(body["max_tokens"].as_u64().unwrap_or(4096)));
         body["tools"]
@@ -581,6 +634,18 @@ async fn model_round(
                 .remove("asset_context");
         }
         body["tool_choice"] = json!({"type":"function","function":{"name":"submit_context"}});
+        // DeepSeek's official Chat Completions API defaults to thinking mode,
+        // which rejects a forced function (including submit_context) with 400.
+        // Disable it only for this structured submission, never for ordinary
+        // execution/context reading, and identify the API by its exact host
+        // rather than a user-controlled provider/model display name.
+        // https://api-docs.deepseek.com/api/create-chat-completion/
+        if reqwest::Url::parse(&s.state.provider_url)
+            .ok()
+            .is_some_and(|url| url.host_str() == Some("api.deepseek.com"))
+        {
+            body["thinking"] = json!({"type":"disabled"});
+        }
     }
     let mut visual = visual_context(s, &node)?;
     visual.identity["preparation_parent"] = json!(w.previous_node.as_ref().or(s.parent.as_ref()));
@@ -935,7 +1000,15 @@ async fn freeze(
     let owner_scope = s.scope.clone();
     let (task, messages) = (s.task.to_owned(), messages.to_vec());
     db(s.state.workspace.root(), move |conn| {
-        let (through, requirements) = crate::session_history::requirement_snapshot(conn, &task)?;
+        let (through, mut requirements) = crate::session_history::requirement_snapshot(conn, &task)?;
+        // Once a task is explicitly defined, old dialogue is recoverable history,
+        // not an ever-growing compulsory input to every compression request.
+        let definition: Option<i64> = conn.query_row("SELECT MAX(seq) FROM agent_task_events WHERE task_id=?1 AND kind='task/definition'",[&task],|r|r.get(0))?;
+        if let Some(mut boundary)=definition {
+            let reviewed:Option<i64>=conn.query_row("SELECT json_extract(m.data,'$.through') FROM agent_task_events e JOIN agent_context_materials m ON m.task_id=e.task_id AND m.id=json_extract(e.data,'$.material_id') WHERE e.task_id=?1 AND e.kind='agent/context_summary' AND json_extract(m.data,'$.owner_scope')=?2 ORDER BY e.seq DESC LIMIT 1",params![task,owner_scope],|r|r.get(0)).optional()?;
+            if let Some(reviewed)=reviewed {boundary=boundary.max(reviewed);}
+            requirements.retain(|seq| *seq>boundary);
+        }
         let material = Material {
             id: agent_service::uuid_like(),
             owner_scope,
@@ -1062,7 +1135,9 @@ async fn business_tool(
         {
             if name.starts_with("ppt_master__") {
                 crate::ppt_sessions::require_page_project(s.state.workspace.root(), s.task)?;
+                crate::ppt_plan::guard(s.state.workspace.root(),s.task,name)?;
             }
+            let supplied = args.clone();
             let answer = match crate::page_tools::call(s.task, &page_name, args, s.cancel).await {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -1073,7 +1148,7 @@ async fn business_tool(
                     return Err(error);
                 }
             };
-            return page_tool_result(s, node, call_id, name, answer);
+            return page_tool_result(s, node, call_id, name, &supplied, answer).await;
         }
         if let Some(catalog) = &s.state.tool_catalog
             && catalog.packages.declares_tool(name)
@@ -1161,24 +1236,24 @@ async fn read_requirement(s: &Session<'_>, args: &Value) -> Result<Value> {
 fn compact_threshold(input_budget: usize) -> usize {
     96_000.min(input_budget.saturating_mul(3) / 4)
 }
-fn review_user(messages: &[Value]) -> Result<Value> {
-    let original = messages
-        .iter()
-        .rev()
-        .find(|m| {
-            m["role"] == "user"
-                && m.get("name").is_none()
-                && !m[crate::context_assets::REFERENCE].is_object()
-        })
-        .context("no original user input in current conversation")?;
-    // Some templates require a user query. Reuse the actual latest human
-    // input; never impersonate the user with a host compression command.
-    // Multimodal handles stay attributed data; this review does not view pixels.
-    Ok(
-        json!({"role":"user","name":"original_user_requirement","content":json!({
-        "original_user_requirement":original["content"],"already_in_supplied_history":true,
-        "new_user_turn":false,"source":original["source"]}).to_string()}),
-    )
+fn review_user(task: &str, through: i64, originals: &[(i64, String)]) -> Result<Value> {
+    // A compressed window intentionally need not retain any human messages.
+    // Its unnamed user messages may instead be tool-injected image deliveries.
+    // Reuse the latest real requirement from the same frozen, task-scoped
+    // history already supplied to the context model, never from that window.
+    let Some((seq, raw)) = originals.iter().filter(|(seq, _)| *seq <= through)
+        .max_by_key(|(seq, _)| *seq) else {
+        return Ok(json!({"role":"user","name":"context_review_request","content":"Organize the supplied working context for the current task board. This is a host compression request, not a new human instruction. Do not redefine the task."}));
+    };
+    let event: Value = serde_json::from_str(raw).context("invalid original user requirement event")?;
+    let original = event.get("model_content").filter(|v| !v.is_null())
+        .or_else(|| event.pointer("/message/content").filter(|v| !v.is_null()))
+        .context("original user requirement event is missing its saved content")?;
+    // Some provider templates require a user query. This is an attributed
+    // repetition, not a new human turn; multimodal data is not viewed here.
+    Ok(json!({"role":"user","name":"original_user_requirement","content":json!({
+        "original_user_requirement":original,"already_in_supplied_history":true,
+        "new_user_turn":false,"source":{"task_id":task,"seq":seq,"kind":"user/message","turn":event["turn"]}}).to_string()}))
 }
 
 fn reference_plan(messages: &[Value]) -> Value {
@@ -1379,7 +1454,7 @@ async fn organize_context(
         child_window.messages[1] = json!({"role":"system","name":"context_snapshot","content":json!({
             "material_id":material.id,"history_through_seq":material.through,
             "requirement_event_seqs":material.requirements,"delivery":"Complete records are supplied in context_review_input"}).to_string()});
-        let (task, requirements) = (s.task.to_owned(), material.requirements.clone());
+        let (task, requirements, through) = (s.task.to_owned(), material.requirements.clone(), material.through);
         let originals = db(s.state.workspace.root(), move |conn| {
             requirements
                 .into_iter()
@@ -1389,6 +1464,7 @@ async fn organize_context(
                         &task,
                         &crate::session_history::EventQuery {
                             exact: Some(seq),
+                            through: Some(through),
                             kinds: &["user/message"],
                             ..Default::default()
                         },
@@ -1407,7 +1483,7 @@ async fn organize_context(
             "estimated_input_tokens":tokens,"current_context":view,"original_user_requirements":requirements,"required_assets":material.required_assets,
             "instruction":"All original requirements, core conversation and lightweight asset handles are supplied. Submit the summary and restore_assets together. Bodies and pixels are withheld; the host restores the selected data before execution resumes. Required skill instructions are restored independently. Do not fetch bodies, bypass pending checks or invent visual findings."}).to_string()}));
         child_window.material_review_delivered = true;
-        child_window.messages.push(review_user(messages)?);
+        child_window.messages.push(review_user(s.task, material.through, &originals)?);
         child_window.read_ranges = originals
             .iter()
             .map(|(seq, raw)| (*seq, vec![(0, raw.chars().count())]))
@@ -1621,36 +1697,44 @@ async fn deliver_interjections(s: &Session<'_>, w: &mut Window) -> Result<bool> 
     Ok(delivered.map(|next| *w = next).is_some())
 }
 
+/// Read the authoritative saved deck once for visual evidence checks. Failure is
+/// data (unknown freshness), not a successful check or a reason to drop analysis.
+async fn current_ppt_project(s: &Session<'_>) -> Result<(Value, Option<String>)> {
+    if s.plugin.as_deref() != Some("ppt-master") {
+        return Ok((Value::Null, Some("No PPT document is bound to this task.".to_owned())));
+    }
+    let result = async {
+        let project = crate::ppt_sessions::project(s.state.workspace.root(), s.task)?
+            .filter(|p| *p > 0).context("PPT project unavailable; freshness was not verified")?;
+        let remote = crate::ppt_sessions::connection(s.state.workspace.root(), s.task)?
+            .context("PPT connection unavailable; freshness was not verified")?;
+        tokio::time::timeout(Duration::from_secs(10), remote.rpc("ppt/project", json!({"project_id":project})))
+            .await.context("PPT freshness lookup timed out")?
+    };
+    let result = tokio::select! {
+        _ = s.cancel.cancelled() => anyhow::bail!("cancelled"),
+        result = result => result,
+    };
+    Ok(match result {
+        Ok(current) => (current, None),
+        Err(error) => (Value::Null, Some(format!("{error:#}"))),
+    })
+}
+
+async fn annotate_visual_result(s: &Session<'_>, output: &mut Value) -> Result<()> {
+    if crate::visual_jobs::has_ppt_evidence(output) {
+        let (current, error) = current_ppt_project(s).await?;
+        crate::visual_jobs::annotate_freshness(output, &current, error.as_deref());
+    }
+    Ok(())
+}
+
 async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
     let jobs = crate::visual_jobs::ready(s.state.workspace.root(), s.task)?;
     if jobs.is_empty() {
         return Ok(());
     }
-    let mut current = Value::Null;
-    let mut version_error = None;
-    if s.plugin.as_deref() == Some("ppt-master") {
-        let project =
-            crate::ppt_sessions::project(s.state.workspace.root(), s.task)?.filter(|p| *p > 0);
-        match crate::ppt_sessions::connection(s.state.workspace.root(), s.task) {
-            Ok(Some(remote)) => {
-                if let Some(project) = project {
-                    let response = tokio::select! {
-                        _ = s.cancel.cancelled()=>anyhow::bail!("cancelled"),
-                        result=remote.rpc("ppt/project",json!({"project_id":project}))=>result,
-                    };
-                    match response {
-                        Ok(value) => current = value,
-                        Err(error) => version_error = Some(format!("{error:#}")),
-                    }
-                }
-            }
-            Ok(None) => {
-                version_error =
-                    Some("PPT connection unavailable; freshness was not verified".to_owned())
-            }
-            Err(error) => version_error = Some(format!("{error:#}")),
-        }
-    }
+    let (current, version_error) = current_ppt_project(s).await?;
     let mut next = w.clone();
     let mut ids = Vec::new();
     for job in jobs {
@@ -1714,6 +1798,12 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         }
         let definitions = tools(s, w);
         ensure!(!s.cancel.is_cancelled(), "cancelled");
+        if s.mode == Mode::Main && s.plugin.as_deref() == Some("ppt-master") {
+            // Refresh once per execution round before capacity planning. The
+            // fixed outline/state block is then included in every estimate and
+            // the actual request, independently of any process compression.
+            crate::ppt_task_state::refresh(s.state, s.task, s.cancel).await?;
+        }
         auto_compact(s, w, step, &definitions).await?;
         let prefix_len = w.messages.len();
         let (node, message) = model_round(s, w, step, &definitions).await?;
@@ -1790,6 +1880,11 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
+                    "read_task_board" => Ok(crate::main_task_anchor::board(s.state.workspace.root(),s.task,None)?.unwrap_or(Value::Null)),
+                    "update_task_definition" => {
+                        ensure!(s.is_root(),"only main Agent may update task definition");
+                        crate::main_task_anchor::update(s.state.workspace.root(),s.task,&args)
+                    },
                     "spawn_agent" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
                         let shared=prepare_delegate_context(s,w,&definitions).await?;
@@ -1867,17 +1962,28 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
                         material_source=Some((call.name.clone(),args.clone()));
                         let visual=visual_context(s,&node)?;
-                        let slide_check = s.plugin.as_deref()==Some("ppt-master") && crate::visual_jobs::sources(s.state.workspace.root(),&visual,&args)?.iter().all(|source| source["source"]=="remote_ppt");
-                        if args["background"].as_bool().unwrap_or(false) || slide_check {
-                            crate::visual_jobs::submit(s.state,&visual,&args,&call.call_id,s.model,s.cancel)
+                        let sources = crate::visual_jobs::sources(s.state.workspace.root(),&visual,&args)?;
+                        let slide_check = s.plugin.as_deref()==Some("ppt-master") && !sources.is_empty()
+                            && sources.iter().all(crate::visual_jobs::is_ppt_source);
+                        let mut output = if args["background"].as_bool().unwrap_or(false) || slide_check {
+                            crate::visual_jobs::submit(s.state,&visual,&args,&call.call_id,s.model,s.cancel)?
                         } else {
-                            crate::image_analysis::execute(s.state,&visual,&args,&call.call_id,s.model,s.cancel).await
+                            crate::image_analysis::execute(s.state,&visual,&args,&call.call_id,s.model,s.cancel).await?
+                        };
+                        // Covers synchronous/mixed-image checks and a completed
+                        // background job returned by submit's deduplication path.
+                        if output["status"] != "accepted" {
+                            output["sources"] = json!(sources);
+                            annotate_visual_result(s, &mut output).await?;
                         }
+                        Ok(output)
                     },
                     "image_analysis_results" => {
                         ensure!(s.mode==Mode::Main,"context subagent cannot collect execution jobs");
                         ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
-                        crate::visual_jobs::results(s.state.workspace.root(),s.task,&args,s.cancel).await
+                        let mut output = crate::visual_jobs::results(s.state.workspace.root(),s.task,&args,s.cancel).await?;
+                        annotate_visual_result(s, &mut output).await?;
+                        Ok(output)
                     },
                     "compress_context" => {
                         ensure!(s.mode==Mode::Main,"RECURSIVE_COMPRESSION_FORBIDDEN");
@@ -2546,6 +2652,37 @@ mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::post};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn native_page_capture_and_disconnected_analysis_keep_explicit_identity() {
+        use base64::Engine;
+        let root = TestRoot::new();
+        let state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
+        let cancel = CancellationToken::new();
+        let session = Session {plugin:Some("ppt-master".into()), state:&state, task:"task", model:"fake",
+            turn:1, cancel:&cancel, ban_execution:false, mode:Mode::Main, scope:"main".into(),
+            parent:None, material:None, input_budget:INPUT_BUDGET};
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8,8).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let result = page_tool_result(&session, "node", "render", "ppt_master__render_slide", &json!({"slide":3}),
+            json!({"ok":true,"document":{"project_id":820,"revision":4,"stable":true},
+                "content":[{"type":"text","text":"第 99 页，宽 1024 像素"},
+                    {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png.get_ref())}]}))
+            .await.unwrap();
+        let context = visual_context(&session, "inspect").unwrap();
+        let sources = crate::visual_jobs::sources(root.path(), &context, &json!({"artifact_ids":[result["artifact_id"]]})).unwrap();
+        assert_eq!(sources[0]["page_index"], 3);
+        assert_eq!(sources[0]["source_revision"], 4);
+        assert!(sources[0]["source_hash"].is_null()); // No authenticated saved-deck lookup.
+        let mut analysis = json!({"status":"succeeded","analysis":"Visible title overlap","sources":sources});
+        annotate_visual_result(&session, &mut analysis).await.unwrap();
+        assert_eq!(analysis["version_checks"][0]["freshness"], "unknown");
+        assert_eq!(analysis["analysis"], "Visible title overlap");
+        let saved = page_tool_result(&session, "node", "edit", "ppt_master__apply_html", &json!({}),
+            json!({"ok":true,"content":[{"type":"text","text":"{\"saved\":true,\"revision\":5}"}]})).await.unwrap();
+        assert_eq!(saved["visual_evidence"]["saved_revision"], 5);
+        assert!(saved["visual_evidence"]["message"].as_str().unwrap().contains("superseded"));
+    }
 
     #[tokio::test]
     async fn git_delegate_file_tool_writes_only_its_worktree() {
@@ -4693,10 +4830,217 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn compression_query_uses_only_the_latest_frozen_human_requirement() {
+        let originals = vec![
+            (2, json!({"turn":1,"message":{"role":"user","content":"Make 20 pages"}}).to_string()),
+            (5, json!({"turn":2,"message":{"role":"user","content":"Keep logos; finish visual review"},
+                "model_content":[{"type":"text","text":"Keep logos; finish visual review"},{"type":"image_ref","artifact_id":"user-reference"}]}).to_string()),
+            (8, json!({"turn":3,"message":{"role":"user","content":"FUTURE_REQUIREMENT"}}).to_string()),
+        ];
+        let query = review_user("task", 7, &originals).unwrap();
+        let data: Value = serde_json::from_str(query["content"].as_str().unwrap()).unwrap();
+        assert_eq!(data["source"], json!({"task_id":"task","seq":5,"kind":"user/message","turn":2}));
+        assert_eq!(data["original_user_requirement"], serde_json::from_str::<Value>(&originals[1].1).unwrap()["model_content"]);
+        assert_eq!(data["new_user_turn"], false);
+        assert!(!query.to_string().contains("FUTURE_REQUIREMENT"));
+        assert_eq!(review_user("task", 1, &originals).unwrap()["name"],"context_review_request");
+    }
+
+    #[tokio::test]
+    async fn fixed_main_requirement_and_saved_outline_are_injected_outside_compaction() {
+        let root = TestRoot::new();
+        let state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',1,0,'user/message',?1)",
+            [json!({"message":{"role":"user","content":"Create 20 pages with the chosen template; keep brand logos"}}).to_string()]).unwrap();
+        conn.execute("INSERT INTO ppt_session_bindings(task_id,subject,project_id) VALUES ('task','test',820)",[]).unwrap();
+        // The separately tested state reader owns the verified project snapshot.
+        crate::ppt_task_state::message(root.path(),"task").unwrap();
+        let snapshot = json!({"project_id":820,"status":"verified","committed_plan":{
+            "outline":"1 Introduction\n2 Delivery constraints\n20 Actions","design":"Preserve selected brand design"}});
+        conn.execute("INSERT INTO agent_ppt_task_state(task_id,snapshot,updated_at) VALUES ('task',?1,0)",[snapshot.to_string()]).unwrap();
+        let cancel = CancellationToken::new();
+        let mut session = Session {plugin:Some("ppt-master".into()),state:&state,task:"task",model:"fake",turn:1,cancel:&cancel,
+            ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,material:None,input_budget:INPUT_BUDGET};
+        let mut window = Window {messages:vec![json!({"role":"system","content":Mode::Main.prompt()}),
+            json!({"role":"system","name":"context_summary","content":"Temporary step: inspect page 10"})],..Default::default()};
+        let original_window = window.messages.clone();
+        for scope in ["main","delegate:worker"] {
+            session.scope = scope.into();
+            let body = request(&session,&window.messages,&[]);
+            let messages = body["messages"].as_array().unwrap();
+            let anchor = messages.iter().find(|m|m["name"]=="main_task_anchor").unwrap();
+            assert!(anchor.to_string().contains("original_request_reference"));
+            assert!(!anchor.to_string().contains("Temporary step"));
+            let plan = messages.iter().find(|m|m["name"]=="ppt_task_state").unwrap();
+            assert!(plan.to_string().contains("20 Actions"));
+            if scope != "main" {assert!(messages.iter().any(|m|m["name"]=="delegated_assignment"));}
+            let mut without_fixed = body.clone();
+            without_fixed["messages"].as_array_mut().unwrap().retain(|m|m["name"]!="main_task_anchor" && m["name"]!="ppt_task_state");
+            assert!(estimate(&body)>estimate(&without_fixed)+100, "capacity planning includes fixed requirements and outline");
+            assert_eq!(window.messages,original_window,"host blocks never enter the compressible window");
+        }
+        session.scope = "main".into();
+        session.input_budget = 256;
+        let error = model_round(&session,&mut window,1,&[]).await.unwrap_err().to_string();
+        assert!(error.contains("MAIN_TASK_ANCHOR_OVER_CAPACITY"));
+        assert_eq!(window.messages,original_window,"capacity failure cannot erase the requirement or process state");
+    }
+
+    #[tokio::test]
+    async fn repeated_compaction_restores_frozen_requirements_without_a_human_in_the_window() {
+        let root = TestRoot::new();
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = received.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body):Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                let messages = body["messages"].as_array().unwrap();
+                let supplied: Value = serde_json::from_str(messages.iter().find(|m| m["name"] == "context_review_input").unwrap()["content"].as_str().unwrap()).unwrap();
+                let query: Value = serde_json::from_str(messages.iter().find(|m| m["name"] == "original_user_requirement").unwrap()["content"].as_str().unwrap()).unwrap();
+                let anchor: Value = serde_json::from_str(messages.iter().find(|m| m["name"] == "main_task_anchor").unwrap()["content"].as_str().unwrap()).unwrap();
+                assert!(anchor["definition"].is_null());
+                assert!(anchor.get("human_updates").is_none());
+                assert_eq!(supplied["original_user_requirements"].as_array().unwrap().len(), 3);
+                assert_eq!(query["original_user_requirement"], "Approved: complete all 20 pages and their visual checks");
+                assert_eq!(query["source"]["seq"], 3);
+                assert_eq!(query["new_user_turn"], false);
+                assert!(!query.to_string().contains("synthetic"));
+                assert!(supplied["current_context"].to_string().contains("QA 10–20 pending"));
+                let n = requests.lock().unwrap().len();
+                requests.lock().unwrap().push(body);
+                let mut result = summary(1);
+                result["original_purpose"] = json!("Create 20 slides");
+                result["current_goal"] = json!("Complete all 20 pages and their visual checks");
+                result["constraints"] = json!("Keep the brand logo fixed");
+                result["progress"] = json!("20 pages saved; QA 10–20 pending");
+                result["next_steps"] = json!("Inspect and fix pages 10–20; do not claim unchecked pages passed");
+                result["source_event_seqs"] = json!([1,2,3]);
+                Json(json!({"choices":[{"finish_reason":"tool_calls","message":call("submit_context",result,n)}]}))
+            }
+        }));
+        let server = tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let state = agent_service::tests::test_state(root.path(), address);
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        for (index, content) in ["Create 20 slides", "Keep the brand logo fixed", "Approved: complete all 20 pages and their visual checks"].iter().enumerate() {
+            conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,0,'user/message',?2)",
+                params![index+1,json!({"turn":index+1,"message":{"role":"user","content":content}}).to_string()]).unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let session = Session {plugin:None,state:&state,task:"task",model:"fake",turn:3,cancel:&cancel,
+            ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,material:None,input_budget:INPUT_BUDGET};
+        let mut window = Window {messages:vec![
+            json!({"role":"system","content":Mode::Main.prompt()}),
+            json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),
+            json!({"role":"assistant","content":"20 pages saved; QA 10–20 pending"}),
+        ], ..Default::default()};
+        for round in 0..3 {
+            if round == 1 {
+                // Browser/image tools also append unnamed user messages. They
+                // are contextual data, not a substitute for an original request.
+                window.messages.push(json!({"role":"user","content":[{"type":"image_ref","artifact_id":"synthetic-image"}]}));
+            }
+            let before = window.messages.len();
+            let (id, summary, retained, _) = organize_context(&session,&window.messages,"compress",Some(100_000),&BTreeSet::new()).await.unwrap();
+            replace_context(&session,&mut window,before,id,summary,retained,&[]).await.unwrap();
+            assert!(!window.messages.iter().any(|m| m["role"]=="user" && m.get("name").is_none()));
+            assert!(!window.messages.iter().any(|m| m["name"]=="main_task_anchor" || m["name"]=="ppt_task_state"));
+            let saved_summary: Value = serde_json::from_str(window.messages[1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(saved_summary["source_event_seqs"], json!([1,2,3]));
+            assert_eq!(saved_summary["progress"], "20 pages saved; QA 10–20 pending");
+        }
+        assert_eq!(received.lock().unwrap().len(), 3);
+        assert_eq!(crate::session_history::requirement_snapshot(&conn,"task").unwrap().1, vec![1,2,3]);
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='task' AND kind='agent/context_summary'",[],|r|r.get::<_,usize>(0)).unwrap(),3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn defined_generic_task_survives_three_compactions_without_reinjecting_transcript() {
+        let root = TestRoot::new();
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = received.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body):Json<Value>| {
+            let requests = requests.clone();
+            async move {
+                let messages = body["messages"].as_array().unwrap();
+                let supplied: Value = serde_json::from_str(messages.iter().find(|m| m["name"] == "context_review_input").unwrap()["content"].as_str().unwrap()).unwrap();
+                let anchor:Value=serde_json::from_str(messages.iter().find(|m|m["name"]=="main_task_anchor").unwrap()["content"].as_str().unwrap()).unwrap();
+                assert_eq!(anchor["definition"]["objective"],"Fix search ordering while preserving API");
+                assert!(anchor.get("human_updates").is_none());
+                assert_eq!(supplied["original_user_requirements"],json!([]));
+                assert!(messages.iter().any(|m|m["name"]=="context_review_request"));
+                assert!(supplied["current_context"].to_string().contains("QA 10–20 pending"));
+                let n = requests.lock().unwrap().len();
+                requests.lock().unwrap().push(body);
+                let mut result = summary(1);
+                result["original_purpose"] = json!("Create 20 slides");
+                result["current_goal"] = json!("Complete all 20 pages and their visual checks");
+                result["constraints"] = json!("Keep the brand logo fixed");
+                result["progress"] = json!("20 pages saved; QA 10–20 pending");
+                result["next_steps"] = json!("Inspect and fix pages 10–20; do not claim unchecked pages passed");
+                result["source_event_seqs"] = json!([1,2,3]);
+                Json(json!({"choices":[{"finish_reason":"tool_calls","message":call("submit_context",result,n)}]}))
+            }
+        }));
+        let server = tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let state = agent_service::tests::test_state(root.path(), address);
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        for (index, content) in ["Create 20 slides", "Keep the brand logo fixed", "Approved: complete all 20 pages and their visual checks"].iter().enumerate() {
+            conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',?1,0,'user/message',?2)",
+                params![index+1,json!({"turn":index+1,"message":{"role":"user","content":content}}).to_string()]).unwrap();
+        }
+        let proposal=crate::main_task_anchor::update(root.path(),"task",&json!({"objective":"Fix search ordering while preserving API","constraints":["Keep API compatibility"],"completion_conditions":["Regression tests pass"],"source_event_seqs":[1,2,3]})).unwrap();
+        crate::main_task_anchor::decide_definition(root.path(),"task",proposal["version"].as_i64().unwrap(),true,"test-user").unwrap();
+        let cancel = CancellationToken::new();
+        let session = Session {plugin:None,state:&state,task:"task",model:"fake",turn:3,cancel:&cancel,
+            ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,material:None,input_budget:INPUT_BUDGET};
+        let mut window = Window {messages:vec![
+            json!({"role":"system","content":Mode::Main.prompt()}),
+            json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),
+            json!({"role":"assistant","content":"20 pages saved; QA 10–20 pending"}),
+        ], ..Default::default()};
+        for round in 0..3 {
+            if round == 1 {
+                // Browser/image tools also append unnamed user messages. They
+                // are contextual data, not a substitute for an original request.
+                window.messages.push(json!({"role":"user","content":[{"type":"image_ref","artifact_id":"synthetic-image"}]}));
+            }
+            let before = window.messages.len();
+            let (id, summary, retained, _) = organize_context(&session,&window.messages,"compress",Some(100_000),&BTreeSet::new()).await.unwrap();
+            replace_context(&session,&mut window,before,id,summary,retained,&[]).await.unwrap();
+            assert!(!window.messages.iter().any(|m| m["role"]=="user" && m.get("name").is_none()));
+            assert!(!window.messages.iter().any(|m| m["name"]=="main_task_anchor" || m["name"]=="ppt_task_state"));
+            let saved_summary: Value = serde_json::from_str(window.messages[1]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(saved_summary["source_event_seqs"], json!([1,2,3]));
+            assert_eq!(saved_summary["progress"], "20 pages saved; QA 10–20 pending");
+        }
+        assert_eq!(received.lock().unwrap().len(), 3);
+        assert_eq!(crate::session_history::requirement_snapshot(&conn,"task").unwrap().1, vec![1,2,3]);
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='task' AND kind='agent/context_summary'",[],|r|r.get::<_,usize>(0)).unwrap(),3);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn single_pass_compaction_restores_selected_data_and_skill_rules_without_replaying_tools()
     {
-        for scenario in ["valid", "foreign", "missing", "changed", "required_missing"] {
+        for scenario in [
+            "valid",
+            "deepseek_official",
+            "deepseek_lookalike_host",
+            "foreign",
+            "missing",
+            "changed",
+            "required_missing",
+        ] {
             let root = TestRoot::new();
             let received = Arc::new(Mutex::new(Vec::<Value>::new()));
             let requests = received.clone();
@@ -4707,6 +5051,13 @@ mod tests {
                 async move {
                     requests.lock().unwrap().push(body.clone());
                     let automatic = body["tool_choice"]["function"]["name"] == "submit_context";
+                    assert_eq!(body["reasoning_effort"], "high");
+                    assert_eq!(body["model"], if scenario.starts_with("deepseek_") { "deepseek-flash" } else { "fake" });
+                    if automatic && scenario == "deepseek_official" {
+                        assert_eq!(body["thinking"], json!({"type":"disabled"}));
+                    } else {
+                        assert!(body.get("thinking").is_none(), "normal requests and other APIs retain their thinking defaults");
+                    }
                     let message = if automatic {
                         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
                         assert!(!body.to_string().contains("COMPLETED_SOURCE_BODY"));
@@ -4738,7 +5089,27 @@ mod tests {
                 }
             }));
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let state = agent_service::tests::test_state(root.path(), address);
+            let mut state = agent_service::tests::test_state(root.path(), address);
+            state.reasoning_effort = Some("high".into());
+            let model = if scenario.starts_with("deepseek_") {
+                let host = if scenario == "deepseek_official" {
+                    "api.deepseek.com"
+                } else {
+                    "api.deepseek.com.example.test"
+                };
+                // Exercise the actual serialized HTTP request, with only DNS
+                // redirected to the local fixture. No upstream credentials.
+                state.provider_url = format!("http://{host}:{}/v1", address.port());
+                state.provider_name = "DeepSeek-official".into();
+                state.model_client = reqwest::Client::builder()
+                    .no_proxy()
+                    .resolve(host, address)
+                    .build()
+                    .unwrap();
+                "deepseek-flash"
+            } else {
+                "fake"
+            };
             db(root.path(), |_| Ok(())).await.unwrap();
             let conn = agent_service::open_db(root.path()).unwrap();
             conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
@@ -4829,7 +5200,7 @@ mod tests {
             run_task(
                 state,
                 "task".into(),
-                "fake".into(),
+                model.into(),
                 "Continue page 2".into(),
                 1,
                 CancellationToken::new(),
@@ -5101,12 +5472,13 @@ mod tests {
         assert_eq!(evidence["result"]["data"]["page_index"], 2);
         assert_eq!(evidence["result"]["data"]["revision"], 3);
         assert!(!view.to_string().contains("HIDDEN_SVG_BODY"));
-        let original = vec![json!({"role":"user","content":"continue"})];
-        let supplied = review_user(&original).unwrap();
+        let original = vec![(7, json!({"message":{"role":"user","content":"continue"}}).to_string())];
+        let supplied = review_user("task", 7, &original).unwrap();
         let content: Value = serde_json::from_str(supplied["content"].as_str().unwrap()).unwrap();
         assert_eq!(content["original_user_requirement"], "continue");
         assert_eq!(content["new_user_turn"], false);
-        assert_eq!(original[0]["content"], "continue");
+        assert_eq!(content["source"]["seq"], 7);
+        assert_eq!(serde_json::from_str::<Value>(&original[0].1).unwrap()["message"]["content"], "continue");
     }
     #[tokio::test]
     #[ignore = "Read-only live-model replay; requires ASSET_REVIEW_DB, ASSET_REVIEW_TASK and ASSET_REVIEW_URL"]

@@ -1,0 +1,18 @@
+{
+  "audit_date": "2026-10-22",
+  "repository": "https://github.com/hugohe3/ppt-master",
+  "upstream_commit": "604ecdec8dd6a0405e1abdb49565430902373276",
+  "skill_version": "6.7.2",
+  "download_directory": "/tmp/ppt-master-upstream-review-20261022/ppt-master",
+  "scope": "Read-only workflow audit; product implementation and deployment paused.",
+  "upstream_sha256": {
+    "SKILL.md": "af0d9548adebc44af1d06225c19762974a22339db901eaa81648faf467b418a2",
+    "workflows/generate-pptx.md": "3639027ce5e3ff8e328cc0056440a4cb308306fc7503d725a62c6b39e1221048",
+    "references/strategist.md": "aab716df8ce2d555a93cadd8ac9c84b5b70e181d992d63de2c35908650b91b00",
+    "references/plan-core.md": "50e623b83de90cfd3f860496e8a9a0b289f8f3aeb1546152c61df37a84d64c8a",
+    "workflows/create-template.md": "12a3bd67aee503cbbed60120477f849dfcfe5494bb736b52efbcf97b03c82b66"
+  },
+  "local_baseline_commit": "33955ebc4b7508aa20c3b8a86e252367979ab291",
+  "local_baseline_skill_sha256": "2a4c77f25b1d2c9a7266ff6528d21c2c9246238f8d5ea7e985b6a2638eb41e94",
+  "current_skill_sha256": "36adebd2da9d2ced0319026a65ceb1e0e74a376b18548017a24d76e475905b71"
+}

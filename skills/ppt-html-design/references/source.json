@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/anthropics/skills",
+  "commit": "69c0b1a0674149f27b61b2635f935524b6add202",
+  "path": "skills/pptx/SKILL.md",
+  "source_sha256": "b6f25545bfb358739f1532f793458b5dbc87ee009933cb7c306b2d951ab6617f",
+  "extracts": [
+    {
+      "file": "anthropic-design-verbatim.md",
+      "start_marker": "### Design Principles",
+      "end_before": "### Workflow",
+      "sha256": "0816210e87895b9f78f2cf536cb086be13c01aba3bc8569a5c0fcd9bbd2ac323"
+    },
+    {
+      "file": "anthropic-visual-qa-verbatim.md",
+      "start_marker": "4. **Visual validation**:",
+      "end_before": "## Editing an existing PowerPoint presentation",
+      "sha256": "db8fe4671c3d00883af5ea11ebe8a1280c28773b2580a1cfc7dcfb8aea22bae8"
+    }
+  ],
+  "note": "Byte-for-byte excerpts. HTML generation contract is local; no upstream converter or PPTX-generation workflow included."
+}

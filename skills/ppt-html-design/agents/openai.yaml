@@ -1,0 +1,4 @@
+interface:
+  display_name: "PPT HTML 视觉设计"
+  short_description: "为 JSON 编辑器设计幻灯片 HTML，保留原版审美指导与对象身份"
+  default_prompt: "使用 $ppt-html-design 为当前演示文稿设计 1280×720 HTML 页面。"

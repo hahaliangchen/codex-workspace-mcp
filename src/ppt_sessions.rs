@@ -56,6 +56,87 @@ async fn bind_chat(connection: &Connection, task: &str, project: u64) {
 pub fn project(root: &std::path::Path, task: &str) -> Result<Option<u64>> {
     Ok(binding(root, task)?.map(|(_, id)| id))
 }
+
+/// A template chosen in the authenticated UI is an immutable resource selection,
+/// not an instruction in the model's prompt. Descendant tools inherit that pin.
+pub(crate) fn template_pin(root: &std::path::Path, task: &str) -> Result<Option<Value>> {
+    let raw: Option<String> = crate::agent_service::open_db(root)?
+        .query_row(
+            "WITH RECURSIVE lineage(id,depth) AS (
+            SELECT ?1,0 UNION ALL SELECT t.parent_task_id,l.depth+1
+            FROM agent_tasks t JOIN lineage l ON t.id=l.id
+            WHERE t.parent_task_id IS NOT NULL AND l.depth<32
+         ) SELECT p.selection FROM lineage l JOIN ppt_template_pins p ON p.task_id=l.id
+         ORDER BY l.depth LIMIT 1",
+            [task],
+            |r| r.get(0),
+        )
+        .optional()?;
+    raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
+        .transpose()
+}
+
+fn pin_template_selection(root: &std::path::Path, task: &str, selection: &Value) -> Result<()> {
+    let Some(id) = selection.get("template_id") else {
+        ensure!(
+            selection.get("template_version").is_none() && selection.get("template_hash").is_none(),
+            "template_id required for version pin"
+        );
+        return Ok(());
+    };
+    let id = id
+        .as_str()
+        .filter(|id| !id.trim().is_empty() && id.len() <= 512)
+        .context("invalid selected template ID")?;
+    let mut pin = json!({"template":id});
+    for key in ["template_version", "template_hash"] {
+        if let Some(value) = selection.get(key).filter(|v| !v.is_null()) {
+            let value = value
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 256)
+                .context("invalid template version/hash")?;
+            if key == "template_hash" {
+                ensure!(
+                    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid template SHA256"
+                );
+            }
+            pin[key] = json!(value);
+        }
+    }
+    if let Some(before) = template_pin(root, task)? {
+        ensure!(
+            before == pin,
+            "TEMPLATE_SELECTION_CHANGED: this conversation is pinned to another template version; start a new presentation to select a different one"
+        );
+        return Ok(());
+    }
+    crate::agent_service::open_db(root)?.execute(
+        "INSERT OR IGNORE INTO ppt_template_pins(task_id,selection) VALUES (?1,?2)",
+        params![task, pin.to_string()],
+    )?;
+    ensure!(
+        template_pin(root, task)? == Some(pin),
+        "template selection changed concurrently"
+    );
+    Ok(())
+}
+
+fn apply_template_pin(root: &std::path::Path, task: &str, args: &mut Value) -> Result<()> {
+    if let Some(pin) = template_pin(root, task)? {
+        ensure!(args.is_object(), "PPT arguments must be an object");
+        for (key, value) in pin.as_object().context("invalid stored template pin")? {
+            if let Some(requested) = args.get(key).filter(|v| !v.is_null()) {
+                ensure!(
+                    requested == value,
+                    "TEMPLATE_SELECTION_MISMATCH: model arguments differ from the user's selected template version"
+                );
+            }
+            args[key] = value.clone();
+        }
+    }
+    Ok(())
+}
 /// A creation page can answer service reads before it has a deck editor.
 /// Reject page calls at that stage instead of queuing an impossible editor wait.
 pub fn require_page_project(root: &std::path::Path, task: &str) -> Result<()> {
@@ -93,6 +174,9 @@ pub async fn execute(
             .is_some_and(|c| c.packages.owns_tool("ppt-master", name)),
         "PPT tool unavailable"
     );
+    if matches!(raw, "init_project" | "use_template") {
+        apply_template_pin(state.workspace.root(), task, &mut args)?;
+    }
     if raw == "init_project" {
         ensure!(
             project == 0,
@@ -133,7 +217,23 @@ pub async fn execute(
     if project > 0 && !independent_skill_read(raw, &args) {
         sync_attachments(state, task, project, &connection).await?;
     }
-    let result = connection.call(raw, args).await?;
+    crate::ppt_plan::guard(state.workspace.root(),task,raw)?;
+    if raw=="export_pptx" {
+        crate::ppt_task_state::refresh(state,task,&state.plugin_cancel).await?;
+        crate::ppt_task_state::require_delivery(state.workspace.root(),task)?;
+    }
+    if raw=="commit_design_spec" {
+        let pages=args["pages"].as_array().context("pages required for the complete outline")?;
+        args["outline"]=json!(pages.iter().enumerate().map(|(i,p)|format!("## {}. {} [{}]\n{}\n视觉意图：{}",i+1,p["title"].as_str().unwrap_or(""),p["id"].as_str().unwrap_or(""),p["requirements"].as_str().unwrap_or(""),p["visual"].as_str().unwrap_or("按内容设计"))).collect::<Vec<_>>().join("\n\n"));
+    }
+    let proposal=if raw=="commit_design_spec" {Some(crate::ppt_plan::proposal(state.workspace.root(),task,project,&args)?)} else {None};
+    let mut result = connection.call(raw, args).await?;
+    if let Some(plan)=proposal {
+        if result["status"]!="failed" && result.get("error").is_none() {
+            let saved=crate::main_task_anchor::propose_plan(state.workspace.root(),task,plan)?;
+            result["outline_confirmation"]=json!({"version":saved["version"],"status":"awaiting_user_confirmation","instruction":"Show the saved full outline. End this turn and wait for the user to confirm it in the outline card; do not generate pages."});
+        }
+    }
     // Failed submissions can still have committed a remote task before the
     // database connection broke. Keep ownership so recovery can query it even
     // while init_project has not bound this conversation to a project yet.
@@ -341,6 +441,19 @@ async fn handle(
         .write()
         .unwrap()
         .insert(task.clone(), connection.clone());
+    if method == "decide_definition" {
+        return Ok(Json(crate::main_task_anchor::decide_definition(state.workspace.root(),&task,
+            args["version"].as_i64().context("proposal version required")?,
+            args["approve"].as_bool().context("approve must be boolean")?,&connection.subject)?).into_response());
+    }
+    if method == "confirm_plan" || method == "confirm_outline" {
+        let version=args["version"].as_i64().context("plan version required")?;
+        let board=crate::main_task_anchor::board(state.workspace.root(),&task,None)?.context("task missing")?;
+        ensure!(board["plan"]["version"]==version,"PLAN_VERSION_CONFLICT: review the latest outline");
+        let saved=connection.rpc("ppt/project",json!({"project_id":project})).await?;
+        ensure!(crate::ppt_plan::saved_matches(&board["plan"]["plan"],&saved),"PLAN_NOT_SAVED: wait for the outline save to finish or resave it");
+        return Ok(Json(crate::main_task_anchor::confirm_plan(state.workspace.root(),&task,version,&connection.subject)?).into_response());
+    }
     if method == "upload" {
         return Ok(Json(crate::attachments::encoded(&state, &task, &args)?).into_response());
     }
@@ -350,13 +463,20 @@ async fn handle(
     }
     if method == "session" {
         args["package_scope"] = json!(scope);
+        if args["method"] == "prompt" {
+            pin_template_selection(state.workspace.root(), &task, &args["selection"])?;
+        }
         if args["method"] == "status" {
+            let board=crate::main_task_anchor::board(state.workspace.root(),&task,None)?;
+            let progress=crate::ppt_task_state::message(state.workspace.root(),&task)?.and_then(|m|m["content"].as_str().and_then(|s|serde_json::from_str::<Value>(s).ok()));
             let response = crate::plugin_sessions::handle(state, "ppt-master", args).await?;
             let status = response.status();
             let mut body: Value = serde_json::from_slice(
                 &axum::body::to_bytes(response.into_body(), 1024 * 1024).await?,
             )?;
             body["project_id"] = json!(project);
+            body["task_board"]=json!(board);
+            body["ppt_progress"]=json!(progress);
             return Ok((status, Json(body)).into_response());
         }
         if project > 0 && args["method"] == "prompt" {
@@ -369,14 +489,10 @@ async fn handle(
             args["name"] == "export_pptx",
             "only AI may modify slide sources"
         );
-        let result = execute(
-            &state,
-            &task,
-            "ppt_master__export_pptx",
-            json!({"project_id":project}),
-        )
-        .await?
-        .context("PPT binding missing")?;
+        // Explicit user download is a draft-capable action, separate from AI final delivery.
+        ensure!(project>0,"PPT project not initialized");
+        let mut result=connection.call("export_pptx",json!({"project_id":project})).await?;
+        result["delivery_kind"]=json!("draft_download");
         return Ok(Json(result).into_response());
     }
     ensure!(
@@ -436,6 +552,45 @@ mod tests {
         extract::Path,
         routing::{get, post},
     };
+    #[test]
+    fn ui_template_selection_persists_and_binds_child_tools_without_model_arguments() {
+        let root = std::env::temp_dir().join(format!(
+            "ppt-template-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = crate::agent_service::open_db(&root).unwrap();
+        for (id, parent) in [("root", None), ("child", Some("root"))] {
+            db.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,parent_task_id) VALUES (?1,'test','test','draft',0,0,?2)",params![id,parent]).unwrap();
+        }
+        let selection = json!({"template_id":"联通品牌","template_version":"v2","template_hash":"a".repeat(64)});
+        pin_template_selection(&root, "root", &selection).unwrap();
+        pin_template_selection(&root, "root", &selection).unwrap();
+        // A subsequent prompt with no selection does not clear the durable pin.
+        pin_template_selection(&root, "root", &json!({"project_id":12})).unwrap();
+        let mut args = json!({"name":"交付管理"});
+        apply_template_pin(&root, "child", &mut args).unwrap();
+        assert_eq!(args["template"], "联通品牌");
+        assert_eq!(args["template_version"], "v2");
+        assert_eq!(args["template_hash"], "a".repeat(64));
+        let mut mismatch = json!({"template":"different"});
+        assert!(apply_template_pin(&root, "child", &mut mismatch).is_err());
+        assert!(
+            pin_template_selection(
+                &root,
+                "root",
+                &json!({"template_id":"联通品牌","template_version":"v3"})
+            )
+            .is_err()
+        );
+        assert!(pin_template_selection(&root, "child", &json!({"template_version":"v3"})).is_err());
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     async fn value(response: Response) -> Value {
         serde_json::from_slice(
             &axum::body::to_bytes(response.into_body(), 1_000_000)
@@ -448,6 +603,164 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", format!("Bearer {token}").parse().unwrap());
         h
+    }
+    #[tokio::test]
+    async fn ppt_prompt_reasoning_selection_reaches_first_and_resumed_model_requests() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let received = captured.clone();
+        let app = Router::new()
+            .route("/api/ppt/{method}", post(|Path(method): Path<String>, Json(body): Json<Value>| async move {
+                let result = match method.as_str() {
+                    "handshake" => json!({"version":1,"user_id":1,"connection_id":"reasoning-test","state":"awaiting_confirmation","plugin":{"id":"ppt-master","title":"PPT","skill":"skill:SKILL.md","pages":[],"tools":[]}}),
+                    "confirm" => json!({"state":"ready"}),
+                    "identity" => json!({"user_id":1}),
+                    "project" => json!({"project_id":7,"slides":[]}),
+                    "bindChat" => json!({"ok":true}),
+                    _ => panic!("unexpected PPT method {method}"),
+                };
+                Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":result}}))
+            }))
+            .route("/resource", get(|| async { "---\nname: ppt-master\ndescription: PPT only\n---\nEdit presentations." }))
+            .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                let received = received.clone();
+                async move {
+                    received.lock().unwrap().push(body);
+                    Json(json!({"choices":[{"message":{"role":"assistant","content":"Done"},"finish_reason":"stop"}]}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!(
+            "ppt-reasoning-test-{}",
+            crate::agent_service::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (runtime, catalog) = crate::skill_packages::test_runtime();
+        let package = remote::connect_user(
+            remote::Config {
+                url: format!("http://{address}"),
+                token: "reasoning-test".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        remote::mount_user_template(&runtime, &catalog.packages, package).unwrap();
+        let mut state = crate::agent_service::tests::test_state(&root, address);
+        state.tool_catalog = Some(catalog);
+        let config = json!({
+            "orchestrator_provider":"test","orchestrator_model":"m",
+            "providers":{"test":{"url":format!("http://{address}/v1"),"api_key":"fake","model_map":{"m":"m"}}},
+            "plugin_models":{"ppt-master":[{"provider":"test","model":"m"}]},
+            "plugin_generation":{"ppt-master":{"reasoning_effort":"low"}},
+            "model_capabilities":{"test":{"m":{"reasoning_efforts":["low","high","xhigh"]}}}
+        });
+        let shared = Arc::new(tokio::sync::RwLock::new(
+            serde_json::from_value::<crate::ai_proxy::AiProxyConfig>(config).unwrap(),
+        ));
+        state.config = Some(shared.clone());
+        let original_config = serde_json::to_value(&*shared.read().await).unwrap();
+        let connected = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "connect",
+                headers("reasoning-test"),
+                json!({}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let connection = &connected["connection_handle"];
+        let opened = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "session",
+                headers("reasoning-test"),
+                json!({"connection_handle":connection,"method":"create","project_id":7}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let task = opened["task_id"].as_str().unwrap();
+        // Creation is a draft. Both its first prompt and later prompts must use
+        // the caller's supported effort, rather than the plugin's low default.
+        for (index, (selected, expected)) in [
+            (Some("high"), Some("high")),
+            (Some("xhigh"), Some("xhigh")),
+            (None, Some("low")),
+            (Some("unsupported"), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut args = json!({"connection_handle":connection,"method":"prompt","task_id":task,
+                "prompt":format!("Update presentation, turn {}", index + 1),"provider":"test","model":"m"});
+            if let Some(effort) = selected {
+                args["reasoning_effort"] = json!(effort);
+            }
+            let response = handle(
+                &runtime,
+                state.clone(),
+                "session",
+                headers("reasoning-test"),
+                args,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let status: String = crate::agent_service::open_db(&root)
+                        .unwrap()
+                        .query_row("SELECT status FROM agent_tasks WHERE id=?1", [task], |r| {
+                            r.get(0)
+                        })
+                        .unwrap();
+                    if status != "running" {
+                        assert_eq!(status, "completed");
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), index + 1);
+            assert_eq!(requests[index]["reasoning_effort"].as_str(), expected);
+            assert_eq!(requests[index]["model"], "m");
+            assert!(
+                requests[index]["messages"]
+                    .to_string()
+                    .contains("Authenticated PPT project binding: 7")
+            );
+            let stored: Option<String> = crate::agent_service::open_db(&root)
+                .unwrap()
+                .query_row(
+                    "SELECT reasoning_effort FROM agent_tasks WHERE id=?1",
+                    [task],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored.as_deref(), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(&*shared.read().await).unwrap(),
+            original_config
+        );
+        active().write().unwrap().remove(task);
+        credentials()
+            .write()
+            .unwrap()
+            .remove(connection.as_str().unwrap());
+        runtime.shutdown().unwrap();
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
     async fn ppt_login_isolates_users_tasks_and_projects_without_global_token_replacement() {
@@ -570,7 +883,9 @@ mod tests {
         assert!(handle(&runtime,state.clone(),"upload",headers("bob"),json!({"connection_handle":bob["connection_handle"],"task_id":task,"name":"brief.md","data":source})).await.is_err());
         assert!(handle(&runtime,state.clone(),"upload",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"name":"deck.pptx","data":source})).await.is_err());
         let mut db = crate::agent_service::open_db(&root).unwrap();
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         crate::attachments::admit(
             &tx,
             &root,
@@ -643,28 +958,70 @@ mod tests {
         .unwrap();
         assert_eq!(read["remote_path"], "sources/brief.md");
         // An uploaded deck is read as text, and its pictures are carried into the project.
-        let deck = base64::engine::general_purpose::STANDARD.encode(std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/attachments/fixtures/sample.pptx")).unwrap());
+        let deck = base64::engine::general_purpose::STANDARD.encode(
+            std::fs::read(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/attachments/fixtures/sample.pptx"),
+            )
+            .unwrap(),
+        );
         let deck_up=value(handle(&runtime,state.clone(),"upload",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"name":"原稿.pptx","data":deck})).await.unwrap()).await;
         let mut db = crate::agent_service::open_db(&root).unwrap();
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-        crate::attachments::admit(&tx,&root,task,2,"Redo this deck",&[json!({"type":"file","receiptId":deck_up["receiptId"]})],Some("ppt-deck"),
-            Some(crate::attachments::PPT_EXTENSIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())).unwrap();
+        let tx = db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        crate::attachments::admit(
+            &tx,
+            &root,
+            task,
+            2,
+            "Redo this deck",
+            &[json!({"type":"file","receiptId":deck_up["receiptId"]})],
+            Some("ppt-deck"),
+            Some(
+                crate::attachments::PPT_EXTENSIONS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ),
+        )
+        .unwrap();
         tx.commit().unwrap();
         let deck_id = &deck_up["file"]["attachmentId"];
-        let text = crate::attachments::read(&state, task, &json!({"attachment_id":deck_id})).await.unwrap();
+        let text = crate::attachments::read(&state, task, &json!({"attachment_id":deck_id}))
+            .await
+            .unwrap();
         assert!(text["content"].as_str().unwrap().contains("图片 s1p1"));
         let before = imports.lock().unwrap().len();
-        let moved = crate::attachments::read(&state, task, &json!({"attachment_id":deck_id,"slide":1})).await.unwrap();
+        let moved =
+            crate::attachments::read(&state, task, &json!({"attachment_id":deck_id,"slide":1}))
+                .await
+                .unwrap();
         assert_eq!(moved["pictures"][0]["id"], "s1p1");
         assert_eq!(moved["pictures"][0]["src"], "project:sources/brief.md");
-        assert_eq!((moved["pictures"][0]["width_px"].as_u64(), moved["pictures"][0]["height_px"].as_u64()), (Some(40), Some(20)));
+        assert_eq!(
+            (
+                moved["pictures"][0]["width_px"].as_u64(),
+                moved["pictures"][0]["height_px"].as_u64()
+            ),
+            (Some(40), Some(20))
+        );
         assert_eq!(moved["pictures"][0]["aspect_ratio"], 2.0);
         let sent = imports.lock().unwrap();
         assert_eq!(sent.len(), before + 1);
         assert_eq!(sent[before]["mediaType"], "image/png");
         assert!(sent[before]["name"].as_str().unwrap().starts_with("s1p1_"));
         drop(sent);
-        assert!(crate::attachments::read(&state, task, &json!({"attachment_id":deck_id,"picture":"s2p1"})).await.is_err());
+        assert!(
+            crate::attachments::read(
+                &state,
+                task,
+                &json!({"attachment_id":deck_id,"picture":"s2p1"})
+            )
+            .await
+            .is_err()
+        );
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1]["user"], 1);

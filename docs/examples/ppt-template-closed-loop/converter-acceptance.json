@@ -1,0 +1,163 @@
+{
+  "method": "AI-authored HTML through the shared converter, independently rendered by LibreOffice 26.2.6.3; no live product model generation claim",
+  "sourceTemplate": "unicom-brand-template.pptx",
+  "sourceUnchanged": true,
+  "checkedDeckPages": [
+    5,
+    20
+  ],
+  "nativeTextAndPDFBlocks": 100,
+  "performance": [
+    {
+      "pages": 5,
+      "timedPipelineMs": 9852,
+      "meanHtmlApplyMs": 1492,
+      "maxHtmlApplyMs": 1548,
+      "stages": [
+        {
+          "step": "copy",
+          "count": 5,
+          "ms": 1066
+        },
+        {
+          "step": "reopen",
+          "count": 5,
+          "ms": 890
+        },
+        {
+          "step": "render",
+          "count": 5,
+          "ms": 436
+        }
+      ]
+    },
+    {
+      "pages": 20,
+      "timedPipelineMs": 82299,
+      "meanHtmlApplyMs": 3732.8,
+      "maxHtmlApplyMs": 3995,
+      "stages": [
+        {
+          "step": "copy",
+          "count": 20,
+          "ms": 3214
+        },
+        {
+          "step": "reopen",
+          "count": 20,
+          "ms": 3109
+        },
+        {
+          "step": "render",
+          "count": 20,
+          "ms": 1321
+        }
+      ]
+    }
+  ],
+  "twoAdditionalHtmlRefinements": [
+    {
+      "page": 14,
+      "ms": 3717,
+      "reason": "explicit author line break, no font shrinking"
+    },
+    {
+      "page": 18,
+      "ms": 4125,
+      "reason": "explicit author line break, no font shrinking"
+    }
+  ],
+  "visualReview": {
+    "renderers": [
+      "editor/headless",
+      "LibreOffice PDF"
+    ],
+    "reviewedPages": {
+      "5": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "20": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ]
+    },
+    "result": "No visible text clipping, object overlap or brand occlusion after the authored HTML refinements."
+  },
+  "boundaries": [
+    "The script authored HTML directly; it did not exercise live Agent model routing, template selection UI or server trial chat.",
+    "This validates a single brand template with Chinese text, simple shapes and fixed raster brand assets; it does not validate every complex OOXML feature.",
+    "Performance is a local measurement including full shared conversion per page, excluding model latency and network. It is not a browser-device performance guarantee.",
+    "The slides are a restrained acceptance sample rather than a claim of open-ended model aesthetic quality.",
+    "LibreOffice 26.2.6.3 re-saving as PPTX removes template policy metadata. Four fixed rectangle decorations become content on engine re-import; template authors must recheck/reapply semantics before AI use after this route. PowerPoint/WPS were not tested."
+  ],
+  "sha256": {
+    "unicom-brand-template.pptx": "55b6a9d5ab06cdd18e20748f530060d64b5926775e496f4da567d66c22fed46d",
+    "unicom-5-pages.pptx": "ed4df20fb19a5bec3e70b5375cb113aea0ac4dcaeb577b24d639c7964474a29e",
+    "unicom-20-pages.pptx": "63bbbe51986effc67d7268c6458e04e602b22ec35bb97a9e2642c9132e52142d"
+  },
+  "externalEditorRoundtrip": {
+    "application": "LibreOffice 26.2.6.3",
+    "filter": "Impress MS PowerPoint 2007 XML",
+    "copy": "libreoffice-resaved/unicom-brand-template.pptx",
+    "originalUnchanged": true,
+    "originalPolicyRecords": 1,
+    "resavedPolicyRecords": 0,
+    "engineCanReopen": true,
+    "pageSemanticsPreserved": false,
+    "nodePurposesChanged": [
+      {
+        "name": "Rectangle 2",
+        "before": "fixed",
+        "after": "content",
+        "beforeKind": "shape",
+        "afterKind": "text"
+      },
+      {
+        "name": "Rectangle 3",
+        "before": "fixed",
+        "after": "content",
+        "beforeKind": "shape",
+        "afterKind": "text"
+      },
+      {
+        "name": "Rectangle 5",
+        "before": "fixed",
+        "after": "content",
+        "beforeKind": "shape",
+        "afterKind": "text"
+      },
+      {
+        "name": "Rectangle 6",
+        "before": "fixed",
+        "after": "content",
+        "beforeKind": "shape",
+        "afterKind": "text"
+      }
+    ],
+    "allNodeNotesLost": true,
+    "result": "FAIL: LibreOffice re-save strips the custom template policy extension. Re-import falls back to defaults and cannot preserve all author intent.",
+    "scope": "Only tested LibreOffice. No inference about Microsoft PowerPoint or WPS."
+  }
+}
