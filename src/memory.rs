@@ -638,7 +638,7 @@ pub fn record_symbol_business_context(
     let workspace_root_path = Path::new(&request.workspace_root);
     let prepared = crate::symbol_description::prepare_record(workspace_root_path, &request)?;
     let mut conn = init_db(workspace_root_path)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let now = unix_now();
     let keywords = request
         .description

@@ -54,6 +54,7 @@ interface DraftSettings {
   plugin_models: Record<string,readonly ModelRef[]>
   visual_tool: ModelUseSettings
   context_agent: ModelUseSettings
+  delegate_agent: ModelUseSettings
   revision: string
   providers: DraftProvider[]
   orchestrator_provider: string
@@ -85,6 +86,7 @@ function toDraft(data: SettingsData): DraftSettings {
     plugin_models: {...data.plugin_models},
     visual_tool: data.visual_tool ?? {},
     context_agent: data.context_agent ?? {},
+    delegate_agent: data.delegate_agent ?? {},
     providers: data.providers.map((p, index) => ({
       _draftId: `saved-${index}-${p.id}`,
       _new: false,
@@ -249,6 +251,7 @@ export function SettingsModal({
         plugin_models: draft.plugin_models,
         visual_tool: draft.visual_tool,
         context_agent: draft.context_agent,
+        delegate_agent: draft.delegate_agent,
         providers: providersPayload,
         orchestrator_provider: draft.orchestrator_provider || null,
         orchestrator_model: draft.orchestrator_model || null,
@@ -383,7 +386,7 @@ export function SettingsModal({
     { id: 'general', label: '通用', icon: <IconSettingsOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'models', label: '模型与提供商', icon: <IconDatabaseOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'observer', label: 'Observer', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
-    { id: 'tools', label: '视觉与压缩', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
+    { id: 'tools', label: '专用模型', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'plugins', label: '插件状态', icon: <IconCordisPluginOutlineRegular className={rootCss.navIcon} size={18} /> },
   ]
 
@@ -842,9 +845,9 @@ export function SettingsModal({
 
             {activeTab === 'tools' && draft !== null && (
               <section className={modelsCss.section}>
-                <h2 className={modelsCss.title}>视觉与上下文压缩</h2>
-                <p className={modelsCss.intro}>专用任务从模型目录选择，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
-                {(['visual_tool', 'context_agent'] as const).map(kind => {
+                <h2 className={modelsCss.title}>专用模型</h2>
+                <p className={modelsCss.intro}>视觉分析、上下文压缩和协作子 Agent 可以单独选模型，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
+                {(['visual_tool', 'context_agent', 'delegate_agent'] as const).map(kind => {
                   const config = draft[kind]
                   const provider = draft.providers.find(p => p.id === (config.provider || draft.orchestrator_provider))
                   const capability = provider?.model_capabilities[config.model || draft.orchestrator_model]
@@ -852,8 +855,12 @@ export function SettingsModal({
                   const update = (patch: Partial<ModelUseSettings>) => updateDraft({ [kind]: { ...config, ...patch } })
                   return (
                     <div key={kind} className={modelsCss.rowCard}>
-                      <h3>{kind === 'visual_tool' ? '视觉分析工具' : '上下文压缩子 Agent'}</h3>
-                      <p className={modelsCss.intro}>{kind === 'visual_tool' ? '分析已保存图片，结果通过普通工具返回。' : '只整理当前任务上下文，提交后继续由主 Agent 执行。'}</p>
+                      <h3>{{ visual_tool: '视觉分析工具', context_agent: '上下文压缩子 Agent', delegate_agent: '协作子 Agent' }[kind]}</h3>
+                      <p className={modelsCss.intro}>{{
+                        visual_tool: '分析已保存图片，结果通过普通工具返回。',
+                        context_agent: '只整理当前任务上下文，提交后继续由主 Agent 执行。',
+                        delegate_agent: '主 Agent 派出去并行干活的子 Agent 用这个模型。可以让主 Agent 用强模型负责拆分、审查和集成，子 Agent 用更省的模型执行。留空则和主 Agent 用同一个。',
+                      }[kind]}</p>
                       <div className={modelsCss.modelAdvanced}>
                         <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>提供商</span>
                           <select className={modelsCss.select} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null, model: null, reasoning_effort: null })}>

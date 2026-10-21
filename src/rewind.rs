@@ -171,7 +171,7 @@ mod tests {
         let mut conn = agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','first','fake','completed',0,0)", []).unwrap();
         conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_runtime_windows(task_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(task_id,scope));").unwrap();
-        let tx = conn.transaction().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         for (turn, text) in [(1, "first"), (2, "second")] {
             agent_service::append_event_tx(&tx, "t", "user/message", &json!({"turn":turn,"message":{"role":"user","content":text}}), None).unwrap();
             agent_service::append_event_tx(&tx, "t", "assistant/message", &json!({"turn":turn}), None).unwrap();

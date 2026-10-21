@@ -1,3 +1,4 @@
+import { randomId } from './randomId.ts'
 import type {AttachmentSubmission} from './components/Attachments'
 import { requestNotificationPermission, useTaskNotifications } from './useTaskNotifications.ts'
 import type { PermissionMode } from './api'
@@ -305,9 +306,14 @@ export function useAgentWorkspace() {
   useTaskNotifications(allTasks, taskId, openTask)
   const submit = useCallback(async (text: string, permissionMode: PermissionMode, attachment?:AttachmentSubmission): Promise<boolean> => {
     setNotice(undefined)
+    if (!taskId && sidebarMode === 'code' && !projects.some(project => project.path === activeWorkspace)) {
+      setNotice('请先添加或选择项目')
+      setFolderDialogOpen(true)
+      return false
+    }
     requestNotificationPermission()
     try {
-      const id = taskId ?? await (pendingSession.current??=api.createSession(activeWorkspace || info?.workspace, sidebarMode).catch(error=>{pendingSession.current=null;throw error}))
+      const id = taskId ?? await (pendingSession.current??=api.createSession(sidebarMode === 'code' ? activeWorkspace : undefined, sidebarMode).catch(error=>{pendingSession.current=null;throw error}))
       const content=[]
       for(const file of attachment?.files??[]){
         let uploaded=uploadedAttachments.current.get(file)
@@ -316,7 +322,7 @@ export function useAgentWorkspace() {
       }
       if(attachment?.signal.aborted)throw Error('上传已取消')
       await api.prompt(id, text, {
-        content,requestId:attachment?.requestId??crypto.randomUUID(),
+        content,requestId:attachment?.requestId??randomId(),
         permission_mode: permissionMode,
         model: modelName ?? undefined,
         reasoning_effort: reasoningEffort ? reasoningEffort : undefined,
@@ -331,7 +337,7 @@ export function useAgentWorkspace() {
       setNotice(messageOf(cause))
       return false
     }
-  }, [api, activeWorkspace, info?.workspace, sidebarMode, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
+  }, [api, activeWorkspace, projects, sidebarMode, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
 
   const stop = useCallback(() => {
     if (taskId === undefined) return
@@ -364,7 +370,7 @@ export function useAgentWorkspace() {
     info, settings, tasks, allTasks, taskId, task, parent, parentId, session,
     ready, isChild, running, heroPhase, composerNote,
     modelName, reasoningEffort, fastMode,
-    projects, workspaces, activeWorkspace: activeWorkspace || info?.workspace || '', selectWorkspace, addWorkspace, removeWorkspace, renameWorkspace,
+    projects, workspaces, activeWorkspace, selectWorkspace, addWorkspace, removeWorkspace, renameWorkspace,
     sidebarMode, changeSidebarMode, updateSession, deleteSession,
     folderDialogOpen, openFolderDialog, closeFolderDialog,
     canContinue: ready && task !== undefined && acceptsPrompt(task),

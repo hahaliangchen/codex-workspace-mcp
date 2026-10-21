@@ -1,3 +1,4 @@
+import { randomId } from '../randomId.ts'
 import {useCallback,useEffect,useRef,useState} from 'react'
 export interface AttachmentRef {attachmentId:string;name:string;bytes:number;mediaType?:string;width?:number;height?:number}
 export interface AttachmentSubmission {files:readonly File[];signal:AbortSignal;requestId:string;onProgress:(label:string)=>void}
@@ -12,7 +13,7 @@ export function useAttachmentDraft(extensions?:readonly string[]) {
       const ext=file.name.split('.').at(-1)?.toLowerCase()??''
       if(extensions&&!extensions.includes(ext)){errors.push(`不支持 ${file.name}`);continue}
       if(file.size===0||file.size>20*1024*1024){errors.push(`${file.name} 必须非空且不超过 20 MiB`);continue}
-      const id=crypto.randomUUID();const preview=file.type.startsWith('image/')?URL.createObjectURL(file):undefined
+      const id=randomId();const preview=file.type.startsWith('image/')?URL.createObjectURL(file):undefined
       if(preview)urls.current.set(id,preview)
       accepted.push({id,file,...(preview?{preview}:{})})
     }

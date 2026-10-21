@@ -101,14 +101,14 @@ mod tests {
         submit(&root, "t", "别动测试").unwrap();
         assert!(pending(&conn, "t").unwrap());
         let mut conn = agent_service::open_db(&root).unwrap();
-        let tx = conn.transaction().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         let messages = take(&tx, "t").unwrap();
         tx.commit().unwrap();
         assert_eq!(messages.len(), 2);
         assert!(messages[0]["content"].as_str().unwrap().ends_with("改用 B 方案"));
         assert_eq!(messages[1]["name"], "user_interjection");
         assert!(!pending(&conn, "t").unwrap());
-        let tx = conn.transaction().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         assert!(take(&tx, "t").unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }

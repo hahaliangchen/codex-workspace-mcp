@@ -440,7 +440,7 @@ mod tests {
             conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','check collision','fake','running',0,0)",[]).unwrap();
             conn.execute("INSERT INTO agent_context_debug VALUES ('task',0)", [])
                 .unwrap();
-            let tx = conn.transaction().unwrap();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             crate::agent_service::append_event_tx(
                 &tx,
                 "task",

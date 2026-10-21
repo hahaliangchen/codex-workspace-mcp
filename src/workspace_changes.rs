@@ -218,7 +218,7 @@ fn record(
     after: Snapshot,
 ) -> Result<Value> {
     let mut conn = connection(root)?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let missing = Image {
         exists: false,
         bytes: None,
@@ -309,8 +309,11 @@ pub fn is_mutation(name: &str) -> bool {
         || crate::project_process::may_change_files(name)
 }
 
+/// Run a mutating tool in `workspace` (the task's project) and record its
+/// before/after images. The change log itself lives in the server's store.
 pub async fn execute_tracked(
     state: AgentServiceState,
+    workspace: std::sync::Arc<crate::tools::Workspace>,
     task: String,
     turn: usize,
     name: String,
@@ -319,21 +322,22 @@ pub async fn execute_tracked(
 ) -> Result<Value> {
     let _guard = tokio::select! { _=cancel.cancelled()=>return Err(anyhow::anyhow!("Tool execution cancelled")), guard=MUTATIONS.lock()=>guard };
     let root = state.workspace.root().to_path_buf();
+    let files = workspace.root().to_path_buf();
     if !crate::project_process::may_change_files(&name) {
         // Boundary checks are mandatory even if optional snapshot capture fails.
-        safe_path(&root, args["path"].as_str().context("missing file path")?)?;
+        safe_path(&files, args["path"].as_str().context("missing file path")?)?;
     }
-    let capture_root = root.clone();
+    let capture_root = files.clone();
     let capture_name = name.clone();
     let capture_args = args.clone();
     let before =
         tokio::task::spawn_blocking(move || capture(&capture_root, &capture_name, &capture_args))
             .await?;
     let result = if crate::project_process::is_tool(&name) {
-        crate::project_process::execute_cancellable(&state.workspace, &name, args.clone(), &cancel)
+        crate::project_process::execute_cancellable(&workspace, &name, args.clone(), &cancel)
             .await
     } else if crate::program_execution::is_tool(&name) {
-        crate::program_execution::execute_cancellable(&state.workspace, &args, &cancel).await
+        crate::program_execution::execute_cancellable(&workspace, &args, &cancel).await
     } else {
         // A started blocking file commit cannot be aborted. Await completion
         // before recording its after-image or releasing the mutation lock.
@@ -341,7 +345,7 @@ pub async fn execute_tracked(
             Err(anyhow::anyhow!("Tool execution cancelled"))
         } else {
             crate::agent_service::execute_tool(
-                state.workspace.clone(),
+                workspace.clone(),
                 state.tool_catalog.as_deref(),
                 &name,
                 args.clone(),
@@ -354,7 +358,7 @@ pub async fn execute_tracked(
     let saved_task = task.clone();
     let changes = tokio::task::spawn_blocking(move || {
         let before = before?;
-        let after = capture(&saved_root,&name,&args)?;
+        let after = capture(&files,&name,&args)?;
         record(&saved_root,&saved_task,turn,before,after)?;
         if background_running {
             // A running script can change files after this snapshot. Do not
@@ -467,6 +471,8 @@ fn restore(path: &Path, bytes: &Option<Vec<u8>>) -> Result<()> {
 
 pub(crate) fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
     let conn = connection(root)?;
+    // Paths are relative to the task's project; the log is in the server store.
+    let files = crate::session_browser::task_workspace(root, task)?;
     let active: usize = conn.query_row(
         "SELECT COUNT(*) FROM agent_tasks WHERE status IN ('running','cancelling')",
         [],
@@ -498,7 +504,7 @@ pub(crate) fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
     let mut prepared = Vec::new();
     let mut conflicts = Vec::new();
     for (relative, before, exists, after) in rows {
-        let path = safe_path(root, &relative)?;
+        let path = safe_path(&files, &relative)?;
         let mut budget = usize::MAX;
         let actual = image(&path, &mut budget)?;
         if actual.exists != exists || actual.bytes != after {
@@ -517,7 +523,7 @@ pub(crate) fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
         let mut restored = false;
         let outcome = (|| -> Result<()> {
             ensure!(
-                safe_path(root, relative)? == *path,
+                safe_path(&files, relative)? == *path,
                 "conflict: {relative} changed its filesystem location"
             );
             let mut budget = usize::MAX;
@@ -548,7 +554,7 @@ pub(crate) fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
                 ) = &prepared[prior];
                 let rollback = (|| -> Result<()> {
                     ensure!(
-                        safe_path(root, relative)? == *path,
+                        safe_path(&files, relative)? == *path,
                         "file location changed during rollback"
                     );
                     let mut budget = usize::MAX;
@@ -613,5 +619,32 @@ fn response(result: std::result::Result<Result<Value>, tokio::task::JoinError>) 
             Json(json!({"error":error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_restores_files_in_the_tasks_own_project() {
+        let base = std::env::temp_dir().join(format!("changes-{}", crate::agent_service::uuid_like()));
+        let (root, project) = (base.join("server"), base.join("project"));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("a.txt"), "new\n").unwrap();
+        fs::write(root.join("a.txt"), "server copy\n").unwrap();
+        let conn = crate::agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','','fake','completed',0,0)", []).unwrap();
+        conn.execute("INSERT INTO agent_session_meta(task_id,workspace) VALUES ('t',?1)", [project.to_string_lossy()]).unwrap();
+        let mut before = Snapshot::new();
+        before.insert("a.txt".into(), Image { exists: true, bytes: Some(b"old\n".to_vec()), stamp: String::new() });
+        let mut after = Snapshot::new();
+        after.insert("a.txt".into(), Image { exists: true, bytes: Some(b"new\n".to_vec()), stamp: String::new() });
+        record(&root, "t", 1, before, after).unwrap();
+        undo(&root, "t", 1).unwrap();
+        assert_eq!(fs::read_to_string(project.join("a.txt")).unwrap(), "old\n");
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "server copy\n", "the server checkout is untouched");
+        let _ = fs::remove_dir_all(&base);
     }
 }

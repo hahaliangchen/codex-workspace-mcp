@@ -282,7 +282,8 @@ pub fn submit(
     let id = agent_service::uuid_like();
     let git = if crate::plugin_sessions::owner(state.workspace.root(),task)?.is_none()
         && !ban_execution && !matches!(state.permission_mode, agent_service::PermissionMode::ReadOnly) {
-        crate::delegate_git::prepare(state.workspace.root(), &id)?
+        // Branch from the project this task works in, not the server's checkout.
+        crate::delegate_git::prepare(&crate::session_browser::task_workspace(state.workspace.root(), task)?, &id)?
     } else { None };
     let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
     let spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
@@ -399,14 +400,27 @@ fn reap(root: &Path, task: &str) -> Result<()> {
     // Same lock order as submit; never mistake an unregistered reservation for a crash.
     let executors = running().lock().unwrap();
     let mut conn = db(root)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let ids = tx
+    // Status polling is a read. Taking the writer lock here makes a waiting
+    // parent compete with its children saving events, heartbeats and outcomes.
+    let ids = conn
         .prepare("SELECT d.id,e.owner_id,e.lease_until FROM agent_delegates d LEFT JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.status='running'")?
         .query_map([task], |r| Ok((r.get::<_, String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<i64>>(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, owner, lease) in ids {
+    let orphaned = |id: &String, owner: &Option<String>, lease: &Option<i64>| {
         let local = owner.as_deref() == Some(instance());
-        if (local && !executors.contains_key(&id)) || (!local && lease.is_none_or(|until| until < now_ms())) {
+        (local && !executors.contains_key(id)) || (!local && lease.is_none_or(|until| until < now_ms()))
+    };
+    if !ids.iter().any(|(id, owner, lease)| orphaned(id, owner, lease)) {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for (id, _, _) in ids {
+        // A foreign executor may have renewed its lease while we waited for
+        // the writer lock. Recheck inside the recovery transaction.
+        let current = tx.query_row(
+            "SELECT e.owner_id,e.lease_until FROM agent_delegates d LEFT JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.id=?2 AND d.status='running'",
+            params![task,id], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<i64>>(1)?))).optional()?;
+        if let Some((owner, lease)) = current && orphaned(&id, &owner, &lease) {
             let result = json!({"status":"interrupted","error":"No live executor after restart. Inspect saved artifacts; the host did not replay the task.","artifact_index":artifact_index(&tx,task,&id)?});
             tx.execute(
                 "UPDATE agent_delegates SET status='interrupted',result=?2 WHERE id=?1",
@@ -517,6 +531,8 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
         .filter(|s| !s.trim().is_empty() && s.chars().count() <= 12000)
         .context("acceptance evidence or unresolved gaps required")?;
     let spec = specification(root,task,id)?;
+    // Delivered files live in the task's project; `root` only holds the store.
+    let files = crate::session_browser::task_workspace(root,task)?;
     let mut conn = db(root)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let refs = args["evidence_refs"].as_array().cloned().unwrap_or_default();
@@ -540,13 +556,14 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
                 "accepted Git review must cite the merge result");
             ensure!(crate::delegate_git::is_merged(root,&spec,head)?,"delegate commit is not present in the main branch");
             let changed=crate::delegate_git::changed_paths(root,&spec)?;
-            let existing=changed.iter().filter(|path| root.join(path).is_file()).collect::<Vec<_>>();
+            let existing=changed.iter().filter(|path| files.join(path).is_file()).collect::<Vec<_>>();
             if !existing.is_empty() {
                 ensure!(receipts.iter().any(|(name,value)|
                     matches!(name.as_str(),"read_file"|"read_file_lines")
                     && value["path"].as_str().is_some_and(|path|existing.iter().any(|changed|changed.as_str()==path))
-                    && fresh_local_read(root,value).unwrap_or(false)),
-                    "accepted Git review must cite a current read of an integrated changed file");
+                    && fresh_local_read(&files,value).unwrap_or(false)),
+                    "accepted Git review must cite a current read of an integrated changed file: after merging, read_file one of {:?} and add that tool result's event_seq to evidence_refs",
+                    existing.iter().take(8).collect::<Vec<_>>());
             }
         } else {
             let output_paths=child_result["artifact_index"]["assets"].as_array().into_iter().flatten()
@@ -556,7 +573,7 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
             for (name,value) in &receipts {
                 if name=="read_file" || name=="read_file_lines" {
                     inspected |= value["path"].as_str().is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
-                        && fresh_local_read(root,value)?;
+                        && fresh_local_read(&files,value)?;
                 } else if name.ends_with("__read_file") {
                     let path=value["data"]["path"].as_str().or_else(||value["path"].as_str());
                     inspected |= path.is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
@@ -608,6 +625,26 @@ pub fn cancel_all(root: &Path, task: &str) {
 mod tests {
     use super::*;
     #[test]
+    fn polling_live_delegates_does_not_wait_for_a_database_writer() {
+        let root = std::env::temp_dir().join(format!("delegate-poll-{}", agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut conn = db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('poll-parent','test','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('poll-child','poll-parent',1,'call','work','{}','running',0)",[]).unwrap();
+        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('poll-child','other-host',?1)",[now_ms()+60_000]).unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        tx.execute("UPDATE agent_tasks SET updated_at=1 WHERE id='poll-parent'",[]).unwrap();
+        let started = std::time::Instant::now();
+        let status = statuses(&root, "poll-parent").unwrap();
+        assert_eq!(status[0]["status"], "running");
+        assert!(ready(&root, "poll-parent").unwrap().is_empty());
+        assert!(outstanding(&root, "poll-parent").unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "read-only polling must not wait for the writer timeout");
+        tx.commit().unwrap();
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn resource_claim_blocks_other_writers_until_delegate_finishes() {
         let root=std::env::temp_dir().join(format!("delegate-claim-{}",agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
@@ -646,14 +683,14 @@ mod tests {
         let spec=json!({"git":worktree});
         std::fs::write(crate::delegate_git::workspace(&root,&spec).unwrap().join("file.txt"),"after\n").unwrap();
         let head=crate::delegate_git::finish(&spec).unwrap().unwrap()["head"].as_str().unwrap().to_owned();
-        let end={let tx=conn.transaction().unwrap();
+        let end={let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let seq=agent_service::append_event_tx(&tx,"parent","subagent/end",&json!({"agent_id":"child"}),Some("append")).unwrap();
             tx.commit().unwrap();seq};
         conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,result,delivered,end_seq,created_at) VALUES ('child','parent',1,'spawn','work',?1,'completed',?2,1,?3,0)",params![spec.to_string(),json!({"status":"completed","git":{"head":head},"artifact_index":{"assets":[]}}).to_string(),end]).unwrap();
         let rejected=review(&root,"parent",&json!({"agent_id":"child","decision":"accepted","evidence":"looks fine"}));
         assert!(rejected.is_err());
         let record=|conn:&mut rusqlite::Connection,call:&str,name:&str,args:Value,result:Value| -> i64 {
-            let tx=conn.transaction().unwrap();
+            let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             agent_service::append_event_tx(&tx,"parent","tool/call",&json!({"callId":call,"name":name,"arguments":args.to_string()}),None).unwrap();
             let seq=agent_service::append_event_tx(&tx,"parent","tool/result",&json!({"message":{"toolCallId":call,"isError":false},"meta":{"result":result}}),None).unwrap();
             tx.commit().unwrap();seq
@@ -824,7 +861,7 @@ mod tests {
             )
             .unwrap();
         }
-        let tx = conn.transaction().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         remember_assets(&tx,"parent","orphan",&json!([{"asset_reference":{"asset_id":"saved-before-compression","source_path":"edited.rs","read_reference":{"tool":"read_asset","arguments":{"asset_id":"saved-before-compression"}}}}])).unwrap();
         // Empty later windows must not erase previously indexed references.
         remember_assets(&tx, "parent", "orphan", &json!([])).unwrap();

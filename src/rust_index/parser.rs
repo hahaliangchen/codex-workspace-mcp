@@ -651,7 +651,7 @@ fn build_index_scoped(
             "rust_symbols",
         )?);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     plan.prepare(&tx, root, "rust", "rust_symbols")?;
     let mut id_counts = HashMap::<String, usize>::new();
     for relative in &plan.changed {

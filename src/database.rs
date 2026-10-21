@@ -8,7 +8,7 @@ pub fn init_db(workspace_root: &Path) -> Result<Connection> {
     }
     let db_path = index_dir.join("codex_state.db");
     let mut conn = Connection::open(db_path)?;
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
     let _ = conn.execute("PRAGMA journal_mode=WAL;", []);
     crate::symbol_index_state::schema(&conn)?;
 
@@ -302,4 +302,78 @@ pub fn get_index_generated_at(conn: &Connection, workspace_root: &str, lang: &st
     )
     .ok()
     .map(|v| v as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    /// Several delegates of one conversation write its events at the same time: every write
+    /// waits its turn instead of failing with "database is locked", and no sequence number repeats.
+    #[test]
+    fn concurrent_writers_wait_for_the_lock_instead_of_failing() {
+        let root = std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let conn = crate::agent_service::open_db(&root).unwrap();
+            conn.execute(
+                "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','p','m','running',0,0)",
+                [],
+            )
+            .unwrap();
+        }
+        let (writers, each) = (8, 40);
+        let threads: Vec<_> = (0..writers)
+            .map(|writer| {
+                let root = root.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    let mut conn = crate::agent_service::open_db(&root).map_err(|e| e.to_string())?;
+                    for step in 0..each {
+                        // Read the next sequence number, then write: the pattern that fails in a deferred transaction.
+                        let tx = conn
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                            .map_err(|e| e.to_string())?;
+                        crate::agent_service::append_event_tx(&tx, "task", "test/event", &json!({"writer":writer,"step":step}), None)
+                            .map_err(|e| e.to_string())?;
+                        tx.commit().map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let conn = crate::agent_service::open_db(&root).unwrap();
+        let (count, distinct): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT seq) FROM agent_task_events WHERE task_id='task'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, distinct), ((writers * each) as i64, (writers * each) as i64));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The same work in deferred transactions shows why they are not used for read-then-write.
+    #[test]
+    fn a_deferred_read_then_write_fails_while_another_connection_writes() {
+        let root = std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut reader = crate::agent_service::open_db(&root).unwrap();
+        let writer = crate::agent_service::open_db(&root).unwrap();
+        writer
+            .execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('a','p','m','running',0,0)", [])
+            .unwrap();
+        let tx = reader.transaction().unwrap();
+        let _: i64 = tx.query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0)).unwrap();
+        writer
+            .execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('b','p','m','running',0,0)", [])
+            .unwrap();
+        let upgrade = tx.execute("UPDATE agent_tasks SET status='done' WHERE id='a'", []);
+        assert!(upgrade.unwrap_err().to_string().contains("locked"));
+        drop(tx);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -112,6 +112,9 @@ pub(crate) struct AiProxyConfig {
     visual_tool: crate::model_settings::ModelSettings,
     #[serde(default)]
     context_agent: crate::model_settings::ModelSettings,
+    /// Task delegates; empty fields inherit the conversation's model.
+    #[serde(default)]
+    delegate_agent: crate::model_settings::ModelSettings,
     #[serde(default)]
     plugin_models: HashMap<String, Vec<crate::model_catalog::ModelRef>>,
     #[serde(default)]
@@ -132,6 +135,7 @@ pub(crate) fn apply_agent_config(
 ) {
     state.visual_tool_settings = config.visual_tool.clone();
     state.context_agent_settings = config.context_agent.clone();
+    state.delegate_agent_settings = config.delegate_agent.clone();
     let main_name = config
         .orchestrator_provider
         .as_deref()
@@ -511,8 +515,15 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
             .cloned()
             .unwrap_or(json!({})),
     )?;
+    config.delegate_agent = serde_json::from_value(
+        generation
+            .get("delegate_agent")
+            .cloned()
+            .unwrap_or(json!({})),
+    )?;
     config.visual_tool.normalize()?;
     config.context_agent.normalize()?;
+    config.delegate_agent.normalize()?;
     config.plugin_models = serde_json::from_value(
         generation
             .get("plugin_models")
@@ -606,7 +617,7 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         "observer_enabled": config.observer_enabled,
         "observer_provider": config.observer_provider,
         "observer_model": config.observer_model,
-                "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+                "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,
         "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     })
 }
@@ -653,7 +664,7 @@ pub(crate) fn catalog_view(config: &AiProxyConfig) -> Value {
     });
     json!({"version":1,"models":models,"defaults":{
         "agent":{"provider":config.orchestrator_provider,"model":config.orchestrator_model},
-        "visual_tool":config.visual_tool,"context_agent":config.context_agent,"plugin_generation":config.plugin_generation,
+        "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,"plugin_generation":config.plugin_generation,
         "observer":{"provider":config.observer_provider,"model":config.observer_model},
     }})
 }
@@ -714,7 +725,7 @@ pub(crate) fn restricted_config(
     scoped.orchestrator_provider = Some(selected.provider.clone());
     scoped.orchestrator_model = Some(selected.model.clone());
     scoped.default_provider = Some(selected.provider.clone());
-    for role in [&mut scoped.visual_tool, &mut scoped.context_agent] {
+    for role in [&mut scoped.visual_tool, &mut scoped.context_agent, &mut scoped.delegate_agent] {
         if role.provider.is_some() || role.model.is_some() {
             let p = role
                 .provider
@@ -882,6 +893,8 @@ struct SettingsEdit {
     visual_tool: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     context_agent: Option<crate::model_settings::ModelSettings>,
+    #[serde(default)]
+    delegate_agent: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     plugin_models: Option<HashMap<String, Vec<crate::model_catalog::ModelRef>>>,
     #[serde(default)]
@@ -1206,6 +1219,7 @@ fn save_settings(
     for (edit, target) in [
         (request.visual_tool, &mut config.visual_tool),
         (request.context_agent, &mut config.context_agent),
+        (request.delegate_agent, &mut config.delegate_agent),
     ] {
         if let Some(mut edit) = edit {
             edit.normalize()?;
@@ -1484,7 +1498,7 @@ fn save_settings(
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
         "model_capabilities": config.model_capabilities,
-                "visual_tool":config.visual_tool,"context_agent":config.context_agent,
+                "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,
         "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     });
     if disk_revision(config_path)? != request.revision {
@@ -2236,7 +2250,7 @@ mod tests {
             &json!({"version":1,"refs":{},"records":{}}),
         )
         .unwrap();
-        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m","gpt-6.1-sol"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000}});
+        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m","gpt-6.1-sol"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000},"delegate_agent":{"model":"m","reasoning_effort":"medium"}});
         payload["plugin_models"] =
             json!({"ppt-master":[{"provider":"test","model":"gpt-6.1-sol"}]});
         payload["plugin_generation"] =
@@ -2246,6 +2260,8 @@ mod tests {
             .unwrap();
         let loaded = load_config(&path).unwrap();
         assert_eq!(loaded.context_agent.context_window, Some(500000));
+        assert_eq!(loaded.delegate_agent.model.as_deref(), Some("m"));
+        assert_eq!(loaded.delegate_agent.reasoning_effort.as_deref(), Some("medium"));
         assert_eq!(
             loaded.plugin_generation["ppt-master"]
                 .reasoning_effort

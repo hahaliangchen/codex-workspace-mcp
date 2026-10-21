@@ -22,7 +22,7 @@ interface PageProps {
 }
 
 export function HeroPage({ workspace, renderSlot }: PageProps) {
-  const currentWs = workspace.activeWorkspace || workspace.info?.workspace || ''
+  const currentWs = workspace.projects.find(project => project.path === workspace.activeWorkspace)?.path ?? ''
   const wsName = workspaceName(currentWs)
 
   return (
@@ -31,7 +31,7 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
         <div className={welcomeCss.heading}>
           <img src={logoImg} className={welcomeCss.logo} alt="" />
           <h1 className={welcomeCss.title}>
-            {workspace.sidebarMode === 'chat' ? '今天想聊点什么？' : <>今天想在 <span className={welcomeCss.workspace}>{wsName}</span> 里种点什么？</>}
+            {workspace.sidebarMode === 'chat' ? '今天想聊点什么？' : !currentWs ? '今天想一起做点什么？' : <>今天想在 <span className={welcomeCss.workspace}>{wsName}</span> 里种点什么？</>}
           </h1>
         </div>
         {renderSlot('agent.composer', {
@@ -41,7 +41,7 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
           running: false,
           workspacePath: currentWs,
           workspaces: workspace.workspaces,
-          activeWorkspace: workspace.activeWorkspace,
+          activeWorkspace: currentWs,
           onSelectWorkspace: workspace.selectWorkspace,
           onOpenAddWorkspace: workspace.openFolderDialog,
           modelName: workspace.modelName ?? undefined,

@@ -56,6 +56,15 @@ async fn bind_chat(connection: &Connection, task: &str, project: u64) {
 pub fn project(root: &std::path::Path, task: &str) -> Result<Option<u64>> {
     Ok(binding(root, task)?.map(|(_, id)| id))
 }
+/// A creation page can answer service reads before it has a deck editor.
+/// Reject page calls at that stage instead of queuing an impossible editor wait.
+pub fn require_page_project(root: &std::path::Path, task: &str) -> Result<()> {
+    ensure!(
+        project(root, task)? != Some(0),
+        "PPT_PROJECT_NOT_INITIALIZED: 当前对话还没有 PPT 项目，这不是网页关闭。提案阶段请用 read_file 读取 skill:pptx_templates/<id>/design_spec.md；给出方案后结束本轮，等待用户确认。确认后先 init_project，并等待 task 成功，再调用 get_template 等页面工具。应用会自动打开编辑器，不要要求用户手动打开。"
+    );
+    Ok(())
+}
 pub fn connection(root: &std::path::Path, task: &str) -> Result<Option<Arc<Connection>>> {
     if binding(root, task)?.is_none() {
         return Ok(None);
@@ -561,7 +570,7 @@ mod tests {
         assert!(handle(&runtime,state.clone(),"upload",headers("bob"),json!({"connection_handle":bob["connection_handle"],"task_id":task,"name":"brief.md","data":source})).await.is_err());
         assert!(handle(&runtime,state.clone(),"upload",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"name":"deck.pptx","data":source})).await.is_err());
         let mut db = crate::agent_service::open_db(&root).unwrap();
-        let tx = db.transaction().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         crate::attachments::admit(
             &tx,
             &root,
@@ -637,7 +646,7 @@ mod tests {
         let deck = base64::engine::general_purpose::STANDARD.encode(std::fs::read(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/attachments/fixtures/sample.pptx")).unwrap());
         let deck_up=value(handle(&runtime,state.clone(),"upload",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"name":"原稿.pptx","data":deck})).await.unwrap()).await;
         let mut db = crate::agent_service::open_db(&root).unwrap();
-        let tx = db.transaction().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         crate::attachments::admit(&tx,&root,task,2,"Redo this deck",&[json!({"type":"file","receiptId":deck_up["receiptId"]})],Some("ppt-deck"),
             Some(crate::attachments::PPT_EXTENSIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>().as_slice())).unwrap();
         tx.commit().unwrap();
@@ -685,6 +694,11 @@ mod tests {
         )
         .await;
         let fresh_task = fresh["task_id"].as_str().unwrap();
+        let error = require_page_project(&root, fresh_task).unwrap_err();
+        assert!(error.to_string().starts_with("PPT_PROJECT_NOT_INITIALIZED"));
+        assert!(error.to_string().contains("init_project"));
+        require_page_project(&root, task).unwrap();
+        require_page_project(&root, "not-a-ppt-session").unwrap();
         let definition = catalog
             .packages
             .tools(&std::collections::BTreeSet::from(["ppt-master".to_owned()]))
@@ -774,6 +788,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(project(&root, fresh_task).unwrap(), Some(11));
+        require_page_project(&root, fresh_task).unwrap();
         active().write().unwrap().remove(task);
         assert!(
             connection(&root, task).is_err(),

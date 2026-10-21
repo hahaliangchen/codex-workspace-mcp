@@ -97,6 +97,24 @@ pub(crate) fn explicitly_rejects_images(status: u16, body: &str) -> bool {
         .any(|word| text.contains(word))
 }
 
+fn probe_answer(raw: &str) -> Value {
+    // Some Qwen gateways put reasoning in content, sometimes without an opening
+    // tag. Only grade the final answer, never a JSON example in the reasoning.
+    let final_text = match raw.rsplit_once("</think>") {
+        Some((_, answer)) => answer,
+        None if raw.contains("<think>") => return Value::Null,
+        None => raw,
+    };
+    serde_json::from_str(
+        final_text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim(),
+    )
+    .unwrap_or(Value::Null)
+}
+
 pub async fn probe(
     client: &reqwest::Client,
     route: &crate::visual_artifacts::VisualRoute,
@@ -150,13 +168,7 @@ pub async fn probe(
                     .pointer("/choices/0/message/content")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let answer: Value = serde_json::from_str(
-                    raw.trim()
-                        .trim_start_matches("```json")
-                        .trim_end_matches("```")
-                        .trim(),
-                )
-                .unwrap_or(Value::Null);
+                let answer = probe_answer(raw);
                 report["answer"] = answer.clone();
                 if answer["cells"] == expected["cells"] {
                     report["capability"] = json!("supported");
@@ -247,14 +259,17 @@ mod tests {
                     json!({"color":color,"dots":dots})
                 })
                 .collect();
-            let content = if mode == 1 {
-                "{}".to_owned()
-            } else {
-                json!({"cells":cells}).to_string()
+            let answer = json!({"cells":cells}).to_string();
+            let content = match mode {
+                1 => "{}".to_owned(),
+                4 => format!("I inspected the image.\n</think>\n```json\n{answer}\n```"),
+                5 => format!("<think>{answer}</think>\n{{}}"),
+                6 => format!("<think>{answer}"),
+                _ => answer,
             };
             Json(json!({"choices":[{"message":{"content":content}}]})).into_response()
         }
-        for mode in 0..4 {
+        for mode in 0..7 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -277,7 +292,7 @@ mod tests {
             assert_eq!(
                 report["capability"],
                 match mode {
-                    0 => "supported",
+                    0 | 4 => "supported",
                     2 => "unsupported",
                     _ => "unknown",
                 },
@@ -285,7 +300,7 @@ mod tests {
             );
             assert!(!report.to_string().contains("secret"));
             assert!(!report.to_string().contains("base64"));
-            if mode >= 2 {
+            if matches!(mode, 2 | 3) {
                 assert!(
                     report["response_body"]
                         .as_str()

@@ -47,7 +47,7 @@ pub(crate) fn build_index_scoped(
             "ts_symbols",
         )?);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     plan.prepare(&tx, root, "ts", "ts_symbols")?;
     for relative in &plan.changed {
         let path_buf = root.join(relative);

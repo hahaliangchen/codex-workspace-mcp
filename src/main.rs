@@ -12,6 +12,7 @@ mod context_assets;
 mod context_rebuild;
 mod context_window;
 mod database;
+mod db_writer;
 mod delegate_git;
 mod file_edit;
 mod flow_skills;

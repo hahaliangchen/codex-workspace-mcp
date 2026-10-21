@@ -803,11 +803,11 @@ mod tests {
         let parts = vec![json!({"type":"file","receiptId":uploaded["receiptId"]})];
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             assert!(admit(&tx, &f.root, "b", 1, "读材料", &parts, None, None).is_err());
         }
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let bad = vec![
                 parts[0].clone(),
                 json!({"type":"file","receiptId":"missing"}),
@@ -815,7 +815,7 @@ mod tests {
             assert!(admit(&tx, &f.root, "a", 1, "读材料", &bad, None, None).is_err());
         }
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let saved = admit(
                 &tx,
                 &f.root,
@@ -833,7 +833,7 @@ mod tests {
         assert!(already(&c, "a", "request-1", "读材料", &parts).unwrap());
         assert!(already(&c, "a", "request-1", "不同内容", &parts).is_err());
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             assert!(admit(&tx, &f.root, "a", 2, "再发", &parts, None, None).is_err());
         }
         let restored = admitted(&f.root, "a", 1).unwrap();
@@ -871,7 +871,7 @@ mod tests {
             json!({"type":"image","mediaType":"image/png","name":"reference.png","data":encoded});
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             let content = admit(&tx, &f.root, "a", 1, "看图", &[part], None, None).unwrap();
             assert_eq!(content[1]["attachment"]["width"], 20);
             assert!(!content[1].to_string().contains("data"));
@@ -955,7 +955,7 @@ mod tests {
         let f = Fixture::new();
         let up = store(&f.state, "a", "report.csv", b"a,b\n1,2").unwrap();
         let mut c = agent_service::open_db(&f.root).unwrap();
-        let tx = c.transaction().unwrap();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         assert!(
             admit(
                 &tx,
@@ -1004,7 +1004,7 @@ sys.stdout.buffer.write(b.getvalue())"#).output().unwrap();
         assert!(output.status.success());
         let up = store(&f.state, "a", "资料.docx", &output.stdout).unwrap();
         let mut c = agent_service::open_db(&f.root).unwrap();
-        let tx = c.transaction().unwrap();
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         admit(
             &tx,
             &f.root,
@@ -1047,7 +1047,7 @@ sys.stdout.buffer.write(b.getvalue())"#).output().unwrap();
         let id = up["file"]["attachmentId"].clone();
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction().unwrap();
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             admit(
                 &tx,
                 &f.root,

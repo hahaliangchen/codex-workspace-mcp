@@ -141,9 +141,7 @@ async fn db<T: Send + 'static>(
     root: &Path,
     f: impl FnOnce(&mut rusqlite::Connection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut conn = agent_service::open_db(&root)?;
+    crate::db_writer::write_async(root, move |conn| {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_runtime_windows(
             task_id TEXT NOT NULL, scope TEXT NOT NULL, state TEXT NOT NULL,
@@ -152,9 +150,9 @@ async fn db<T: Send + 'static>(
             task_id TEXT NOT NULL, id TEXT NOT NULL, data TEXT NOT NULL,
             PRIMARY KEY(task_id,id));",
         )?;
-        f(&mut conn)
+        f(conn)
     })
-    .await?
+    .await
 }
 async fn save(s: &Session<'_>, w: &Window) -> Result<()> {
     let (task, scope, text) = (
@@ -1036,9 +1034,12 @@ async fn business_tool(
     let _claim=if let Some(resource)=crate::collaboration_jobs::resource_key(tool_workspace.root(),name,&args)? {
         Some(crate::collaboration_jobs::claim_resource(s.state.workspace.root(),s.task,s.delegate_id(),call_id,resource)?)
     } else { None };
-    if crate::workspace_changes::is_mutation(name) && tool_workspace.root()==s.state.workspace.root() {
+    // The main agent's edits are tracked in whichever project the task uses;
+    // git delegates and plugin pages keep their own records.
+    if crate::workspace_changes::is_mutation(name) && s.delegate_id().is_none() && s.plugin.is_none() {
         crate::workspace_changes::execute_tracked(
             s.state.clone(),
+            tool_workspace.clone(),
             s.task.to_owned(),
             s.turn,
             name.to_owned(),
@@ -1059,6 +1060,9 @@ async fn business_tool(
         if let Some(catalog) = &s.state.tool_catalog
             && let Some(page_name) = catalog.packages.page_tool(name)
         {
+            if name.starts_with("ppt_master__") {
+                crate::ppt_sessions::require_page_project(s.state.workspace.root(), s.task)?;
+            }
             let answer = match crate::page_tools::call(s.task, &page_name, args, s.cancel).await {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -2306,6 +2310,17 @@ pub(crate) fn run_delegate(
     Box::pin(async move {
         let specification =
             crate::collaboration_jobs::specification(state.workspace.root(), &task, &id)?;
+        // A configured delegate model replaces the conversation's; with nothing
+        // configured the delegate runs exactly as the conversation does.
+        let settings = &state.delegate_agent_settings;
+        let (state, model) = if settings.provider.is_none() && settings.model.is_none() && settings.reasoning_effort.is_none() {
+            (state, model)
+        } else {
+            let resolved = settings.resolve(&state, &model)?;
+            let model = resolved.default_model.clone();
+            (resolved, model)
+        };
+        let input_budget = state.delegate_agent_settings.input_budget(INPUT_BUDGET);
         let s = Session {
             plugin: crate::plugin_sessions::owner(state.workspace.root(), &task)?,
             state: &state,
@@ -2318,7 +2333,7 @@ pub(crate) fn run_delegate(
             scope: format!("delegate:{id}"),
             parent: Some(parent),
             material: None,
-            input_budget: INPUT_BUDGET,
+            input_budget,
         };
         let mut w: Window =
             serde_json::from_value(shared_context).context("invalid inherited execution window")?;
@@ -2832,6 +2847,7 @@ mod tests {
                 let message=if let Some(assignment)=messages.iter().find(|m|m["name"]=="parent_assignment") {
                     let spec:Value=serde_json::from_str(assignment["content"].as_str().unwrap()).unwrap();
                     assert_eq!(headers["x-agent-affinity"].to_str().unwrap(),crate::model_transport::affinity("task",&format!("delegate:{}",spec["agent_id"].as_str().unwrap())));
+                    assert_eq!(body["model"], "delegate-model", "delegates use the configured delegate model");
                     assert_eq!(spec["context"], "");
                     assert!(messages.iter().any(|m| m["name"]=="inherited_tool_result" && m["content"].as_str().is_some_and(|v|v.contains("CONFIRMED_TEMPLATE_BODY_DO_NOT_REREAD"))), "loaded template must reach the child without an extra model read");
                     assert!(messages.iter().any(|m|m["role"]=="user" && m["content"]=="Delegate independent files, then inspect and accept the results"));
@@ -2842,12 +2858,16 @@ mod tests {
                         tool("child-write","write_file",json!({"path":format!("{name}.txt"),"content":format!("{name} output")}))
                     } else {
                         // The fast delegate can complete only after the main Agent has
-                        // performed independent work while both delegates are active.
-                        for _ in 0..200 {if files.join("main.txt").exists(){break;}tokio::time::sleep(Duration::from_millis(5)).await;}
+                        // performed independent work and attempted a premature final
+                        // answer (its 5th request) while both delegates are active.
+                        // Waiting on the request count, not wall time, keeps the
+                        // order fixed however long each main step takes.
+                        for _ in 0..2000 {if files.join("main.txt").exists() && calls.load(Ordering::SeqCst)>=5 {break;}tokio::time::sleep(Duration::from_millis(5)).await;}
                         assert!(files.join("main.txt").exists());
                         json!({"role":"assistant","content":format!("{name}-report")})
                     }
                 } else {
+                    assert_eq!(body["model"], "fake", "the main agent keeps the conversation's model");
                     assert_eq!(headers["x-agent-affinity"].to_str().unwrap(),crate::model_transport::affinity("task","main"));
                     let step=calls.fetch_add(1,Ordering::SeqCst);
                     match step {
@@ -2892,7 +2912,8 @@ mod tests {
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let mut state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        state.delegate_agent_settings.model = Some("delegate-model".into());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
@@ -4368,7 +4389,7 @@ mod tests {
         staged_db.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
         let upload =
             crate::attachments::store(&staged_state, "task", "feedback.png", &png).unwrap();
-        let tx = staged_db.transaction().unwrap();
+        let tx = staged_db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
         crate::attachments::admit(
             &tx,
             root.path(),

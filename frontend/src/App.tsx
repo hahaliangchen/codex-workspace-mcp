@@ -177,7 +177,7 @@ export function App({ renderSlot }: AgentSlotProps) {
           taskId={workspace.taskId}
           running={workspace.running}
           onChangesUpdated={workspace.session.reload}
-          workspacePath={workspace.info?.workspace ?? 'codex-workspace-mcp'}
+          workspacePath={workspace.task?.workspace ?? workspace.activeWorkspace ?? workspace.info?.workspace ?? ''}
           events={workspace.session.events}
           onClose={() => setRightPanelOpen(false)}
         />

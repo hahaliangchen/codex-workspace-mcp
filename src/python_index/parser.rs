@@ -635,7 +635,7 @@ fn build_index_scoped(
             "python_symbols",
         )?);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     plan.prepare(&tx, root, "python", "python_symbols")?;
     for relative in &plan.changed {
         let path_buf = root.join(relative);

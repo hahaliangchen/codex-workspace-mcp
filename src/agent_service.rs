@@ -102,6 +102,8 @@ pub struct AgentServiceState {
     pub visual: crate::visual_artifacts::VisualSettings,
     pub visual_tool_settings: crate::model_settings::ModelSettings,
     pub context_agent_settings: crate::model_settings::ModelSettings,
+    /// Model for task delegates; all-empty means "same as the conversation".
+    pub delegate_agent_settings: crate::model_settings::ModelSettings,
     pub config: Option<Arc<tokio::sync::RwLock<crate::ai_proxy::AiProxyConfig>>>,
     pub config_path: Option<std::path::PathBuf>,
     pub tool_catalog: Option<Arc<crate::builtin_plugins::ToolCatalog>>,
@@ -245,7 +247,7 @@ pub async fn create_draft_task(State(state): State<AgentServiceState>, input: Op
     let id = task_id.clone();
     let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let mut conn = open_db(&root)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,provider_name,reasoning_effort,fast_mode) VALUES (?1,'',?2,'draft',?3,?3,?4,?5,?6)",
             params![id, model, now(), provider_name, reasoning_effort, fast_mode],
@@ -544,11 +546,13 @@ fn append_event(
     data: Value,
     surface_op: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut conn = open_db(root)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    append_event_tx(&tx, task_id, kind, &data, surface_op)?;
-    tx.commit()?;
-    Ok(())
+    let (task_id, kind, surface_op) = (task_id.to_owned(), kind.to_owned(), surface_op.map(str::to_owned));
+    crate::db_writer::write(root, move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        append_event_tx(&tx, &task_id, &kind, &data, surface_op.as_deref())?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 pub(crate) fn append_event_tx(
@@ -2771,6 +2775,7 @@ pub(crate) mod tests {
             visual: Default::default(),
             visual_tool_settings: Default::default(),
             context_agent_settings: Default::default(),
+            delegate_agent_settings: Default::default(),
             config: None,
             config_path: None,
             tool_catalog: None,

@@ -1,3 +1,4 @@
+import { randomId } from '../randomId.ts'
 import {AttachmentRail,useAttachmentDraft,type AttachmentSubmission} from './Attachments.tsx'
 import { PREFILL_EVENT, recentPrefill } from './RewindControl.tsx'
 import { ContextRing, type ContextUsage } from './ContextRing.tsx'
@@ -110,9 +111,9 @@ export function Composer({
   const attachments=useAttachmentDraft()
   const fileInput=useRef<HTMLInputElement>(null)
   const uploadAbort=useRef<AbortController|null>(null)
-  const requestId=useRef(crypto.randomUUID())
+  const requestId=useRef(randomId())
   const [uploadLabel,setUploadLabel]=useState('')
-  useEffect(()=>{requestId.current=crypto.randomUUID()},[draft,attachments.items])
+  useEffect(()=>{requestId.current=randomId()},[draft,attachments.items])
   useEffect(()=>()=>uploadAbort.current?.abort(),[])
 
   const [submitting, setSubmitting] = useState(false)
@@ -475,7 +476,7 @@ export function Composer({
               onClick={() => setWorkspaceMenuOpen(open => !open)}
             >
               <IconFolderOpenRegular className={heroShellCss.folder} size={16} />
-              <span className={heroShellCss.workspaceLabel}>{wsName}</span>
+              <span className={heroShellCss.workspaceLabel}>{wsName || '选择项目'}</span>
               <IconChevronDownOutlineRegular className={heroShellCss.chevron} size={12} />
             </button>
 
@@ -485,7 +486,7 @@ export function Composer({
               anchor={null}
               portal
               getAnchorRect={() => workspaceAnchorRef.current?.getBoundingClientRect() ?? null}
-              items={(workspaces.length > 0 ? workspaces : [activeWorkspace || workspacePath || 'codex-workspace-mcp']).map(ws => ({
+              items={workspaces.map(ws => ({
                 id: ws,
                 label: workspaceName(ws),
                 icon: <IconFolderCloseRegular size={16} />,

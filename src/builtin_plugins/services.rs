@@ -344,6 +344,7 @@ impl Plugin for AgentTasksPlugin {
             visual: Default::default(),
             visual_tool_settings: Default::default(),
             context_agent_settings: Default::default(),
+            delegate_agent_settings: Default::default(),
             config: Some(settings.config.clone()),
             config_path: Some(settings.path.clone()),
             tool_catalog: Some(tools),

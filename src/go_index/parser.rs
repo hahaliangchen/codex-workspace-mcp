@@ -650,7 +650,7 @@ fn build_index_scoped(
             "go_symbols",
         )?);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     plan.prepare(&tx, root, "go", "go_symbols")?;
     for relative in &plan.changed {
         let path_buf = root.join(relative);

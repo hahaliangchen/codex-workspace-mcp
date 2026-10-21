@@ -99,7 +99,7 @@ pub(crate) async fn handle(state: AgentServiceState, id: &str, args: Value) -> R
         crate::model_catalog::restrict(&mut latest, id).await?;
         let task = format!("task_{}", agent_service::uuid_like());
         let mut conn = agent_service::open_db(root)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,provider_name,reasoning_effort,fast_mode) VALUES (?1,'',?2,'draft',?3,?3,?4,?5,?6)", params![task,latest.default_model,chrono::Utc::now().timestamp_millis(),latest.provider_name,latest.reasoning_effort,latest.fast_mode])?;
         tx.execute(
             "INSERT INTO plugin_sessions(task_id,plugin_id) VALUES (?1,?2)",

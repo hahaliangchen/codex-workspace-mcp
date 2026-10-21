@@ -166,13 +166,14 @@ export interface CatalogModel {
 export interface ModelCatalog {
   readonly version: number
   readonly models: readonly CatalogModel[]
-  readonly defaults: Readonly<Record<'agent' | 'visual_tool' | 'context_agent' | 'observer', ModelUseSettings>>
+  readonly defaults: Readonly<Record<'agent' | 'visual_tool' | 'context_agent' | 'delegate_agent' | 'observer', ModelUseSettings>>
 }
 
 export interface SettingsData {
   readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
+  readonly delegate_agent?: ModelUseSettings
   readonly revision: string
   readonly providers: readonly ProviderConfig[]
   readonly orchestrator_provider: string | null
@@ -200,6 +201,7 @@ export interface SaveSettingsInput {
   readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
   readonly context_agent?: ModelUseSettings
+  readonly delegate_agent?: ModelUseSettings
   readonly revision: string
   readonly providers: readonly SaveProviderInput[]
   readonly orchestrator_provider: string | null

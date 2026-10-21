@@ -26,6 +26,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(git_output(root, args)?.trim().to_owned())
 }
 
+/// The repository a delegate branched from. Recorded at prepare time so a
+/// task in any registered project merges back into that project, not into
+/// the server's own checkout; older delegates fall back to `root`.
+fn repository(root: &Path, spec: &Value) -> PathBuf {
+    spec["git"]["repository"].as_str().map_or_else(|| root.to_path_buf(), PathBuf::from)
+}
+
 fn worktree_parent(root: &Path) -> Result<PathBuf> {
     let root = root.canonicalize()?;
     let parent = root
@@ -42,6 +49,24 @@ fn clean_checkout(root: &Path) -> Result<bool> {
         let path = line.get(3..).unwrap_or("");
         path == ".codex-workspace-mcp" || path.starts_with(".codex-workspace-mcp/")
     }))
+}
+
+/// The host's per-project index and memory store. It must never be committed
+/// by a delegate or overwritten by a merge, so it is excluded repository-wide
+/// (the local .git/info/exclude, shared by every worktree; .gitignore is the user's).
+const STATE_DIR: &str = ".codex-workspace-mcp";
+
+fn exclude_state_dir(root: &Path) -> Result<()> {
+    let common = PathBuf::from(git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
+    let exclude = common.join("info").join("exclude");
+    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
+    let rule = format!("/{STATE_DIR}/");
+    if !current.lines().any(|line| line.trim() == rule) {
+        std::fs::create_dir_all(exclude.parent().context("exclude file has no parent")?)?;
+        let separator = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+        std::fs::write(&exclude, format!("{current}{separator}{rule}\n"))?;
+    }
+    Ok(())
 }
 
 pub fn prepare(root: &Path, id: &str) -> Result<Option<Value>> {
@@ -67,6 +92,7 @@ pub fn prepare(root: &Path, id: &str) -> Result<Option<Value>> {
         clean_checkout(root)?,
         "GIT_DELEGATE_DIRTY_BASE: commit or otherwise preserve the current working tree before starting isolated delegates"
     );
+    exclude_state_dir(root)?;
     let base = git(root, &["rev-parse", "HEAD"])?;
     let branch = format!("codex/delegate-{id}");
     let path = worktree_parent(root)?.join(id);
@@ -74,11 +100,12 @@ pub fn prepare(root: &Path, id: &str) -> Result<Option<Value>> {
     let path_str = path.to_str().context("worktree path is not UTF-8")?;
     git(root, &["worktree", "add", "-b", &branch, path_str, &base])?;
     Ok(Some(
-        json!({"branch":branch,"worktree":path,"base":base,"status":"active"}),
+        json!({"branch":branch,"worktree":path,"base":base,"repository":top,"status":"active"}),
     ))
 }
 
 pub fn workspace(root: &Path, spec: &Value) -> Result<PathBuf> {
+    let root = &repository(root, spec);
     let Some(path) = spec["git"]["worktree"].as_str() else {
         return Ok(root.to_path_buf());
     };
@@ -95,6 +122,8 @@ pub fn finish(spec: &Value) -> Result<Option<Value>> {
         return Ok(None);
     };
     let root = Path::new(path);
+    // Also covers worktrees prepared before the exclusion existed.
+    exclude_state_dir(root)?;
     git(root, &["add", "-A"])?;
     if !git(root, &["status", "--porcelain"])?.is_empty() {
         git(
@@ -125,6 +154,7 @@ pub fn diff(root: &Path, spec: &Value) -> Result<Value> {
         .as_str()
         .context("missing delegate base")?;
     let worktree = workspace(root, spec)?;
+    let root = &repository(root, spec);
     ensure!(
         git(&worktree, &["status", "--porcelain"])?.is_empty(),
         "delegate worktree changed after its result was archived; inspect and snapshot it before merging"
@@ -153,7 +183,7 @@ pub fn changed_paths(root: &Path, spec: &Value) -> Result<Vec<String>> {
         .as_str()
         .context("missing delegate base")?;
     Ok(
-        git_output(root, &["diff", "--name-only", "-z", base, branch, "--"])?
+        git_output(&repository(root, spec), &["diff", "--name-only", "-z", base, branch, "--"])?
             .split('\0')
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
@@ -162,6 +192,7 @@ pub fn changed_paths(root: &Path, spec: &Value) -> Result<Vec<String>> {
 }
 
 pub fn merge(root: &Path, spec: &Value, expected_head: &str) -> Result<Value> {
+    let root = &repository(root, spec);
     let branch = spec["git"]["branch"]
         .as_str()
         .context("not a Git delegate")?;
@@ -196,6 +227,7 @@ pub fn merge(root: &Path, spec: &Value, expected_head: &str) -> Result<Value> {
 }
 
 pub fn is_merged(root: &Path, spec: &Value, expected_head: &str) -> Result<bool> {
+    let root = &repository(root, spec);
     let branch = spec["git"]["branch"]
         .as_str()
         .context("not a Git delegate")?;
@@ -214,6 +246,39 @@ pub fn is_merged(root: &Path, spec: &Value, expected_head: &str) -> Result<bool>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delegates_merge_into_the_project_they_branched_from() {
+        let parent = std::env::temp_dir().join(format!("delegate-repo-{}", crate::agent_service::uuid_like()));
+        let (server, project) = (parent.join("server"), parent.join("project"));
+        for root in [&server, &project] {
+            std::fs::create_dir_all(root).unwrap();
+            git(root, &["init", "-b", "main"]).unwrap();
+            std::fs::write(root.join("file.txt"), "before\n").unwrap();
+            git(root, &["add", "-A"]).unwrap();
+            git(root, &["-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "base"]).unwrap();
+        }
+        let spec = json!({"git":prepare(&project, "child").unwrap().unwrap()});
+        // Callers pass the server root; the recorded repository wins.
+        let child = workspace(&server, &spec).unwrap();
+        assert!(child.starts_with(parent.join(".codex-workspace-mcp-worktrees").join("project")));
+        std::fs::write(child.join("file.txt"), "after\n").unwrap();
+        // Both checkouts have their own host state store; neither may be committed or clobbered.
+        for dir in [&child, &project] {
+            std::fs::create_dir_all(dir.join(STATE_DIR)).unwrap();
+            std::fs::write(dir.join(STATE_DIR).join("codex_state.db"), dir.to_string_lossy().as_bytes()).unwrap();
+        }
+        let head = finish(&spec).unwrap().unwrap()["head"].as_str().unwrap().to_owned();
+        assert!(diff(&server, &spec).unwrap()["diff"].as_str().unwrap().contains("+after"));
+        assert!(!diff(&server, &spec).unwrap()["stat"].as_str().unwrap().contains(STATE_DIR));
+        merge(&server, &spec, &head).unwrap();
+        assert!(is_merged(&server, &spec, &head).unwrap());
+        assert_eq!(changed_paths(&server, &spec).unwrap(), vec!["file.txt"]);
+        assert_eq!(std::fs::read_to_string(project.join("file.txt")).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(server.join("file.txt")).unwrap(), "before\n");
+        assert_eq!(std::fs::read_to_string(project.join(STATE_DIR).join("codex_state.db")).unwrap(), project.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn delegate_branch_is_isolated_until_explicit_merge() {
         let parent = std::env::temp_dir().join(format!(
