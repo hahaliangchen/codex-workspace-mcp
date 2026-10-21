@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-static MUTATIONS: Mutex<()> = Mutex::const_new(());
+pub(crate) static MUTATIONS: Mutex<()> = Mutex::const_new(());
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 32 * 1024 * 1024;
@@ -465,7 +465,7 @@ fn restore(path: &Path, bytes: &Option<Vec<u8>>) -> Result<()> {
     }
 }
 
-fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
+pub(crate) fn undo(root: &Path, task: &str, turn: usize) -> Result<Value> {
     let conn = connection(root)?;
     let active: usize = conn.query_row(
         "SELECT COUNT(*) FROM agent_tasks WHERE status IN ('running','cancelling')",

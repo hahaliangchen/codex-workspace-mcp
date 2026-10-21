@@ -6,7 +6,7 @@ export interface SkillPackage {
   pages: { id: string; title: string; entry: string; renderer: string }[]
 }
 
-export type PermissionMode = 'read_only' | 'workspace_write' | 'full_access'
+export type PermissionMode = 'read_only' | 'workspace_write' | 'ask' | 'full_access'
 
 export interface RequestContextMeta {
   readonly id: number
@@ -83,6 +83,11 @@ export type TaskStatus =
 export interface Task {
   readonly task_id: string
   readonly prompt: string
+  readonly kind?: 'chat' | 'code'
+  readonly title?: string | null
+  readonly pinned?: boolean
+  readonly archived?: boolean
+  readonly workspace?: string | null
   readonly model: string
   readonly provider_name?: string | null
   readonly reasoning_effort?: string | null
@@ -93,7 +98,11 @@ export interface Task {
   readonly parent_task_id: string | null
   /** Set for plugin page chats: pure conversations with no working directory. */
   readonly plugin_id?: string | null
+  /** Paused on an "ask before running" card. */
+  readonly awaiting_approval?: boolean | undefined
 }
+
+export interface Project { readonly path: string; readonly title: string }
 
 export interface AgentInfo {
   readonly ready: boolean
@@ -241,6 +250,37 @@ export function acceptsPrompt(task: Task): boolean {
   return task.parent_task_id === null && (task.status === 'draft' || isTerminal(task.status))
 }
 
+export type MemoryKind = 'work' | 'architecture'
+/** What the agent recalls by search: work lessons and its picture of the code. */
+export interface Memories {
+  readonly work: readonly { id: number; time: number; kind: string; summary: string; implementation: string; tests: string; risks: string; files: string[]; applies_to: string }[]
+  readonly architecture: readonly { id: number; time: number; area: string; summary: string; boundaries: string; risks: string; files: string[] }[]
+}
+
+/** Selected task-flow steps sent to be distilled into a project skill. */
+export interface SkillDraftInput {
+  readonly goal: string
+  readonly steps: readonly {
+    readonly title: string
+    readonly status: string
+    readonly description: string
+    readonly tools: readonly { readonly name: string; readonly input: string; readonly output: string; readonly failed: boolean }[]
+  }[]
+}
+
+/** An editable SKILL.md draft; saved under the project's .agents/skills. */
+export interface SkillDraft {
+  readonly name: string
+  readonly description: string
+  readonly body: string
+}
+
+/** The project's AGENTS.md, injected into every request of its code sessions. */
+export interface ProjectNotes {
+  readonly path: string
+  readonly content: string
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init)
   const text = await response.text()
@@ -288,6 +328,17 @@ export const api = {
     xhr.onerror=()=>{signal.removeEventListener('abort',abort);reject(Error('附件上传失败'))};xhr.onabort=()=>{signal.removeEventListener('abort',abort);reject(Error('上传已取消'))};
     if(signal.aborted){signal.removeEventListener('abort',abort);reject(Error('上传已取消'));return}xhr.send(file)
   }),
+  memories: (workspace: string) => request<Memories>(`/agent/memories?workspace=${encodeURIComponent(workspace)}`),
+  updateMemory: (workspace: string, kind: MemoryKind, id: number, summary: string) => patch<Memories>(`/agent/memories/${kind}/${id}`, { workspace, summary }),
+  forgetMemory: (workspace: string, kind: MemoryKind, id: number) => request<Memories>(`/agent/memories/${kind}/${id}?workspace=${encodeURIComponent(workspace)}`, { method: 'DELETE' }),
+  searchSessions: (q: string) => request<{ matches: { task_id: string; snippet: string }[] }>(`/agent/sessions/search?q=${encodeURIComponent(q)}`),
+  rewind: (taskId: string, turn: number) => post<{ turn: number; prompt: string; undone_turns: number[] }>(`${task(taskId)}/rewind`, { turn }),
+  interject: (taskId: string, text: string) => post<{ seq: number }>(`${task(taskId)}/interjections`, { text }),
+  skillDraft: (taskId: string, input: SkillDraftInput) => post<SkillDraft>(`${task(taskId)}/skill-draft`, input),
+  saveSkill: (taskId: string, draft: SkillDraft, overwrite = false) => post<{ name: string; path: string }>(`${task(taskId)}/skills`, { ...draft, overwrite }),
+  notes: (workspace: string) => request<ProjectNotes>(`/agent/notes?workspace=${encodeURIComponent(workspace)}`),
+  saveNotes: (workspace: string, content: string) => put<ProjectNotes>('/agent/notes', { workspace, content }),
+  addNote: (workspace: string, note: string) => post<ProjectNotes>('/agent/notes', { workspace, note }),
   skillPackages: () => request<{ packages: SkillPackage[] }>('/agent/skill-packages'),
   installPackage: (path: string) => post<{ packages: SkillPackage[] }>('/agent/skill-packages', { path }),
   connectRemotePackage: (url: string, token: string) => post<{ packages: SkillPackage[] }>('/agent/skill-packages/remote', { url, token }),
@@ -299,6 +350,12 @@ export const api = {
   skillTool: <T>(id: string, name: string, payload: unknown) => post<T>(`/agent/skill-packages/${encodeURIComponent(id)}/tools/${encodeURIComponent(name)}`, payload),
   info: () => request<AgentInfo>('/agent/info'),
   listTasks: async (limit = 50) => (await request<{ tasks: Task[] }>(`/agent/tasks?limit=${limit}`)).tasks,
+  projects: async () => (await request<{projects: Project[]}>('/agent/workspaces')).projects,
+  addProject: (path: string) => post<Project>('/agent/workspaces', {path}),
+  renameProject: (path: string, title: string) => patch('/agent/workspaces', {path, title}),
+  removeProject: (path: string) => request('/agent/workspaces', {method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path})}),
+  updateSession: (id: string, payload: {title?: string; pinned?: boolean; archived?: boolean}) => patch(`/agent/sessions/${encodeURIComponent(id)}`, payload),
+  deleteSession: (id: string) => request<{deleted: string[]}>(`/agent/sessions/${encodeURIComponent(id)}`, {method: 'DELETE'}),
   getTask: (id: string) => request<Task>(task(id)),
   updateTask: (id: string, payload: { model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | null | undefined; fast_mode?: boolean | undefined }) =>
     patch<Task>(task(id), payload),
@@ -310,7 +367,7 @@ export const api = {
   changes: (id: string, turn: number) => request<ChangesSummary>(`${task(id)}/changes/${turn}`),
   changeDiff: (id: string, turn: number, index: number, path?: string) => request<FileDiff>(`${task(id)}/changes/${turn}/files/${index}${path === undefined ? '' : `?path=${encodeURIComponent(path)}`}`, { cache: 'no-store' }),
   undoChanges: (id: string, turn: number) => post<ChangesSummary>(`${task(id)}/changes/${turn}/undo`, {}),
-  createSession: async () => (await post<{ task_id: string }>('/agent/sessions')).task_id,
+  createSession: async (workspace?: string, kind: 'chat' | 'code' = 'code') => (await post<{ task_id: string }>('/agent/sessions', {workspace, kind})).task_id,
   prompt: (id: string, prompt: string, options?: { permission_mode?: PermissionMode | undefined; model?: string | undefined; provider?: string | undefined; reasoning_effort?: string | undefined; fast_mode?: boolean | undefined; content?: readonly unknown[]; requestId?: string }) =>
     post<{ task_id: string }>(`${task(id)}/messages`, { prompt, ...options }),
   cancel: (id: string) => request<unknown>(task(id), { method: 'DELETE' }),

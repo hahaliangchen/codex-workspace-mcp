@@ -11,7 +11,6 @@ interface CodexRightPanelProps {
   events?: readonly AgentEvent[] | undefined
   running?: boolean | undefined
   onClose?: (() => void) | undefined
-  onOpenSettings?: (() => void) | undefined
   onChangesUpdated?: (() => void) | undefined
   width?: number | undefined
 }
@@ -22,7 +21,6 @@ export function CodexRightPanel({
   events = [],
   running = false,
   onClose,
-  onOpenSettings,
   onChangesUpdated,
   width,
 }: CodexRightPanelProps) {
@@ -44,11 +42,6 @@ export function CodexRightPanel({
             <span className={css.projectName} title={workspacePath}>{projectName}</span>
           </div>
           <div className={css.headerActions}>
-            <button type="button" className={css.iconBtn} title="项目设置" onClick={onOpenSettings}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="1" /><circle cx="19" cy="12" r="1" /><circle cx="5" cy="12" r="1" />
-              </svg>
-            </button>
             <button type="button" className={css.iconBtn} title="关闭面板" onClick={onClose}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />

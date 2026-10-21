@@ -69,6 +69,7 @@ function iconFor(name: string): ReactNode {
 }
 
 function titleFor(name: string): string {
+  if (name === 'read_skill') return '读取了技能'
   if (name === 'run_program') return '运行了程序'
   if (name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) return '运行了命令'
   if (/write|edit|replace|apply|patch/.test(name)) return '编辑了文件'

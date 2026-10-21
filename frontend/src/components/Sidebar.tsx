@@ -1,102 +1,37 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { api } from '../api.ts'
 import clsx from 'clsx'
-import {
-  IconFolderCloseRegular,
-  IconFolderOpenRegular,
-} from '@deepseek-ai/dsh-client-ui-primitives'
-import type { Task, TaskStatus } from '../api.ts'
-import { t } from '../i18n.ts'
+import { Button, Menu, Modal, IconFolderCloseRegular, IconFolderOpenRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { Project, Task, TaskStatus } from '../api.ts'
+import { isChat, projectGroups, taskTitle, visibleTasks } from '../sidebarModel.ts'
+export { taskTitle, workspaceName } from '../sidebarModel.ts'
 import css from './CodexSidebar.module.css'
+import { ProjectNotesDialog } from './ProjectNotesDialog.tsx'
+import { MemoryDialog } from './MemoryDialog.tsx'
+import sproutLogo from '../assets/sprout.svg'
 
 export function dotState(status: TaskStatus): 'done' | 'warning' | 'ongoing' | 'error' | 'idle' {
   switch (status) {
-    case 'running':
-    case 'cancelling':
-      return 'ongoing'
-    case 'completed':
-      return 'done'
-    case 'failed':
-    case 'interrupted':
-      return 'error'
-    case 'max_steps':
-    case 'cancelled':
-      return 'warning'
-    case 'draft':
-      return 'idle'
+    case 'running': case 'cancelling': return 'ongoing'
+    case 'completed': return 'done'
+    case 'failed': case 'interrupted': return 'error'
+    case 'max_steps': case 'cancelled': return 'warning'
+    case 'draft': return 'idle'
   }
 }
 
-export function workspaceName(path: string): string {
-  const parts = path.replace(/^\\\\\?\\/, '').split(/[\\/]/).filter(Boolean)
-  return parts.at(-1) ?? (path || 'codex-workspace-mcp')
+type Dialog = {kind: 'rename-task' | 'delete-task'; task: Task} | {kind: 'rename-project' | 'delete-project'; project: Project}
+function RowMenu({ label, items, onSelect }: {label: string; items: {id: string; label: string; danger?: boolean}[]; onSelect: (id: string) => void}) {
+  const [open, setOpen] = useState(false)
+  return <Menu open={open} onClose={() => setOpen(false)} items={items} onSelect={id => { setOpen(false); onSelect(id) }} align="end" portal dense
+    anchor={<button type="button" className={clsx(css.sectionActionBtn, css.rowMenu)} aria-label={label} title={label} onClick={() => setOpen(value => !value)}>···</button>} />
 }
-
-export function taskTitle(task: Task): string {
-  const line = task.prompt.trim().split('\n', 1)[0] ?? ''
-  return line === '' ? t('app.untitled') : line
-}
-
-interface ProjectCategory {
-  name: string
-  items: string[]
-}
-
-const DEFAULT_PROJECT_GROUPS: ProjectCategory[] = [
-  {
-    name: 'bert simple',
-    items: [
-      '解释模型为何不归一化向量',
-      '实施架构重构与泛化升级',
-      '解释注意力机制中的V',
-      '检查项目代码与训练数据',
-    ],
-  },
-  {
-    name: 'rag go',
-    items: [
-      '解决项目冲突并以远程为主',
-      '测试 PDF 解析并记录耗时',
-      '测试 RapidOCR PDF 识别速度',
-      '查找 SQLite 的非占用用途',
-      '我服了',
-    ],
-  },
-  {
-    name: 'RAG Milvus dev',
-    items: [
-      '分析断层日志事件存储',
-      '添加 MinerU 配置验证脚本',
-      '移除标签业务逻辑',
-      '恢复 RAG 切片丢失全局视野',
-      '修复 sing-box DNS 配置',
-    ],
-  },
-  {
-    name: 'woc-wnas',
-    items: [
-      '把 master 分支合并到 master-bcl',
-    ],
-  },
-]
 
 export function Sidebar({
-  tasks: rootTasks,
-  allTasks,
-  selectedId,
-  activeTaskId,
-  workspace,
-  workspaces = [],
-  activeWorkspace,
-  onSelectWorkspace,
-  onAddWorkspace,
-  dark: _dark,
-  collapsed = false,
-  width = 260,
-  onToggleCollapse,
-  onNew,
-  onSelect,
-  onToggleTheme: _onToggleTheme,
-  onOpenSettings,
+  tasks, allTasks: _allTasks, selectedId, activeTaskId, workspace, projects = [], activeWorkspace,
+  onSelectWorkspace, onAddWorkspace, onRemoveWorkspace, onRenameWorkspace,
+  mode = 'code', onModeChange, onUpdateSession, onDeleteSession,
+  collapsed = false, width = 260, onToggleCollapse, onNew, onSelect, onOpenSettings,
 }: {
   tasks: readonly Task[]
   allTasks?: readonly Task[] | undefined
@@ -104,9 +39,16 @@ export function Sidebar({
   activeTaskId?: string | undefined
   workspace: string
   workspaces?: readonly string[] | undefined
+  projects?: readonly Project[] | undefined
   activeWorkspace?: string | undefined
   onSelectWorkspace?: ((ws: string) => void) | undefined
   onAddWorkspace?: (() => void) | undefined
+  onRemoveWorkspace?: ((path: string) => Promise<void>) | undefined
+  onRenameWorkspace?: ((path: string, title: string) => Promise<void>) | undefined
+  mode?: 'chat' | 'code' | undefined
+  onModeChange?: ((mode: 'chat' | 'code') => void) | undefined
+  onUpdateSession?: ((id: string, input: {title?: string; pinned?: boolean; archived?: boolean}) => Promise<void>) | undefined
+  onDeleteSession?: ((id: string) => Promise<void>) | undefined
   dark?: boolean | undefined
   collapsed?: boolean | undefined
   width?: number | undefined
@@ -117,404 +59,128 @@ export function Sidebar({
   onOpenSettings?: (() => void) | undefined
 }) {
   const [searchOpen, setSearchOpen] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [folderOpen, setFolderOpen] = useState(true)
-  const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({
-    'bert simple': true,
-    'rag go': true,
-    'RAG Milvus dev': true,
-    'woc-wnas': true,
-  })
-  const [showMoreProjects, setShowMoreProjects] = useState(false)
-  const searchInputRef = useRef<HTMLInputElement>(null)
-
-  const currentHighlightedId = activeTaskId ?? selectedId
-
-  // Plugin page chats are pure conversations: no working directory, so they
-  // never belong to a project folder.
-  const tasks = useMemo(() => rootTasks.filter(item => !item.plugin_id), [rootTasks])
-  const chatTasks = useMemo(() => rootTasks.filter(item => item.plugin_id), [rootTasks])
-
-  // Build children map
-  const childrenByParent = useMemo(() => {
-    const map = new Map<string, Task[]>()
-    for (const item of allTasks ?? []) {
-      if (item.parent_task_id !== null) {
-        const list = map.get(item.parent_task_id) ?? []
-        list.push(item)
-        map.set(item.parent_task_id, list)
+  const [query, setQuery] = useState('')
+  const [closed, setClosed] = useState<Record<string, boolean>>({})
+  const [archived, setArchived] = useState(false)
+  const [dialog, setDialog] = useState<Dialog>()
+  const [notesProject, setNotesProject] = useState<Project>()
+  const [memoryProject, setMemoryProject] = useState<Project>()
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const searchRef = useRef<HTMLInputElement>(null)
+  const currentId = activeTaskId ?? selectedId
+  // Titles filter instantly; message content is searched on the server after a pause.
+  const [snippets, setSnippets] = useState<ReadonlyMap<string, string>>(new Map())
+  useEffect(() => {
+    const q = query.trim()
+    if ([...q].length < 2) { setSnippets(new Map()); return }
+    let live = true
+    const timer = window.setTimeout(() => {
+      api.searchSessions(q).then(result => { if (live) setSnippets(new Map(result.matches.map(match => [match.task_id, match.snippet]))) }, () => {})
+    }, 250)
+    return () => { live = false; window.clearTimeout(timer) }
+  }, [query])
+  const contentHits = useMemo(() => new Set(snippets.keys()), [snippets])
+  const filtered = visibleTasks(tasks, query, archived, contentHits)
+  const {groups, ungrouped} = projectGroups(projects, filtered, workspace)
+  const chats = filtered.filter(isChat)
+  const request = (next: Dialog) => {
+    setError('')
+    setDraft('task' in next ? taskTitle(next.task) : next.project.title)
+    setDialog(next)
+  }
+  const run = async (action: () => Promise<void> | undefined) => {
+    setError('')
+    setBusy(true)
+    try { await action(); setDialog(undefined) } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)) }
+    finally { setBusy(false) }
+  }
+  const confirm = () => {
+    if (!dialog) return
+    void run(() => {
+      switch (dialog.kind) {
+        case 'rename-task': return onUpdateSession?.(dialog.task.task_id, {title: draft.trim()})
+        case 'delete-task': return onDeleteSession?.(dialog.task.task_id)
+        case 'rename-project': return onRenameWorkspace?.(dialog.project.path, draft.trim())
+        case 'delete-project': return onRemoveWorkspace?.(dialog.project.path)
       }
-    }
-    return map
-  }, [allTasks])
-
-  // Filter tasks based on search
-  const filteredTasks = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase()
-    if (q === '') return tasks
-    return tasks.filter((item) => {
-      if (taskTitle(item).toLowerCase().includes(q)) return true
-      const children = childrenByParent.get(item.task_id) ?? []
-      return children.some(child => taskTitle(child).toLowerCase().includes(q))
     })
-  }, [tasks, searchQuery, childrenByParent])
-
-  // Map titles to task ids for quick lookup
-  const taskByTitle = useMemo(() => {
-    const map = new Map<string, Task>()
-    for (const t of allTasks ?? tasks) {
-      map.set(taskTitle(t).trim(), t)
-    }
-    return map
-  }, [allTasks, tasks])
-
-  const toggleProject = (name: string) => {
-    setExpandedProjects(prev => ({ ...prev, [name]: !prev[name] }))
   }
-
-  if (collapsed) {
-    return (
-      <div className={clsx(css.root, css.collapsedRoot)} style={{ width: 56 }}>
-        <button
-          type="button"
-          className={css.iconBtn}
-          title="展开侧边栏"
-          onClick={onToggleCollapse}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-            <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
-            <line x1="9" x2="9" y1="3" y2="21" />
-          </svg>
-        </button>
-      </div>
-    )
+  const sessionRow = (task: Task, nested = false) => {
+    const running = task.status === 'running' || task.status === 'cancelling'
+    return <div key={task.task_id} className={clsx(css.itemRow, task.task_id === currentId && css.sessionActive)}>
+      <button type="button" className={nested ? css.sessionRow : css.recentRow} onClick={() => onSelect(task.task_id)} title={taskTitle(task)}>
+        <span className={css.sessionTitle}>{taskTitle(task)}{query.trim() && snippets.has(task.task_id) && <span className={css.searchSnippet}>{snippets.get(task.task_id)}</span>}</span>
+        {task.pinned && <span className={css.pinMark} aria-label="已置顶">⌃</span>}
+        {task.awaiting_approval ? <span className={css.awaitingMark} title="等你确认是否运行命令">待确认</span> : running && <span className={css.runningSpinner} aria-label="执行中">◌</span>}
+      </button>
+      <RowMenu label={`会话操作：${taskTitle(task)}`} items={[
+        {id:'rename', label:'重命名'}, {id:'pin', label: task.pinned ? '取消置顶' : '置顶'},
+        {id:'archive', label: task.archived ? '取消归档' : '归档'}, {id:'delete', label:'删除会话', danger:true},
+      ]} onSelect={id => {
+        if (id === 'rename') request({kind:'rename-task',task})
+        else if (id === 'delete') request({kind:'delete-task',task})
+        else void run(() => onUpdateSession?.(task.task_id, id === 'pin' ? {pinned:!task.pinned} : {archived:!task.archived}))
+      }} />
+    </div>
   }
-
-  return (
-    <div className={css.root} style={{ width }}>
-      {/* Static product identity; new conversations use the dedicated button. */}
-      <div className={css.header}>
-        <div className={css.brandGroup} title="Composer">
-          <span className={css.brandTitle}>Composer</span>
-        </div>
-
-        <div className={css.headerActions}>
-          <button
-            type="button"
-            className={css.iconBtn}
-            title="通知"
-            onClick={onOpenSettings}
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-              <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
-            </svg>
-          </button>
-
-          <button
-            type="button"
-            className={css.iconBtn}
-            title="搜索 (Ctrl+K)"
-            onClick={() => {
-              setSearchOpen(!searchOpen)
-              if (!searchOpen) window.setTimeout(() => searchInputRef.current?.focus(), 50)
-            }}
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="11" cy="11" r="8" />
-              <line x1="21" y1="21" x2="16.65" y2="16.65" />
-            </svg>
-          </button>
-
-          {onToggleCollapse && (
-            <button
-              type="button"
-              className={css.iconBtn}
-              title="折叠侧边栏"
-              onClick={onToggleCollapse}
-            >
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-                <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
-                <line x1="9" x2="9" y1="3" y2="21" />
-              </svg>
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* 2. New Chat Button: 新聊天 */}
-      <div className={css.newChatRow}>
-        <button
-          type="button"
-          className={css.newChatBtn}
-          onClick={onNew}
-        >
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
-            <path d="M18.375 2.625a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z" />
-          </svg>
-          <span>新聊天</span>
+  const renaming = dialog?.kind.startsWith('rename')
+  if (collapsed) return <div className={clsx(css.root, css.collapsedRoot)}><button type="button" className={css.iconBtn} title="展开侧边栏" onClick={onToggleCollapse}>☰</button></div>
+  return <aside className={css.root} style={{width}} aria-label="会话侧栏">
+    <div className={css.header}>
+      <span className={css.brandTitle}><img src={sproutLogo} width={18} height={18} alt="" />Composer</span>
+      <div className={css.headerActions}>
+        <button type="button" className={css.iconBtn} title="搜索会话" aria-label="搜索会话" onClick={() => {setSearchOpen(value => !value); window.setTimeout(() => searchRef.current?.focus(),0)}}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/></svg>
         </button>
-      </div>
-
-      {/* 3. Search Bar Input when open */}
-      {searchOpen && (
-        <div className={css.searchBox}>
-          <input
-            ref={searchInputRef}
-            type="text"
-            className={css.searchInput}
-            placeholder="搜索任务或会话..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Escape') {
-                setSearchQuery('')
-                setSearchOpen(false)
-              }
-            }}
-          />
-        </div>
-      )}
-
-      {/* 4. Scrollable Areas: 项目 (Projects) & 最近 (Recent) */}
-      <div className={css.scrollArea}>
-        {/* Section: 项目 */}
-        <div className={css.section}>
-          <div className={css.sectionHeaderRow}>
-            <div className={css.sectionTitleLeft}>
-              <span>项目</span>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className={css.sectionChevron}>
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-            </div>
-            <div className={css.sectionActionsRight}>
-              <button type="button" className={css.sectionActionBtn} title="更多选项">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                  <circle cx="5" cy="12" r="1.8" />
-                  <circle cx="12" cy="12" r="1.8" />
-                  <circle cx="19" cy="12" r="1.8" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                className={css.sectionActionBtn}
-                title="选择文件夹 / 添加项目"
-                onClick={onAddWorkspace}
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </button>
-            </div>
-          </div>
-
-          {/* Active Primary Workspace */}
-          {(() => {
-            const currentWs = activeWorkspace || workspace
-            return (
-              <div className={css.projectGroup}>
-                <div
-                  className={clsx(css.projectHeaderRow, css.projectHeaderRowActive)}
-                  onClick={() => {
-                    setFolderOpen(!folderOpen)
-                    onSelectWorkspace?.(currentWs)
-                  }}
-                  title={currentWs}
-                >
-                  <span className={css.folderIcon}>
-                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
-                    </svg>
-                  </span>
-                  <span className={css.projectTitle}>{workspaceName(currentWs)}</span>
-                </div>
-
-            {folderOpen && (
-              <div className={css.projectSubList}>
-                {filteredTasks.length === 0 ? (
-                  <button
-                    type="button"
-                    className={clsx(css.sessionRow, css.sessionActive)}
-                    onClick={onNew}
-                  >
-                    <span className={css.sessionTitle}>Clarify request</span>
-                  </button>
-                ) : (
-                  filteredTasks.map((item) => {
-                    const isSelected = item.task_id === currentHighlightedId
-                    const isRunning = item.status === 'running' || item.status === 'cancelling'
-
-                    return (
-                      <button
-                        key={item.task_id}
-                        type="button"
-                        className={clsx(css.sessionRow, isSelected && css.sessionActive)}
-                        onClick={() => onSelect(item.task_id)}
-                        title={taskTitle(item)}
-                      >
-                        <span className={css.sessionTitle}>{taskTitle(item)}</span>
-                        {isRunning && (
-                          <span className={css.runningSpinner} title="执行中">
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                            </svg>
-                          </span>
-                        )}
-                      </button>
-                    )
-                  })
-                )}
-              </div>
-            )}
-          </div>
-        )
-      })()}
-          {/* Other Registered Workspaces from Workspaces List */}
-          {workspaces
-            .filter(ws => ws !== (activeWorkspace || workspace))
-            .map((ws) => {
-              const name = workspaceName(ws)
-              return (
-                <div key={ws} className={css.projectGroup}>
-                  <div
-                    className={css.projectHeaderRow}
-                    onClick={() => onSelectWorkspace?.(ws)}
-                    title={ws}
-                  >
-                    <span className={css.folderIcon}>
-                      <IconFolderCloseRegular size={14} />
-                    </span>
-                    <span className={css.projectTitle}>{name}</span>
-                  </div>
-                </div>
-              )
-            })}
-
-          {/* Other Project Groups Matching User Screenshot */}
-          {DEFAULT_PROJECT_GROUPS.map((proj) => {
-            const isOpen = expandedProjects[proj.name] !== false
-            return (
-              <div key={proj.name} className={css.projectGroup}>
-                <div
-                  className={css.projectHeaderRow}
-                  onClick={() => toggleProject(proj.name)}
-                >
-                  <span className={css.folderIcon}>
-                    {isOpen ? <IconFolderOpenRegular size={14} /> : <IconFolderCloseRegular size={14} />}
-                  </span>
-                  <span className={css.projectTitle}>{proj.name}</span>
-                </div>
-
-                {isOpen && (
-                  <div className={css.projectSubList}>
-                    {proj.items.map((title) => {
-                      const matchedTask = taskByTitle.get(title)
-                      const isSelected = matchedTask ? matchedTask.task_id === currentHighlightedId : false
-                      const isRunning = matchedTask ? matchedTask.status === 'running' : false
-
-                      return (
-                        <button
-                          key={title}
-                          type="button"
-                          className={clsx(css.sessionRow, isSelected && css.sessionActive)}
-                          onClick={() => {
-                            if (matchedTask) onSelect(matchedTask.task_id)
-                          }}
-                          title={title}
-                        >
-                          <span className={css.sessionTitle}>{title}</span>
-                          {isRunning && (
-                            <span className={css.runningSpinner} title="执行中">
-                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                                <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-                              </svg>
-                            </span>
-                          )}
-                        </button>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
-            )
-          })}
-
-          <button
-            type="button"
-            className={css.expandBtn}
-            onClick={() => setShowMoreProjects(!showMoreProjects)}
-          >
-            <span>{showMoreProjects ? '收起显示' : '展开显示'}</span>
-          </button>
-        </div>
-
-        {/* Section: 聊天 (plugin conversations, no working directory) */}
-        {chatTasks.length > 0 && (
-          <div className={css.section} style={{ marginTop: 14 }}>
-            <div className={css.sectionHeader}>聊天</div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {chatTasks.map((task) => {
-                const isSelected = task.task_id === currentHighlightedId
-                const isRunning = task.status === 'running' || task.status === 'cancelling'
-                return (
-                  <button
-                    key={task.task_id}
-                    type="button"
-                    className={clsx(css.recentRow, isSelected && css.recentRowActive)}
-                    onClick={() => onSelect(task.task_id)}
-                    title={taskTitle(task)}
-                  >
-                    <span className={css.sessionTitle}>{taskTitle(task)}</span>
-                    {isRunning && <span className={css.runningSpinner} title="执行中" />}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* Section: 最近 */}
-        <div className={css.section} style={{ marginTop: 14 }}>
-          <div className={css.sectionHeader}>最近</div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-            {tasks.length > 0 ? (
-              tasks.slice(0, 5).map((task) => {
-                const isSelected = task.task_id === currentHighlightedId
-                return (
-                  <button
-                    key={task.task_id}
-                    type="button"
-                    className={clsx(css.recentRow, isSelected && css.recentRowActive)}
-                    onClick={() => onSelect(task.task_id)}
-                    title={taskTitle(task)}
-                  >
-                    <span className={css.sessionTitle}>{taskTitle(task)}</span>
-                  </button>
-                )
-              })
-            ) : (
-              [
-                'Clarify request',
-                '移植 DSH 核心功能到 Rust',
-                '解释模型为何不归一化向量',
-              ].map((title) => (
-                <button
-                  key={title}
-                  type="button"
-                  className={css.recentRow}
-                  onClick={onNew}
-                  title={title}
-                >
-                  <span className={css.sessionTitle}>{title}</span>
-                </button>
-              ))
-            )}
-          </div>
-        </div>
+        <button type="button" className={css.iconBtn} title="设置" aria-label="设置" onClick={onOpenSettings}>⚙</button>
+        <button type="button" className={css.iconBtn} title="折叠侧边栏" aria-label="折叠侧边栏" onClick={onToggleCollapse}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+        </button>
       </div>
     </div>
-  )
+    <div className={css.newChatRow}>
+      <button type="button" className={css.newChatBtn} onClick={onNew}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M16 3l5 5-9 9-5 1 1-5Z"/></svg>{mode === 'chat' ? '新聊天' : '新代码会话'}</button>
+      <div className={css.modeSwitch} role="tablist" aria-label="会话类型">
+        <button type="button" role="tab" aria-selected={mode === 'chat'} aria-label="聊天" title="聊天" className={clsx(css.modeButton, mode === 'chat' && css.modeActive)} onClick={() => onModeChange?.('chat')}>
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c-5 0-9 3.4-9 7.6 0 2.2 1.1 4.2 2.9 5.6L5 20.5l4.3-2.1c.9.2 1.8.3 2.7.3 5 0 9-3.4 9-7.6s-4-7.6-9-7.6Z" fill="#5DCAA5"/><circle cx="8.2" cy="11.1" r="1.15" fill="#fff"/><circle cx="12" cy="11.1" r="1.15" fill="#fff"/><circle cx="15.8" cy="11.1" r="1.15" fill="#fff"/></svg>
+        </button>
+        <button type="button" role="tab" aria-selected={mode === 'code'} aria-label="代码" title="代码" className={clsx(css.modeButton, mode === 'code' && css.modeActive)} onClick={() => onModeChange?.('code')}>
+          <svg width="18" height="18" viewBox="0 0 64 64" aria-hidden="true"><path d="M20 18 8 32l12 14M44 18l12 14-12 14" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" fill="none"/><path d="M24 44C22 30 30 20 42 18c2 14-6 26-18 26Z" fill="#1D9E75"/><path d="M24 44 36 28" stroke="#E1F5EE" strokeWidth="2.5" strokeLinecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+    {searchOpen && <div className={css.searchBox}><input ref={searchRef} className={css.searchInput} placeholder="搜索标题和聊天内容…" aria-label="搜索会话标题和内容" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => {if(event.key === 'Escape'){setQuery('');setSearchOpen(false)}}}/></div>}
+    <div className={css.scrollArea} role="tabpanel" aria-label={mode === 'code' ? '代码会话' : '聊天会话'}>
+      <div className={css.sectionHeaderRow}>
+        <span className={css.sectionTitleLeft}>{mode === 'code' ? '项目' : '聊天'}{archived ? ' · 已归档' : ''}</span>
+        <div className={css.sectionActionsRight}>
+          <button type="button" className={css.sectionActionBtn} title={archived ? '返回未归档会话' : '查看已归档会话'} aria-label={archived ? '返回未归档会话' : '查看已归档会话'} onClick={() => setArchived(value => !value)}>▣</button>
+          {mode === 'code' && <button type="button" className={css.sectionActionBtn} title="添加项目" aria-label="添加项目" onClick={onAddWorkspace}>＋</button>}
+        </div>
+      </div>
+      {mode === 'code' ? <>
+        {groups.filter(group => !query.trim() || group.tasks.length > 0 || group.title.toLocaleLowerCase().includes(query.toLocaleLowerCase().trim())).map(project => <div key={project.path} className={css.projectGroup}>
+          <div className={clsx(css.itemRow, css.projectHeaderRow, project.path === activeWorkspace && css.projectHeaderRowActive)}>
+            <button type="button" className={css.folderToggle} aria-label={`${closed[project.path] ? '展开' : '折叠'}项目：${project.title}`} aria-expanded={!closed[project.path]} onClick={() => setClosed(current => ({...current,[project.path]:!current[project.path]}))}>{closed[project.path] ? <IconFolderCloseRegular size={15}/> : <IconFolderOpenRegular size={15}/>}</button>
+            <button type="button" className={css.projectSelect} title={project.path} onClick={() => onSelectWorkspace?.(project.path)}><span className={css.projectTitle}>{project.title}</span></button>
+            <RowMenu label={`项目操作：${project.title}`} items={[{id:'notes', label:'项目备注'},{id:'memory', label:'AI 的记忆'},{id:'rename', label:'重命名'},{id:'delete',label:'移除项目',danger:true}]} onSelect={id => id === 'notes' ? setNotesProject(project) : id === 'memory' ? setMemoryProject(project) : request({kind:id === 'rename' ? 'rename-project' : 'delete-project',project})}/>
+          </div>
+          {(!closed[project.path] || query.trim()) && <div className={css.projectSubList}>{project.tasks.map(task => sessionRow(task,true))}</div>}
+        </div>)}
+        {ungrouped.length > 0 && <><div className={css.sectionHeader}>未分组</div>{ungrouped.map(task => sessionRow(task))}</>}
+        {groups.length === 0 && ungrouped.length === 0 && <p className={css.emptyState}>{query.trim() ? '没有匹配的会话' : archived ? '暂无归档会话' : '添加项目，开始代码会话'}</p>}
+      </> : chats.length ? chats.map(task => sessionRow(task)) : <p className={css.emptyState}>{query.trim() ? '没有匹配的聊天' : archived ? '暂无归档聊天' : '暂无聊天'}</p>}
+    </div>
+    {error && !dialog && <div className={css.actionError} role="alert">{error}</div>}
+    <ProjectNotesDialog project={notesProject} onClose={() => setNotesProject(undefined)} />
+    <MemoryDialog project={memoryProject} onClose={() => setMemoryProject(undefined)} />
+    <Modal open={!!dialog} onClose={() => {if(!busy)setDialog(undefined)}} title={renaming ? '重命名' : dialog?.kind === 'delete-project' ? '移除项目' : '删除会话'} closeLabel="关闭"
+      description={renaming ? '输入新的显示名称' : dialog?.kind === 'delete-project' ? '仅从项目列表移除，目录文件和已有会话会保留。' : '删除此会话及其子任务的历史记录。此操作无法撤销。'}
+      footer={<><Button variant="outline" disabled={busy} onClick={() => setDialog(undefined)}>取消</Button><Button variant="primary" disabled={busy || (!!renaming && !draft.trim())} onClick={confirm}>{busy ? '处理中…' : renaming ? '保存' : '确认删除'}</Button></>}>
+      {renaming ? <input autoFocus className={css.searchInput} aria-label="新名称" value={draft} disabled={busy} onChange={event => setDraft(event.target.value)} onKeyDown={event => {if(event.key === 'Enter' && draft.trim() && !busy)confirm()}}/> : <p className={css.dialogName}>{draft}</p>}
+      {error && <div className={css.actionError} role="alert">{error}</div>}
+    </Modal>
+  </aside>
 }

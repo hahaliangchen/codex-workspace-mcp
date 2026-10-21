@@ -20,8 +20,9 @@
 }
 
 .selected {
-  border-color: var(--dsw-alias-button-info-fill, #4176e6) !important;
-  box-shadow: 0 0 0 3px rgba(65, 118, 230, 0.18), 0 4px 16px rgba(65, 118, 230, 0.12) !important;
+  border-color: #1d9e75 !important;
+  background: var(--sprout-soft, #e3f1ea) !important;
+  box-shadow: 0 0 0 3px rgba(29, 158, 117, 0.28), 0 4px 16px rgba(15, 110, 86, 0.14) !important;
 }
 
 .running {

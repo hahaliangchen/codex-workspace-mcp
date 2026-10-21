@@ -14,8 +14,8 @@
 
   --codex-bg-main: #ffffff;
   --codex-dock-bg: #ffffff;
-  --codex-sidebar-bg: #fbfbfb;
-  --codex-panel-bg: #fbfbfb;
+  --codex-sidebar-bg: #f6f8f6;
+  --codex-panel-bg: #f6f8f6;
   --codex-card-bg: #ffffff;
 
   /* Crisp, high-contrast text matching OpenAI Codex Desktop */
@@ -25,11 +25,14 @@
 
   --codex-border-subtle: #efefef;
   --codex-card-border: #e5e7eb;
-  --codex-hover-bg: #f4f4f5;
-  --codex-active-pill: #ebecee;
-  --codex-active-hover: #e4e4e7;
-  --codex-blue-primary: #007aff;
-  --codex-blue-hover: #0066d6;
+  --codex-hover-bg: #eef3ef;
+  --codex-active-pill: #e3f1ea;
+  --codex-active-hover: #d6ebe0;
+  /* Sprout theme: the brand accent is green; the variable names predate it. */
+  --codex-blue-primary: #1d9e75;
+  --codex-blue-hover: #0f6e56;
+  --sprout-strong: #0f6e56;
+  --sprout-soft: #e3f1ea;
   --codex-amber-circle: #d97706;
   --codex-amber-bg: #fef3c7;
   --codex-amber-border: #fde68a;
@@ -40,45 +43,47 @@
 
   /* Harmonize DSH tokens with Codex aesthetic */
   --dsw-alias-bg-base: #ffffff;
-  --dsw-specific-sidebar-fill: #fbfbfb;
+  --dsw-specific-sidebar-fill: #f6f8f6;
   --dsw-alias-border-l2: #e5e7eb;
   --dsw-alias-border-l3: #efefef;
   --dsw-alias-label-primary: #111827;
   --dsw-alias-label-secondary: #374151;
   --dsw-alias-label-tertiary: #6b7280;
-  --dsw-alias-interactive-bg-hover: #f4f4f5;
-  --dsw-alias-state-business-primary: #007aff;
+  --dsw-alias-interactive-bg-hover: #eef3ef;
+  --dsw-alias-state-business-primary: #1d9e75;
 }
 
 body[data-ds-dark-theme] {
   --codex-bg-main: #18181b;
   --codex-dock-bg: #141415;
-  --codex-sidebar-bg: #18181b;
-  --codex-panel-bg: #18181b;
+  --codex-sidebar-bg: #151917;
+  --codex-panel-bg: #151917;
   --codex-card-bg: #202024;
   --codex-text-primary: #f4f4f5;
   --codex-text-secondary: #e4e4e7;
   --codex-text-muted: #a1a1aa;
   --codex-border-subtle: #27272a;
   --codex-card-border: #323238;
-  --codex-hover-bg: #27272a;
-  --codex-active-pill: #2e2e33;
-  --codex-active-hover: #38383f;
-  --codex-blue-primary: #0a84ff;
-  --codex-blue-hover: #0070e0;
+  --codex-hover-bg: #222a25;
+  --codex-active-pill: #1d3a2e;
+  --codex-active-hover: #24493a;
+  --codex-blue-primary: #1d9e75;
+  --codex-blue-hover: #25b585;
+  --sprout-strong: #5dcaa5;
+  --sprout-soft: #1d3a2e;
   --codex-amber-circle: #f59e0b;
   --codex-amber-bg: #78350f33;
   --codex-amber-border: #b45309;
 
   --dsw-alias-bg-base: #18181b;
-  --dsw-specific-sidebar-fill: #18181b;
+  --dsw-specific-sidebar-fill: #151917;
   --dsw-alias-border-l2: #323238;
   --dsw-alias-border-l3: #27272a;
   --dsw-alias-label-primary: #f4f4f5;
   --dsw-alias-label-secondary: #e4e4e7;
   --dsw-alias-label-tertiary: #a1a1aa;
-  --dsw-alias-interactive-bg-hover: #27272a;
-  --dsw-alias-state-business-primary: #0a84ff;
+  --dsw-alias-interactive-bg-hover: #222a25;
+  --dsw-alias-state-business-primary: #1d9e75;
 }
 
 /* ==========================================================================
@@ -101,4 +106,27 @@ html, body, input, button, textarea, select {
 button:focus-visible {
   outline: 2px solid var(--codex-blue-primary);
   outline-offset: 1px;
+}
+
+/* Sprout theme: re-point the platform's brand ramp (named "deepseek") at
+   green so links, bubbles and info buttons follow. html raises specificity
+   above the platform's own body rules. */
+html body,
+html body[data-ds-dark-theme] {
+  --dsw-static-deepseek-50: #eef7f2;
+  --dsw-static-deepseek-100: #e3f1ea;
+  --dsw-static-deepseek-200: #c8e6d8;
+  --dsw-static-deepseek-300: #9fe1cb;
+  --dsw-static-deepseek-400: #5dcaa5;
+  --dsw-static-deepseek-450: #2bb084;
+  --dsw-static-deepseek-500: #1d9e75;
+  --dsw-static-deepseek-600: #0f6e56;
+  --dsw-static-deepseek-700-delete: #085041;
+  --dsw-static-deepseek-800: #1d3a2e;
+  --dsw-static-deepseek-900: #14261f;
+}
+html body[data-ds-dark-theme] {
+  --dsw-specific-bubble: #1f3029;
+  --dsw-specific-bubble-highlight: #24493a;
+  --dsw-specific-sidebar-nav-item-active-accent: #1d3a2e;
 }

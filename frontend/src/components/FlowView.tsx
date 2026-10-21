@@ -11,6 +11,7 @@ import '@xyflow/react/dist/style.css'
 
 import type { AgentEvent, Task } from '../api.ts'
 import {
+  chatItems,
   flowState,
   formatDuration,
   reviewMatchesNode,
@@ -23,6 +24,8 @@ import { TaskNode } from './TaskNode.tsx'
 import { RequestContextPanel } from './RequestContextPanel.tsx'
 import { VisualMaterials } from './VisualMaterials.tsx'
 import { useAgentApi } from '../cordis/react.tsx'
+import { SkillDraftDialog, skillDraftInput } from './SkillDraftDialog.tsx'
+import type { SkillDraftInput } from '../api.ts'
 import styles from './FlowView.module.css'
 
 const nodeTypes = {
@@ -83,7 +86,12 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
   // Initially null so the user gets the full unobstructed Flow diagram.
   // Clicking any node opens the detail drawer on the right.
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
-  useEffect(() => { setSelectedNodeId(null) }, [task?.task_id, flow.organizedTurn])
+  // Picking mode: clicks collect steps to save as a project skill instead of opening details.
+  const [picking, setPicking] = useState(false)
+  const [picked, setPicked] = useState<ReadonlySet<string>>(new Set())
+  const [skillInput, setSkillInput] = useState<SkillDraftInput>()
+  useEffect(() => { setSelectedNodeId(null); setPicking(false); setPicked(new Set()) }, [task?.task_id, flow.organizedTurn])
+  const canSaveSkill = !!task?.workspace && !running
   useEffect(() => {
     if (!selectedNodeId && !showRequests) return
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') { setSelectedNodeId(null); setShowRequests(false) } }
@@ -102,7 +110,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
       type: 'taskNode',
       position: positions.get(n.id) ?? { x: 60, y: 100 },
       data: n,
-      selected: n.id === selectedNodeId,
+      selected: picking ? picked.has(n.id) : n.id === selectedNodeId,
     }))
 
     const flowEdges: Edge[] = currentEdges.map(e => ({
@@ -113,7 +121,17 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
     }))
 
     return { nodes: flowNodes, edges: flowEdges }
-  }, [flow, selectedNodeId])
+  }, [flow, selectedNodeId, picking, picked])
+  const togglePicked = (id: string) => setPicked(current => {
+    const next = new Set(current)
+    if (!next.delete(id)) next.add(id)
+    return next
+  })
+  const openSkillDraft = () => {
+    const steps = flow.nodes.filter(node => picked.has(node.id))
+    const goal = chatItems(events, task).flatMap(item => item.kind === 'user' ? [item.text] : []).slice(-3).join('\n---\n')
+    setSkillInput(skillDraftInput(goal, steps))
+  }
 
   const durationInfo = useTaskDuration(events, task, running)
   const selectedNode = useMemo(() => {
@@ -164,6 +182,11 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
           <button type="button" className={styles.topBarPillBtn} disabled={debugBusy || !task} aria-pressed={debug} onClick={() => { void toggleDebug() }} title="显示或隐藏上下文详情；规划、执行和观察的完整请求始终记录并在任务结束后保留">{debug ? '上下文：显示' : '上下文：隐藏'}</button>
           {debug && <button type="button" className={styles.topBarPillBtn} onClick={() => setShowRequests(true)}>全部请求</button>}
           {debugError && <span role="alert" title={debugError}>上下文显示设置失败</span>}
+          {canSaveSkill && nodes.length > 0 && <button type="button" className={`${styles.topBarPillBtn} ${picking ? styles.topBarPillActive : ''}`} aria-pressed={picking}
+            title="选取一段步骤，提炼成项目技能，以后遇到类似任务按这个流程走"
+            onClick={() => { setPicking(value => !value); setPicked(new Set()); setSelectedNodeId(null); setShowRequests(false) }}>
+            {picking ? '退出选取' : '选取流程'}
+          </button>}
           {activeNode && (
             <button
               type="button"
@@ -230,8 +253,8 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
-          onNodeClick={(_, node) => { setSelectedNodeId(node.id); setShowRequests(false) }}
-          onPaneClick={() => { setSelectedNodeId(null); setShowRequests(false) }}
+          onNodeClick={(_, node) => { if (picking) { togglePicked(node.id); return } setSelectedNodeId(node.id); setShowRequests(false) }}
+          onPaneClick={() => { if (picking) return; setSelectedNodeId(null); setShowRequests(false) }}
           fitView
           fitViewOptions={{ padding: 0.2 }}
           minZoom={0.2}
@@ -254,6 +277,13 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
             }}
           />
         </ReactFlow>
+
+        {picking && <div className={styles.pickBar} role="status">
+          <span>{picked.size === 0 ? '点击节点，选出要保存的步骤（失败的步骤也可以选，会被写成注意事项）' : `已选 ${picked.size} 个步骤`}</span>
+          {picked.size > 0 && <button type="button" className={styles.pickBarLink} onClick={() => setPicked(new Set())}>清空</button>}
+          <button type="button" className={styles.pickBarPrimary} disabled={picked.size === 0} onClick={openSkillDraft}>存为技能</button>
+        </div>}
+        {task && <SkillDraftDialog taskId={task.task_id} input={skillInput} onClose={() => setSkillInput(undefined)} onSaved={() => { setPicking(false); setPicked(new Set()) }} />}
 
         {/* Selected Node Detail Drawer (slides in from right on node click) */}
         {debug && showRequests && task && <div className={styles.drawer}>

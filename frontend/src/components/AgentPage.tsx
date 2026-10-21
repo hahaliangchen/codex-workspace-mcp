@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, type Dispatch, type SetStateAction } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react'
 import clsx from 'clsx'
-import logoImg from '../assets/logo.png'
+import logoImg from '../assets/sprout.svg'
 import { taskTitle, workspaceName } from './Sidebar.tsx'
 import { FlowView } from './FlowView.tsx'
+import { latestContextUsage } from './ContextRing.tsx'
 import { SkillPagesView } from './SkillPagesView.tsx'
 import type { AgentSlotProps } from '../cordis/slot-contract.ts'
 import root from '../dsh/conversation/ConversationRoot.module.css'
@@ -21,7 +22,7 @@ interface PageProps {
 }
 
 export function HeroPage({ workspace, renderSlot }: PageProps) {
-  const currentWs = workspace.activeWorkspace ?? workspace.info?.workspace ?? ''
+  const currentWs = workspace.activeWorkspace || workspace.info?.workspace || ''
   const wsName = workspaceName(currentWs)
 
   return (
@@ -30,7 +31,7 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
         <div className={welcomeCss.heading}>
           <img src={logoImg} className={welcomeCss.logo} alt="" />
           <h1 className={welcomeCss.title}>
-            你想让我们在 <span className={welcomeCss.workspace}>{wsName}</span> 中构建什么？
+            {workspace.sidebarMode === 'chat' ? '今天想聊点什么？' : <>今天想在 <span className={welcomeCss.workspace}>{wsName}</span> 里种点什么？</>}
           </h1>
         </div>
         {renderSlot('agent.composer', {
@@ -106,6 +107,7 @@ export function ConversationPage({
     composerNote, session, openTask, submit, stop, interruptNode,
   } = workspace
   const durationInfo = useTaskDuration(session.events, task, running)
+  const contextUsage = useMemo(() => latestContextUsage(session.events), [session.events])
   const currentTitle = task === undefined ? t('app.untitled') : taskTitle(task)
 
   return (
@@ -157,7 +159,7 @@ export function ConversationPage({
           </button>
         </div>
 
-        {/* Right: Duration badge, Right Panel Toggle, Menu */}
+        {/* Right: Duration badge, Right Panel Toggle */}
         <div className={headerCss.rightUtils}>
           {durationInfo.currentTurnDurationMs !== undefined && (
             <div className={headerCss.durationBadge}>
@@ -181,19 +183,6 @@ export function ConversationPage({
             </button>
           )}
 
-          {/* Options ... */}
-          <button
-            type="button"
-            className={headerCss.iconBtn}
-            title="更多操作"
-            onClick={() => workspace.openSettings()}
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="1" />
-              <circle cx="19" cy="12" r="1" />
-              <circle cx="5" cy="12" r="1" />
-            </svg>
-          </button>
         </div>
       </header>
 
@@ -234,7 +223,8 @@ export function ConversationPage({
                 )
               : renderSlot('agent.composer', {
                   variant: 'composer',
-                  disabled: !ready || !canContinue,
+                  // A running turn still takes messages: interjections or a queue.
+                  disabled: !ready || (!canContinue && !running),
                   note: composerNote,
                   running,
                   workspacePath: workspace.activeWorkspace ?? workspace.info?.workspace,
@@ -252,6 +242,8 @@ export function ConversationPage({
                   onOpenSettings: workspace.openSettings,
                   onSubmit: submit,
                   onStop: stop,
+                  onInterject: workspace.interject,
+                  contextUsage,
                 })}
           </div>
         </div>

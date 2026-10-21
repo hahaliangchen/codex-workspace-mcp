@@ -58,6 +58,13 @@ export function App({ renderSlot }: AgentSlotProps) {
   const sidebar = renderSlot('agent.sidebar', {
     tasks: workspace.tasks,
     allTasks: workspace.allTasks,
+    projects: workspace.projects,
+    mode: workspace.sidebarMode,
+    onModeChange: workspace.changeSidebarMode,
+    onRemoveWorkspace: workspace.removeWorkspace,
+    onRenameWorkspace: workspace.renameWorkspace,
+    onUpdateSession: workspace.updateSession,
+    onDeleteSession: workspace.deleteSession,
     selectedId: workspace.isChild ? workspace.parentId : workspace.taskId,
     activeTaskId: workspace.taskId,
     workspace: workspace.activeWorkspace ?? workspace.info?.workspace ?? '',
@@ -173,7 +180,6 @@ export function App({ renderSlot }: AgentSlotProps) {
           workspacePath={workspace.info?.workspace ?? 'codex-workspace-mcp'}
           events={workspace.session.events}
           onClose={() => setRightPanelOpen(false)}
-          onOpenSettings={workspace.openSettings}
         />
       )}
 

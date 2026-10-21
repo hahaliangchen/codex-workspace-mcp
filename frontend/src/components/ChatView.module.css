@@ -199,3 +199,37 @@
 }
 .delegateCard > summary > span { font-size: 12px; opacity: .65; }
 .delegateProcess { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+
+.interjection {
+  align-self: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 80%;
+  margin: 6px 0 6px auto;
+  padding: 8px 12px;
+  border-radius: 14px;
+  background: var(--dsw-specific-bubble, #eef7f2);
+  color: var(--codex-text-primary, #111827);
+  font-size: 13.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.interjectionTag {
+  font-size: 11.5px;
+  color: var(--sprout-strong, #0f6e56);
+}
+
+.userWithRewind {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+.userWithRewind > button {
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.userWithRewind:hover > button,
+.userWithRewind > button:focus-visible {
+  opacity: 1;
+}

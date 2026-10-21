@@ -183,7 +183,9 @@ pub fn tools(state: &AgentServiceState) -> Vec<Value> {
             .filter(|tool| {
                 tool["function"]["name"]
                     .as_str()
-                    .is_some_and(|name| read_tool(name) && state.permission_mode.allows(name))
+                    .is_some_and(|name| read_tool(name) && state.permission_mode.allows(name)
+                        // The observer cannot pause for approval, so ask mode withholds gated tools.
+                        && !crate::tool_approvals::needs_approval(state.permission_mode, name, None, false))
             })
             .collect::<Vec<_>>();
     tools.push(crate::session_history::tool());
@@ -258,6 +260,7 @@ mod tests {
         assert!(observer.followup().is_none());
         for permission in [
             agent_service::PermissionMode::ReadOnly,
+            agent_service::PermissionMode::Ask,
             agent_service::PermissionMode::FullAccess,
         ] {
             let mut state = state.clone();

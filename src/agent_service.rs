@@ -36,6 +36,8 @@ const OBSERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
+    /// Edits proceed; execution waits for the user's approval (tool_approvals).
+    Ask,
     #[default]
     FullAccess,
 }
@@ -57,8 +59,8 @@ impl PermissionMode {
             | "browser_click"
             | "browser_press_key"
             | "browser_upload"
-            | "browser_screenshot" => matches!(self, Self::FullAccess),
-            "browser_close" => matches!(self, Self::FullAccess),
+            | "browser_screenshot" => matches!(self, Self::FullAccess | Self::Ask),
+            "browser_close" => matches!(self, Self::FullAccess | Self::Ask),
             _ => true,
         }
     }
@@ -214,7 +216,9 @@ pub struct CreateTaskRequest {
 
 /// A browser session may exist before its first prompt. Its ID is also the
 /// durable Rust task ID, so reconnects do not need a client-side ID map.
-pub async fn create_draft_task(State(state): State<AgentServiceState>) -> impl IntoResponse {
+#[derive(Default, Deserialize)]
+pub struct DraftSessionInput { pub workspace: Option<String>, pub kind: Option<String> }
+pub async fn create_draft_task(State(state): State<AgentServiceState>, input: Option<Json<DraftSessionInput>>) -> impl IntoResponse {
     let state = state.with_latest_config().await;
     if state.plugin_cancel.is_cancelled() {
         return (
@@ -225,17 +229,29 @@ pub async fn create_draft_task(State(state): State<AgentServiceState>) -> impl I
     }
     let task_id = format!("task_{}", uuid_like());
     let root = state.workspace.root().to_path_buf();
+    let input = input.map(|Json(input)| input).unwrap_or_default();
+    let kind = if input.kind.as_deref() == Some("chat") { "chat" } else { "code" };
+    let selected_workspace = match input.workspace {
+        Some(path) => match std::fs::canonicalize(path) {
+            Ok(path) if path.is_dir() => path,
+            _ => return (StatusCode::BAD_REQUEST, Json(json!({"error":"项目目录不存在"}))).into_response(),
+        },
+        None => root.clone(),
+    };
     let model = state.default_model.clone();
     let provider_name = state.provider_name.clone();
     let reasoning_effort = state.reasoning_effort.clone();
     let fast_mode = state.fast_mode;
     let id = task_id.clone();
     let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let conn = open_db(&root)?;
-        conn.execute(
+        let mut conn = open_db(&root)?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,provider_name,reasoning_effort,fast_mode) VALUES (?1,'',?2,'draft',?3,?3,?4,?5,?6)",
             params![id, model, now(), provider_name, reasoning_effort, fast_mode],
         )?;
+        tx.execute("INSERT INTO agent_session_meta(task_id,workspace,kind) VALUES (?1,?2,?3)",params![id,selected_workspace.to_string_lossy(),kind])?;
+        tx.commit()?;
         Ok(())
     }).await;
     match inserted {
@@ -322,7 +338,7 @@ pub struct AgentEvent {
     pub surface_op: Option<String>,
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -376,6 +392,7 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
         "ALTER TABLE agent_tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    crate::session_browser::schema(&conn, root)?;
     Ok(conn)
 }
 
@@ -1438,6 +1455,9 @@ pub(crate) async fn save_observer_lessons(
     trace: &[Value],
 ) -> anyhow::Result<Value> {
     let known_read_targets = observer_known_read_targets(trace, task_id, 24);
+    // Lessons belong to the project the task worked in, not the server's own root.
+    let project = crate::session_browser::task_workspace(state.workspace.root(), task_id)?;
+    let project_root = project.display().to_string();
     let source_trace = serde_json::to_string(
         &trace
             .iter()
@@ -1576,7 +1596,7 @@ pub(crate) async fn save_observer_lessons(
             .into_iter()
             .collect::<Vec<_>>();
         let request = crate::memory::RecordWorkMemoryRequest {
-            workspace_root: state.workspace.root().display().to_string(),
+            workspace_root: project_root.clone(),
             summary: memory_summary.clone(),
             files_changed,
             implementation: String::new(),
@@ -1621,7 +1641,7 @@ pub(crate) async fn save_observer_lessons(
                 entry.source_refs = refs;
                 let response = workspace.record_work_memory(entry)?;
                 crate::memory::bind_observer_sources(
-                    workspace.root(),
+                    &project,
                     &response.recorded.summary,
                     &response.recorded.implementation,
                     &versions,
@@ -1684,7 +1704,7 @@ pub(crate) async fn save_observer_lessons(
         }
         if let Some(target) = target {
             description_requests.push(crate::memory::RecordSymbolBusinessContextRequest {
-                workspace_root: state.workspace.root().display().to_string(),
+                workspace_root: project_root.clone(),
                 symbol_id: target
                     .get("symbol_id")
                     .and_then(Value::as_str)
@@ -2148,7 +2168,10 @@ pub async fn get_task(
         Ok(conn.query_row("SELECT id,prompt,model,status,created_at,updated_at,parent_task_id,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1", [&task_id], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0}))).optional()?)
     }).await;
     match result {
-        Ok(Ok(Some(task))) => Json(task).into_response(),
+        Ok(Ok(Some(task))) => match open_db(state.workspace.root()).and_then(|conn|crate::session_browser::decorate(&conn,state.workspace.root(),task)) {
+            Ok(task) => Json(task).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"could not read sidebar state"}))).into_response(),
+        },
         Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error":"task not found"})),
@@ -2209,7 +2232,10 @@ pub async fn update_task(
         ).optional()?)
     }).await;
     match updated {
-        Ok(Ok(Some(task))) => Json(task).into_response(),
+        Ok(Ok(Some(task))) => match open_db(state.workspace.root()).and_then(|conn|crate::session_browser::decorate(&conn,state.workspace.root(),task)) {
+            Ok(task) => Json(task).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"error":"could not read sidebar state"}))).into_response(),
+        },
         Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error":"task not found"})),
@@ -2233,12 +2259,12 @@ pub async fn list_tasks(
     Query(query): Query<ListTasksQuery>,
 ) -> impl IntoResponse {
     let root = state.workspace.root().to_path_buf();
-    let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
+    let limit = query.limit.unwrap_or(50).clamp(1, 10000) as i64;
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
         let conn = open_db(&root)?;
-        let mut stmt = conn.prepare("SELECT t.id,t.prompt,t.model,t.status,t.created_at,t.updated_at,t.parent_task_id,t.provider_name,t.reasoning_effort,t.fast_mode,p.plugin_id FROM agent_tasks t LEFT JOIN plugin_sessions p ON p.task_id=t.id ORDER BY t.updated_at DESC LIMIT ?1")?;
+        let mut stmt = conn.prepare("SELECT t.id,t.prompt,t.model,t.status,t.created_at,t.updated_at,t.parent_task_id,t.provider_name,t.reasoning_effort,t.fast_mode,p.plugin_id FROM agent_tasks t LEFT JOIN plugin_sessions p ON p.task_id=t.id WHERE trim(t.prompt)<>'' OR t.status IN ('running','cancelling') OR EXISTS(SELECT 1 FROM agent_task_events e WHERE e.task_id=t.id AND e.kind='user/message') ORDER BY t.updated_at DESC,t.id LIMIT ?1")?;
         let rows = stmt.query_map([limit], |r| Ok(json!({"task_id":r.get::<_,String>(0)?,"prompt":r.get::<_,String>(1)?,"model":r.get::<_,String>(2)?,"status":r.get::<_,String>(3)?,"created_at":r.get::<_,i64>(4)?,"updated_at":r.get::<_,i64>(5)?,"parent_task_id":r.get::<_,Option<String>>(6)?,"provider_name":r.get::<_,Option<String>>(7)?,"reasoning_effort":r.get::<_,Option<String>>(8)?,"fast_mode":r.get::<_,i64>(9)? != 0,"plugin_id":r.get::<_,Option<String>>(10)?})))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|task|crate::session_browser::decorate(&conn,&root,task)).collect()
     }).await;
     match result {
         Ok(Ok(tasks)) => Json(json!({"tasks":tasks})).into_response(),

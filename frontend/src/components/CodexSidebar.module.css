@@ -13,8 +13,8 @@
 }
 
 :global(body[data-ds-dark-theme]) .root {
-  background: #18181b;
-  border-right-color: #27272a;
+  background: var(--codex-sidebar-bg);
+  border-right-color: #232a26;
 }
 
 /* Static product identity and sidebar actions (media_1791084975044.png) */
@@ -36,6 +36,9 @@
 }
 
 .brandTitle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 15px;
   font-weight: 600;
   color: var(--codex-text-primary, #18181b);
@@ -247,8 +250,12 @@
   background: var(--codex-hover-bg, #f4f4f5);
 }
 
+.projectHeaderRowActive .projectTitle {
+  color: var(--sprout-strong, #0f6e56);
+}
+
 :global(body[data-ds-dark-theme]) .projectHeaderRowActive {
-  background: #27272a;
+  background: var(--codex-hover-bg);
 }
 
 :global(body[data-ds-dark-theme]) .projectHeaderRow {
@@ -322,14 +329,14 @@
 
 /* Active Session Pill in Codex: subtle gray pill background #ebecee */
 .sessionActive {
-  background: var(--codex-active-pill, #ebecee) !important;
-  color: var(--codex-text-primary, #111827) !important;
+  background: var(--sprout-soft, #e3f1ea) !important;
+  color: var(--sprout-strong, #0f6e56) !important;
   font-weight: 500;
 }
 
 :global(body[data-ds-dark-theme]) .sessionActive {
-  background: #2e2e33 !important;
-  color: #fafafa !important;
+  background: var(--sprout-soft) !important;
+  color: #e1f5ee !important;
 }
 
 .sessionTitle {
@@ -434,3 +441,29 @@
   align-items: center;
   padding: 12px 0;
 }
+
+.newChatRow { display: flex; align-items: center; gap: 6px; }
+.newChatBtn { flex: 1; min-width: 0; width: auto; }
+.modeSwitch { display: flex; flex-shrink: 0; gap: 2px; padding: 2px; border-radius: 9px; background: var(--codex-hover-bg, #efefef); }
+.modeButton { display: flex; align-items: center; justify-content: center; width: 34px; height: 29px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--codex-text-muted, #71717a); cursor: pointer; }
+.modeActive { background: var(--codex-card-bg, #fff); border-color: #c8e6d8; color: var(--sprout-strong, #0f6e56); box-shadow: 0 1px 3px #0f6e5614; }
+.itemRow { display: flex; align-items: center; min-width: 0; border-radius: 6px; }
+.itemRow:hover { background: var(--codex-hover-bg, #f4f4f5); }
+.itemRow > .sessionRow, .itemRow > .recentRow { flex: 1; width: 0; min-width: 0; background: transparent; color: inherit; }
+.rowMenu { flex-shrink: 0; margin-right: 3px; opacity: 0; font-size: 17px; letter-spacing: 1px; }
+.itemRow:hover .rowMenu, .itemRow:focus-within .rowMenu, .rowMenu[aria-expanded='true'] { opacity: 1; }
+.projectHeaderRow { padding-left: 5px; padding-right: 0; gap: 5px; }
+.folderToggle { border: 0; background: transparent; color: var(--codex-text-muted, #71717a); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 3px; flex-shrink: 0; }
+.projectSelect { flex: 1; min-width: 0; padding: 0; height: 100%; display: flex; align-items: center; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.emptyState { padding: 14px 8px; margin: 0; color: var(--codex-text-muted, #71717a); font-size: 12px; line-height: 1.6; }
+.actionError { padding: 8px 12px; color: #cf3434; font-size: 12px; overflow-wrap: anywhere; }
+.dialogName { overflow-wrap: anywhere; }
+.pinMark { margin-left: 5px; color: var(--codex-text-muted, #71717a); }
+.root button:focus-visible { outline: 2px solid var(--codex-blue-primary, #007aff); outline-offset: -2px; }
+:global(body[data-ds-dark-theme]) .modeSwitch { background: #27272a; }
+:global(body[data-ds-dark-theme]) .modeActive { background: var(--sprout-soft); border-color: #2d5a47; color: #e1f5ee; }
+:global(body[data-ds-dark-theme]) .itemRow:hover { background: var(--codex-hover-bg); }
+:global(body[data-ds-dark-theme]) .itemRow { color: #d4d4d8; }
+@media (hover: none) { .rowMenu { opacity: 1; } }
+.awaitingMark { flex: none; margin-left: 4px; padding: 0 6px; border-radius: 6px; background: var(--sprout-soft, #e3f1ea); color: var(--sprout-strong, #0f6e56); font-size: 11px; line-height: 18px; }
+.searchSnippet { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; font-weight: 400; color: var(--codex-text-muted, #6b7280); }

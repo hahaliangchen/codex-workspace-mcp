@@ -1,4 +1,6 @@
 import {AttachmentRail,useAttachmentDraft,type AttachmentSubmission} from './Attachments.tsx'
+import { PREFILL_EVENT, recentPrefill } from './RewindControl.tsx'
+import { ContextRing, type ContextUsage } from './ContextRing.tsx'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
 import clsx from 'clsx'
@@ -55,7 +57,10 @@ function mentionInsert(path: string): string {
   return path.includes(' ') ? `@"${path}" ` : `@${path} `
 }
 
-export type DshPermissionMode = 'read_only' | 'workspace_write' | 'full_access'
+export type DshPermissionMode = 'read_only' | 'workspace_write' | 'ask' | 'full_access'
+
+const FULL_ACCESS_ICON = <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" aria-hidden="true"><path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8l1-5.5Z" /></svg>
+const ASK_ICON = <svg width="14" height="14" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50C10 28 26 12 52 12c0 26-16 42-38 38Z" fill="currentColor" opacity="0.85" /><path d="M14 50 40 24" stroke="#fff" strokeWidth="4" strokeLinecap="round" /></svg>
 
 export function Composer({
   variant,
@@ -76,6 +81,8 @@ export function Composer({
   onOpenSettings,
   onSubmit,
   onStop,
+  onInterject,
+  contextUsage,
 }: {
   variant: 'hero' | 'composer'
   disabled: boolean
@@ -95,6 +102,9 @@ export function Composer({
   onOpenSettings?: ((tab?: SettingsTab) => void) | undefined
   onSubmit: (text: string, permissionMode: DshPermissionMode, attachment?: AttachmentSubmission) => Promise<boolean>
   onStop: (() => void) | undefined
+  /** Deliver text into the running turn; rejects with NOT_RUNNING once it has ended. */
+  onInterject?: ((text: string) => Promise<void>) | undefined
+  contextUsage?: ContextUsage | undefined
 }) {
   const [draft, setDraft] = useState('')
   const attachments=useAttachmentDraft()
@@ -111,11 +121,12 @@ export function Composer({
   const [permissionMode, setPermissionMode] = useState<DshPermissionMode>(() => {
     try {
       const saved = localStorage.getItem('dsh_permission_mode')
-      if (saved === 'read_only' || saved === 'workspace_write' || saved === 'full_access') {
+      if (saved === 'read_only' || saved === 'workspace_write' || saved === 'ask' || saved === 'full_access') {
         return saved
       }
     } catch {}
-    return 'full_access'
+    // New users start with commands needing approval; full access is an explicit choice.
+    return 'ask'
   })
   const [permMenuOpen, setPermMenuOpen] = useState(false)
   const [permMenuPos, setPermMenuPos] = useState<{ top?: number; bottom?: number; left: number }>({ left: 16 })
@@ -123,13 +134,6 @@ export function Composer({
   const permMenuRef = useRef<HTMLDivElement>(null)
   const [showRiskConfirm, setShowRiskConfirm] = useState(false)
   const [riskAcknowledged, setRiskAcknowledged] = useState(false)
-  const [bannerDismissed, setBannerDismissed] = useState(() => {
-    try {
-      return localStorage.getItem('codex_perm_banner_dismissed') === 'true'
-    } catch {
-      return false
-    }
-  })
   const [modelMenuOpen, setModelMenuOpen] = useState(false)
   const [pane, setPane] = useState<'root' | 'model' | 'effort'>('root')
   const [menuPos, setMenuPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 24 })
@@ -147,7 +151,30 @@ export function Composer({
     if (variant === 'hero' && !disabled) inputRef.current?.focus()
   }, [variant, disabled])
 
-  const canSend = !disabled && !running && !submitting && (draft.trim() !== '' || attachments.items.length>0)
+  // A rewind hands the removed message back for editing.
+  useEffect(() => {
+    const prefill = () => {
+      const text = recentPrefill()
+      if (text === undefined) return
+      setDraft(text)
+      window.setTimeout(() => inputRef.current?.focus(), 0)
+    }
+    prefill()
+    window.addEventListener(PREFILL_EVENT, prefill)
+    return () => window.removeEventListener(PREFILL_EVENT, prefill)
+  }, [])
+  // While a turn runs, text can still go out: into the turn (interject) or after it (queue).
+  const [queued, setQueued] = useState<readonly string[]>([])
+  const midTurn = running && onInterject !== undefined
+  const canSend = !disabled && !submitting && (midTurn
+    ? draft.trim() !== '' && attachments.items.length === 0
+    : !running && (draft.trim() !== '' || attachments.items.length>0))
+  useEffect(() => {
+    if (running || disabled || submitting || queued.length === 0) return
+    const [next, ...rest] = queued
+    setQueued(rest)
+    void onSubmit(next!, permissionMode).then(sent => { if (!sent) setQueued(current => [next!, ...current]) })
+  }, [running, disabled, submitting, queued, onSubmit, permissionMode])
   const token = useMemo(() => activeToken(draft, caret), [draft, caret])
   const tokenKey = token === null ? '' : `${token.kind}:${token.start}:${token.query}`
 
@@ -317,8 +344,20 @@ export function Composer({
     setModelMenuOpen(true)
   }
 
-  const submit = async () => {
+  const submit = async (mode: 'interject' | 'queue' = 'interject') => {
     if (!canSend) return
+    if (midTurn) {
+      const text = draft.trim()
+      setDraft('')
+      if (mode === 'queue') { setQueued(current => [...current, text]); return }
+      try {
+        await onInterject!(text)
+      } catch {
+        // The turn ended (or the request failed) before delivery: send it next instead of losing it.
+        setQueued(current => [...current, text])
+      }
+      return
+    }
     setSubmitting(true)
     try {
       const controller=new AbortController();uploadAbort.current=controller
@@ -420,53 +459,6 @@ export function Composer({
           {note}
         </div>
       )}
-      {/* DSH Full Access Risk Notice Banner */}
-      {!bannerDismissed && permissionMode === 'full_access' && (
-        <div className={codexCss.permissionBanner}>
-          <div className={codexCss.bannerLeft}>
-            <span className={codexCss.infoIcon}>ⓘ</span>
-            <div className={codexCss.bannerContent}>
-              <span className={codexCss.bannerTitle}>完全权限已开启</span>
-              <span className={codexCss.bannerText}>
-                启用完全权限后，智能体可修改工作区文件，并直接运行外部命令。命令不受文件工具的工作区路径限制，仅建议在你信任当前任务时使用。{' '}
-                <a
-                  href="#learn-more"
-                  className={codexCss.learnMoreLink}
-                  onClick={(e) => {
-                    e.preventDefault()
-                    onOpenSettings?.('general')
-                  }}
-                >
-                  了解更多关于安全权限的信息。
-                </a>
-              </span>
-            </div>
-          </div>
-          <div className={codexCss.bannerActions}>
-            <button
-              type="button"
-              className={codexCss.dismissBtn}
-              onClick={() => {
-                setBannerDismissed(true)
-                try {
-                  localStorage.setItem('codex_perm_banner_dismissed', 'true')
-                } catch {}
-              }}
-            >
-              不再显示
-            </button>
-            <button
-              type="button"
-              className={codexCss.closeBannerBtn}
-              title="关闭提示"
-              aria-label="关闭提示"
-              onClick={() => setBannerDismissed(true)}
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* Outer Composer Container */}
       <div className={codexCss.composerBox}>
@@ -522,6 +514,13 @@ export function Composer({
         {/* Layer 2: White Floating Input Card */}
         <div className={codexCss.card} data-composer-card onDragOver={event=>{if(event.dataTransfer.types.includes('Files'))event.preventDefault()}} onDrop={event=>{event.preventDefault();if(!disabled&&!running&&!submitting)attachments.add(event.dataTransfer.files)}}>
           <input ref={fileInput} type='file' multiple hidden aria-label='上传附件' onChange={event=>{if(event.target.files)attachments.add(event.target.files);event.target.value=''}}/>
+          {queued.length > 0 && <div className={codexCss.queueList} aria-label="排队中的消息">
+            {queued.map((text, index) => <div key={index} className={codexCss.queueItem}>
+              <span className={codexCss.queueTag}>排队中</span>
+              <span className={codexCss.queueText} title={text}>{text}</span>
+              <button type="button" className={codexCss.queueRemove} aria-label="取消这条排队消息" onClick={() => setQueued(current => current.filter((_, i) => i !== index))}>✕</button>
+            </div>)}
+          </div>}
           <AttachmentRail items={attachments.items} onRemove={attachments.remove} disabled={submitting}/>
           {attachments.error&&<div role='alert' style={{color:'#b42318',padding:'4px 12px'}}>{attachments.error}</div>}
           {uploadLabel&&<div role='status' style={{padding:'4px 12px',fontSize:12}}>{uploadLabel}</div>}
@@ -533,7 +532,7 @@ export function Composer({
               value={draft}
               disabled={disabled||submitting}
               onPaste={event=>{const files=Array.from(event.clipboardData.files);if(files.length&&!running){attachments.add(files);if(!event.clipboardData.getData('text/plain'))event.preventDefault()}}}
-              placeholder={placeholder}
+              placeholder={midTurn ? '补充或纠正方向，回车插话；也可以排队等这轮结束' : placeholder}
               aria-label={placeholder}
               onChange={(event) => {
                 setDraft(event.target.value)
@@ -581,20 +580,22 @@ export function Composer({
                 type="button"
                 className={clsx(
                   codexCss.permPill,
-                  permissionMode === 'workspace_write' && codexCss.permPillNeutral,
-                  permissionMode === 'read_only' && codexCss.permPillSafe,
+                  permissionMode !== 'ask' && codexCss.permPillNeutral,
+                  permissionMode === 'ask' && codexCss.permPillSafe,
                 )}
                 onClick={togglePermDropdown}
                 title="切换工作区操作权限"
               >
                 {permissionMode === 'full_access' && (
                   <>
-                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8">
-                      <circle cx="8" cy="8" r="7" />
-                      <line x1="8" y1="4.5" x2="8" y2="8.5" />
-                      <circle cx="8" cy="11.5" r="0.8" fill="currentColor" />
-                    </svg>
+                    {FULL_ACCESS_ICON}
                     <span>完全权限</span>
+                  </>
+                )}
+                {permissionMode === 'ask' && (
+                  <>
+                    {ASK_ICON}
+                    <span>执行前询问</span>
                   </>
                 )}
                 {permissionMode === 'workspace_write' && (
@@ -622,6 +623,7 @@ export function Composer({
             </div>
 
             <div className={codexCss.rightControls}>
+              <ContextRing usage={contextUsage} />
               {/* Model Selector Pill */}
               <button
                 ref={modelTriggerRef}
@@ -640,21 +642,20 @@ export function Composer({
                 <IconChevronDownOutlineRegular className={codexCss.chevronDown} size={11} />
               </button>
 
-              {/* Bare Mic Button */}
-              <button
-                type="button"
-                className={codexCss.micBtn}
-                title="语音输入"
-                onClick={() => {}}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                  <line x1="12" y1="19" x2="12" y2="22" />
-                </svg>
-              </button>
-
               {/* Blue Action Circle: Stop / Send / Audio Wave (media_1791084397752.png) */}
+              {midTurn && canSend && <>
+                <Tooltip label="等这一轮结束后再发" side="top" delayMs={300}>
+                  <button type="button" className={codexCss.queueBtn} onClick={() => { void submit('queue') }}>排队</button>
+                </Tooltip>
+                <Tooltip label="插话：送进正在进行的这一轮" side="top" delayMs={300}>
+                  <button type="button" className={codexCss.actionBtn} aria-label="插话" onClick={() => { void submit('interject') }}>
+                    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="12" y1="19" x2="12" y2="5" />
+                      <polyline points="5 12 12 5 19 12" />
+                    </svg>
+                  </button>
+                </Tooltip>
+              </>}
               {submitting ? <button type='button' aria-label='取消上传' className={codexCss.stopBtn} onClick={()=>uploadAbort.current?.abort()}>{STOP_ICON}</button> : running && onStop !== undefined ? (
                 <Tooltip label={t('input.stop')} side="top" delayMs={500}>
                   <button
@@ -682,21 +683,12 @@ export function Composer({
                   </button>
                 </Tooltip>
               ) : (
-                <Tooltip label="实时语音 (Voice Mode)" side="top" delayMs={500}>
-                  <button
-                    type="button"
-                    className={codexCss.actionBtn}
-                    aria-label="实时语音"
-                    onClick={() => { inputRef.current?.focus() }}
-                  >
-                    <svg width="15" height="15" viewBox="0 0 17 16" fill="currentColor">
-                      <rect x="2.5" y="5.5" width="1.8" height="5" rx="0.9" />
-                      <rect x="6" y="2" width="1.8" height="12" rx="0.9" />
-                      <rect x="9.5" y="4" width="1.8" height="8" rx="0.9" />
-                      <rect x="13" y="6" width="1.8" height="4" rx="0.9" />
-                    </svg>
-                  </button>
-                </Tooltip>
+                <button type="button" className={codexCss.actionBtn} aria-label={t('input.send')} disabled>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="19" x2="12" y2="5" />
+                    <polyline points="5 12 12 5 19 12" />
+                  </svg>
+                </button>
               )}
             </div>
           </div>
@@ -898,16 +890,6 @@ export function Composer({
         >
           <div className={codexCss.permPopoverHeader}>
             <span className={codexCss.permPopoverTitle}>工作区操作权限</span>
-            <button
-              type="button"
-              className={codexCss.permPopoverLearnMore}
-              onClick={() => {
-                setPermMenuOpen(false)
-                onOpenSettings?.('general')
-              }}
-            >
-              了解更多
-            </button>
           </div>
 
           <div className={codexCss.permOptionList}>
@@ -936,24 +918,18 @@ export function Composer({
               )}
             </button>
 
-            {/* 2. 工作区内修改 (Workspace Write) */}
+            {/* 2. 执行前询问 (Ask) */}
             <button
               type="button"
               className={codexCss.permOptionItem}
-              onClick={() => handleSelectPermission('workspace_write')}
+              onClick={() => handleSelectPermission('ask')}
             >
-              <span className={codexCss.permOptionIcon}>
-                <svg width="18" height="18" viewBox="0 0 16 16" fill="none" strokeWidth="1.3">
-                  <path d="M6.4209 1.68067C7.43922 1.299 8.56177 1.29898 9.58008 1.68067L14.0996 3.375C14.2946 3.44811 14.4236 3.63455 14.4238 3.84278V6.89063C14.1115 6.71853 13.7761 6.58312 13.4238 6.48926V4.18946L9.22852 2.61621C8.43657 2.31947 7.56341 2.31939 6.77148 2.61621L2.5752 4.18946V7.11914C2.5752 11.1796 5.52369 13.056 8 14.0391C8.27653 13.9293 8.55827 13.8067 8.8418 13.6729C9.07101 13.9468 9.33228 14.1929 9.62012 14.4053C9.12409 14.6579 8.63578 14.8696 8.17871 15.0449C8.0637 15.0889 7.93628 15.0889 7.82129 15.0449C5.22011 14.0472 1.5752 11.9381 1.5752 7.11914V3.84278C1.57541 3.63469 1.70463 3.44821 1.89941 3.375L6.4209 1.68067Z" fill="currentColor" />
-                  <path d="M5.26392 6.60339H10.7361" stroke="currentColor" strokeLinecap="round" />
-                  <path d="M5.26392 9.86902H8.32833" stroke="currentColor" strokeLinecap="round" />
-                </svg>
-              </span>
+              <span className={codexCss.permOptionIcon}>{ASK_ICON}</span>
               <div className={codexCss.permOptionBody}>
-                <span className={codexCss.permOptionTitle}>工作区内修改</span>
-                <span className={codexCss.permOptionDesc}>允许修改工作区文件；不开放未隔离的外部命令</span>
+                <span className={codexCss.permOptionTitle}>执行前询问</span>
+                <span className={codexCss.permOptionDesc}>直接修改工作区文件；运行命令或打开浏览器前先问你，可以一次允许整个会话或整个项目</span>
               </div>
-              {permissionMode === 'workspace_write' && (
+              {permissionMode === 'ask' && (
                 <span className={codexCss.permOptionCheck}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                     <polyline points="20 6 9 17 4 12" />
@@ -968,16 +944,10 @@ export function Composer({
               className={codexCss.permOptionItem}
               onClick={() => handleSelectPermission('full_access')}
             >
-              <span className={clsx(codexCss.permOptionIcon, codexCss.permOptionIconWarn)}>
-                <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8">
-                  <circle cx="8" cy="8" r="7" />
-                  <line x1="8" y1="4.5" x2="8" y2="8.5" />
-                  <circle cx="8" cy="11.5" r="0.8" fill="currentColor" />
-                </svg>
-              </span>
+              <span className={clsx(codexCss.permOptionIcon, codexCss.permOptionIconWarn)}>{FULL_ACCESS_ICON}</span>
               <div className={codexCss.permOptionBody}>
-                <span className={clsx(codexCss.permOptionTitle, codexCss.permOptionTitleWarn)}>完全权限</span>
-                <span className={codexCss.permOptionDesc}>允许修改工作区文件及执行外部命令；文件工具仍检查工作区路径</span>
+                <span className={codexCss.permOptionTitle}>完全权限</span>
+                <span className={codexCss.permOptionDesc}>不再询问，agent 自己运行命令和浏览器。适合说完就交给它、不想被打断的时候</span>
               </div>
               {permissionMode === 'full_access' && (
                 <span className={codexCss.permOptionCheck}>
@@ -996,12 +966,12 @@ export function Composer({
       {showRiskConfirm && (
         <RiskConfirmation
           open={showRiskConfirm}
-          title="确认启用完全权限？"
-          description="启用完全权限后，智能体可修改工作区文件，并直接运行外部命令。命令不受文件工具的工作区路径限制，仅建议在你信任当前任务时使用。"
-          acknowledgeLabel="我已了解风险，并愿意继续"
+          title="切换到完全权限？"
+          description="之后 agent 会直接运行命令、打开浏览器，不再逐条询问。命令以你的系统账户运行，不受工作区目录限制。只需要确认这一次。"
+          acknowledgeLabel="我了解，之后不用再问"
           cancelLabel="取消"
           closeLabel="关闭"
-          confirmLabel="启用完全权限"
+          confirmLabel="切换"
           acknowledged={riskAcknowledged}
           onAcknowledgedChange={setRiskAcknowledged}
           onCancel={() => {

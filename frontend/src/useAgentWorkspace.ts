@@ -1,7 +1,8 @@
 import type {AttachmentSubmission} from './components/Attachments'
+import { requestNotificationPermission, useTaskNotifications } from './useTaskNotifications.ts'
 import type { PermissionMode } from './api'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { acceptsPrompt, type AgentInfo, type SettingsData, type Task } from './api.ts'
+import { acceptsPrompt, type AgentInfo, type SettingsData, type Task, type Project } from './api.ts'
 import { useAgentApi } from './cordis/react.tsx'
 import { t } from './i18n.ts'
 import { useSession } from './useSession.ts'
@@ -45,45 +46,45 @@ export function useAgentWorkspace() {
   const [selectedEffortOverride, setSelectedEffortOverride] = useState<string | null>()
   const [selectedFastModeOverride, setSelectedFastModeOverride] = useState<boolean>()
 
-  const [workspaces, setWorkspaces] = useState<string[]>(() => {
-    try {
-      const saved = localStorage.getItem('codex_workspaces')
-      if (saved) return JSON.parse(saved)
-    } catch {}
-    return [
-      'd:\\enterpriseProject\\codex-workspace-mcp',
-      'd:\\enterpriseProject\\pptx-editor-engine',
-      'd:\\enterpriseProject\\deepseek-harness',
-      'd:\\enterpriseProject\\woc-wnas',
-      'd:\\enterpriseProject\\ai-ppt-server',
-    ]
-  })
-
+  const [projects, setProjects] = useState<readonly Project[]>([])
+  const workspaces = projects.map(project => project.path)
   const [activeWorkspace, setActiveWorkspace] = useState<string>(() => {
-    return localStorage.getItem('codex_active_workspace') || 'd:\\enterpriseProject\\codex-workspace-mcp'
+    try { return localStorage.getItem('codex_active_workspace') ?? '' } catch { return '' }
   })
-
+  const [sidebarMode, setSidebarMode] = useState<'chat' | 'code'>(() => {
+    try { return localStorage.getItem('codex_sidebar_mode') === 'chat' ? 'chat' : 'code' } catch { return 'code' }
+  })
+  const changeSidebarMode = useCallback((mode: 'chat' | 'code') => {
+    setSidebarMode(mode)
+    try { localStorage.setItem('codex_sidebar_mode', mode) } catch {}
+  }, [])
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
-
+  const refreshProjects = useCallback(async () => {
+    const list = await api.projects()
+    setProjects(list)
+    setActiveWorkspace(current => list.some(project => project.path === current) ? current : list[0]?.path ?? '')
+  }, [api])
   const selectWorkspace = useCallback((ws: string) => {
     setActiveWorkspace(ws)
+    changeSidebarMode('code')
     try { localStorage.setItem('codex_active_workspace', ws) } catch {}
     openTask(undefined)
-  }, [])
-
-  const addWorkspace = useCallback((ws: string) => {
-    const trimmed = ws.trim()
-    if (!trimmed) return
-    setWorkspaces((prev) => {
-      const next = prev.includes(trimmed) ? prev : [trimmed, ...prev]
-      try { localStorage.setItem('codex_workspaces', JSON.stringify(next)) } catch {}
-      return next
-    })
-    setActiveWorkspace(trimmed)
-    try { localStorage.setItem('codex_active_workspace', trimmed) } catch {}
+  }, [changeSidebarMode])
+  const addWorkspace = useCallback(async (path: string) => {
+    const project = await api.addProject(path.trim())
+    await refreshProjects()
+    selectWorkspace(project.path)
     setFolderDialogOpen(false)
-    openTask(undefined)
-  }, [])
+  }, [api, refreshProjects, selectWorkspace])
+  const removeWorkspace = useCallback(async (path: string) => {
+    await api.removeProject(path)
+    await refreshProjects()
+    if (path === activeWorkspace) openTask(undefined)
+  }, [api, activeWorkspace, refreshProjects])
+  const renameWorkspace = useCallback(async (path: string, title: string) => {
+    await api.renameProject(path, title)
+    await refreshProjects()
+  }, [api, refreshProjects])
 
   const openFolderDialog = useCallback(() => setFolderDialogOpen(true), [])
   const closeFolderDialog = useCallback(() => setFolderDialogOpen(false), [])
@@ -95,7 +96,7 @@ export function useAgentWorkspace() {
   }, [taskId])
 
   const refreshTasks = useCallback(() => {
-    api.listTasks(100).then(
+    api.listTasks(10000).then(
       list => { setAllTasks(list) },
       () => {},
     )
@@ -105,19 +106,6 @@ export function useAgentWorkspace() {
     api.info().then(
       value => {
         setInfo(value)
-        if (value.workspace) {
-          setWorkspaces(prev => {
-            if (!prev.includes(value.workspace)) {
-              const next = [value.workspace, ...prev]
-              try { localStorage.setItem('codex_workspaces', JSON.stringify(next)) } catch {}
-              return next
-            }
-            return prev
-          })
-          if (!localStorage.getItem('codex_active_workspace')) {
-            setActiveWorkspace(value.workspace)
-          }
-        }
       },
       (cause: unknown) => { setNotice(messageOf(cause)) },
     )
@@ -127,8 +115,45 @@ export function useAgentWorkspace() {
     )
   }, [api])
 
+  useEffect(() => {
+    let disposed = false
+    void (async () => {
+      try {
+        const saved = localStorage.getItem('codex_workspaces')
+        if (saved) {
+          const paths: unknown = JSON.parse(saved)
+          if (Array.isArray(paths)) {
+            for (const path of paths) if (typeof path === 'string') {
+              try { await api.addProject(path) } catch { /* Invalid legacy paths were demo entries. */ }
+            }
+          }
+          localStorage.removeItem('codex_workspaces')
+        }
+        if (!disposed) await refreshProjects()
+      } catch (cause) { if (!disposed) setNotice(messageOf(cause)) }
+    })()
+    return () => { disposed = true }
+  }, [api, refreshProjects])
+
+  const deleteSession = useCallback(async (id: string) => {
+    const result = await api.deleteSession(id)
+    setAllTasks(current => current.filter(task => !result.deleted.includes(task.task_id)))
+    if (taskId && result.deleted.includes(taskId)) openTask(undefined)
+    refreshTasks()
+  }, [api, taskId, refreshTasks])
+
   const session = useSession(taskId, refreshTasks)
   const task = session.task
+  const updateSession = useCallback(async (id: string, input: {title?: string; pinned?: boolean; archived?: boolean}) => {
+    await api.updateSession(id, input)
+    refreshTasks()
+    if (id === taskId) session.reload()
+  }, [api, refreshTasks, taskId, session.reload])
+  useEffect(() => {
+    if (!task) return
+    changeSidebarMode(task.plugin_id || task.kind === 'chat' ? 'chat' : 'code')
+    if (task.workspace) setActiveWorkspace(task.workspace)
+  }, [task?.task_id, changeSidebarMode])
 
   useEffect(() => {
     const onHash = () => {
@@ -276,11 +301,13 @@ export function useAgentWorkspace() {
 
   const pendingSession=useRef<Promise<string>|null>(null)
   const uploadedAttachments=useRef(new Map<File,{task:string;receiptId:string}>())
-  useEffect(()=>{pendingSession.current=null},[taskId,activeWorkspace])
+  useEffect(()=>{pendingSession.current=null},[taskId,activeWorkspace,sidebarMode])
+  useTaskNotifications(allTasks, taskId, openTask)
   const submit = useCallback(async (text: string, permissionMode: PermissionMode, attachment?:AttachmentSubmission): Promise<boolean> => {
     setNotice(undefined)
+    requestNotificationPermission()
     try {
-      const id = taskId ?? await (pendingSession.current??=api.createSession().catch(error=>{pendingSession.current=null;throw error}))
+      const id = taskId ?? await (pendingSession.current??=api.createSession(activeWorkspace || info?.workspace, sidebarMode).catch(error=>{pendingSession.current=null;throw error}))
       const content=[]
       for(const file of attachment?.files??[]){
         let uploaded=uploadedAttachments.current.get(file)
@@ -304,7 +331,7 @@ export function useAgentWorkspace() {
       setNotice(messageOf(cause))
       return false
     }
-  }, [api, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
+  }, [api, activeWorkspace, info?.workspace, sidebarMode, fastMode, modelName, reasoningEffort, refreshTasks, session.reload, taskId])
 
   const stop = useCallback(() => {
     if (taskId === undefined) return
@@ -312,6 +339,12 @@ export function useAgentWorkspace() {
       () => { session.reload() },
       (cause: unknown) => { setNotice(messageOf(cause)) },
     )
+  }, [api, session.reload, taskId])
+
+  const interject = useCallback(async (text: string) => {
+    if (taskId === undefined) throw new Error('NOT_RUNNING')
+    await api.interject(taskId, text)
+    session.reload()
   }, [api, session.reload, taskId])
 
   const interruptNode = useCallback((nodeId: string) => {
@@ -331,12 +364,13 @@ export function useAgentWorkspace() {
     info, settings, tasks, allTasks, taskId, task, parent, parentId, session,
     ready, isChild, running, heroPhase, composerNote,
     modelName, reasoningEffort, fastMode,
-    workspaces, activeWorkspace, selectWorkspace, addWorkspace,
+    projects, workspaces, activeWorkspace: activeWorkspace || info?.workspace || '', selectWorkspace, addWorkspace, removeWorkspace, renameWorkspace,
+    sidebarMode, changeSidebarMode, updateSession, deleteSession,
     folderDialogOpen, openFolderDialog, closeFolderDialog,
     canContinue: ready && task !== undefined && acceptsPrompt(task),
     settingsOpen, settingsTab, setSettingsTab,
     openSettings, closeSettings, saveSettings, refreshInfoAndSettings, selectModel, setGenerationOptions,
-    openTask, submit, stop, interruptNode,
+    openTask, submit, stop, interject, interruptNode,
   }
 }
 

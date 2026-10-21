@@ -664,3 +664,63 @@
     transform: translateY(0);
   }
 }
+
+/* Mid-turn messages: queue button and queued list */
+.queueBtn {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 14px;
+  border: 1px solid var(--codex-card-border, #e5e7eb);
+  background: transparent;
+  color: var(--codex-text-secondary, #374151);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.queueBtn:hover {
+  background: var(--codex-hover-bg, #f4f4f5);
+}
+.queueList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px 0;
+}
+.queueItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--codex-text-secondary, #374151);
+}
+.queueTag {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--sprout-soft, #e3f1ea);
+  color: var(--sprout-strong, #0f6e56);
+  font-size: 11.5px;
+}
+.queueText {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.queueRemove {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--codex-text-muted, #6b7280);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.actionBtn:disabled,
+.actionBtn:disabled:hover {
+  background: var(--sprout-soft, #e3f1ea);
+  color: var(--codex-text-muted, #9ca3af);
+  cursor: default;
+  transform: none;
+}

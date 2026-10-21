@@ -1976,6 +1976,12 @@ pub async fn run(
         )
         .route("/agent/commands", get(crate::agent_service::slash_commands))
         .route(
+            "/agent/notes",
+            get(crate::project_notes::get)
+                .put(crate::project_notes::put)
+                .post(crate::project_notes::post),
+        )
+        .route(
             "/agent/skill-packages/{id}/tools/{name}",
             post(crate::skill_packages::call_tool),
         )
@@ -1996,6 +2002,11 @@ pub async fn run(
             "/agent/sessions",
             post(crate::agent_service::create_draft_task),
         )
+        .route("/agent/workspaces", get(crate::session_browser::projects).post(crate::session_browser::add_project).patch(crate::session_browser::rename_project).delete(crate::session_browser::remove_project))
+        .route("/agent/sessions/search", get(crate::session_browser::search))
+        .route("/agent/memories", get(crate::memory_panel::get))
+        .route("/agent/memories/{kind}/{id}", axum::routing::patch(crate::memory_panel::patch).delete(crate::memory_panel::delete))
+        .route("/agent/sessions/{task_id}", axum::routing::delete(crate::session_browser::delete_session).patch(crate::session_browser::update_session))
         .route(
             "/agent/tasks/{task_id}",
             get(crate::agent_service::get_task)
@@ -2033,6 +2044,26 @@ pub async fn run(
         .route(
             "/agent/tasks/{task_id}/visual-artifacts/{id}/image",
             get(crate::visual_artifacts::image_route),
+        )
+        .route(
+            "/agent/tasks/{task_id}/rewind",
+            post(crate::rewind::post),
+        )
+        .route(
+            "/agent/tasks/{task_id}/interjections",
+            post(crate::interjections::post),
+        )
+        .route(
+            "/agent/tasks/{task_id}/approvals",
+            post(crate::tool_approvals::decide),
+        )
+        .route(
+            "/agent/tasks/{task_id}/skill-draft",
+            post(crate::flow_skills::draft),
+        )
+        .route(
+            "/agent/tasks/{task_id}/skills",
+            post(crate::flow_skills::save_route),
         )
         .route(
             "/agent/tasks/{task_id}/flow/nodes/{node_id}/interrupt",

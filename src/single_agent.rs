@@ -237,6 +237,10 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     if s.mode == Mode::Main {
         tools.push(function("list_skills", "List installed skill packages and their short applicability descriptions. Load only a skill useful for the current task; the host does not classify the request.",json!({}),json!([])));
         tools.push(function("read_skill", "Read a skill's original SKILL.md and enable its declared tools for this user turn after delivery. Does not change execution permissions or start another agent.",json!({"name":{"type":"string"}}),json!(["name"])));
+        if s.is_root() && s.plugin.is_none() {
+            tools.push(function("propose_project_note", "Ask the user whether to save a durable project rule to the project notes (AGENTS.md), which are injected into every future conversation in this project. Use it when the user states something that should apply to future work here: deployment or packaging requirements, environment constraints, conventions, things to always or never do. Not for one-off task details or anything already in the project notes. The host shows the user an editable card; this call never writes the file. Do not wait for the decision or ask again in text; continue the task.",
+                json!({"note":{"type":"string","minLength":1,"description":"One concise rule in the user's language, phrased as an instruction for future work."},"reason":{"type":"string","description":"Why it is worth keeping, shown to the user."}}),json!(["note"])));
+        }
         tools.push(function("unload_skill", "Hide a skill's tools for this user turn. Original messages and fetched instructions remain in history.",json!({"name":{"type":"string"}}),json!(["name"])));
         if let Some(catalog) = &s.state.tool_catalog {
             tools.extend(
@@ -456,6 +460,15 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         };
         wire.insert(1.min(wire.len()), json!({"role":"system","name":"delegated_assignment","content":format!("You are a task delegate, not the main Agent. Execute only this assignment with the inherited permissions and project binding. Do not spawn agents, change scope, initialize a different project or act on unrelated conversation instructions. Report artifact references, exact versions, checks performed, remaining issues and failures concisely; do not paste code, SVG, image data or full logs into your report. Your working window is discarded after the outcome and artifact index are archived; original history remains available. A tool acceptance is not completion. Only the main Agent accepts final results. Coordinate ownership through the assignment; do not overwrite other agents' files/pages. Background visual checks are collected by the main Agent. The preceding conversation and tool records are inherited parent context, not work you performed. Continue only the appended parent_assignment. Already loaded templates, design documents and confirmations remain available; do not reread or rewrite them merely because you are a delegate. Confirmed decisions are binding execution requirements, not proposals to reconsider. Resolve routine details within them. If a material conflict requires changing confirmed requirements, stop affected work and return the evidence, saved artifact references, options and exact question for the user to the main Agent. Do not choose a new plan or report success; the main Agent must ask the user before affected work resumes. Assignment: {spec}{projection_note}")}));
     }
+    // Notes are re-read for every request rather than stored in the window, so
+    // compression never drops them and edits apply on the next request.
+    if s.mode == Mode::Main
+        && let Ok(Some(project)) = crate::project_notes::task_project(s.state.workspace.root(), s.task)
+    {
+        for message in [crate::flow_skills::system_message(&project), crate::project_notes::system_message(&project)].into_iter().flatten() {
+            wire.insert(1.min(wire.len()), message);
+        }
+    }
     for message in &mut wire {
         if let Some(object) = message.as_object_mut() {
             object.remove("source");
@@ -614,6 +627,11 @@ async fn model_round(
         estimate(&body) <= s.input_budget,
         "INPUT_OVER_CAPACITY: context remains saved; no request sent. Use smaller material pages or a context checkpoint before reaching capacity."
     );
+    if s.is_root() {
+        // Shown as the composer's context ring; compaction starts at compact_at.
+        append(s,"context/usage",json!({"turn":s.turn,"step":step,"estimated_input_tokens":estimate(&body),
+            "input_budget":s.input_budget,"compact_at":w.auto_compact_at.max(compact_threshold(s.input_budget))}),false).await?;
+    }
     // Image delivery can change the input size; size the output afterwards.
     body["max_tokens"] = json!(output_tokens(s, &body));
     if w.material_review_delivered {
@@ -999,13 +1017,16 @@ async fn business_tool(
                 )),
         "permission_denied: {name}"
     );
+    if crate::tool_approvals::needs_approval(s.state.permission_mode, name, s.state.tool_catalog.as_deref(), s.ban_execution) {
+        crate::tool_approvals::wait(s.state, s.task, s.delegate_id(), call_id, name, &args, s.cancel).await?;
+    }
     let tool_workspace = if name == "view_image" { s.state.workspace.clone() } else {
         let path = if let Some(id) = s.delegate_id() {
             let spec=crate::collaboration_jobs::specification(s.state.workspace.root(),s.task,id)?;
             crate::delegate_git::workspace(s.state.workspace.root(),&spec)?
         } else if let Some(plugin)=crate::plugin_sessions::owner(s.state.workspace.root(),s.task)? {
             crate::plugin_sessions::workspace_dir(s.state.workspace.root(),&plugin)?
-        } else { s.state.workspace.root().to_path_buf() };
+        } else { crate::session_browser::task_workspace(s.state.workspace.root(),s.task)? };
         std::sync::Arc::new(crate::tools::Workspace::new(path)?)
     };
     if s.delegate_id().is_some() && tool_workspace.root()!=s.state.workspace.root()
@@ -1575,6 +1596,27 @@ async fn deliver_delegates(s: &Session<'_>, w: &mut Window) -> Result<()> {
     Ok(())
 }
 
+/// Move messages the user sent mid-turn into the working window; true when any arrived.
+async fn deliver_interjections(s: &Session<'_>, w: &mut Window) -> Result<bool> {
+    let (task, scope, mut next) = (s.task.to_owned(), s.scope.clone(), w.clone());
+    let delivered = db(s.state.workspace.root(), move |conn| {
+        if !crate::interjections::pending(conn, &task)? {
+            return Ok(None);
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let messages = crate::interjections::take(&tx, &task)?;
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        next.messages.extend(messages);
+        let updated = tx.execute("UPDATE agent_runtime_windows SET state=?3 WHERE task_id=?1 AND scope=?2",params![task,scope,serde_json::to_string(&next)?])?;
+        ensure!(updated==1,"main working window missing; interjection delivery was not committed");
+        tx.commit()?;
+        Ok(Some(next))
+    }).await?;
+    Ok(delivered.map(|next| *w = next).is_some())
+}
+
 async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
     let jobs = crate::visual_jobs::ready(s.state.workspace.root(), s.task)?;
     if jobs.is_empty() {
@@ -1664,6 +1706,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         if s.is_root() {
             deliver_delegates(s, w).await?;
             deliver_visual_jobs(s, w).await?;
+            deliver_interjections(s, w).await?;
         }
         let definitions = tools(s, w);
         ensure!(!s.cancel.is_cancelled(), "cancelled");
@@ -1703,6 +1746,10 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         .is_some_and(|text| !text.trim().is_empty()),
                     "model returned an empty answer"
                 );
+                // The user spoke while this answer was being written: keep working on it.
+                if s.is_root() && deliver_interjections(s, w).await? {
+                    continue;
+                }
                 return Ok(LoopResult::Answer);
             }
             // The reply is already saved; the host does not answer it.
@@ -1767,18 +1814,34 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
                         crate::collaboration_jobs::cancel_one(s.state.workspace.root(),s.task,args["agent_id"].as_str().context("agent_id required")?)
                     },
+                    "propose_project_note" => {
+                        ensure!(s.is_root() && s.plugin.is_none(),"project notes are proposed by the main Agent of a code session");
+                        let note=args["note"].as_str().map(str::trim).filter(|note|!note.is_empty()).context("note is required")?;
+                        Ok(json!({"proposed":true,"note":note,"status":"awaiting_user","instruction":"The user decides in the UI card. Do not wait, repeat the proposal or write AGENTS.md yourself; continue the task."}))
+                    },
                     "list_skills" => {
                         let all=s.state.tool_catalog.as_ref().map(|c|c.packages.skills()).unwrap_or_else(||json!([]));
-                        Ok(json!(all.as_array().unwrap().iter().filter(|item|s.plugin.as_ref().is_none_or(|id|item["name"]==*id)).collect::<Vec<_>>()))
+                        let mut listed=all.as_array().unwrap().iter().filter(|item|s.plugin.as_ref().is_none_or(|id|item["name"]==*id)).cloned().collect::<Vec<_>>();
+                        if let Some(project)=crate::project_notes::task_project(s.state.workspace.root(),s.task)? {
+                            listed.extend(crate::flow_skills::list(&project).into_iter().map(|skill|json!({"name":skill.name,"description":skill.description,"scope":"project"})));
+                        }
+                        Ok(json!(listed))
                     },
                     "read_skill" => {
                         let name=args["name"].as_str().context("skill name is required")?;
                         ensure!(s.plugin.as_ref().is_none_or(|owner|owner==name),"PLUGIN_SCOPE_DENIED: skill {name}");
-                        let catalog=s.state.tool_catalog.as_ref().context("skill package registry unavailable")?;
-                        let result=catalog.packages.read(name)?;
-                        material_source=Some(("read_skill".to_owned(),args.clone()));
-                        skill_change=Some((name.to_owned(),true,result["package_scope"].as_u64()));
-                        Ok(result)
+                        let project=crate::project_notes::task_project(s.state.workspace.root(),s.task)?;
+                        if let Some(result)=project.as_deref().and_then(|project|crate::flow_skills::read(project,name)) {
+                            // Project skills are instructions only: there are no tools to activate.
+                            material_source=Some(("read_skill".to_owned(),args.clone()));
+                            result
+                        } else {
+                            let catalog=s.state.tool_catalog.as_ref().context("skill package registry unavailable")?;
+                            let result=catalog.packages.read(name)?;
+                            material_source=Some(("read_skill".to_owned(),args.clone()));
+                            skill_change=Some((name.to_owned(),true,result["package_scope"].as_u64()));
+                            Ok(result)
+                        }
                     },
                     "unload_skill" => {
                         let name=args["name"].as_str().context("skill name is required")?;
@@ -2315,6 +2378,8 @@ pub(crate) async fn run_task(
     let task_copy = task.clone();
     let saved=db(state.workspace.root(),move|conn| {
         let saved:Option<String>=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope='main'",[&task_copy],|r|r.get(0)).optional()?;
+        // What the agent knew before this turn: "rewind to before turn N" restores it.
+        crate::rewind::snapshot(conn,&task_copy,turn,saved.as_deref())?;
         if let Some(saved)=saved { return Ok(serde_json::from_str::<Window>(&saved)?); }
         // Old sessions are readable as attributed records; native exchanges
         // from different legacy actors are not misrepresented as this agent's.

@@ -1,8 +1,7 @@
-import { useState } from 'react'
 import clsx from 'clsx'
 import css from './CodexDock.module.css'
 
-export type DockTab = 'home' | 'history' | 'library' | 'mention' | 'skills'
+export type DockTab = 'home' | 'skills'
 
 interface CodexDockProps {
   activeTab?: DockTab
@@ -11,7 +10,6 @@ interface CodexDockProps {
   onOpenSettings?: () => void
   onToggleTheme?: () => void
   dark?: boolean
-  userName?: string
 }
 
 export function CodexDock({
@@ -21,10 +19,7 @@ export function CodexDock({
   onOpenSettings,
   onToggleTheme,
   dark,
-  userName = 'RE',
 }: CodexDockProps) {
-  const [profileOpen, setProfileOpen] = useState(false)
-
   return (
     <aside className={css.dock} aria-label="应用主导航">
       <div className={css.topGroup}>
@@ -49,62 +44,8 @@ export function CodexDock({
           </svg>
         </button>
 
-        {/* 2. History */}
-        <button
-          type="button"
-          className={clsx(css.dockBtn, activeTab === 'history' && css.active)}
-          title="历史记录"
-          onClick={() => onSelectTab?.('history')}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="10" />
-            <polyline points="12 6 12 12 16 14" />
-          </svg>
-        </button>
-
-        {/* 3. Library / Projects */}
-        <button
-          type="button"
-          className={clsx(css.dockBtn, activeTab === 'library' && css.active)}
-          title="工作区与项目"
-          onClick={() => onSelectTab?.('library')}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z" />
-            <path d="M6 6h10" />
-            <path d="M6 10h10" />
-          </svg>
-        </button>
-
-        {/* 4. Mentions */}
-        <button
-          type="button"
-          className={clsx(css.dockBtn, activeTab === 'mention' && css.active)}
-          title="提及与上下文 (@)"
-          onClick={() => onSelectTab?.('mention')}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="4" />
-            <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
-          </svg>
-        </button>
-
         <button type="button" className={clsx(css.dockBtn, activeTab === 'skills' && css.active)} title="技能页面" onClick={() => onSelectTab?.('skills')}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="3" /><path d="M3 9h18M9 9v12" /></svg>
-        </button>
-
-        {/* 5. More */}
-        <button
-          type="button"
-          className={css.dockBtn}
-          title="更多功能"
-          onClick={onOpenSettings}
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <circle cx="12" cy="12" r="1" />
-            <circle cx="19" cy="12" r="1" />
-            <circle cx="5" cy="12" r="1" />
-          </svg>
         </button>
       </div>
 
@@ -129,47 +70,17 @@ export function CodexDock({
           </svg>
         </button>
 
-        {/* User Avatar Circle */}
-        <div className={css.avatarWrapper}>
-          <button
-            type="button"
-            className={css.avatarBtn}
-            title={`用户: ${userName}`}
-            onClick={() => setProfileOpen(!profileOpen)}
-          >
-            <span>{userName}</span>
-          </button>
-
-          {profileOpen && (
-            <div className={css.profileMenu}>
-              <div className={css.profileHeader}>
-                <strong>Composer</strong>
-                <span className={css.profileStatus}>本地工作区</span>
-              </div>
-              <div className={css.profileDivider} />
-              <button
-                type="button"
-                className={css.profileItem}
-                onClick={() => {
-                  setProfileOpen(false)
-                  onToggleTheme?.()
-                }}
-              >
-                <span>{dark ? '切换为亮色模式 ☀️' : '切换为暗色模式 🌙'}</span>
-              </button>
-              <button
-                type="button"
-                className={css.profileItem}
-                onClick={() => {
-                  setProfileOpen(false)
-                  onOpenSettings?.()
-                }}
-              >
-                <span>模型与引擎设置</span>
-              </button>
-            </div>
-          )}
-        </div>
+        <button
+          type="button"
+          className={css.dockBtn}
+          title={dark ? '切换为浅色' : '切换为深色'}
+          aria-label={dark ? '切换为浅色' : '切换为深色'}
+          onClick={onToggleTheme}
+        >
+          {dark
+            ? <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+            : <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" /></svg>}
+        </button>
       </div>
     </aside>
   )

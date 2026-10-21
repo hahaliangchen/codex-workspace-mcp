@@ -30,6 +30,10 @@ export default defineConfig({
       '/agent/skill-page-sdk.js': backend,
       '/agent/workspace/files': backend,
       '/agent/commands': backend,
+      '/agent/notes': backend,
+      '/agent/memories': backend,
+      '/agent/workspaces': backend,
+      '/agent/models': backend,
     },
   },
   build: {

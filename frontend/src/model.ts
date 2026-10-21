@@ -16,6 +16,7 @@ export type TurnEndReason =
 export type ChatItem =
   | { readonly kind: 'subagent'; readonly key: string; readonly agentId: string; readonly name: string; readonly status: string; readonly events: readonly AgentEvent[]; readonly report: string; readonly review: string; readonly time: number }
   | { readonly kind: 'turn'; readonly key: string; readonly turn: number }
+  | { readonly kind: 'interjection'; readonly key: string; readonly text: string; readonly time: number; readonly delivered: boolean }
   | { readonly kind: 'user'; readonly key: string; readonly text: string; readonly time: number; readonly attachments?:readonly {name:string;url:string;image:boolean}[] }
   | { readonly kind: 'assistant'; readonly key: string; readonly text: string; readonly reasoning: string; readonly time: number; readonly streaming: boolean; readonly turn: number; readonly step: number }
   | { readonly kind: 'observer'; readonly key: string; readonly summary: string; readonly suggestions: readonly string[]; readonly time: number }
@@ -132,6 +133,7 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
     }
     delegates.set(id, child)
   }
+  const deliveredInterjections = new Set(events.filter(event => event.type === 'user/interjection_delivered').map(event => Number(event.data.interjection_seq)))
   const results = new Map<string, ToolResult>()
   for (const event of events) {
     if (event.type !== 'tool/result') continue
@@ -157,6 +159,9 @@ export function chatItems(events: readonly AgentEvent[], task?: Task): ChatItem[
         if (turn > 1) items.push({ kind: 'turn', key, turn })
         break
       }
+      case 'user/interjection':
+        items.push({ kind: 'interjection', key, text: stringOf(event.data.text) ?? '', time: event.time, delivered: deliveredInterjections.has(event.seq) })
+        break
       case 'user/message': {
         if (turnStartTime === undefined) {
           turnStartTime = event.time

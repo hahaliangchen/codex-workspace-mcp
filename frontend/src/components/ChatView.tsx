@@ -19,6 +19,9 @@ import { useTaskDuration } from '../useTaskDuration.ts'
 import { AssistantMessage } from './AssistantMessage.tsx'
 import css from './ChatView.module.css'
 import { ToolRow } from './ToolRow.tsx'
+import { NoteProposal } from './NoteProposal.tsx'
+import { ApprovalCards } from './ApprovalCards.tsx'
+import { RewindControl } from './RewindControl.tsx'
 import { SmoothMarkdown } from './SmoothMarkdown.tsx'
 
 function TurnEnd({ reason, durationMs }: { reason: TurnEndReason; durationMs?: number | undefined }) {
@@ -110,6 +113,11 @@ function Item({
           <ul>{item.suggestions.map((suggestion, index) => <li key={index}>{suggestion}</li>)}</ul>
         </div>
       )
+    case 'interjection':
+      return <div className={css.interjection}>
+        <span className={css.interjectionTag}>{item.delivered ? '插话 · 已送达' : '插话 · 下一步送达'}</span>
+        <span>{item.text}</span>
+      </div>
     case 'tool':
       return (
         <ToolRow
@@ -145,6 +153,7 @@ function AssistantTurnView({
   liveDurationMs,
   slashNames,
   onOpenTask,
+  workspace,
 }: {
   turn: AssistantTurnData
   taskId: string
@@ -155,6 +164,7 @@ function AssistantTurnView({
   liveDurationMs?: number | undefined
   slashNames: readonly string[]
   onOpenTask: (taskId: string) => void
+  workspace: string | null | undefined
 }) {
   const isTurnRunning = !turn.closed && running
   const [userToggled, setUserToggled] = useState<boolean | null>(null)
@@ -163,7 +173,11 @@ function AssistantTurnView({
   const labels = useMemo(() => markdownLabels(t), [])
 
 
-  const hasTools = turn.tools.length > 0
+  // Note proposals wait for the user, so they sit below the answer, not in the collapsible process.
+  const isNote = (item: ChatItem): item is ChatItem & { kind: 'tool' } => item.kind === 'tool' && item.name === 'propose_project_note'
+  const notes = turn.tools.filter(isNote)
+  const processTools = turn.tools.filter(item => !isNote(item))
+  const hasTools = processTools.length > 0
   const hasReasoning = Boolean(turn.assistant?.reasoning && turn.assistant.reasoning.trim() !== '')
   const duration = turn.durationMs ?? (isTurnRunning ? liveDurationMs : undefined)
 
@@ -219,7 +233,7 @@ function AssistantTurnView({
 
           {hasTools && (
             <div className={css.toolsList}>
-              {turn.tools.map((tool) => (
+              {processTools.map((tool) => (
                 <Item
                   key={tool.key}
                   item={tool}
@@ -231,7 +245,7 @@ function AssistantTurnView({
             </div>
           )}
 
-          {!hasReasoning && !hasTools && (
+          {!hasReasoning && !hasTools && notes.length === 0 && (
             <div style={{ color: 'var(--dsw-alias-label-tertiary, #9ca3af)', fontSize: 12, padding: '4px 0' }}>
               （本轮未产生额外的思考或外部工具调用）
             </div>
@@ -259,6 +273,8 @@ function AssistantTurnView({
         </div>
       )}
 
+      {notes.map(note => <NoteProposal key={note.key} callId={note.callId} rawArguments={note.arguments} workspace={workspace} />)}
+
       {/* 6. Codex-Style Edited Files Summary Card */}
       {changes && <ChangesCard taskId={taskId} summary={changes} running={running} onChangesUpdated={onChangesUpdated} />}
       {trackingError && <p role="status" className={css.turnNote}>部分改动未能记录：{trackingError}</p>}
@@ -273,7 +289,7 @@ function AssistantTurnView({
 
 type ChatNode =
   | { kind: 'subagent'; item: ChatItem & { kind: 'subagent' } }
-  | { kind: 'user'; item: ChatItem & { kind: 'user' } }
+  | { kind: 'user'; item: ChatItem & { kind: 'user' }; turn: number }
   | { kind: 'retrospective'; item: ChatItem & { kind: 'retrospective' } }
   | { kind: 'assistant-turn'; turn: AssistantTurnData }
   | { kind: 'turn-end'; item: ChatItem & { kind: 'turn-end' } }
@@ -343,7 +359,7 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
 
       if (item.kind === 'user') {
         flushTurn()
-        list.push({ kind: 'user', item })
+        list.push({ kind: 'user', item, turn: turnNumber })
         return
       }
 
@@ -359,7 +375,7 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
         return
       }
 
-      if (item.kind === 'tool' || item.kind === 'observer') {
+      if (item.kind === 'tool' || item.kind === 'observer' || item.kind === 'interjection') {
         if (!currentTurn) {
           currentTurn = {
             key: `turn:${item.key}`,
@@ -413,13 +429,14 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
             {nodes.map((node) => {
               if (node.kind === 'user') {
                 return (
-                  <div key={node.item.key} className={chatCss.flowItem} data-chat-flow-kind="user">
+                  <div key={node.item.key} className={`${chatCss.flowItem} ${css.userWithRewind}`} data-chat-flow-kind="user">
                     <Item
                       item={node.item}
                       turnClosed={true}
                       slashNames={slashNames}
                       onOpenTask={onOpenTask}
                     />
+                    {task && !running && task.parent_task_id === null && <RewindControl taskId={task.task_id} turn={node.turn} onRewound={() => onChangesUpdated?.()} />}
                   </div>
                 )
               }
@@ -437,6 +454,7 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
                       liveDurationMs={durationInfo.currentTurnDurationMs}
                       slashNames={slashNames}
                       onOpenTask={onOpenTask}
+                      workspace={task?.workspace}
                     />
                   </div>
                 )
@@ -453,6 +471,8 @@ export function ChatView({ events, task, running, onOpenTask, onChangesUpdated }
                 </div>
               )
             })}
+
+            {task && <ApprovalCards className={chatCss.flowItem} taskId={task.task_id} events={events} />}
 
             {thinking && nodes.length === 0 && (
               <div className={chatCss.flowItem}>
