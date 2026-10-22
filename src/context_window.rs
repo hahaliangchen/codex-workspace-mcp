@@ -1,6 +1,27 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
+#[derive(Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct TokenCalibration {
+    route: String,
+    ratio: Option<f64>,
+}
+
+impl TokenCalibration {
+    pub fn estimate(&self, value: &Value, route: &str) -> usize {
+        let ratio = if self.route == route { self.ratio.unwrap_or(1.0) } else { 1.0 };
+        (estimate(value) as f64 * ratio).ceil() as usize
+    }
+
+    pub fn observe(&mut self, route: &str, estimated: usize, actual: usize) {
+        if estimated == 0 || actual == 0 { return; }
+        self.route = route.to_owned();
+        // Include modest headroom for tokenizer/framing differences. Missing or
+        // implausible usage must not make the host's estimate unbounded.
+        self.ratio = Some((actual as f64 / estimated as f64 * 1.05).clamp(0.1, 10.0));
+    }
+}
+
 /// Provenance stays beside the message array, never in its original body.
 #[derive(Clone, Default)]
 pub struct HistoryView {
@@ -70,6 +91,21 @@ pub fn prepare(body: &mut Value, _protected_prefix: usize) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calibration_is_scoped_to_provider_model_and_ignores_missing_usage() {
+        let mut calibration = TokenCalibration::default();
+        let input = json!({"messages":[{"role":"user","content":"中文材料".repeat(500)}]});
+        let raw = estimate(&input);
+        assert_eq!(calibration.estimate(&input,"a/model"), raw);
+        calibration.observe("a/model", raw, raw / 3);
+        let adjusted = calibration.estimate(&input,"a/model");
+        assert!(adjusted < raw / 2 && adjusted >= raw / 3);
+        assert_eq!(calibration.estimate(&input,"b/model"), raw);
+        calibration.observe("a/model", raw, 0);
+        assert_eq!(calibration.estimate(&input,"a/model"), adjusted);
+        let restored: TokenCalibration = serde_json::from_value(serde_json::to_value(&calibration).unwrap()).unwrap();
+        assert_eq!(restored.estimate(&input,"a/model"), adjusted);
+    }
     #[test]
     fn below_capacity_is_unchanged() {
         let mut body = json!({"messages":[{"role":"system","content":"goal"},{"role":"user","content":"原文 \n"}]});

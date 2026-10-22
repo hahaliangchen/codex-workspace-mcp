@@ -101,7 +101,8 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
 
   // Stable execution-window columns, with dependency edges preserved.
   const { nodes, edges } = useMemo(() => {
-    const currentNodes = flow.nodes.filter(node => node.turn === flow.organizedTurn)
+    const hasTree = flow.nodes.some(node => node.id.startsWith('task:'))
+    const currentNodes = flow.nodes.filter(node => hasTree ? node.id.startsWith('task:') : node.turn === flow.organizedTurn)
     const nodeOrder = new Map(currentNodes.map((node, index) => [node.id, index]))
     const currentEdges = flow.edges.filter(edge => nodeOrder.has(edge.source) && nodeOrder.has(edge.target))
     const positions = layoutAgentFlow(currentNodes, currentEdges)
@@ -140,7 +141,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
   }, [flow.nodes, selectedNodeId])
 
   const activeNode = useMemo(() => {
-    const current = flow.nodes.filter(node => node.turn === flow.organizedTurn)
+    const current = flow.nodes.filter(node => node.id.startsWith('task:') || node.turn === flow.organizedTurn)
     return (
       current.find(node => node.id === flow.activeNodeId) ??
       [...current].reverse().find(node => node.status === 'running')
@@ -173,8 +174,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
         <div className={styles.flowSummary}>
           <span className={styles.flowIcon}>↗</span>
           <div className={styles.flowSummaryText}>
-            <strong>Agent 请求流程</strong>
-            <span className={styles.flowSubtext}>每列对应一个任务分支，每个节点对应一次模型请求；上下文压缩单独分支显示</span>
+            <strong>{flow.nodes.some(node => node.id.startsWith('task:')) ? '任务树' : 'Agent 请求流程'}</strong>
           </div>
         </div>
 
@@ -195,7 +195,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               title="点击查看当前进行中节点详情"
             >
               <span className={styles.pulseDot} />
-              <span>当前步骤: #{activeNode.id.split(':').pop()} {activeNode.title}</span>
+              <span className={styles.activeTitle}>当前步骤: #{activeNode.id.split(':').pop()?.slice(0, 8)} {activeNode.title}</span>
             </button>
           )}
 
@@ -316,9 +316,12 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <div className={styles.nodeMetaBar}>
                 <span className={`${styles.nodeStatusBadge} ${styles['status_' + selectedNode.status] ?? ''}`}>
                   {selectedNode.status === 'running' && '⟳ 进行中'}
-                  {(selectedNode.status === 'done' || selectedNode.status === 'completed') && '↩ 执行已结束'}
+                  {(selectedNode.status === 'done' || selectedNode.status === 'completed') && (selectedNode.id.startsWith('task:') ? '任务已完成' : '↩ 执行已结束')}
                   {(selectedNode.status === 'ready' || selectedNode.status === 'pending') && '○ 待执行'}
                   {selectedNode.status === 'paused' && '⏸ 待继续'}
+                  {selectedNode.status === 'suspended' && '挂起，等待子任务'}
+                  {selectedNode.status === 'needs_user' && '等待用户决定'}
+                  {selectedNode.status === 'cancelled' && '已取消'}
                   {selectedNode.status === 'blocked' && '⚠ 受阻'}
                   {selectedNode.status === 'interrupted' && '⏸ 已暂停 / 中断'}
                   {selectedNode.status === 'failed' && '✕ 失败'}

@@ -321,12 +321,22 @@
   color: #d4d4d8;
 }
 
+/* Ask-before-run follows the theme: sprout green or ginkgo gold, with the
+   theme's soft tint on hover instead of a grey or green wash. */
 .permPillSafe {
-  color: #059669;
+  color: var(--sprout-strong, #0f6e56);
+}
+
+.permPillSafe:hover {
+  background: var(--sprout-soft, #e3f1ea);
 }
 
 :global(body[data-ds-dark-theme]) .permPillSafe {
-  color: #34d399;
+  color: var(--sprout-strong, #5dcaa5);
+}
+
+:global(body[data-ds-dark-theme]) .permPillSafe:hover {
+  background: var(--sprout-soft, #1d3a2e);
 }
 
 /* 4. Codex-styled Permission Popover for DSH permissions (media_1791085181305.png) */

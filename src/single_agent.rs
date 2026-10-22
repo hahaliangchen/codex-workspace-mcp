@@ -15,12 +15,15 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod task_frames;
+pub(crate) mod tool_groups;
+
 const INPUT_BUDGET: usize =
     crate::context_window::MAX_TOKENS - crate::model_settings::OUTPUT_RESERVE;
 const SUMMARY_BUDGET: usize = 24_000;
 const PAGE_CHARS: usize = 24_000;
 const CONTEXT_ROUNDS: usize = 64;
-const CONTEXT_POLICY_VERSION: u32 = 4;
+const CONTEXT_POLICY_VERSION: u32 = 5;
 const DELEGATE_FORK_MIN_TOKENS: usize = 16_000;
 const DELEGATE_PROJECTION_OPERATION_CHARS: usize = 2_000;
 const DELEGATE_PROJECTION_TOOL_RESULT_CHARS: usize = 8_000;
@@ -49,6 +52,14 @@ impl Mode {
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct Window {
     #[serde(default)]
+    task_node_id: Option<String>,
+    #[serde(default)]
+    instruction_versions: BTreeMap<String,String>,
+    #[serde(default)]
+    loaded_tool_groups: BTreeSet<String>,
+    #[serde(default)]
+    pressure_warned: bool,
+    #[serde(default)]
     active_skills: BTreeSet<String>,
     #[serde(default)]
     active_skill_scopes: BTreeMap<String, crate::plugin_runtime::ScopeId>,
@@ -70,11 +81,23 @@ struct Window {
     context_policy_version: u32,
     #[serde(default)]
     auto_compact_failed_turn: Option<usize>,
+    #[serde(default)]
+    token_calibration: crate::context_window::TokenCalibration,
+    #[serde(default)]
+    context_budget: usize,
+}
+impl Window {
+    fn input_tokens(&self, s: &Session<'_>, body: &Value) -> usize {
+        self.token_calibration.estimate(body, &calibration_route(s))
+    }
+}
+fn calibration_route(s: &Session<'_>) -> String {
+    format!("{}|{}|{}", s.state.provider_name, s.state.provider_url, s.model)
 }
 /// Thresholds from a retired algorithm cannot suppress the current policy.
 /// Failure backoff prevents loops within a turn, not retries on later input.
 fn reconcile_context_policy(w: &mut Window, turn: usize, budget: usize) -> bool {
-    let outdated = w.context_policy_version != CONTEXT_POLICY_VERSION;
+    let outdated = w.context_policy_version != CONTEXT_POLICY_VERSION || w.context_budget != budget;
     let retry = w
         .auto_compact_failed_turn
         .is_some_and(|failed| failed != turn);
@@ -83,6 +106,7 @@ fn reconcile_context_policy(w: &mut Window, turn: usize, budget: usize) -> bool 
     }
     w.auto_compact_at = compact_threshold(budget);
     w.context_policy_version = CONTEXT_POLICY_VERSION;
+    w.context_budget = budget;
     w.auto_compact_failed_turn = None;
     true
 }
@@ -97,6 +121,7 @@ struct Material {
     required_assets: Vec<String>,
     messages: Vec<Value>,
 }
+#[derive(Clone)]
 struct Session<'a> {
     plugin: Option<String>,
     state: &'a AgentServiceState,
@@ -175,6 +200,15 @@ async fn save(s: &Session<'_>, w: &Window) -> Result<()> {
     }).await
 }
 async fn append(s: &Session<'_>, kind: &str, mut data: Value, surface: bool) -> Result<i64> {
+    if let Some(id)=s.scope.strip_prefix("node:") {data["task_node_id"]=json!(id);}
+    if s.mode==Mode::Context && let Some(material)=s.material.as_ref() {
+        if let Some(id)=material.owner_scope.strip_prefix("node:") {data["task_node_id"]=json!(id);}
+        else if material.owner_scope=="main" {data["task_node_id"]=json!(crate::task_tree::ROOT);}
+        else if let Some(agent)=material.owner_scope.strip_prefix("delegate:") {
+            let conn=agent_service::open_db(s.state.workspace.root())?;
+            if let Some(node)=crate::task_tree::nodes(&conn,s.task)?.into_iter().find(|n|n.agent_id.as_deref()==Some(agent)) {data["task_node_id"]=json!(node.node_id);}
+        }
+    }
     let mut kind = kind.to_owned();
     if let Some(id) = s.delegate_id() {
         data["agent_id"] = json!(id);
@@ -206,6 +240,15 @@ fn function(name: &str, description: &str, properties: Value, required: Value) -
         "parameters":{"type":"object","properties":properties,"required":required}}})
 }
 fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
+    let mut definitions = available_tools(s, w);
+    if s.mode == Mode::Main {
+        definitions.retain(|tool| tool_groups::group(tool["function"]["name"].as_str().unwrap_or(""))
+            .is_none_or(|group| w.loaded_tool_groups.contains(group)));
+    }
+    definitions
+}
+
+fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     let mut tools = if s.mode == Mode::Main {
         agent_service::local_tools(
             &s.state.workspace,
@@ -233,9 +276,10 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         json!({"asset_ids":{"type":"array","minItems":1,"items":{"type":"string"}},"reason":{"type":"string"}}),json!(["asset_ids","reason"])));
     tools.push(function("list_context_assets", "Inspect the asset references and loaded/reference-only states in your current context. Does not read asset files or alter context.",json!({}),json!([])));
     if s.mode == Mode::Main && s.is_root() {
+        tools.extend(crate::task_tree::tools());
         tools.push(function("read_task_board", "Read the durable main objective, constraints, deliverables and host execution status. Domain-neutral; not a chat transcript or inferred completion.",json!({}),json!([])));
         tools.push(function("update_task_definition", "Propose a concise main task definition or change for human UI confirmation. This NEVER changes the active objective. Return awaiting_user_confirmation; do not treat it as approved. Only explicit main-task scope/constraint changes justify updates. Never append temporary steps, emotional remarks, status questions, raw transcripts or progress. Cite real user event sequences from read_session_history; preserve all still-effective constraints. This tool cannot confirm plans or mark work complete.",json!({
-            "expected_version":{"type":"integer","description":"Current definition version from read_task_board; omit only for first creation"},
+            "expected_version":{"type":"integer","description":"Exact active definition.version from read_task_board. When definition is null, omit this field entirely; zero is not an initial version."},
             "objective":{"type":"string"},"constraints":{"type":"array","items":{"type":"string"}},
             "completion_conditions":{"type":"array","items":{"type":"string"}},
             "source_event_seqs":{"type":"array","items":{"type":"integer"}}}),json!(["objective","constraints","completion_conditions","source_event_seqs"])));
@@ -270,8 +314,8 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         tools.push(crate::image_analysis::tool());
         tools.push(crate::visual_jobs::tool());
         tools.push(function("refresh_asset", "Explicitly re-read the current local file/range behind an existing file asset. Returns its current version as an asset; keeps the old snapshot and reference. Never replays commands or captures screenshots.",json!({"asset_id":{"type":"string"}}),json!(["asset_id"])));
-        tools.push(function("compress_context", "Summarize core conversation and select next-needed asset references in one read-only submission. The host restores selected data and active skill rules before continuing. Set deep=true only for a deliberate investigation of missing historical evidence, not routine capacity management. Original history is preserved; no business execution or recursive agents.",
-            json!({"reason":{"type":"string"},"deep":{"type":"boolean","default":false}}), json!(["reason"])));
+        tools.push(function("compress_context", "Compress older work exchanges in this frame in one read-only submission. User originals, declared inputs, pinned materials and two recent exchanges are preserved. Prefer split_task when completed work can be folded into a verified child result.",
+            json!({"reason":{"type":"string"}}), json!(["reason"])));
     } else {
         let asset_plan = json!({"type":"array","description":"Explicit asset decisions. Omitted assets keep their currently loaded contents and references. Use reference only when you decide the body is no longer needed.","items":{"type":"object","properties":{"asset_id":{"type":"string"},"mode":{"type":"string","enum":["keep","reference","excerpt"]},"event_seqs":{"type":"array","items":{"type":"integer"},"description":"For excerpt mode, retain only these already-loaded page deliveries; obtain event_seq from read_asset delivery_reference."}},"required":["asset_id","mode"]}});
         let paging = json!({"char_offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":PAGE_CHARS}});
@@ -288,6 +332,9 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
                 "tool_history":{"type":"string"},"asset_context":asset_plan,"source_event_seqs":{"type":"array","items":{"type":"integer"}},
                 "visual_conclusions":{"type":"array","items":{"type":"object","properties":{"artifact_id":{"type":"string"},"conclusion":{"type":"string"}},"required":["artifact_id","conclusion"]}}}),
             json!(["original_purpose","current_goal","requirement_changes","constraints","progress","open_questions","next_steps","tool_history","source_event_seqs","visual_conclusions"])));
+    }
+    if s.mode==Mode::Main && s.delegate_id().is_some() && w.task_node_id.is_some() {
+        tools.extend(crate::task_tree::tools().into_iter().filter(|t|t["function"]["name"]=="return_task"));
     }
     if w.material_review_delivered {
         tools.retain(|tool| tool["function"]["name"] == "submit_context");
@@ -310,6 +357,9 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     }
     if s.is_root() {
         tools.extend(crate::collaboration_jobs::tools());
+    }
+    if s.mode == Mode::Main {
+        tools.extend(tool_groups::tools());
     }
     tools.retain(|tool| page_allows(s, tool["function"]["name"].as_str().unwrap_or("")));
     tools
@@ -342,7 +392,10 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
             | "read_task_requirement"
             | "checkpoint_context"
             | "submit_context"
-    ) || s
+            | "list_tool_groups"
+            | "load_tool_group"
+            | "unload_tool_group"
+    ) || crate::task_tree::is_tool(name) || s
         .state
         .tool_catalog
         .as_ref()
@@ -352,6 +405,13 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
 fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str) -> Result<()> {
     if let Some(id)=s.delegate_id() {
         crate::collaboration_jobs::ensure_active(s.state.workspace.root(),s.task,id)?;
+    }
+    if matches!(name.trim_start_matches("ppt_master__"),"apply_html"|"manage_design_pages"|"apply_edits"|"build_deck") {
+        if let Some(id)=w.task_node_id.as_deref() {
+            let conn=agent_service::open_db(s.state.workspace.root())?;
+            let node=crate::task_tree::get(&conn,s.task,id)?;
+            crate::task_tree::validate_plan_version(&conn,s.task,&node)?;
+        }
     }
     ensure!(
         !crate::collaboration_jobs::is_tool(name) || s.is_root(),
@@ -371,6 +431,11 @@ fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str)
         s.mode == Mode::Main,
         "TOOL_UNAVAILABLE_CONTEXT: {name}; a read-only context subagent cannot use this tool or start another subagent"
     );
+    if let Some(group) = tool_groups::group(name) {
+        if available_tools(s, w).iter().any(|tool| tool["function"]["name"] == name) {
+            anyhow::bail!("TOOL_GROUP_NOT_LOADED: {name}; call load_tool_group with group={group} alone, then use the tool after it appears in the next request");
+        }
+    }
     if let Some(catalog) = &s.state.tool_catalog {
         for skill in catalog.packages.skills().as_array().into_iter().flatten() {
             let Some(owner) = skill["name"].as_str() else {
@@ -474,14 +539,29 @@ fn visual_context(s: &Session<'_>, node: &str) -> Result<crate::visual_artifacts
 }
 fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value {
     let mut wire = messages.to_vec();
+    let mut host_messages = Vec::new();
+    let frame_id=messages.iter().find_map(|m| {
+        (m["name"]=="task_node").then(||m["content"].as_str().and_then(|raw|serde_json::from_str::<Value>(raw).ok()).and_then(|n|n["node_id"].as_str().map(str::to_owned))).flatten()
+    });
+    if s.mode==Mode::Main {
+        if let Ok(conn)=agent_service::open_db(s.state.workspace.root()) {
+            if let Ok(Some(status))=crate::task_tree::frame_status(&conn,s.task,frame_id.as_deref().unwrap_or(crate::task_tree::ROOT)) {
+                host_messages.push(host_message(json!({"name":"task_status","content":status.to_string()})));
+            }
+        }
+        match crate::context_assets::frame_index(s.state.workspace.root(),s.task,frame_id.as_deref().unwrap_or(crate::task_tree::ROOT),messages) {
+            Ok(index) if index["assets"].as_array().is_some_and(|items|!items.is_empty())=>host_messages.push(host_message(json!({"name":"task_asset_index","content":index.to_string()}))),
+            _=>{}
+        }
+    }
     // Host-owned requirements are reconstructed independently for every wire
     // request. They are never written into the compressible Window/Material.
-    let mut anchor_error = match crate::main_task_anchor::message(
-        s.state.workspace.root(), s.task, s.material.as_ref().map(|material| material.through),
+    let mut anchor_error = match crate::main_task_anchor::frame_message(
+        s.state.workspace.root(), s.task, s.material.as_ref().map(|material| material.through),frame_id.as_deref(),
     ) {
         Ok(Some(anchor)) => {
             let tokens = estimate(&anchor);
-            wire.insert(1.min(wire.len()), anchor);
+            host_messages.push(host_message(anchor));
             (tokens.saturating_add(4096) > s.input_budget).then(|| format!(
                 "MAIN_TASK_ANCHOR_OVER_CAPACITY: {tokens} requirement tokens plus reserved process capacity exceed the {} input budget; task definition was not silently omitted", s.input_budget))
         }
@@ -489,8 +569,8 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         Err(error) => Some(format!("MAIN_TASK_ANCHOR_UNAVAILABLE: {error:#}; no model request may omit the main task requirements")),
     };
     if s.mode == Mode::Main && s.plugin.as_deref() == Some("ppt-master") {
-        match crate::ppt_task_state::message(s.state.workspace.root(), s.task) {
-            Ok(Some(state)) => wire.insert(1.min(wire.len()), state),
+        match crate::ppt_task_state::frame_message(s.state.workspace.root(), s.task,frame_id.as_deref()) {
+            Ok(Some(state)) => host_messages.push(host_message(state)),
             Ok(None) => {},
             Err(error) => anchor_error = Some(format!("PPT_TASK_STATE_UNAVAILABLE: {error:#}; host state was not silently omitted")),
         }
@@ -522,6 +602,8 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             object.remove("viewed_by_context_agent");
             object.remove(crate::context_assets::REFERENCE);
             object.remove("_asset_state");
+            object.remove("_frame_input");
+            object.remove("_pinned");
         }
     }
     if let Some(owner) = &s.plugin {
@@ -543,14 +625,15 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
                 )
             };
             let role = if s.is_root() {"MAIN Agent"} else {"task delegate"};
-            wire.push(json!({"role":"system","content":format!("Current execution: {role}. {activation}")}));
+            host_messages.push(host_message(json!({"name":"skill_activation","content":format!("Current execution: {role}. {activation}")})));
         }
     }
     if s.plugin.as_deref() == Some("ppt-master")
         && let Ok(Some(project)) = crate::ppt_sessions::project(s.state.workspace.root(), s.task)
     {
-        wire.push(json!({"role":"system","content":format!("Authenticated PPT project binding: {project}. If positive, continue this project and never initialize or switch to another project. If zero, initialize a new PPT project when needed. The host enforces this binding.")}));
+        host_messages.push(host_message(json!({"name":"ppt_project_binding","content":format!("Authenticated PPT project binding: {project}. If positive, continue this project and never initialize or switch to another project. If zero, initialize a new PPT project when needed. The host enforces this binding.")})));
     }
+    wire.extend(host_messages);
     // Main capacity is monitored by the host, not a changing system prompt.
     // The read-only context agent needs capacity for its own checkpoints; keep
     // that notice at the tail, outside the cacheable system prefix.
@@ -606,6 +689,16 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         body["service_tier"] = json!("fast");
     }
     body
+}
+fn host_message(mut message: Value) -> Value {
+    message["role"] = json!("user");
+    let content = message["content"].take();
+    let mut status = content.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object).unwrap_or_else(|| json!({"content":content}));
+    status["host_status"] = json!(true);
+    status["not_a_user_request"] = json!(true);
+    message["content"] = json!(status.to_string());
+    message
 }
 fn output_tokens(s: &Session<'_>, body: &Value) -> usize {
     crate::model_settings::output_tokens(s.state, s.model, s.input_budget, estimate(body))
@@ -687,23 +780,23 @@ async fn model_round(
         .unwrap()
         .retain(|m| !(m["role"] == "user" && m["content"].as_array().is_some_and(Vec::is_empty)));
     ensure!(
-        estimate(&body) <= s.input_budget,
+        w.input_tokens(s, &body) <= s.input_budget,
         "INPUT_OVER_CAPACITY: context remains saved; no request sent. Use smaller material pages or a context checkpoint before reaching capacity."
     );
-    if s.is_root() {
+    if s.mode==Mode::Main {
         // Shown as the composer's context ring; compaction starts at compact_at.
-        append(s,"context/usage",json!({"turn":s.turn,"step":step,"estimated_input_tokens":estimate(&body),
+        append(s,"context/usage",json!({"turn":s.turn,"step":step,"nodeId":node,"estimated_input_tokens":w.input_tokens(s, &body),"raw_estimated_input_tokens":estimate(&body),
             "input_budget":s.input_budget,"compact_at":w.auto_compact_at.max(compact_threshold(s.input_budget))}),false).await?;
     }
     // Image delivery can change the input size; size the output afterwards.
-    body["max_tokens"] = json!(output_tokens(s, &body));
+    body["max_tokens"] = json!(crate::model_settings::output_tokens(s.state, s.model, s.input_budget, w.input_tokens(s, &body)));
     if w.material_review_delivered {
         body["max_tokens"] = json!(4096.min(body["max_tokens"].as_u64().unwrap_or(4096)));
     }
     let trace = crate::request_context::record(s.state.workspace.root(), s.task,
         json!({"actor":s.actor(),"stage":match s.mode {Mode::Main=>"execution",Mode::Context=>"context_organization"},
             "turn":s.turn,"step":step,"nodeId":node,"request_id":s.turn,"request_flow":true,
-            "parent_node_id":s.parent,"previous_node_id":w.previous_node,"context_scope":s.scope,"agent_id":s.delegate_id(),"visual_dispatch":dispatch}), &body).await
+            "parent_node_id":s.parent,"previous_node_id":w.previous_node,"context_scope":s.scope,"task_node_id":w.task_node_id.as_deref().or_else(||s.scope.strip_prefix("node:")),"agent_id":s.delegate_id(),"visual_dispatch":dispatch}), &body).await
         .context("Cannot persist model input and flow node; request was not sent")?;
     w.previous_node = Some(node.clone());
     save(s, w).await?;
@@ -768,7 +861,7 @@ async fn model_round(
                     "model response was truncated or filtered; no tool was executed"
                 );
                 diagnostics.phase("completed");
-                return Ok(message);
+                return Ok((message, stats));
             }
             let completed =
                 crate::model_transport::consume_response(response, &diagnostics).await?;
@@ -785,7 +878,7 @@ async fn model_round(
                 "model response was truncated or filtered; no tool was executed"
             );
             diagnostics.phase("completed");
-            Ok::<_, anyhow::Error>(completed.message)
+            Ok::<_, anyhow::Error>((completed.message, completed.stats))
         };
         diagnostics
             .watch(
@@ -803,8 +896,15 @@ async fn model_round(
         "failed"
     };
     let transport = diagnostics.finish(status, response.as_ref().err());
-    trace.finish_checked(status, json!({"response":response.as_ref().ok(),"error":response.as_ref().err().map(|e|format!("{e:#}")),"transport":transport})).await?;
-    let message = response?;
+    trace.finish_checked(status, json!({"response":response.as_ref().ok().map(|r| &r.0),"usage":response.as_ref().ok().map(|r| &r.1["usage"]),"error":response.as_ref().err().map(|e|format!("{e:#}")),"transport":transport})).await?;
+    let (message, stats) = response?;
+    let usage = &stats["usage"];
+    if let Some(actual) = usage["prompt_tokens"].as_u64().or_else(|| usage["input_tokens"].as_u64()).and_then(|n| usize::try_from(n).ok()) {
+        w.token_calibration.observe(&calibration_route(s), estimate(&body), actual);
+        append(s, "context/model_usage", json!({"turn":s.turn,"step":step,"request_node_id":node,
+            "raw_estimated_input_tokens":estimate(&body),"calibrated_input_tokens":w.input_tokens(s,&body),
+            "usage":usage,"input_budget":s.input_budget}), false).await?;
+    }
     // Only images originating in this subagent's view_image calls are candidates.
     let delivered: BTreeSet<String> = dispatch["images"]
         .as_array()
@@ -1000,15 +1100,10 @@ async fn freeze(
     let owner_scope = s.scope.clone();
     let (task, messages) = (s.task.to_owned(), messages.to_vec());
     db(s.state.workspace.root(), move |conn| {
-        let (through, mut requirements) = crate::session_history::requirement_snapshot(conn, &task)?;
-        // Once a task is explicitly defined, old dialogue is recoverable history,
-        // not an ever-growing compulsory input to every compression request.
-        let definition: Option<i64> = conn.query_row("SELECT MAX(seq) FROM agent_task_events WHERE task_id=?1 AND kind='task/definition'",[&task],|r|r.get(0))?;
-        if let Some(mut boundary)=definition {
-            let reviewed:Option<i64>=conn.query_row("SELECT json_extract(m.data,'$.through') FROM agent_task_events e JOIN agent_context_materials m ON m.task_id=e.task_id AND m.id=json_extract(e.data,'$.material_id') WHERE e.task_id=?1 AND e.kind='agent/context_summary' AND json_extract(m.data,'$.owner_scope')=?2 ORDER BY e.seq DESC LIMIT 1",params![task,owner_scope],|r|r.get(0)).optional()?;
-            if let Some(reviewed)=reviewed {boundary=boundary.max(reviewed);}
-            requirements.retain(|seq| *seq>boundary);
-        }
+        let through=crate::session_history::load_events(conn,&task,&crate::session_history::EventQuery{newest:Some(1),..Default::default()})?.last().map(|e|e.seq).unwrap_or(-1);
+        let requirements=messages.iter().filter_map(|m|m["source"]["seq"].as_i64()).filter(|seq| {
+            crate::session_history::load_events(conn,&task,&crate::session_history::EventQuery{exact:Some(*seq),kinds:&["user/message"],..Default::default()}).is_ok_and(|rows|!rows.is_empty())
+        }).collect();
         let material = Material {
             id: agent_service::uuid_like(),
             owner_scope,
@@ -1234,7 +1329,7 @@ async fn read_requirement(s: &Session<'_>, args: &Value) -> Result<Value> {
 // Context size is monitored by the host. The context model still decides what
 // evidence to retain; original history and file snapshots are never discarded.
 fn compact_threshold(input_budget: usize) -> usize {
-    96_000.min(input_budget.saturating_mul(3) / 4)
+    input_budget.saturating_mul(85) / 100
 }
 fn review_user(task: &str, through: i64, originals: &[(i64, String)]) -> Result<Value> {
     // A compressed window intentionally need not retain any human messages.
@@ -1440,9 +1535,13 @@ async fn organize_context(
         scope: format!("context:{}", material.id),
         parent: Some(node.to_owned()),
         material: Some(material.clone()),
-        input_budget: s.state.context_agent_settings.input_budget(s.input_budget),
+        input_budget: s.state.context_agent_settings.resolved_input_budget(&child_state, &child_state.default_model),
     };
     let mut child_window = Window {
+        task_node_id:if s.delegate_id().is_some() {
+            let conn=agent_service::open_db(s.state.workspace.root())?;
+            crate::task_tree::nodes(&conn,s.task)?.into_iter().find(|n|n.agent_id.as_deref()==s.delegate_id()).map(|n|n.node_id)
+        }else{s.scope.strip_prefix("node:").map(str::to_owned)},
         messages: vec![
             json!({"role":"system","content":Mode::Context.prompt()}),
             child_start(s.task, &material),
@@ -1529,6 +1628,21 @@ async fn organize_context(
         )
     }
 }
+fn preserved_frame_messages(messages:&[Value])->Vec<Value> {
+    let recent=messages.iter().enumerate().rev().filter(|(_,m)|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|c|!c.is_empty())).nth(1).map(|(i,_)|i).unwrap_or(messages.len());
+    messages.iter().enumerate().filter(|(i,m)| *i>=recent || m["_frame_input"]==true || m["_pinned"]==true
+        || matches!(m["name"].as_str(),Some("task_path"|"task_node"|"task_child_return"|"task_instruction"))
+        || m["role"]=="user" && (m.get("name").is_none() || m["name"]=="user_interjection"))
+        .map(|(i,m)| {
+            let mut message=m.clone();
+            if i<recent && message["role"]=="tool" {
+                message["role"]=json!("user");message["name"]=json!("saved_asset");
+                message.as_object_mut().unwrap().remove("tool_call_id");
+            }
+            message
+        }).collect()
+}
+
 async fn replace_context(
     s: &Session<'_>,
     w: &mut Window,
@@ -1542,23 +1656,25 @@ async fn replace_context(
         json!({"role":"system","content":s.prompt()}),
         json!({"role":"system","name":"context_summary","content":summary.to_string()}),
     ];
-    messages.extend(retained_assets);
+    messages.extend(preserved_frame_messages(&w.messages[..prefix_len]));
+    for retained in retained_assets {if !messages.contains(&retained) {messages.push(retained);}}
     messages.extend_from_slice(&w.messages[prefix_len..]);
     ensure!(
-        estimate(&request(s, &messages, definitions)) <= s.input_budget,
+        w.input_tokens(s, &request(s, &messages, definitions)) <= s.input_budget,
         "COMPACTED_CONTEXT_OVER_CAPACITY; original working context retained"
     );
     let (task, scope, mut next) = (s.task.to_owned(), s.scope.clone(), w.clone());
     next.messages = messages;
-    let size = estimate(&request(s, &next.messages, definitions));
+    let size = next.input_tokens(s, &request(s, &next.messages, definitions));
     next.auto_compact_at = compact_threshold(s.input_budget)
         .max(size.saturating_add(s.input_budget / 10))
         .min(s.input_budget.saturating_sub(4096));
     next.auto_compact_failed_turn = None;
+    next.pressure_warned = false;
     let saved = next.clone();
     db(s.state.workspace.root(),move|conn| {
         let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        agent_service::append_event_tx(&tx,&task,"agent/context_summary",&json!({"actor":"context_agent","material_id":material,"message":{"role":"system","name":"context_summary","content":summary.to_string()},"result":summary}),None)?;
+        agent_service::append_event_tx(&tx,&task,"agent/context_summary",&json!({"actor":"context_agent","task_node_id":saved.task_node_id,"material_id":material,"message":{"role":"system","name":"context_summary","content":summary.to_string()},"result":summary}),None)?;
         tx.execute("INSERT INTO agent_runtime_windows VALUES (?1,?2,?3) ON CONFLICT(task_id,scope) DO UPDATE SET state=excluded.state",params![task,scope,serde_json::to_string(&saved)?])?;
         tx.commit()?;Ok(())
     }).await?;
@@ -1574,8 +1690,20 @@ async fn auto_compact(
     if s.mode != Mode::Main {
         return Ok(());
     }
-    let before = estimate(&request(s, &w.messages, definitions));
+    let before = w.input_tokens(s, &request(s, &w.messages, definitions));
+    if before < s.input_budget.saturating_mul(60)/100 {w.pressure_warned=false;}
+    if before >= s.input_budget.saturating_mul(60)/100 && !w.pressure_warned {
+        w.pressure_warned=true;
+        w.messages.push(json!({"role":"user","name":"task_context_pressure","content":"Host context status, not a user request: this frame reached 60% of its input budget. Prefer split_task to fold verified completed work and plan the remaining units. If splitting is not meaningful, explain why and continue; at 85% the host will compress older work exchanges."}));
+        append(s,"context/split_reminder",json!({"turn":s.turn,"estimated_input_tokens":before,"threshold":s.input_budget.saturating_mul(60)/100}),false).await?;
+        save(s,w).await?;
+    }
     if before < w.auto_compact_at.max(compact_threshold(s.input_budget)) {
+        return Ok(());
+    }
+    let protected=preserved_frame_messages(&w.messages);
+    // Fixed inputs and recent native exchanges cannot shrink through a summary.
+    if !w.messages.iter().any(|m|m["role"]!="system" && m["name"]!="task_context_pressure" && !protected.contains(m)) {
         return Ok(());
     }
     let node = w
@@ -1591,7 +1719,7 @@ async fn auto_compact(
         replace_context(s, w, prefix_len, material, summary, retained, definitions).await
     }
     .await;
-    let after = estimate(&request(s, &w.messages, definitions));
+    let after = w.input_tokens(s, &request(s, &w.messages, definitions));
     if let Err(error) = result {
         ensure!(!s.cancel.is_cancelled(), "cancelled");
         // A failed organizer cannot replace the window or trigger a loop on
@@ -1787,7 +1915,15 @@ async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
 }
 
 async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<LoopResult> {
+    let mut current_session=s.clone();
     for step in 1..=max_rounds {
+        let s=&current_session;
+        if w.skill_turn != Some(s.turn) {
+            w.active_skills.clear();
+            w.active_skill_scopes.clear();
+            w.skill_turn=Some(s.turn);
+            save(s,w).await?;
+        }
         if let Some(id)=s.delegate_id() {
             crate::collaboration_jobs::ensure_active(s.state.workspace.root(),s.task,id)?;
         }
@@ -1796,6 +1932,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             deliver_visual_jobs(s, w).await?;
             deliver_interjections(s, w).await?;
         }
+        task_frames::notices(s,w).await?;
         let definitions = tools(s, w);
         ensure!(!s.cancel.is_cancelled(), "cancelled");
         if s.mode == Mode::Main && s.plugin.as_deref() == Some("ppt-master") {
@@ -1844,6 +1981,11 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                 if s.is_root() && deliver_interjections(s, w).await? {
                     continue;
                 }
+                if s.delegate_id().is_some() && w.task_node_id.is_some() {
+                    w.messages.push(json!({"role":"user","name":"task_return_required","content":"Host status, not a new assignment: this delegate node is still running. Finish with return_task and cite successful event_seq evidence, or return failed/blocked/needs_user with the required details. Ordinary prose does not complete a task node."}));
+                    save(s,w).await?;
+                    continue;
+                }
                 return Ok(LoopResult::Answer);
             }
             // The reply is already saved; the host does not answer it.
@@ -1857,6 +1999,21 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             "duplicate or missing tool call id"
         );
         let call_count = calls.len();
+        if s.mode == Mode::Main && call_count == 1 && tool_groups::is_change(&calls[0].name) {
+            tool_groups::execute(s, w, &calls[0], &definitions, &node, step).await?;
+            continue;
+        }
+        if call_count==1 && s.delegate_id().is_some() && calls[0].name=="return_task" {
+            if task_frames::delegate_return(s,w,&calls[0],&node,step).await? {return Ok(LoopResult::Answer);}
+            continue;
+        }
+        let delegate_start=call_count==1 && calls[0].name=="start_task" && serde_json::from_str::<Value>(&calls[0].arguments).ok().is_some_and(|args|task_frames::delegate_start(s,&calls[0].name,&args).unwrap_or(false));
+        if call_count==1 && s.is_root() && crate::task_tree::is_tool(&calls[0].name) && !delegate_start {
+            let (scope,end)=task_frames::execute(s,w,&calls[0],call_count,&node,step).await?;
+            current_session.scope=scope;
+            if end {return Ok(LoopResult::Answer);}
+            continue;
+        }
         let mut replacement = None;
         let mut checkpoint = None;
         let mut submitted = None;
@@ -1876,19 +2033,29 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                 let args:Value=serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
                 // Mode enforcement is independent of the model's advertised schema.
                 validate_tool(s,w,&definitions,&call.name)?;
-                if matches!(call.name.as_str(),"compress_context"|"checkpoint_context"|"submit_context"|"release_assets"|"read_skill"|"unload_skill") {
+                if crate::task_tree::is_tool(&call.name) || tool_groups::is_change(&call.name) || matches!(call.name.as_str(),"compress_context"|"checkpoint_context"|"submit_context"|"release_assets"|"read_skill"|"unload_skill") {
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
-                    "read_task_board" => Ok(crate::main_task_anchor::board(s.state.workspace.root(),s.task,None)?.unwrap_or(Value::Null)),
+                    "list_tool_groups" => Ok(tool_groups::list(s, w)),
+                    "load_tool_group" | "unload_tool_group" => anyhow::bail!("tool group changes must be called alone"),
+                    "read_task_board" => {
+                        let mut board=crate::main_task_anchor::board(s.state.workspace.root(),s.task,None)?.unwrap_or_else(||json!({}));
+                        let conn=agent_service::open_db(s.state.workspace.root())?;
+                        board["task_tree"]=crate::task_tree::board(&conn,s.task)?;
+                        Ok(board)
+                    },
                     "update_task_definition" => {
                         ensure!(s.is_root(),"only main Agent may update task definition");
                         crate::main_task_anchor::update(s.state.workspace.root(),s.task,&args)
                     },
-                    "spawn_agent" => {
+                    "spawn_agent"|"start_task" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
-                        let shared=prepare_delegate_context(s,w,&definitions).await?;
-                        crate::collaboration_jobs::submit(s.state,s.task,s.turn,&call.call_id,&node,s.model,&args,s.ban_execution,shared,s.cancel)
+                        let (assignment,shared)=task_frames::delegate_context(s,w,&args,call.name=="start_task").await?;
+                        crate::collaboration_jobs::submit(s.state,s.task,s.turn,&call.call_id,&node,s.model,&assignment,s.ban_execution,shared,s.cancel)
+                    },
+                    "return_task"=>{
+                        anyhow::bail!("return_task must be called alone")
                     },
                     "wait_agents" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
@@ -1987,13 +2154,13 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     },
                     "compress_context" => {
                         ensure!(s.mode==Mode::Main,"RECURSIVE_COMPRESSION_FORBIDDEN");
-                        let deep=args["deep"].as_bool().unwrap_or(false);
-                        let before=estimate(&request(s,&w.messages,&definitions));
-                        let (material,summary,retained,scope)=organize_context(s,&w.messages[..prefix_len],&node,if deep {None}else{Some(before)},&w.active_skills).await?;
+                        let before=w.input_tokens(s,&request(s,&w.messages,&definitions));
+                        let (material,summary,retained,scope)=organize_context(s,&w.messages[..prefix_len],&node,Some(before),&w.active_skills).await?;
                         let mut proposed=vec![json!({"role":"system","content":s.prompt()}),json!({"role":"system","name":"context_summary","content":summary.to_string()})];
+                        proposed.extend(preserved_frame_messages(&w.messages[..prefix_len]));
                         proposed.extend(retained.iter().cloned());
                         proposed.extend_from_slice(&w.messages[prefix_len..]);
-                        ensure!(estimate(&request(s,&proposed,&definitions))+4096 < s.input_budget,"COMPACTED_CONTEXT_OVER_CAPACITY: original context retained; explicitly release unneeded bodies or choose smaller excerpts");
+                        ensure!(w.input_tokens(s,&request(s,&proposed,&definitions))+4096 < s.input_budget,"COMPACTED_CONTEXT_OVER_CAPACITY: original context retained; explicitly release unneeded bodies or choose smaller excerpts");
                         replacement=Some((material.clone(),summary,retained));
                         Ok(json!({"organized":true,"material_id":material,"context_scope":scope}))
                     },
@@ -2039,11 +2206,12 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         let retained=crate::context_assets::retained(&w.messages,&args["asset_context"])?;
                         let mut proposed=vec![json!({"role":"system","content":Mode::Context.prompt()}),child_start(s.task,s.material.as_ref().unwrap()),json!({"role":"user","name":"context_checkpoint","content":text})];
                         proposed.extend(retained.iter().cloned());
-                        ensure!(estimate(&request(s,&proposed,&definitions))+4096 < s.input_budget,"CHECKPOINT_CONTEXT_OVER_CAPACITY: explicitly choose reference mode for assets you no longer need; current context is unchanged");
+                        ensure!(w.input_tokens(s,&request(s,&proposed,&definitions))+4096 < s.input_budget,"CHECKPOINT_CONTEXT_OVER_CAPACITY: explicitly choose reference mode for assets you no longer need; current context is unchanged");
                         checkpoint=Some((text.to_owned(),retained)); Ok(json!({"checkpoint_saved":true}))
                     },
                     "submit_context" => { validate_summary(s,w,&args).await?; submitted=Some(args); Ok(json!({"accepted":true})) },
                     name => {
+                        ensure!(!crate::task_tree::is_tool(name),"task-changing tools must be called alone");
                         // A delegate's small write receipts are artifacts too: preserve
                         // their paths/versions even after its working window is gone.
                         if crate::context_assets::is_material_tool(name) || s.delegate_id().is_some() {material_source=Some((name.to_owned(),args.clone()));}
@@ -2107,7 +2275,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             {
                 candidate.push(json!({"role":"user","content":[{"type":"image_ref","artifact_id":result["artifact_id"]}]}));
             }
-            let fits = estimate(&request(s, &candidate, &definitions)) + 4096 < s.input_budget;
+            let fits = w.input_tokens(s, &request(s, &candidate, &definitions)) + 4096 < s.input_budget;
             if fits
                 && !is_error
                 && let Some((name, enable, scope)) = skill_change
@@ -2144,6 +2312,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             );
             if let Some(reference) = &asset_reference {
                 delivered_message = crate::context_assets::tagged(delivered_message, reference);
+                if call.name=="read_skill" {delivered_message["_pinned"]=json!(true);}
                 if !fits {
                     delivered_message["_asset_state"] = json!("not_delivered");
                 }
@@ -2194,7 +2363,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             ];
             w.messages.extend(retained_assets);
             ensure!(
-                estimate(&request(s, &w.messages, &definitions)) <= s.input_budget,
+                w.input_tokens(s, &request(s, &w.messages, &definitions)) <= s.input_budget,
                 "CHECKPOINT_CONTEXT_OVER_CAPACITY"
             );
             save(s, w).await?;
@@ -2426,7 +2595,7 @@ pub(crate) fn run_delegate(
             let model = resolved.default_model.clone();
             (resolved, model)
         };
-        let input_budget = state.delegate_agent_settings.input_budget(INPUT_BUDGET);
+        let input_budget = state.delegate_agent_settings.resolved_input_budget(&state, &model);
         let s = Session {
             plugin: crate::plugin_sessions::owner(state.workspace.root(), &task)?,
             state: &state,
@@ -2466,8 +2635,9 @@ pub(crate) fn run_delegate(
         let last = w.messages.iter().rev().find(|m| {
             m["role"] == "assistant" && m["tool_calls"].as_array().is_none_or(|a| a.is_empty())
         });
+        let task_return=w.task_node_id.as_deref().map(|id|->Result<_>{Ok(crate::task_tree::get(&agent_service::open_db(state.workspace.root())?,&task,id)?.result)}).transpose()?.flatten();
         Ok(
-            json!({"status":status,"report":last.map(|m|m["content"].clone()),"history_reference":last.map(|m|m["source"]["history_reference"].clone()),"error":outcome.err().map(|e|format!("{e:#}")),"context_scope":s.scope}),
+            json!({"status":status,"report":task_return.as_ref().map(|r|r["result"].clone()).or_else(||last.map(|m|m["content"].clone())),"task_return":task_return,"history_reference":last.map(|m|m["source"]["history_reference"].clone()),"error":outcome.err().map(|e|format!("{e:#}")),"context_scope":s.scope}),
         )
     })
 }
@@ -2482,7 +2652,7 @@ pub(crate) async fn run_task(
     turn: usize,
     ban_execution: bool,
 ) -> Result<()> {
-    let s = Session {
+    let mut s = Session {
         plugin: crate::plugin_sessions::owner(state.workspace.root(), &task)?,
         state: &state,
         task: &task,
@@ -2494,23 +2664,41 @@ pub(crate) async fn run_task(
         scope: "main".into(),
         parent: None,
         material: None,
-        input_budget: INPUT_BUDGET,
+        input_budget: crate::model_settings::input_budget(&state, &model),
     };
     let task_copy = task.clone();
     let saved=db(state.workspace.root(),move|conn| {
-        let saved:Option<String>=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope='main'",[&task_copy],|r|r.get(0)).optional()?;
+        let main:Option<String>=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope='main'",[&task_copy],|r|r.get(0)).optional()?;
         // What the agent knew before this turn: "rewind to before turn N" restores it.
-        crate::rewind::snapshot(conn,&task_copy,turn,saved.as_deref())?;
-        if let Some(saved)=saved { return Ok(serde_json::from_str::<Window>(&saved)?); }
+        crate::rewind::snapshot(conn,&task_copy,turn,main.as_deref())?;
+        let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut root=crate::task_tree::ensure_root(&tx,&task_copy,turn)?;
+        let active=if let Some(active)=crate::task_tree::active(&tx,&task_copy)? {active} else {
+            root.status="running".into();
+            crate::task_tree::emit(&tx,&task_copy,"task/node_resumed",&mut root,turn)?;
+            root
+        };
+        let scope=crate::task_tree::scope(&active.node_id);
+        let saved:Option<String>=tx.query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope=?2",params![task_copy,scope],|r|r.get(0)).optional()?;
+        tx.commit()?;
+        if let Some(saved)=saved { return Ok((serde_json::from_str::<Window>(&saved)?,scope)); }
+        ensure!(scope=="main","active task frame missing; refusing to recreate an empty branch");
         // Old sessions are readable as attributed records; native exchanges
         // from different legacy actors are not misrepresented as this agent's.
         let mut messages=vec![json!({"role":"system","content":Mode::Main.prompt()})];
         for event in crate::session_history::load_events(conn,&task_copy,&crate::session_history::EventQuery{kinds:&["user/message","assistant/message","tool/call","tool/result","organizer/method_message","organizer/context_note","organizer/continuation_plan"],..Default::default()})? {
-            messages.push(json!({"role":"user","name":"historical_record","content":json!({"seq":event.seq,"kind":event.kind,"record":event.data()?}).to_string()}));
+            if event.kind=="user/message" {
+                let data=event.data()?;
+                messages.push(sourced(json!({"role":"user","content":data.get("model_content").unwrap_or(&data["message"]["content"])}),&task_copy,event.seq));
+            } else {
+                messages.push(json!({"role":"user","name":"historical_record","content":json!({"seq":event.seq,"kind":event.kind,"record":event.data()?}).to_string()}));
+            }
         }
-        Ok(Window{messages,..Default::default()})
+        Ok((Window{messages,..Default::default()},scope))
     }).await?;
-    let mut w = saved;
+    let (mut w,scope) = saved;
+    s.scope=scope;
+    w.task_node_id=Some(s.scope.strip_prefix("node:").unwrap_or(crate::task_tree::ROOT).to_owned());
     if let Some(system) = w.messages.first_mut().filter(|m| m["role"] == "system") {
         if system["content"] != Mode::Main.prompt() {
             system["content"] = json!(Mode::Main.prompt());
@@ -2637,7 +2825,9 @@ pub(crate) async fn run_task(
     } else {
         json!({"kind":"error","error":{"code":status,"message":outcome.as_ref().err().map(|e|format!("{e:#}"))}})
     };
-    append(&s, "turn/end", json!({"turn":turn,"reason":reason}), false).await?;
+    let mut terminal_session=s.clone();
+    terminal_session.scope=crate::task_tree::scope(w.task_node_id.as_deref().unwrap_or(crate::task_tree::ROOT));
+    append(&terminal_session, "turn/end", json!({"turn":turn,"reason":reason}), false).await?;
     agent_service::finish(&state, &task, status).await?;
     if status == "cancelled" {
         return Ok(());
@@ -2652,6 +2842,16 @@ mod tests {
     use super::*;
     use axum::{Json, Router, extract::State, routing::post};
     use std::sync::{Arc, Mutex};
+
+    async fn seed_tool_groups(state: &AgentServiceState, task: &str, groups: &[&str]) {
+        let task=task.to_owned();
+        let window=Window{messages:vec![json!({"role":"system","content":Mode::Main.prompt()})],
+            loaded_tool_groups:groups.iter().map(|g|(*g).to_owned()).collect(),..Default::default()};
+        db(state.workspace.root(),move|conn| {
+            conn.execute("INSERT INTO agent_runtime_windows VALUES (?1,'main',?2)",params![task,serde_json::to_string(&window)?])?;
+            Ok(())
+        }).await.unwrap();
+    }
 
     #[tokio::test]
     async fn native_page_capture_and_disconnected_analysis_keep_explicit_identity() {
@@ -2841,8 +3041,8 @@ mod tests {
             material: None,
             input_budget: INPUT_BUDGET,
         };
-        let reference = json!({"asset_id":"large-asset","source_path":"large.rs","bytes":240000});
-        let body = "A".repeat(240_000);
+        let reference = json!({"asset_id":"large-asset","source_path":"large.rs","bytes":360000});
+        let body = "A".repeat(360_000);
         let parent = Window {
             messages: vec![
                 json!({"role":"system","content":"MAIN_SYSTEM"}),
@@ -2986,11 +3186,14 @@ mod tests {
                     assert_eq!(headers["x-agent-affinity"].to_str().unwrap(),crate::model_transport::affinity("task",&format!("delegate:{}",spec["agent_id"].as_str().unwrap())));
                     assert_eq!(body["model"], "delegate-model", "delegates use the configured delegate model");
                     assert_eq!(spec["context"], "");
-                    assert!(messages.iter().any(|m| m["name"]=="inherited_tool_result" && m["content"].as_str().is_some_and(|v|v.contains("CONFIRMED_TEMPLATE_BODY_DO_NOT_REREAD"))), "loaded template must reach the child without an extra model read");
-                    assert!(messages.iter().any(|m|m["role"]=="user" && m["content"]=="Delegate independent files, then inspect and accept the results"));
+                    assert!(messages.iter().any(|m| m["name"]=="saved_asset" && m["content"].as_str().is_some_and(|v|v.contains("CONFIRMED_TEMPLATE_BODY_DO_NOT_REREAD"))), "declared template must reach the child without an extra model read");
+                    assert!(messages.iter().any(|m|m["name"]=="task_instruction" && m["content"].as_str().is_some_and(|text|text.contains("Delegate independent files, then inspect and accept the results"))));
                     assert!(!body["tools"].as_array().unwrap().iter().any(|t|crate::collaboration_jobs::is_tool(t["function"]["name"].as_str().unwrap())));
                     let name=spec["name"].as_str().unwrap();
-                    if !messages.iter().any(|m|m["role"]=="tool") {
+                    if !body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="write_file") {
+                        return Json(json!({"choices":[{"finish_reason":"tool_calls","message":tool("child-load-files","load_tool_group",json!({"group":"files"}))}]}));
+                    }
+                    if !messages.iter().any(|m|m["tool_call_id"]=="child-write") {
                         if name=="slow" {gate.notified().await;}
                         tool("child-write","write_file",json!({"path":format!("{name}.txt"),"content":format!("{name} output")}))
                     } else {
@@ -3001,17 +3204,19 @@ mod tests {
                         // order fixed however long each main step takes.
                         for _ in 0..2000 {if files.join("main.txt").exists() && calls.load(Ordering::SeqCst)>=5 {break;}tokio::time::sleep(Duration::from_millis(5)).await;}
                         assert!(files.join("main.txt").exists());
-                        json!({"role":"assistant","content":format!("{name}-report")})
+                        let receipt:Value=serde_json::from_str(messages.iter().rev().find(|m|m["role"]=="tool").unwrap()["content"].as_str().unwrap()).unwrap();
+                        tool("child-return","return_task",json!({"status":"done","result":format!("{name}-report"),"evidence":[receipt["event_seq"]]}))
                     }
                 } else {
                     assert_eq!(body["model"], "fake", "the main agent keeps the conversation's model");
                     assert_eq!(headers["x-agent-affinity"].to_str().unwrap(),crate::model_transport::affinity("task","main"));
                     let step=calls.fetch_add(1,Ordering::SeqCst);
                     match step {
-                        0=>tool("read-template","read_file",json!({"path":"approved-template.svg"})),
-                        1|2=>{let name=if step==1{"slow"}else{"fast"};tool(&format!("spawn-{name}"),"spawn_agent",json!({"name":name,"task":format!("Write and verify {name}.txt only")}))},
-                        3=>tool("main-write","write_file",json!({"path":"main.txt","content":"independent progress"})),
-                        4=>json!({"role":"assistant","content":"UNVERIFIED_FINAL_MUST_NOT_APPEAR"}),
+                        0=>{let instruction:Value=serde_json::from_str(messages.iter().find(|m|m["name"]=="task_instruction").unwrap()["content"].as_str().unwrap()).unwrap();tool("scope-user","scope_message",json!({"instruction_id":instruction["id"],"node_id":"n0"}))},
+                        1=>tool("read-template","read_file",json!({"path":"approved-template.svg"})),
+                        2|3=>{let name=if step==2{"slow"}else{"fast"};let receipt:Value=serde_json::from_str(messages.iter().find(|m|m["tool_call_id"]=="read-template").unwrap()["content"].as_str().unwrap()).unwrap();tool(&format!("spawn-{name}"),"spawn_agent",json!({"name":name,"task":format!("Write and verify {name}.txt only"),"asset_ids":[receipt["asset_reference"]["asset_id"]]}))},
+                        4=>tool("main-write","write_file",json!({"path":"main.txt","content":"independent progress"})),
+                        5=>json!({"role":"assistant","content":"UNVERIFIED_FINAL_MUST_NOT_APPEAR"}),
                         _=>{
                             let completions=messages.iter().filter(|m|m["name"]=="delegate_completion").map(|m|{
                                 let value:Value=serde_json::from_str(m["content"].as_str().unwrap()).unwrap();
@@ -3051,11 +3256,13 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
         state.delegate_agent_settings.model = Some("delegate-model".into());
+        seed_tool_groups(&state,"task",&["files","collaboration"]).await;
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
+        // Parallel suites also perform large context snapshots and SQLite writes.
         tokio::time::timeout(
-            Duration::from_secs(20),
+            Duration::from_secs(60),
             run_task(
                 state,
                 "task".into(),
@@ -3068,7 +3275,14 @@ mod tests {
             ),
         )
         .await
-        .unwrap()
+        .unwrap_or_else(|error| {
+            let events = crate::session_history::load_events(&conn, "task", &Default::default()).unwrap();
+            let progress = events.iter().rev().take(12)
+                .map(|event| format!("{} {} {}", event.seq, event.kind, event.raw.chars().take(500).collect::<String>()))
+                .collect::<Vec<_>>().join("\n");
+            panic!("delegate test timed out: {error}; main steps={}; status={}; recent events:\n{progress}",
+                steps.load(Ordering::SeqCst), crate::collaboration_jobs::statuses(root.path(), "task").unwrap());
+        })
         .unwrap();
         assert_eq!(
             conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| {
@@ -3079,6 +3293,20 @@ mod tests {
         );
         let events =
             crate::session_history::load_events(&conn, "task", &Default::default()).unwrap();
+        let group_loads = events.iter().filter(|event| {
+            event.kind == "subagent/event" && event.data().is_ok_and(|data| {
+                data["event_type"] == "tool/call" && data["event"]["name"] == "load_tool_group"
+            })
+        }).collect::<Vec<_>>();
+        assert_eq!(group_loads.len(), 2, "both delegates load their own file tools");
+        for event in group_loads {
+            let data = event.data().unwrap();
+            let owner: String = conn.query_row(
+                "SELECT node_id FROM agent_task_events WHERE task_id='task' AND seq=?1",
+                [event.seq], |r| r.get(0)).unwrap();
+            assert_ne!(owner, "n0");
+            assert_eq!(data["event"]["task_node_id"], owner);
+        }
         let visible = events
             .iter()
             .filter(|e| e.kind == "assistant/message")
@@ -3515,11 +3743,12 @@ mod tests {
                     assert!(packet["asset_reference"]["asset_id"].is_string());
                     let result=packet.get("original_result").unwrap_or(&packet);
                     assert_eq!(result["content"],std::fs::read_to_string(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/builtin_plugins/code_flow/SKILL.md")).unwrap());
-                    assert_eq!(body["messages"].as_array().unwrap().iter().filter(|message|message["role"]=="user").count(),1);
+                    assert_eq!(body["messages"].as_array().unwrap().iter().filter(|message|message["role"]=="user" && message.get("name").is_none()).count(),1);
                 }
                 if n==4 {
-                    let system=body["messages"].as_array().unwrap().iter().filter(|m|m["role"]=="system").map(Value::to_string).collect::<Vec<_>>().join("\n");
-                    assert!(system.contains("Current execution: MAIN Agent."));assert!(system.contains("NOT available"));
+                    let status=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="skill_activation").unwrap();
+                    assert_eq!(status["role"],"user");
+                    assert!(status.to_string().contains("Current execution: MAIN Agent."));assert!(status.to_string().contains("NOT available"));
                 }
                 if n==5 {
                     let error=body["messages"].as_array().unwrap().iter().rev().find(|m|m["role"]=="tool").unwrap()["content"].as_str().unwrap();
@@ -3807,7 +4036,7 @@ mod tests {
                     }
                 }
                 5 => {
-                    assert_eq!(messages.len(), 4); // system, task refs, checkpoint, capacity
+                    assert_eq!(messages.iter().filter(|m|m["name"]!="main_task_anchor").count(), 4);
                     assert!(messages[2]["name"] == "context_checkpoint");
                     assert!(!body.to_string().contains("LONG_RAW_FILLER"));
                     s.phase = 4;
@@ -3851,137 +4080,13 @@ mod tests {
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
         (root, state, script, server)
     }
-    #[tokio::test]
-    async fn multi_round_context_subagent_preserves_plan_and_records_every_request() {
-        let (root, mut state, script, server) = setup().await;
-        state.context_agent_settings = crate::model_settings::ModelSettings {
-            model: Some("child-model".into()),
-            reasoning_effort: Some("low".into()),
-            context_window: Some(500000),
-            ..Default::default()
-        };
-        let prompt = format!(
-            "检查 PPT 前两页，保留窗口和服务，不改源码。{}中段关键要求：第二页仍需检查。",
-            "LONG_RAW_FILLER".repeat(2400)
-        );
-        run_task(
-            state.clone(),
-            "task".into(),
-            "fake".into(),
-            prompt.clone(),
-            3,
-            CancellationToken::new(),
-            1,
-            false,
-        )
-        .await
-        .unwrap();
-        let conn = agent_service::open_db(root.path()).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .unwrap(),
-            "completed"
-        );
-        let original: String = conn
-            .query_row(
-                "SELECT data FROM agent_task_events WHERE kind='user/message' AND task_id='task'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&original).unwrap()["message"]["content"][0]["text"],
-            prompt
-        );
-        // A second process-style load must reuse the compact context and plan.
-        run_task(
-            state,
-            "task".into(),
-            "fake".into(),
-            "继续，并说明约束".into(),
-            2,
-            CancellationToken::new(),
-            2,
-            false,
-        )
-        .await
-        .unwrap();
-        let request_count = script.lock().unwrap().requests.len();
-        let rows: Vec<(String, String, String)> = conn
-            .prepare("SELECT actor,metadata,request_json FROM agent_request_contexts ORDER BY id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(rows.len(), request_count);
-        assert!(request_count > 8);
-        for (index, (actor, metadata, body)) in rows.iter().enumerate() {
-            assert!(actor == "agent" || actor == "context_agent");
-            let meta: Value = serde_json::from_str(metadata).unwrap();
-            assert_eq!(meta["status"], "completed");
-            assert!(meta["outcome"]["response"].is_object());
-            if actor == "context_agent" {
-                assert!(meta["parent_node_id"].is_string());
-                let child_body: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(child_body["model"], "child-model");
-                assert_eq!(child_body["reasoning_effort"], "low");
-                assert!(
-                    child_body["messages"].as_array().unwrap().last().unwrap()["content"]
-                        .as_str()
-                        .unwrap()
-                        .contains("input budget 475424")
-                );
-            } else {
-                assert_eq!(
-                    serde_json::from_str::<Value>(&body).unwrap()["model"],
-                    "fake"
-                );
-            }
-            assert_eq!(
-                serde_json::from_str::<Value>(body).unwrap(),
-                script.lock().unwrap().requests[index]
-            );
-        }
-        for kind in ["flow/node_add", "flow/node_state"] {
-            let count: usize = conn
-                .query_row(
-                    "SELECT count(*) FROM agent_task_events WHERE kind=?1",
-                    [kind],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, request_count);
-        }
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM agent_task_events WHERE kind='agent/context_summary'",
-                [],
-                |r| r.get::<_, usize>(0)
-            )
-            .unwrap(),
-            1
-        );
-        let still_original:String=conn.query_row("SELECT data FROM agent_task_events WHERE kind='user/message' AND json_extract(data,'$.turn')=1",[],|r|r.get(0)).unwrap();
-        assert_eq!(original, still_original);
-        let summary_record: String = conn
-            .query_row(
-                "SELECT data FROM agent_task_events WHERE kind='agent/context_summary'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&summary_record).unwrap()["result"],
-            summary(script.lock().unwrap().requirement)
-        );
-        server.abort();
-    }
     #[test]
     fn incremental_requests_keep_the_system_and_history_prefix_stable() {
         let root = TestRoot::new();
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','PPT','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO ppt_session_bindings(task_id,subject,project_id) VALUES ('task','test',820)",[]).unwrap();
+        crate::ppt_task_state::message(root.path(),"task").unwrap();
         let mut state =
             agent_service::tests::test_state(root.path(), "127.0.0.1:1".parse().unwrap());
         state.provider_routes.insert(
@@ -3992,6 +4097,7 @@ mod tests {
                 api_key: state.api_key.clone(),
                 models: Default::default(),
                 max_output_tokens: Default::default(),
+                context_windows: Default::default(),
                 context_request_options: [("fake".into(),json!({"chat_template_kwargs":{"enable_thinking":false},"model":"must-not-override","tools":["must-not-override"]}))].into_iter().collect(),
             },
         );
@@ -4019,6 +4125,9 @@ mod tests {
         continued
             .push(json!({"role":"user","content":"Continue step two with more source material"}));
         let a = request(&s, &original, &[]);
+        conn.execute("UPDATE agent_tasks SET status='completed' WHERE id='task'",[]).unwrap();
+        conn.execute("INSERT INTO agent_ppt_task_state(task_id,snapshot,updated_at) VALUES ('task',?1,0)",
+            [json!({"project_id":820,"status":"verified","deck":{"pages":10},"committed_plan":{"outline":"UPDATED_STATE"}}).to_string()]).unwrap();
         s.turn = 2;
         let b = request(&s, &continued, &[]);
         assert!(a.get("chat_template_kwargs").is_none());
@@ -4026,7 +4135,14 @@ mod tests {
         assert_eq!(a["messages"][0], b["messages"][0]);
         let first = a["messages"].as_array().unwrap();
         let second = b["messages"].as_array().unwrap();
-        assert_eq!(first, &second[..first.len()]);
+        let stable_len = first.iter().position(|m| m["name"]=="main_task_anchor" || m["name"]=="skill_activation").unwrap_or(first.len());
+        assert_eq!(&first[..stable_len], &second[..stable_len]);
+        for name in ["main_task_anchor","ppt_task_state","skill_activation"] {
+            assert_eq!(first.iter().find(|m|m["name"]==name).unwrap()["role"], "user");
+            assert_eq!(second.iter().find(|m|m["name"]==name).unwrap()["role"], "user");
+        }
+        assert_ne!(first.iter().find(|m|m["name"]=="main_task_anchor"),second.iter().find(|m|m["name"]=="main_task_anchor"));
+        assert_ne!(first.iter().find(|m|m["name"]=="ppt_task_state"),second.iter().find(|m|m["name"]=="ppt_task_state"));
         assert!(!a["messages"][0].to_string().contains("Context capacity:"));
         assert!(
             !b["messages"]
@@ -4058,7 +4174,7 @@ mod tests {
             ..Default::default()
         };
         assert!(reconcile_context_policy(&mut window, 3, INPUT_BUDGET));
-        assert_eq!(window.auto_compact_at, 96_000);
+        assert_eq!(window.auto_compact_at, compact_threshold(INPUT_BUDGET));
         assert_eq!(window.messages, originals);
         window.auto_compact_at = 123_456;
         assert!(!reconcile_context_policy(&mut window, 4, INPUT_BUDGET));
@@ -4074,16 +4190,18 @@ mod tests {
             "failure backoff still protects the same turn"
         );
         assert!(reconcile_context_policy(&mut window, 5, INPUT_BUDGET));
-        assert_eq!(window.auto_compact_at, 96_000);
+        assert_eq!(window.auto_compact_at, compact_threshold(INPUT_BUDGET));
         assert_eq!(window.auto_compact_failed_turn, None);
         assert_eq!(window.messages, originals);
+        assert!(reconcile_context_policy(&mut window,6,49_152));
+        assert_eq!(window.auto_compact_at,41_779,"a smaller model cannot inherit the old model's high threshold");
     }
 
     #[test]
-    fn automatic_threshold_leaves_headroom_and_caps_long_windows() {
-        assert_eq!(compact_threshold(INPUT_BUDGET), 96_000);
-        assert_eq!(compact_threshold(8192), 6144);
-        assert_eq!(compact_threshold(1_000_000), 96_000);
+    fn automatic_threshold_tracks_eighty_five_percent_of_the_frame_budget() {
+        assert_eq!(compact_threshold(INPUT_BUDGET), INPUT_BUDGET*85/100);
+        assert_eq!(compact_threshold(8192), 6963);
+        assert_eq!(compact_threshold(1_000_000), 850_000);
     }
     #[tokio::test]
     async fn automatic_compression_runs_before_large_main_request_and_survives_restore() {
@@ -4099,8 +4217,9 @@ mod tests {
             let window = Window {
                 messages: vec![
                     json!({"role":"system","content":Mode::Main.prompt()}),
-                    json!({"role":"assistant","content":"LONG_RAW_FILLER".repeat(24_000)}),
+                    json!({"role":"assistant","content":"LONG_RAW_FILLER".repeat(40_000)}),
                 ],
+                loaded_tool_groups:BTreeSet::from(["files".into()]),
                 ..Default::default()
             };
             conn.execute(
@@ -4146,6 +4265,7 @@ mod tests {
             let saved: Window = serde_json::from_str(&saved).unwrap();
 
             assert!(saved.auto_compact_at >= compact_threshold(INPUT_BUDGET));
+            assert_eq!(saved.loaded_tool_groups,window.loaded_tool_groups);
             assert_eq!(
                 serde_json::to_string(&saved.messages)
                     .unwrap()
@@ -4454,7 +4574,7 @@ mod tests {
                 "fake".into(),
                 crate::visual_artifacts::ImageCapability::Supported,
             );
-        agent_service::open_db(root.path()).unwrap().execute("INSERT INTO agent_tasks VALUES ('task','test','fake','running',0,0,NULL,NULL,NULL,0)",[]).unwrap();
+        agent_service::open_db(root.path()).unwrap().execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
         let mut png = std::io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(8, 8)
             .write_to(&mut png, image::ImageFormat::Png)
@@ -4569,7 +4689,7 @@ mod tests {
                     json!({"role":"assistant","content":"原文报告\n第二页末行越界；原因无法仅凭截图确认。"})
                 } else if body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool") {
                     let messages=body["messages"].as_array().unwrap();
-                    assert_eq!(messages.iter().filter(|m|m["role"]=="user").count(),1);
+                    assert_eq!(messages.iter().filter(|m|m["role"]=="user" && m["name"].is_null()).count(),1);
                     assert!(messages[1]["content"].to_string().contains("UNRELATED_MAIN_CONTEXT"));
                     let reply=messages.iter().find(|m|m["role"]=="tool").unwrap();
                     assert_eq!(reply["tool_call_id"],"analyze-call");
@@ -4591,6 +4711,8 @@ mod tests {
         state.visual_tool_settings.model = Some("gpt-6.1-sol".into());
         state.visual_tool_settings.reasoning_effort = Some("medium".into());
         let conn = agent_service::open_db(root.path()).unwrap();
+
+        seed_tool_groups(&state,"task",&["vision"]).await;
 
         run_task(
             state.clone(),
@@ -4626,7 +4748,7 @@ mod tests {
             window
                 .messages
                 .iter()
-                .filter(|m| m["role"] == "user")
+                .filter(|m| m["role"] == "user" && m["name"].is_null())
                 .count(),
             1
         );
@@ -4788,6 +4910,7 @@ mod tests {
         )
         .unwrap();
         *artifact_id.lock().unwrap() = artifact["artifact_id"].as_str().unwrap().to_owned();
+        seed_tool_groups(&state,"task",&["vision","files"]).await;
         run_task(
             state,
             "task".into(),
@@ -4890,7 +5013,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_compaction_restores_frozen_requirements_without_a_human_in_the_window() {
+    async fn repeated_compaction_preserves_only_this_frames_original_user_messages() {
         let root = TestRoot::new();
         let received = Arc::new(Mutex::new(Vec::<Value>::new()));
         let requests = received.clone();
@@ -4905,7 +5028,7 @@ mod tests {
                 let anchor: Value = serde_json::from_str(messages.iter().find(|m| m["name"] == "main_task_anchor").unwrap()["content"].as_str().unwrap()).unwrap();
                 assert!(anchor["definition"].is_null());
                 assert!(anchor.get("human_updates").is_none());
-                assert_eq!(supplied["original_user_requirements"].as_array().unwrap().len(), 3);
+                assert_eq!(supplied["original_user_requirements"].as_array().unwrap().len(), 1);
                 assert_eq!(query["original_user_requirement"], "Approved: complete all 20 pages and their visual checks");
                 assert_eq!(query["source"]["seq"], 3);
                 assert_eq!(query["new_user_turn"], false);
@@ -4919,7 +5042,7 @@ mod tests {
                 result["constraints"] = json!("Keep the brand logo fixed");
                 result["progress"] = json!("20 pages saved; QA 10–20 pending");
                 result["next_steps"] = json!("Inspect and fix pages 10–20; do not claim unchecked pages passed");
-                result["source_event_seqs"] = json!([1,2,3]);
+                result["source_event_seqs"] = json!([3]);
                 Json(json!({"choices":[{"finish_reason":"tool_calls","message":call("submit_context",result,n)}]}))
             }
         }));
@@ -4936,7 +5059,7 @@ mod tests {
             ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,material:None,input_budget:INPUT_BUDGET};
         let mut window = Window {messages:vec![
             json!({"role":"system","content":Mode::Main.prompt()}),
-            json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),
+            sourced(json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),"task",3),
             json!({"role":"assistant","content":"20 pages saved; QA 10–20 pending"}),
         ], ..Default::default()};
         for round in 0..3 {
@@ -4948,10 +5071,10 @@ mod tests {
             let before = window.messages.len();
             let (id, summary, retained, _) = organize_context(&session,&window.messages,"compress",Some(100_000),&BTreeSet::new()).await.unwrap();
             replace_context(&session,&mut window,before,id,summary,retained,&[]).await.unwrap();
-            assert!(!window.messages.iter().any(|m| m["role"]=="user" && m.get("name").is_none()));
+            assert!(window.messages.iter().any(|m| m["content"]=="Approved: complete all 20 pages and their visual checks"));
             assert!(!window.messages.iter().any(|m| m["name"]=="main_task_anchor" || m["name"]=="ppt_task_state"));
             let saved_summary: Value = serde_json::from_str(window.messages[1]["content"].as_str().unwrap()).unwrap();
-            assert_eq!(saved_summary["source_event_seqs"], json!([1,2,3]));
+            assert_eq!(saved_summary["source_event_seqs"], json!([3]));
             assert_eq!(saved_summary["progress"], "20 pages saved; QA 10–20 pending");
         }
         assert_eq!(received.lock().unwrap().len(), 3);
@@ -4961,7 +5084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defined_generic_task_survives_three_compactions_without_reinjecting_transcript() {
+    async fn defined_generic_task_and_original_messages_survive_three_frame_compactions() {
         let root = TestRoot::new();
         let received = Arc::new(Mutex::new(Vec::<Value>::new()));
         let requests = received.clone();
@@ -4975,8 +5098,8 @@ mod tests {
                 let anchor:Value=serde_json::from_str(messages.iter().find(|m|m["name"]=="main_task_anchor").unwrap()["content"].as_str().unwrap()).unwrap();
                 assert_eq!(anchor["definition"]["objective"],"Fix search ordering while preserving API");
                 assert!(anchor.get("human_updates").is_none());
-                assert_eq!(supplied["original_user_requirements"],json!([]));
-                assert!(messages.iter().any(|m|m["name"]=="context_review_request"));
+                assert_eq!(supplied["original_user_requirements"].as_array().unwrap().len(),1);
+                assert!(messages.iter().any(|m|m["name"]=="original_user_requirement"));
                 assert!(supplied["current_context"].to_string().contains("QA 10–20 pending"));
                 let n = requests.lock().unwrap().len();
                 requests.lock().unwrap().push(body);
@@ -4986,7 +5109,7 @@ mod tests {
                 result["constraints"] = json!("Keep the brand logo fixed");
                 result["progress"] = json!("20 pages saved; QA 10–20 pending");
                 result["next_steps"] = json!("Inspect and fix pages 10–20; do not claim unchecked pages passed");
-                result["source_event_seqs"] = json!([1,2,3]);
+                result["source_event_seqs"] = json!([3]);
                 Json(json!({"choices":[{"finish_reason":"tool_calls","message":call("submit_context",result,n)}]}))
             }
         }));
@@ -5005,7 +5128,7 @@ mod tests {
             ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,material:None,input_budget:INPUT_BUDGET};
         let mut window = Window {messages:vec![
             json!({"role":"system","content":Mode::Main.prompt()}),
-            json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),
+            sourced(json!({"role":"user","content":"Approved: complete all 20 pages and their visual checks"}),"task",3),
             json!({"role":"assistant","content":"20 pages saved; QA 10–20 pending"}),
         ], ..Default::default()};
         for round in 0..3 {
@@ -5017,10 +5140,10 @@ mod tests {
             let before = window.messages.len();
             let (id, summary, retained, _) = organize_context(&session,&window.messages,"compress",Some(100_000),&BTreeSet::new()).await.unwrap();
             replace_context(&session,&mut window,before,id,summary,retained,&[]).await.unwrap();
-            assert!(!window.messages.iter().any(|m| m["role"]=="user" && m.get("name").is_none()));
+            assert!(window.messages.iter().any(|m| m["content"]=="Approved: complete all 20 pages and their visual checks"));
             assert!(!window.messages.iter().any(|m| m["name"]=="main_task_anchor" || m["name"]=="ppt_task_state"));
             let saved_summary: Value = serde_json::from_str(window.messages[1]["content"].as_str().unwrap()).unwrap();
-            assert_eq!(saved_summary["source_event_seqs"], json!([1,2,3]));
+            assert_eq!(saved_summary["source_event_seqs"], json!([3]));
             assert_eq!(saved_summary["progress"], "20 pages saved; QA 10–20 pending");
         }
         assert_eq!(received.lock().unwrap().len(), 3);
@@ -5636,6 +5759,7 @@ mod tests {
                 api_key: state.api_key.clone(),
                 models: state.model_map.clone(),
                 max_output_tokens: Default::default(),
+                context_windows: Default::default(),
                 context_request_options: [(
                     "qwen3.8-27b".into(),
                     json!({"chat_template_kwargs":{"enable_thinking":false}}),

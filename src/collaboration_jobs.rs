@@ -107,7 +107,7 @@ pub fn tools() -> Vec<Value> {
         function(
             "spawn_agent",
             "Delegate one independent task. At most five task agents run per conversation; context compression does not consume these slots. Returns immediately. The host inherits the current execution context, including confirmed requirements, loaded materials, execution receipts, active skills and asset references. Large parents are projected to narrative and references, so include the asset_ids the delegate should read first and do not repeat shared requirements, design specs or outlines. Supply the specific task, owned files/pages and acceptance criteria; the optional context field is for assignment-specific exceptions or references only. Delegates inherit this conversation's model, permissions and plugin/project binding; they cannot create further delegates. You remain responsible for verifying their actual results.",
-            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Asset handles the delegate should read first. Bodies remain references in projected contexts."}}),
+            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"inputs":{"type":"object","description":"Declared assets, pinned materials, node returns, history events, and tool_groups for the delegate. Omitted tool_groups starts with core tools only."},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Asset handles the delegate should read first. Bodies remain references in projected contexts."}}),
             json!(["name", "task"]),
         ),
         function(
@@ -286,7 +286,15 @@ pub fn submit(
         crate::delegate_git::prepare(&crate::session_browser::task_workspace(state.workspace.root(), task)?, &id)?
     } else { None };
     let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
-    let spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
+    let mut spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
+    if let Some(node)=shared_context.get("task_node") {
+        let mut node:crate::task_tree::Node=serde_json::from_value(node.clone())?;
+        let saved=crate::task_tree::get(&tx,task,&node.node_id)?;
+        ensure!(saved.status=="pending" && saved.executor=="delegate","delegate node is no longer pending");
+        node.agent_id=Some(id.clone());node.status="running".into();
+        spec["task_node_id"]=json!(node.node_id);
+        crate::task_tree::emit(&tx,task,"task/node_started",&mut node,turn)?;
+    }
     tx.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,'running',?7)",params![id,task,turn,call,name,spec.to_string(),chrono::Utc::now().timestamp_millis()])?;
     tx.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,?2,?3)",
         params![id,instance(),now_ms()+LEASE_MS])?;
@@ -375,6 +383,7 @@ pub fn submit(
                 "UPDATE agent_delegates SET status=?3,result=?4 WHERE id=?1 AND status='running' AND EXISTS (SELECT 1 FROM agent_delegate_executors WHERE agent_id=?1 AND owner_id=?2)",
                 params![job,instance(),result["status"].as_str().unwrap_or("failed"),result.to_string()])?;
             if updated == 0 { return Ok(()); }
+            crate::task_tree::finish_delegate(&tx,&task,&job,&result,turn)?;
             let seq = agent_service::append_event_tx(
                 &tx,
                 &task,
@@ -426,6 +435,7 @@ fn reap(root: &Path, task: &str) -> Result<()> {
                 "UPDATE agent_delegates SET status='interrupted',result=?2 WHERE id=?1",
                 params![id, result.to_string()],
             )?;
+            crate::task_tree::finish_delegate(&tx,task,&id,&result,0)?;
             let seq = agent_service::append_event_tx(
                 &tx,
                 task,
@@ -594,6 +604,12 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
         }
     }
     let value = json!({"decision":decision,"evidence":evidence,"evidence_refs":refs,"git_head":args["git_head"]});
+    if let Some(node_id)=spec["task_node_id"].as_str() {
+        let mut node=crate::task_tree::get(&tx,task,node_id)?;
+        ensure!(decision!="accepted" || node.status=="done","cannot accept a delegate without a verified done return");
+        node.review=Some(decision.to_owned());
+        crate::task_tree::emit(&tx,task,"task/node_reviewed",&mut node,0)?;
+    }
     let n=tx.execute("UPDATE agent_delegates SET review=?3 WHERE task_id=?1 AND id=?2 AND status!='running' AND delivered=1",params![task,id,value.to_string()])?;
     ensure!(
         n == 1,

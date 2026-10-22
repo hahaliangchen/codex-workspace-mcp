@@ -235,13 +235,7 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         .await?;
     ensure!(body.len() <= 128000, "remote skill body too large");
     remote.skill = String::from_utf8(body)?;
-    let front = remote
-        .skill
-        .strip_prefix("---\n")
-        .and_then(|s| s.split_once("\n---"))
-        .context("skill frontmatter required")?
-        .0;
-    let fields: Value = serde_yaml::from_str(front)?;
+    let fields = super::frontmatter(&remote.skill)?;
     ensure!(fields["name"] == id, "remote skill ID mismatch");
     let description = fields["description"]
         .as_str()

@@ -12,6 +12,19 @@ use std::{
 
 pub const REFERENCE: &str = "_asset_reference";
 
+pub fn rewind(tx: &rusqlite::Transaction, task: &str, start: i64) -> Result<()> {
+    for (table, predicate) in [
+        ("agent_context_assets", "json_extract(reference_json,'$.history_reference.event_seq')>=?2"),
+        ("agent_context_materials", "json_extract(data,'$.through')>=?2"),
+    ] {
+        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0))?;
+        if exists {
+            tx.execute(&format!("DELETE FROM {table} WHERE task_id=?1 AND {predicate}"), params![task, start])?;
+        }
+    }
+    Ok(())
+}
+
 fn connection(root: &Path) -> Result<Connection> {
     let conn = crate::agent_service::open_db(root)?;
     conn.execute_batch(
@@ -190,6 +203,8 @@ pub fn register(
             json!({"tool":"refresh_asset","arguments":{"asset_id":id}});
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let owner:Option<String>=tx.query_row("SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",params![task,seq],|r|r.get(0)).optional()?;
+    reference["task_node_id"]=json!(owner);
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO agent_context_assets VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
@@ -207,7 +222,7 @@ pub fn register(
             &tx,
             task,
             "asset/registered",
-            &json!({"reference":reference}),
+            &json!({"reference":reference,"task_node_id":owner}),
             None,
         )?;
     }
@@ -286,6 +301,8 @@ fn register_remote_file(
         reference["download_url"] = json!(remote.resource_url(project, path)?);
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let owner:Option<String>=tx.query_row("SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",params![task,seq],|r|r.get(0)).optional()?;
+    reference["task_node_id"]=json!(owner);
     tx.execute(
         "INSERT OR IGNORE INTO agent_context_assets VALUES (?1,?2,?3,?4,?5,'',?6)",
         params![
@@ -301,7 +318,7 @@ fn register_remote_file(
         &tx,
         task,
         "asset/registered",
-        &json!({"reference":reference}),
+        &json!({"reference":reference,"task_node_id":owner}),
         None,
     )?;
     tx.commit()?;
@@ -632,6 +649,40 @@ pub fn catalog(messages: &[Value]) -> Value {
         );
     }
     json!({"assets":entries.into_values().collect::<Vec<_>>(),"note":"Loaded material remains in context until an explicit AI edit. image_selected is not proof of pixel delivery."})
+}
+
+pub fn frame_index(root:&Path,task:&str,node:&str,messages:&[Value])->Result<Value> {
+    let conn=crate::agent_service::open_db(root)?;
+    let mut entries=BTreeMap::<String,Value>::new();
+    for message in messages {
+        if let Some(id)=message[REFERENCE]["asset_id"].as_str() {entries.insert(id.to_owned(),message[REFERENCE].clone());}
+    }
+    let rows=conn.prepare("SELECT a.reference_json FROM agent_context_assets a
+        JOIN agent_task_events e ON e.task_id=a.task_id AND e.seq=json_extract(a.reference_json,'$.history_reference.event_seq')
+        LEFT JOIN agent_task_nodes n ON n.task_id=e.task_id AND n.node_id=e.node_id
+        WHERE a.task_id=?1 AND (COALESCE(e.node_id,'n0')=?2 OR (n.parent_id=?2 AND n.status='done'
+            AND (n.executor='inline' OR json_extract(n.data,'$.review')='accepted')))
+        ORDER BY e.seq DESC LIMIT 65")?.query_map(params![task,node],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let possibly_more=rows.len()==65;
+    for raw in rows {
+        let reference:Value=serde_json::from_str(&raw)?;
+        if let Some(id)=reference["asset_id"].as_str() {entries.entry(id.to_owned()).or_insert(reference);}
+    }
+    let total=entries.len();
+    let mut selected=Vec::new();
+    let mut tokens=0;
+    for reference in entries.into_values().take(64) {
+        let mut item=json!({});
+        for key in ["asset_id","kind","source_tool","source_path","history_reference","read_reference","content_hash"] {
+            if let Some(value)=reference.get(key) {item[key]=value.clone();}
+        }
+        let size=crate::context_window::estimate(&item);
+        if tokens+size>3000 {break;}
+        tokens+=size;selected.push(item);
+    }
+    Ok(json!({"host_status":true,"not_a_user_request":true,"truncated":possibly_more||selected.len()<total,
+        "assets":selected,"remaining_reference":{"tool":"read_session_history","arguments":{"node_id":node,"include_descendants":true}},
+        "instruction":"Asset handles only. Read bodies only when needed; a handle is not proof of successful completion."}))
 }
 
 /// The reviewer sees the entire conversation with asset bodies replaced by

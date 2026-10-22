@@ -336,7 +336,7 @@
 
 :global(body[data-ds-dark-theme]) .sessionActive {
   background: var(--sprout-soft) !important;
-  color: #e1f5ee !important;
+  color: var(--theme-on-soft, #e1f5ee) !important;
 }
 
 .sessionTitle {
@@ -446,7 +446,7 @@
 .newChatBtn { flex: 1; min-width: 0; width: auto; }
 .modeSwitch { display: flex; flex-shrink: 0; gap: 2px; padding: 2px; border-radius: 9px; background: var(--codex-hover-bg, #efefef); }
 .modeButton { display: flex; align-items: center; justify-content: center; width: 34px; height: 29px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--codex-text-muted, #71717a); cursor: pointer; }
-.modeActive { background: var(--codex-card-bg, #fff); border-color: #c8e6d8; color: var(--sprout-strong, #0f6e56); box-shadow: 0 1px 3px #0f6e5614; }
+.modeActive { background: var(--codex-card-bg, #fff); border-color: var(--codex-card-border, #e5e7eb); color: var(--sprout-strong, #0f6e56); box-shadow: 0 1px 2px rgba(16, 24, 40, 0.07); }
 .itemRow { display: flex; align-items: center; min-width: 0; border-radius: 6px; }
 .itemRow:hover { background: var(--codex-hover-bg, #f4f4f5); }
 .itemRow > .sessionRow, .itemRow > .recentRow { flex: 1; width: 0; min-width: 0; background: transparent; color: inherit; }
@@ -461,7 +461,7 @@
 .pinMark { margin-left: 5px; color: var(--codex-text-muted, #71717a); }
 .root button:focus-visible { outline: 2px solid var(--codex-blue-primary, #007aff); outline-offset: -2px; }
 :global(body[data-ds-dark-theme]) .modeSwitch { background: #27272a; }
-:global(body[data-ds-dark-theme]) .modeActive { background: var(--sprout-soft); border-color: #2d5a47; color: #e1f5ee; }
+:global(body[data-ds-dark-theme]) .modeActive { background: var(--sprout-soft); border-color: var(--theme-soft-border, #2d5a47); color: var(--theme-on-soft, #e1f5ee); box-shadow: none; }
 :global(body[data-ds-dark-theme]) .itemRow:hover { background: var(--codex-hover-bg); }
 :global(body[data-ds-dark-theme]) .itemRow { color: #d4d4d8; }
 @media (hover: none) { .rowMenu { opacity: 1; } }

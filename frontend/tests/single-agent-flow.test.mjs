@@ -6,6 +6,32 @@ const source = await readFile(new URL('../src/model.ts', import.meta.url), 'utf8
 const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2024 } })
 const { flowState } = await import('data:text/javascript;base64,' + Buffer.from(outputText).toString('base64'))
 const event = (type, data) => ({ type, time: 0, data: { turn: 1, ...data } })
+
+test('task nodes persist across turns and finish only on an explicit return', () => {
+  const state = flowState([
+    event('task/node_planned', { node_id: 'n0', kind: 'root', executor: 'inline', status: 'running', title: 'Twenty pages' }),
+    event('task/node_planned', { node_id: 'page7', parent_id: 'n0', kind: 'planned', executor: 'inline', status: 'pending', title: 'Page 7' }),
+    event('task/node_suspended', { node_id: 'n0', kind: 'root', executor: 'inline', status: 'suspended' }),
+    event('task/node_started', { node_id: 'page7', parent_id: 'n0', kind: 'planned', executor: 'inline', status: 'running' }),
+    event('flow/node_add', { node: { id: 'request7', kind: 'agent', task_node_id: 'page7', status: 'running' } }),
+    event('tool/call', { flowNodeId: 'request7', callId: 'check7', name: 'run_program', arguments: '{}' }),
+    event('tool/result', { flowNodeId: 'request7', message: { role: 'tool', toolCallId: 'check7', content: [{ type: 'text', text: 'missing class' }] } }),
+    event('turn/end', { reason: { kind: 'completed' } }),
+    event('turn/start', { turn: 2 }),
+    event('task/node_planned', { turn: 2, node_id: 'repair', parent_id: 'page7', kind: 'branch', executor: 'inline', status: 'running', title: 'Repair CSS' }),
+    event('task/node_suspended', { turn: 2, node_id: 'page7', parent_id: 'n0', kind: 'planned', executor: 'inline', status: 'suspended' }),
+    event('task/node_returned', { turn: 2, node_id: 'repair', parent_id: 'page7', kind: 'branch', executor: 'inline', status: 'done', result: { result: 'CSS verified' } }),
+    event('task/node_resumed', { turn: 2, node_id: 'page7', parent_id: 'n0', kind: 'planned', executor: 'inline', status: 'running' }),
+  ])
+  assert.equal(state.nodes.filter(n => n.id.startsWith('task:')).length, 3)
+  assert.equal(state.nodes.find(n => n.id === 'task:n0').status, 'suspended')
+  const page = state.nodes.find(n => n.id === 'task:page7')
+  assert.equal(page.status, 'running')
+  assert.equal(page.tools[0].output, 'missing class')
+  assert.equal(state.nodes.find(n => n.id === 'task:repair').description, 'CSS verified')
+  assert.equal(state.activeNodeId, 'task:page7')
+  assert.ok(state.edges.some(e => e.source === 'task:page7' && e.target === 'task:repair'))
+})
 test('each model request retains parent, tools and outcome after reload', () => {
   const events = [
     event('turn/start', { runtime: 'single_agent' }),

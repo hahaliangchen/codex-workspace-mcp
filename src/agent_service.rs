@@ -74,6 +74,8 @@ pub struct AgentProviderRoute {
     pub models: HashMap<String, String>,
     /// Output limits declared per upstream model id (`maxTokens`).
     pub max_output_tokens: HashMap<String, usize>,
+    /// Total input/output limits declared by the model catalog (`contextWindow`).
+    pub context_windows: HashMap<String, usize>,
     /// Model-specific template options for context work only, from the catalog.
     pub context_request_options: HashMap<String, Value>,
 }
@@ -388,6 +390,16 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
         "ALTER TABLE agent_task_events ADD COLUMN surface_op TEXT",
         [],
     );
+    let has_node: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_task_events') WHERE name='node_id')", [], |r|r.get(0))?;
+    if !has_node {
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_task_events') WHERE name='node_id')", [], |r|r.get::<_,bool>(0))? {
+            tx.execute("ALTER TABLE agent_task_events ADD COLUMN node_id TEXT", [])?;
+        }
+        tx.commit()?;
+    }
+    crate::task_tree::schema(&conn)?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS task_events_node ON agent_task_events(task_id,node_id,seq);")?;
     let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN parent_task_id TEXT", []);
     let _ = conn.execute("ALTER TABLE agent_tasks ADD COLUMN provider_name TEXT", []);
     let _ = conn.execute(
@@ -398,6 +410,19 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
         "ALTER TABLE agent_tasks ADD COLUMN fast_mode INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let has_high_water: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_tasks') WHERE name='event_high_water')",
+        [], |row| row.get(0),
+    )?;
+    if !has_high_water {
+        let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let migrated: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_tasks') WHERE name='event_high_water')", [], |row| row.get(0))?;
+        if !migrated {
+            tx.execute("ALTER TABLE agent_tasks ADD COLUMN event_high_water INTEGER NOT NULL DEFAULT -1", [])?;
+            tx.execute("UPDATE agent_tasks SET event_high_water=COALESCE((SELECT MAX(seq) FROM agent_task_events WHERE task_id=agent_tasks.id),-1)", [])?;
+        }
+        tx.commit()?;
+    }
     crate::session_browser::schema(&conn, root)?;
     Ok(conn)
 }
@@ -416,30 +441,18 @@ pub async fn recover_orphaned_tasks(workspace_root: &std::path::Path) -> anyhow:
             if let Some(event)=crate::session_history::load_events(&conn,&task_id,&crate::session_history::EventQuery{kinds:&["step/start","step/end"],newest:Some(1),..Default::default()})?.pop()
                 && event.kind=="step/start" {
                 let step_data=event.data()?;
-                let step_seq: i64 = conn.query_row(
-                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id=?1",
-                    [&task_id],
-                    |row| row.get(0),
-                )?;
-                conn.execute(
-                    "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES (?1,?2,?3,'step/end',?4)",
-                    params![task_id,step_seq,now(),step_data.to_string()],
-                )?;
+                let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                append_event_tx(&tx, &task_id, "step/end", &step_data, None)?;
+                tx.commit()?;
             }
             let turn=crate::session_history::load_events(&conn,&task_id,&crate::session_history::EventQuery{kinds:&["turn/start"],newest:Some(1),..Default::default()})?.pop().map(|event|event.data()).transpose()?.and_then(|data|data["turn"].as_u64()).unwrap_or(1) as usize;
-            let seq: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id=?1",
-                [&task_id],
-                |row| row.get(0),
-            )?;
-            conn.execute(
-                "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES (?1,?2,?3,'turn/end',?4)",
-                params![task_id,seq,now(),json!({"turn":turn,"reason":{"kind":"interrupted"}}).to_string()],
-            )?;
-            conn.execute(
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            append_event_tx(&tx, &task_id, "turn/end", &json!({"turn":turn,"reason":{"kind":"interrupted"}}), None)?;
+            tx.execute(
                 "UPDATE agent_tasks SET status='interrupted',updated_at=?2 WHERE id=?1",
                 params![task_id, now()],
             )?;
+            tx.commit()?;
         }
         cleanup_terminal_task_data(&mut conn, None, true)?;
         Ok(())
@@ -559,6 +572,14 @@ fn append_event(
     })
 }
 
+/// Preview the next identity inside the same write transaction that appends it.
+pub(crate) fn next_event_seq(tx: &rusqlite::Transaction, task_id: &str) -> anyhow::Result<i64> {
+    Ok(tx.query_row(
+        "SELECT MAX(event_high_water,COALESCE((SELECT MAX(seq) FROM agent_task_events WHERE task_id=?1),-1))+1 FROM agent_tasks WHERE id=?1",
+        [task_id], |row| row.get(0),
+    )?)
+}
+
 pub(crate) fn append_event_tx(
     tx: &rusqlite::Transaction,
     task_id: &str,
@@ -566,18 +587,24 @@ pub(crate) fn append_event_tx(
     data: &Value,
     surface_op: Option<&str>,
 ) -> anyhow::Result<i64> {
-    let seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_task_events WHERE task_id = ?1",
-        [task_id],
-        |row| row.get(0),
-    )?;
+    let seq = next_event_seq(tx, task_id)?;
+    let node = if let Some(id) = data["task_node_id"].as_str() {
+        Some(id.to_owned())
+    } else if let Some(agent) = data["agent_id"].as_str() {
+        tx.query_row("SELECT node_id FROM agent_task_nodes WHERE task_id=?1 AND json_extract(data,'$.agent_id')=?2", params![task_id,agent], |r|r.get::<_,String>(0)).optional()?
+    } else {
+        crate::task_tree::active(tx,task_id)?.map(|n|n.node_id)
+    };
     tx.execute(
-        "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data,surface_op) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![task_id, seq, now(), kind, serde_json::to_string(&data)?, surface_op],
+        "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data,surface_op,node_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![task_id, seq, now(), kind, serde_json::to_string(&data)?, surface_op,node],
     )?;
+    if matches!(kind,"user/message"|"user/interjection") && let Some(node) = &node {
+        crate::task_tree::register_user(tx,task_id,seq,node,data.get("message").map(|m|&m["content"]).unwrap_or(&data["text"]))?;
+    }
     tx.execute(
-        "UPDATE agent_tasks SET updated_at=?2 WHERE id=?1",
-        params![task_id, now()],
+        "UPDATE agent_tasks SET updated_at=?2,event_high_water=?3 WHERE id=?1",
+        params![task_id, now(), seq],
     )?;
     Ok(seq)
 }

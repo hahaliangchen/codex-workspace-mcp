@@ -252,6 +252,30 @@ pub fn message(root: &Path, task: &str) -> Result<Option<Value>> {
     Ok(Some(json!({"role":"system","name":"ppt_task_state","content":data.to_string()})))
 }
 
+pub fn frame_message(root:&Path,task:&str,node:Option<&str>)->Result<Option<Value>> {
+    let Some(mut message)=message(root,task)? else {return Ok(None);};
+    let Some(id)=node else {return Ok(Some(message));};
+    let conn=agent_service::open_db(root)?;
+    let Some(page)=crate::task_tree::current_ppt_page(&conn,task,id)? else {return Ok(Some(message));};
+    let mut data:Value=serde_json::from_str(message["content"].as_str().context("invalid PPT state")?)?;
+    data["current_page"]=page.clone();
+    let board=crate::main_task_anchor::board(root,task,None)?;
+    data["current_page"]["plan_current"]=json!(board.as_ref().is_some_and(|b|b["plan_confirmed"]==true && b["plan"]["version"]==page["plan_version"]));
+    if let Some(plan)=board.as_ref().filter(|b|b["plan"]["version"]==page["plan_version"]) {
+        data["current_page"]["design"]=plan["plan"]["plan"]["design"].clone();
+    }
+    if let Some(plan)=data["committed_plan"].as_object_mut() {plan.remove("outline");}
+    if let Some(visual)=data["visual"].as_object_mut() {
+        for (key,value) in visual {
+            if let Some(values)=value.as_array_mut() {
+                values.retain(|entry|if key=="pages" {entry["page_index"]==page["page_index"]} else {entry==&page["page_index"]});
+            }
+        }
+    }
+    message["content"]=json!(data.to_string());
+    Ok(Some(message))
+}
+
 pub fn require_delivery(root:&Path,task:&str)->Result<Value> {
     let message=message(root,task)?.context("PPT state missing")?;
     let data:Value=serde_json::from_str(message["content"].as_str().context("PPT state invalid")?)?;
@@ -304,6 +328,7 @@ mod tests {
         assert_eq!(data["selected_template"]["template_id"],"brand");
         assert_eq!(data["visual"]["passed_pages"],json!([]));
         assert_eq!(plan_for_review(&root,"t").unwrap().unwrap()["outline"],project(22)["outline"]);
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -317,6 +342,7 @@ mod tests {
         assert_eq!(state["visual"]["passed_pages"],json!([]));
         assert_eq!(state["visual"]["pages"][0]["issues"][0],"红线穿过正文");
         assert_eq!(state["visual"]["pages"][0]["evidence_reference"]["visual_job_id"],"j");
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -336,6 +362,7 @@ mod tests {
         assert_eq!(state["visual"]["checked_current_pages"],json!([3]));
         assert_eq!(state["visual"]["pages"][0]["plan_matches"],false);
         assert_eq!(state["visual"]["passed_pages"],json!([]));
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -353,6 +380,7 @@ mod tests {
         assert_eq!(state["visual"]["verdict_unknown_pages"],json!([1,2,3,4,5,6]));
         assert_eq!(state["visual"]["pending_pages"],json!([6]));
         assert_eq!(state["visual"]["pages"][0]["analysis_excerpt"],"All good, pass");
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
@@ -368,6 +396,7 @@ mod tests {
         assert_eq!(state["visual"]["pages"][0]["freshness"],"unknown");
         assert!(state["error"].as_str().unwrap().contains("PPT offline"));
         assert!(plan_for_review(&root,"t").unwrap().is_none());
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test(start_paused=true)]
@@ -382,6 +411,7 @@ mod tests {
         let cancel=CancellationToken::new();cancel.cancel();
         assert!(refresh_from(&root,"t",820,&cancel,std::future::pending()).await.is_err());
         assert_eq!(data(&root)["status"],"unknown");
+        drop(_conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -393,6 +423,7 @@ mod tests {
         assert_eq!(state["status"],"unknown");
         assert!(state["committed_plan"].is_null());
         assert!(state["error"].as_str().unwrap().contains("PPT_PLAN_TOO_LARGE"));
+        drop(_conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -404,6 +435,31 @@ mod tests {
         assert_eq!(data(&root)["project_id"],821);
         conn.execute("DELETE FROM ppt_session_bindings WHERE task_id='t'",[]).unwrap();
         assert!(message(&root,"t").unwrap().is_none());
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn page_frame_keeps_shared_design_and_only_its_own_visual_state() {
+        let (root,conn)=setup();let current=project(22);
+        let proposal=crate::main_task_anchor::propose_plan(&root,"t",json!({"domain":"ppt","project_id":820,
+            "target_page_count":2,"outline":current["outline"],"design":current["design"],"items":[
+                {"id":"p1","title":"First","requirements":"First page requirements"},
+                {"id":"p2","title":"Second","requirements":"Second page requirements"}]})).unwrap();
+        crate::main_task_anchor::confirm_plan(&root,"t",proposal["version"].as_i64().unwrap(),"user").unwrap();
+        job(&conn,"first","completed",json!([source(1,22)]),review(1,"pass"),1);
+        job(&conn,"second","completed",json!([source(2,22)]),review(2,"needs_fix"),2);
+        store(&root,"t",820,Ok(current.clone())).unwrap();
+        let node=crate::task_tree::nodes(&conn,"t").unwrap().into_iter().find(|n|n.metadata["page_index"]==1).unwrap();
+        let message=frame_message(&root,"t",Some(&node.node_id)).unwrap().unwrap();
+        let state:Value=serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+        assert_eq!(state["current_page"]["requirements"],"First page requirements");
+        assert_eq!(state["current_page"]["design"],current["design"]);
+        assert_eq!(state["current_page"]["plan_current"],true);
+        assert!(state["committed_plan"]["outline"].is_null());
+        assert_eq!(state["visual"]["pages"].as_array().unwrap().len(),1);
+        assert_eq!(state["visual"]["passed_pages"],json!([1]));
+        assert_eq!(state["visual"]["needs_fix_pages"],json!([]));
+        drop(conn);std::fs::remove_dir_all(root).unwrap();
     }
 }

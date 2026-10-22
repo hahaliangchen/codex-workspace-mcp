@@ -55,3 +55,17 @@
   background: var(--dsw-alias-bg-module-platform);
   border-color: var(--dsw-static-neutral-bluish-400);
 }
+
+/* Colour theme cubes: three dots preview the theme's accents. */
+.swatches {
+  display: inline-flex;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.swatches i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.14);
+}

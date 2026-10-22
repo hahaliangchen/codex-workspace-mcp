@@ -9,8 +9,8 @@
 .root {
   display: flex;
   flex-direction: column;
-  padding: 4px 0;
-  margin: 2px 0;
+  padding: 2px 0;
+  margin: 0;
 }
 
 .leading {
@@ -151,6 +151,8 @@
 .bodyWrap {
   display: flex;
   flex-direction: column;
+  /* An expanded body keeps clear of the next compact row. */
+  padding-bottom: 6px;
 }
 
 /* Hover-revealed jump to the trajectory record: a small pill in real flow
@@ -352,3 +354,64 @@
   clip: rect(0 0 0 0);
   white-space: nowrap;
 }
+
+/* Tone chips: every tool row leads with a small tinted tile whose colour
+   family says what kind of action it was (read, edit, run, task tree…).
+   The tile replaces the bare 16px glyph; the row height is unchanged. */
+.root[data-tone] {
+  --tool-chip-bg: #f1f2f4;
+  --tool-chip-fg: #6b7280;
+}
+.root[data-tone='read'] { --tool-chip-bg: #eaf2ff; --tool-chip-fg: #2f6fd6; }
+.root[data-tone='edit'] { --tool-chip-bg: #fff3df; --tool-chip-fg: #b86200; }
+.root[data-tone='run'] { --tool-chip-bg: #eceef2; --tool-chip-fg: #3f4652; }
+.root[data-tone='search'] { --tool-chip-bg: #e3f5f2; --tool-chip-fg: #0d8573; }
+.root[data-tone='task'] { --tool-chip-bg: var(--sprout-soft, #e3f1ea); --tool-chip-fg: var(--sprout-strong, #0f6e56); }
+.root[data-tone='agent'] { --tool-chip-bg: #efeafe; --tool-chip-fg: #6a4fd6; }
+.root[data-tone='media'] { --tool-chip-bg: #fdebf3; --tool-chip-fg: #c03c78; }
+.root[data-tone='web'] { --tool-chip-bg: #e8ecff; --tool-chip-fg: #4655cf; }
+.root[data-tone='context'] { --tool-chip-bg: #f1efea; --tool-chip-fg: #6b6356; }
+.root[data-tone='danger'],
+.root[data-tone][data-state='error'] { --tool-chip-bg: #fdecec; --tool-chip-fg: #d23c3c; }
+
+:global(body[data-ds-dark-theme]) .root[data-tone] { --tool-chip-bg: #2a2a2e; --tool-chip-fg: #a1a1aa; }
+:global(body[data-ds-dark-theme]) .root[data-tone='read'] { --tool-chip-bg: #1d2a40; --tool-chip-fg: #8db4f5; }
+:global(body[data-ds-dark-theme]) .root[data-tone='edit'] { --tool-chip-bg: #3a2a12; --tool-chip-fg: #f2b45c; }
+:global(body[data-ds-dark-theme]) .root[data-tone='run'] { --tool-chip-bg: #2a2c31; --tool-chip-fg: #d4d7dd; }
+:global(body[data-ds-dark-theme]) .root[data-tone='search'] { --tool-chip-bg: #133430; --tool-chip-fg: #5fd0bf; }
+:global(body[data-ds-dark-theme]) .root[data-tone='task'] { --tool-chip-bg: var(--sprout-soft, #1d3a2e); --tool-chip-fg: var(--sprout-strong, #5dcaa5); }
+:global(body[data-ds-dark-theme]) .root[data-tone='agent'] { --tool-chip-bg: #2b2442; --tool-chip-fg: #b6a4f7; }
+:global(body[data-ds-dark-theme]) .root[data-tone='media'] { --tool-chip-bg: #3a1f2b; --tool-chip-fg: #f08cb4; }
+:global(body[data-ds-dark-theme]) .root[data-tone='web'] { --tool-chip-bg: #23284a; --tool-chip-fg: #a3aef5; }
+:global(body[data-ds-dark-theme]) .root[data-tone='context'] { --tool-chip-bg: #2c2a26; --tool-chip-fg: #c9c2b6; }
+:global(body[data-ds-dark-theme]) .root[data-tone='danger'],
+:global(body[data-ds-dark-theme]) .root[data-tone][data-state='error'] { --tool-chip-bg: #3d1f1f; --tool-chip-fg: #f08a8a; }
+
+.root[data-tone] .leading {
+  width: calc(20px + var(--dsh-content-font-delta, 0px));
+  height: calc(20px + var(--dsh-content-font-delta, 0px));
+  margin-right: 8px;
+  border-radius: 6px;
+  background: var(--tool-chip-bg);
+  color: var(--tool-chip-fg);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.root[data-tone] .leading svg:not([data-state]) {
+  width: calc(13px + var(--dsh-content-font-delta, 0px));
+  height: calc(13px + var(--dsh-content-font-delta, 0px));
+}
+
+.root[data-tone] .leading .chevron {
+  color: inherit;
+}
+
+/* A stopped call keeps its colour family but steps back visually. */
+.root[data-tone][data-state='stopped'] .leading {
+  opacity: 0.55;
+}
+
+/* 银杏 theme: task chips turn ginkgo gold (via --sprout-*), so edits move to
+   chestnut to stay distinguishable from them. Failed rows keep the error red. */
+:global(body[data-theme='ginkgo']) .root[data-tone='edit']:not([data-state='error']) { --tool-chip-bg: #f5ebe4; --tool-chip-fg: #8b5a3c; }
+:global(body[data-theme='ginkgo'][data-ds-dark-theme]) .root[data-tone='edit']:not([data-state='error']) { --tool-chip-bg: #33261f; --tool-chip-fg: #d9a688; }

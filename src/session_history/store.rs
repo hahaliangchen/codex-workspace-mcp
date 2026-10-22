@@ -7,6 +7,8 @@ use std::path::Path;
 
 #[derive(Default)]
 pub struct EventQuery<'a> {
+    pub node_id: Option<&'a str>,
+    pub include_descendants: bool,
     pub after: Option<i64>,
     pub through: Option<i64>,
     pub exact: Option<i64>,
@@ -40,6 +42,15 @@ pub fn load_events(
         "SELECT seq,timestamp,kind,data,surface_op FROM agent_task_events WHERE task_id=?1"
             .to_owned();
     let mut args = vec![SqlValue::Text(task.to_owned())];
+    if let Some(node)=query.node_id {
+        args.push(SqlValue::Text(node.to_owned()));
+        let slot=args.len();
+        sql.push_str(&format!(" AND (COALESCE(node_id,'n0')=?{slot}"));
+        if query.include_descendants {
+            sql.push_str(&format!(" OR COALESCE(node_id,'n0') IN (WITH RECURSIVE descendants(id) AS (SELECT ?{slot} UNION SELECT n.node_id FROM agent_task_nodes n JOIN descendants d ON n.parent_id=d.id WHERE n.task_id=?1) SELECT id FROM descendants)"));
+        }
+        sql.push_str(&format!(" OR EXISTS(SELECT 1 FROM agent_task_nodes n WHERE n.task_id=?1 AND n.node_id=?{slot} AND COALESCE(agent_task_events.node_id,'n0')=json_extract(n.data,'$.source.node_id') AND seq BETWEEN json_extract(n.data,'$.source.after_seq') AND json_extract(n.data,'$.source.through_seq')))"));
+    }
     for (value, expression) in [
         (query.after, "seq>"),
         (query.through, "seq<="),
@@ -155,7 +166,7 @@ mod tests {
     use super::*;
     #[test]
     fn compression_has_no_private_history_query() {
-        let source = include_str!("../single_agent.rs");
+        let source = include_str!("../single_agent.rs").replace("\r\n","\n");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(
             !production.contains("FROM agent_task_events"),
@@ -343,7 +354,10 @@ pub(super) fn search_events(
         ensure!(exists, "Conversation not found in this workspace: {target}");
     }
     let project_offset = args["project_offset"].as_i64().unwrap_or(0).max(0);
-    let base=format!("WITH history AS (
+    let base=format!("WITH RECURSIVE descendants(task_id,id) AS (
+        SELECT task_id,node_id FROM agent_task_nodes WHERE node_id=?4 AND (?1 IS NULL OR task_id=?1)
+        UNION SELECT n.task_id,n.node_id FROM agent_task_nodes n JOIN descendants d ON n.task_id=d.task_id AND n.parent_id=d.id
+    ), history AS (
         SELECT e.task_id,e.seq,e.timestamp,e.kind,e.data,
             CASE WHEN e.kind LIKE 'tool/%' THEN 'tool'
                  WHEN json_extract(e.data,'$.actor') IS NOT NULL THEN json_extract(e.data,'$.actor')
@@ -353,16 +367,18 @@ pub(super) fn search_events(
                  WHEN e.kind LIKE 'observer/%' THEN 'observer'
                  WHEN e.kind LIKE 'organizer/%' THEN 'organizer'
                  WHEN e.kind LIKE 'tool/%' THEN 'tool' ELSE 'worker' END AS role,
-            COALESCE(json_extract(e.data,'$.nodeId'),json_extract(e.data,'$.flowNodeId'),
+            COALESCE(e.node_id,json_extract(e.data,'$.nodeId'),json_extract(e.data,'$.flowNodeId'),
                 json_extract(e.data,'$.identity.node_id'),
                 (SELECT json_extract(c.data,'$.flowNodeId') FROM agent_task_events c
                  WHERE c.task_id=e.task_id AND c.kind='tool/call'
-                   AND json_extract(c.data,'$.callId')=json_extract(e.data,'$.message.toolCallId') ORDER BY c.seq DESC LIMIT 1)) AS node_id
+                   AND json_extract(c.data,'$.callId')=json_extract(e.data,'$.message.toolCallId') ORDER BY c.seq DESC LIMIT 1),'n0') AS node_id
         FROM agent_task_events e WHERE (?1 IS NULL OR e.task_id=?1)
           AND (e.kind!='debug/context_request' OR ?6 IS NOT NULL OR ?12)
     ), filtered AS (SELECT * FROM history
       WHERE (?2='all' OR role=?2) AND (?3='' OR instr(lower(data),?3)>0 {context_search})
-        AND (?4='' OR node_id=?4) AND (?5 IS NULL OR json_extract(data,'$.turn')=?5)
+        AND (?4='' OR node_id=?4 OR (?13 AND EXISTS(SELECT 1 FROM descendants d WHERE d.task_id=history.task_id AND d.id=history.node_id))
+          OR EXISTS(SELECT 1 FROM agent_task_nodes n WHERE n.task_id=history.task_id AND n.node_id=?4 AND history.node_id=json_extract(n.data,'$.source.node_id') AND seq BETWEEN json_extract(n.data,'$.source.after_seq') AND json_extract(n.data,'$.source.through_seq')))
+        AND (?5 IS NULL OR json_extract(data,'$.turn')=?5)
         AND (?6 IS NULL OR seq=?6) AND (?7 IS NULL OR seq<?7) AND (?10 IS NULL OR seq>?10)
         AND (?11 IS NULL OR json_extract(data,'$.identity.request_id') IS NULL OR json_extract(data,'$.identity.request_id')=?11)
     )");
@@ -394,6 +410,7 @@ pub(super) fn search_events(
         number(after),
         number(request),
         SqlValue::Integer(i64::from(args["include_context"] == true)),
+        SqlValue::Integer(i64::from(args["include_descendants"] == true)),
     ];
     let rows = query_events(conn, &format!("{base}{select}"), bindings, |row| {
         Ok((

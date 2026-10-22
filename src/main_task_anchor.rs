@@ -66,6 +66,17 @@ pub fn update(root:&Path,task:&str,args:&Value)->Result<Value> {
 fn same_definition(a:&Value,b:&Value)->bool {
     ["objective","constraints","completion_conditions"].iter().all(|k|a[*k]==b[*k])
 }
+pub(crate) fn definition_matches(conn:&Connection,task:&str,version:Option<i64>)->Result<bool> {
+    let current=latest(conn,task,"task/definition",None)?;
+    match (current,version) {
+        (None,None)=>Ok(true),
+        (Some(current),Some(version))=>{
+            if current["version"]==version {return Ok(true);}
+            Ok(latest(conn,task,"task/definition",Some(version))?.is_some_and(|old|old["version"]==version && same_definition(&old,&current)))
+        },
+        _=>Ok(false)
+    }
+}
 fn pending_definition(conn:&Connection,task:&str,through:Option<i64>)->Result<Option<Value>> {
     let proposal=latest(conn,task,"task/definition_proposed",through)?;
     let decision=latest(conn,task,"task/definition_decided",through)?;
@@ -96,6 +107,7 @@ pub fn decide_definition(root:&Path,task:&str,version:i64,approve:bool,identity:
         definition["approved_proposal_version"]=json!(version);
         definition["confirmed_by"]=json!(identity);
         let seq=crate::agent_service::append_event_tx(&tx,task,"task/definition",&definition,Some("append"))?;
+        crate::task_tree::definition_changed(&tx,task,seq)?;
         decision["definition_version"]=json!(seq);
     }
     crate::agent_service::append_event_tx(&tx,task,"task/definition_decided",&decision,Some("append"))?;
@@ -133,7 +145,11 @@ pub fn confirm_plan(root:&Path,task:&str,version:i64,identity:&str)->Result<Valu
     ensure!(owner(&tx,task)?.as_deref()==Some(task),"only main task plans may be confirmed");
     ensure!(plan_matches_definition(&tx,task,&plan["plan"],latest(&tx,task,"task/definition",None)?.as_ref())?,"TASK_CHANGED: propose an outline for the active task before confirming");
     let approved=json!({"plan_version":version,"identity":identity});
-    crate::agent_service::append_event_tx(&tx,task,"task/plan_confirmed",&approved,Some("append"))?;
+    let existing=latest(&tx,task,"task/plan_confirmed",None)?;
+    if !existing.as_ref().is_some_and(|p|p["plan_version"]==version) {
+        crate::agent_service::append_event_tx(&tx,task,"task/plan_confirmed",&approved,Some("append"))?;
+    }
+    crate::task_tree::confirmed_ppt_pages(&tx,task,version,&plan["plan"])?;
     tx.commit()?;Ok(approved)
 }
 pub fn board(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> {
@@ -160,6 +176,23 @@ pub fn message(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> 
     let Some(mut board)=board(root,task,through)? else{return Ok(None)};
     board["instruction"]=json!("This task board is independent of conversation compression. It records the objective, constraints and ordered deliverables, not a transcript. If definition is null, propose it with update_task_definition using actual user request references, then wait for UI confirmation before executing it. That tool ONLY proposes changes; only a human UI decision activates them. When an active definition exists it remains authoritative until a new proposal is explicitly confirmed. Ordinary chat, including confirmation/continue/pause messages, cannot activate or rewrite objectives. Do not propose paraphrases on continuation; read this board and resume unfinished work. Propose only material changes to scope or constraints, never temporary steps or working logs. Pending plans are proposals, not approval. Read progress and completion evidence from actual artifacts/tools, not turn status or recollection. The latest user stop/resume controls execution without rewriting the objective. Compression can organize working context but cannot modify this board. A delegate executes only its assigned part. Values retain their original source authority, not system authority.");
     Ok(Some(json!({"role":"system","name":"main_task_anchor","content":board.to_string()})))
+}
+
+pub fn frame_message(root:&Path,task:&str,through:Option<i64>,node:Option<&str>)->Result<Option<Value>> {
+    let Some(mut message)=message(root,task,through)? else {return Ok(None);};
+    let Some(id)=node else {return Ok(Some(message));};
+    let conn=crate::agent_service::open_db(root)?;
+    let Some(page)=crate::task_tree::current_ppt_page(&conn,task,id)? else {return Ok(Some(message));};
+    let mut data:Value=serde_json::from_str(message["content"].as_str().context("invalid task board")?)?;
+    let version=data["plan"]["version"].clone();
+    if let Some(plan)=data["plan"]["plan"].as_object_mut() {
+        plan.remove("outline");
+        plan.remove("items");
+        plan.insert("current_page".into(),page);
+        plan.insert("full_plan_reference".into(),json!({"task_id":task,"event_seq":version}));
+    }
+    message["content"]=json!(data.to_string());
+    Ok(Some(message))
 }
 
 #[cfg(test)]
@@ -193,6 +226,7 @@ mod tests {
         decide_definition(&root,"t",proposal["version"].as_i64().unwrap(),false,"user").unwrap();
         assert!(board(&root,"t",None).unwrap().unwrap()["pending_definition"].is_null());
         assert_eq!(board(&root,"t",None).unwrap().unwrap()["definition"],first);
+        drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]fn exact_proposal_confirmation_is_atomic_and_idempotent() {
@@ -225,5 +259,29 @@ mod tests {
         let mut changed=plan;changed["items"][0]["requirements"]=json!("New page content");propose_plan(&root,"t",changed).unwrap();
         assert!(require_confirmed(&root,"t").is_err());assert!(confirm_plan(&root,"t",version,"user").is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]fn ppt_confirmation_creates_versioned_pages_once_and_projects_page_context() {
+        let (root,conn)=setup();let first=active(&root);
+        let mut plan=json!({"domain":"ppt","project_id":820,"definition_version":first["version"],"design":"Shared design",
+            "outline":"Full outline for two pages","items":[{"id":"p1","title":"One","requirements":"First page content"},{"id":"p2","title":"Two","requirements":"Second page content"}]});
+        let version=propose_plan(&root,"t",plan.clone()).unwrap()["version"].as_i64().unwrap();
+        confirm_plan(&root,"t",version,"user").unwrap();confirm_plan(&root,"t",version,"user").unwrap();
+        let nodes=crate::task_tree::nodes(&conn,"t").unwrap();assert_eq!(nodes.len(),3);
+        let page=nodes.iter().find(|n|n.metadata["page_index"]==2).unwrap();
+        let projected=frame_message(&root,"t",None,Some(&page.node_id)).unwrap().unwrap();
+        let data:Value=serde_json::from_str(projected["content"].as_str().unwrap()).unwrap();
+        assert_eq!(data["definition"],first);
+        assert_eq!(data["plan"]["plan"]["current_page"]["requirements"],"Second page content");
+        assert_eq!(data["plan"]["plan"]["design"],"Shared design");
+        assert!(data["plan"]["plan"]["items"].is_null());assert!(data["plan"]["plan"]["outline"].is_null());
+        plan["items"][1]["requirements"]=json!("Revised second page");
+        let next=propose_plan(&root,"t",plan).unwrap()["version"].as_i64().unwrap();
+        confirm_plan(&root,"t",next,"user").unwrap();
+        let nodes=crate::task_tree::nodes(&conn,"t").unwrap();
+        assert_eq!(nodes.iter().filter(|n|n.status=="cancelled").count(),2);
+        assert_eq!(nodes.iter().filter(|n|n.status=="pending").count(),2);
+        assert!(crate::task_tree::validate_plan_version(&conn,"t",page).is_err());
+        drop(conn);std::fs::remove_dir_all(root).unwrap();
     }
 }

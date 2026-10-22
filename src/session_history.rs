@@ -698,6 +698,7 @@ pub fn tool() -> Value {
         "query":{"type":"string","maxLength":1000},
         "role":{"type":"string","enum":["all","user","agent","context_agent","worker","organizer","observer","tool"]},
         "node_id":{"type":"string"},"turn":{"type":"integer","minimum":1},
+        "include_descendants":{"type":"boolean","default":false,"description":"Include events owned by descendants of node_id. Split nodes also expose their explicit source interval."},
         "request_id":{"type":"integer","minimum":1,"description":"Human goal ID from task history_reference; excludes late Observer records from a replaced goal."},
         "before_seq":{"type":"integer","minimum":0},"after_seq":{"type":"integer","minimum":-1,"description":"Exclusive lower bound from task history_reference; retain when paging within that human goal."},"event_seq":{"type":"integer","minimum":0},
         "limit":{"type":"integer","minimum":1,"maximum":12},

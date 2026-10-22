@@ -13,8 +13,6 @@ use rusqlite::{Connection, Transaction, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-const MAX_CHARS: usize = 20_000;
-
 pub fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_interjections(task_id TEXT NOT NULL,seq INTEGER NOT NULL,text TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(task_id,seq));",
@@ -25,9 +23,7 @@ pub fn schema(conn: &Connection) -> Result<()> {
 /// Record an interjection for a running task; fails once the task is idle so
 /// the caller sends an ordinary message instead.
 pub fn submit(root: &std::path::Path, task: &str, text: &str) -> Result<i64> {
-    let text = text.trim();
-    ensure!(!text.is_empty(), "消息不能为空");
-    ensure!(text.chars().count() <= MAX_CHARS, "消息太长");
+    ensure!(!text.trim().is_empty(), "消息不能为空");
     let mut conn = agent_service::open_db(root)?;
     schema(&conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

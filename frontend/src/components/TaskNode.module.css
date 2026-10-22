@@ -20,9 +20,9 @@
 }
 
 .selected {
-  border-color: #1d9e75 !important;
+  border-color: var(--codex-blue-primary, #1d9e75) !important;
   background: var(--sprout-soft, #e3f1ea) !important;
-  box-shadow: 0 0 0 3px rgba(29, 158, 117, 0.28), 0 4px 16px rgba(15, 110, 86, 0.14) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--codex-blue-primary, #1d9e75) 28%, transparent), 0 4px 16px color-mix(in srgb, var(--codex-blue-hover, #0f6e56) 14%, transparent) !important;
 }
 
 .running {

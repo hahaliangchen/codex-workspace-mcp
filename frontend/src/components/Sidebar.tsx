@@ -8,7 +8,7 @@ export { taskTitle, workspaceName } from '../sidebarModel.ts'
 import css from './CodexSidebar.module.css'
 import { ProjectNotesDialog } from './ProjectNotesDialog.tsx'
 import { MemoryDialog } from './MemoryDialog.tsx'
-import sproutLogo from '../assets/sprout.svg'
+import { useBrandIcon } from '../brand.ts'
 
 export function dotState(status: TaskStatus): 'done' | 'warning' | 'ongoing' | 'error' | 'idle' {
   switch (status) {
@@ -58,6 +58,7 @@ export function Sidebar({
   onToggleTheme?: (() => void) | undefined
   onOpenSettings?: (() => void) | undefined
 }) {
+  const brandLogo = useBrandIcon()
   const [searchOpen, setSearchOpen] = useState(false)
   const [query, setQuery] = useState('')
   const [closed, setClosed] = useState<Record<string, boolean>>({})
@@ -129,7 +130,7 @@ export function Sidebar({
   if (collapsed) return <div className={clsx(css.root, css.collapsedRoot)}><button type="button" className={css.iconBtn} title="展开侧边栏" onClick={onToggleCollapse}>☰</button></div>
   return <aside className={css.root} style={{width}} aria-label="会话侧栏">
     <div className={css.header}>
-      <span className={css.brandTitle}><img src={sproutLogo} width={18} height={18} alt="" />Composer</span>
+      <span className={css.brandTitle}><img src={brandLogo} width={18} height={18} alt="" />Composer</span>
       <div className={css.headerActions}>
         <button type="button" className={css.iconBtn} title="搜索会话" aria-label="搜索会话" onClick={() => {setSearchOpen(value => !value); window.setTimeout(() => searchRef.current?.focus(),0)}}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="10.5" cy="10.5" r="7.5"/><path d="m16 16 5 5"/></svg>
@@ -144,10 +145,10 @@ export function Sidebar({
       <button type="button" className={css.newChatBtn} onClick={onNew}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M16 3l5 5-9 9-5 1 1-5Z"/></svg>{mode === 'chat' ? '新聊天' : '新代码会话'}</button>
       <div className={css.modeSwitch} role="tablist" aria-label="会话类型">
         <button type="button" role="tab" aria-selected={mode === 'chat'} aria-label="聊天" title="聊天" className={clsx(css.modeButton, mode === 'chat' && css.modeActive)} onClick={() => onModeChange?.('chat')}>
-          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c-5 0-9 3.4-9 7.6 0 2.2 1.1 4.2 2.9 5.6L5 20.5l4.3-2.1c.9.2 1.8.3 2.7.3 5 0 9-3.4 9-7.6s-4-7.6-9-7.6Z" fill="#5DCAA5"/><circle cx="8.2" cy="11.1" r="1.15" fill="#fff"/><circle cx="12" cy="11.1" r="1.15" fill="#fff"/><circle cx="15.8" cy="11.1" r="1.15" fill="#fff"/></svg>
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5c-5 0-9 3.4-9 7.6 0 2.2 1.1 4.2 2.9 5.6L5 20.5l4.3-2.1c.9.2 1.8.3 2.7.3 5 0 9-3.4 9-7.6s-4-7.6-9-7.6Z" style={{fill: 'var(--theme-leaf-light)'}}/><circle cx="8.2" cy="11.1" r="1.15" fill="#fff"/><circle cx="12" cy="11.1" r="1.15" fill="#fff"/><circle cx="15.8" cy="11.1" r="1.15" fill="#fff"/></svg>
         </button>
         <button type="button" role="tab" aria-selected={mode === 'code'} aria-label="代码" title="代码" className={clsx(css.modeButton, mode === 'code' && css.modeActive)} onClick={() => onModeChange?.('code')}>
-          <svg width="18" height="18" viewBox="0 0 64 64" aria-hidden="true"><path d="M20 18 8 32l12 14M44 18l12 14-12 14" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" fill="none"/><path d="M24 44C22 30 30 20 42 18c2 14-6 26-18 26Z" fill="#1D9E75"/><path d="M24 44 36 28" stroke="#E1F5EE" strokeWidth="2.5" strokeLinecap="round"/></svg>
+          <svg width="18" height="18" viewBox="0 0 64 64" aria-hidden="true"><path d="M20 18 8 32l12 14M44 18l12 14-12 14" stroke="currentColor" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" fill="none"/><path d="M24 44C22 30 30 20 42 18c2 14-6 26-18 26Z" style={{fill: 'var(--theme-leaf-mid)'}}/><path d="M24 44 36 28" style={{stroke: 'var(--theme-leaf-vein)'}} strokeWidth="2.5" strokeLinecap="round"/></svg>
         </button>
       </div>
     </div>

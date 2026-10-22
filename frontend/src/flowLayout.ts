@@ -5,6 +5,24 @@ import type { FlowEdgeData, FlowNodeData } from './model.ts'
  * New requests and completions never move an existing branch sideways.
  */
 export function layoutAgentFlow(nodes: readonly FlowNodeData[], edges: readonly FlowEdgeData[]) {
+  if (nodes.length > 0 && nodes.every(node => node.id.startsWith('task:'))) {
+    const positions = new Map<string, { x: number; y: number }>()
+    const children = new Map<string, FlowNodeData[]>()
+    for (const node of nodes) if (node.parentId) children.set(node.parentId, [...children.get(node.parentId) ?? [], node])
+    let column = 0
+    const visiting = new Set<string>()
+    const place = (node: FlowNodeData, depth: number): number => {
+      if (visiting.has(node.id)) return column++
+      visiting.add(node.id)
+      const columns = (children.get(node.id) ?? []).map(child => place(child, depth + 1))
+      const x = columns.length ? (columns[0]! + columns.at(-1)!) / 2 : column++
+      positions.set(node.id, { x: 60 + x * 380, y: 50 + depth * 250 })
+      return x
+    }
+    for (const root of nodes.filter(node => !node.parentId || !nodes.some(parent => parent.id === node.parentId))) place(root, 0)
+    for (const node of nodes) if (!positions.has(node.id)) place(node, 0)
+    return positions
+  }
   const byId = new Map(nodes.map(node => [node.id, node]))
   const order = new Map(nodes.map((node, index) => [node.id, index]))
   const incoming = new Map<string, string[]>()

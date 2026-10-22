@@ -569,7 +569,7 @@ export function trajectoryRows(events: readonly AgentEvent[]): TrajectoryRow[] {
 }
 
 export type FlowNodeKind = string
-export type FlowNodeStatus = 'ready' | 'running' | 'done' | 'waiting_children' | 'pending' | 'paused' | 'blocked' | 'completed' | 'skipped' | 'interrupted' | 'failed' | 'deprecated'
+export type FlowNodeStatus = 'ready' | 'running' | 'done' | 'waiting_children' | 'suspended' | 'needs_user' | 'cancelled' | 'pending' | 'paused' | 'blocked' | 'completed' | 'skipped' | 'interrupted' | 'failed' | 'deprecated'
 
 export interface FlowToolExecution {
   readonly id: string
@@ -711,6 +711,10 @@ function extractFilesFromArgs(argsStr: string): string[] {
 
 function flowStatus(value: unknown): FlowNodeStatus {
   switch (value) {
+    case 'suspended': return 'suspended'
+    case 'needs_user': return 'needs_user'
+    case 'cancelled': return 'cancelled'
+    case 'pending': return 'pending'
     case 'ready':
     case 'done':
     case 'running':
@@ -789,6 +793,30 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     const data = event.data || {}
     const turn = numberOf(data.turn) ?? currentTurn
     switch (event.type) {
+      case 'task/node_planned':
+      case 'task/node_revised':
+      case 'task/node_started':
+      case 'task/node_suspended':
+      case 'task/node_resumed':
+      case 'task/node_returned':
+      case 'task/node_reviewed': {
+        const rawId = stringOf(data.node_id)
+        if (!rawId) break
+        const id = `task:${rawId}`
+        const node = nodeMap.get(id) ?? createFlowNode(id, turn)
+        node.title = stringOf(data.title) ?? node.title
+        node.kind = data.kind === 'root' ? 'task_root' : data.kind === 'branch' ? 'task_branch' : 'task_planned'
+        const result = data.result as Record<string, unknown> | undefined
+        node.description = stringOf(result?.result) ?? stringOf(data.goal) ?? node.description
+        node.status = flowStatus(data.status)
+        node.agentId = stringOf(data.agent_id)
+        const parent = stringOf(data.parent_id)
+        node.parentId = parent ? `task:${parent}` : undefined
+        nodeMap.set(id, node)
+        if (parent && !edges.some(e => e.id === `task-edge:${rawId}`)) edges.push({ id: `task-edge:${rawId}`, source: `task:${parent}`, target: id, label: stringOf(data.spawned_from), animated: false })
+        if (data.executor === 'inline' && node.status === 'running') activeNodeId = id
+        break
+      }
       case 'subagent/start': {
         const id = stringOf(data.agent_id)
         if (!id || delegates.has(id)) break
@@ -916,7 +944,8 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
           node.description = stringOf(rawNode.description) ?? node.description
           node.status = flowStatus(rawNode.status ?? node.status)
           const parent = stringOf(rawNode.parent_id)
-          node.parentId = parent ? nodeKey(parent, turn) : node.parentId
+          const taskParent = stringOf(rawNode.task_node_id)
+          node.parentId = taskParent ? `task:${taskParent}` : parent ? nodeKey(parent, turn) : node.parentId
           node.agentId = stringOf(rawNode.agent_id) ?? stringOf(data.agent_id)
             ?? (node.kind === 'worker' && node.parentId ? delegatesByParent.get(node.parentId) : undefined)
             ?? node.agentId
@@ -1012,6 +1041,7 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const reason = reasonOf(data.reason)
         for (const node of nodeMap.values()) {
           if (node.turn !== turn) continue
+          if (node.id.startsWith('task:')) continue
           if (node.status === 'running') {
             node.status = reason.kind === 'error' ? 'failed'
               : reason.kind === 'aborted' ? 'interrupted' : 'done'
@@ -1035,6 +1065,13 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
     if (status === 'running') activeNodeId = id
   }
   const nodes: FlowNodeData[] = [...nodeMap.values()].map(node => ({ ...node, files: [...node.files] }))
+  for (const node of nodes) {
+    if (!node.id.startsWith('task:')) continue
+    const requests = nodes.filter(request => request.parentId === node.id && !request.id.startsWith('task:'))
+    ;(node as { tools: readonly FlowToolExecution[] }).tools = [...node.tools, ...requests.flatMap(request => request.tools)]
+  }
+  const activeTask = nodes.find(node => node.id.startsWith('task:') && node.status === 'running' && !node.agentId)
+  if (activeTask) activeNodeId = activeTask.id
   const nodesById = new Map(nodes.map(node => [node.id, node]))
   const labeledEdges = edges.map(edge => {
     const target = nodesById.get(edge.target)

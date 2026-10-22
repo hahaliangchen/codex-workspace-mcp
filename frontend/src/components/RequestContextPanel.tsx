@@ -87,6 +87,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
 
   const visible = useMemo(() => items.filter(item => {
     if (nodeId === undefined) return true
+    if (nodeId.startsWith('task:')) return item.task_node_id === nodeId.slice(5)
     if (item.request_id !== undefined && requestId !== undefined && item.request_id !== requestId) return false
     if (item.revision !== undefined && revision !== undefined && item.revision !== revision) return false
     if (item.plan_revision !== undefined && planRevision !== undefined && item.plan_revision !== planRevision) return false
@@ -100,7 +101,7 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
            (Boolean(itemWorkId) && (itemWorkId === nodeId || `turn_${item.turn}:${itemWorkId}` === nodeId || itemWorkId === rawNodeId))
   }), [items, nodeId, turn, workId, requestId, revision, planRevision])
   const active = visible.find(item => item.id === selected)
-  const predecessor = active ? items.find(item => item.id < active.id && item.actor === active.actor) : undefined
+  const predecessor = active ? items.find(item => item.id < active.id && item.actor === active.actor && item.task_node_id === active.task_node_id) : undefined
 
   useEffect(() => {
     setSelected(null); setContext(null); setPrevious(null); setCompare(false)
@@ -147,7 +148,6 @@ export function RequestContextPanel({ taskId, events, nodeId, turn, workId, requ
 
   return <section className={css.panel}>
     <h3>实际模型请求上下文</h3>
-    <p className={css.hint}>规划、执行和观察的每次完整请求自动记录，任务结束后保留。Worker 是 Organizer 专注任务的执行分身，接收任务及必要信息并返回结果；Observer 只在执行结束后复盘原始过程，结论显示在聊天中。这里展示各次请求实际收到的上下文；同一历史事实被多次引用不代表多次操作。规划前请求及复盘可在「全部请求」查看。</p>
     {error && <p role="alert" className={css.error}>{error}</p>}
     <select aria-label="选择模型请求" value={selected ?? ''} onChange={event => { setSelected(Number(event.target.value) || null); setCompare(false) }}>
       <option value="">选择请求（{visible.length} 条）</option>

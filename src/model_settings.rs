@@ -7,9 +7,23 @@ pub const OUTPUT_RESERVE: usize = 24_576;
 /// Used when the DSH model entry does not declare `maxTokens`.
 pub const DEFAULT_MAX_OUTPUT: usize = 32_768;
 
+pub fn context_window(state: &AgentServiceState, model: &str) -> usize {
+    declared_context_window(state,model).unwrap_or(crate::context_window::MAX_TOKENS)
+}
+
+fn declared_context_window(state: &AgentServiceState, model: &str) -> Option<usize> {
+    state.provider_routes.get(&state.provider_name)
+        .and_then(|route| route.context_windows.get(route.models.get(model).map(String::as_str).unwrap_or(model)))
+        .copied()
+}
+
+pub fn input_budget(state: &AgentServiceState, model: &str) -> usize {
+    let capacity = context_window(state, model);
+    capacity.saturating_sub(OUTPUT_RESERVE.min(capacity / 4)).max(1)
+}
+
 /// The model's declared output limit, bounded by what the window has left
-/// after `input` tokens. Input budgets already leave OUTPUT_RESERVE free, so
-/// a request within budget always receives at least that much.
+/// after `input` tokens. Small windows reserve one quarter for generation.
 pub fn output_tokens(
     state: &AgentServiceState,
     model: &str,
@@ -22,8 +36,9 @@ pub fn output_tokens(
         .and_then(|route| route.max_output_tokens.get(model))
         .copied()
         .unwrap_or(DEFAULT_MAX_OUTPUT);
+    let capacity = input_budget.saturating_add(OUTPUT_RESERVE.min(input_budget / 3));
     declared
-        .min((input_budget + OUTPUT_RESERVE).saturating_sub(input))
+        .min(declared_context_window(state, model).unwrap_or(capacity).min(capacity).saturating_sub(input))
         .max(1)
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -84,8 +99,16 @@ impl ModelSettings {
     }
     pub fn input_budget(&self, inherited: usize) -> usize {
         self.context_window
-            .map(|n| n.saturating_sub(OUTPUT_RESERVE))
+            .map(|n| n.saturating_sub(OUTPUT_RESERVE.min(n / 4)))
             .unwrap_or(inherited)
+    }
+    pub fn resolved_input_budget(&self, state: &AgentServiceState, model: &str) -> usize {
+        let catalog = declared_context_window(state,model);
+        let capacity = match (self.context_window,catalog) {
+            (Some(configured),Some(declared)) => configured.min(declared),
+            (configured,declared) => configured.or(declared).unwrap_or(crate::context_window::MAX_TOKENS),
+        };
+        capacity.saturating_sub(OUTPUT_RESERVE.min(capacity / 4)).max(1)
     }
     pub fn resolve(&self, main: &AgentServiceState, main_model: &str) -> Result<AgentServiceState> {
         let mut state = main.clone();
@@ -144,6 +167,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 max_output_tokens: [("mapped-model".into(), 64_000)].into_iter().collect(),
+                context_windows: Default::default(),
                 context_request_options: Default::default(),
             },
         );
@@ -170,6 +194,12 @@ mod tests {
             output_tokens(&routed, "undeclared", 231_424, 1_000),
             DEFAULT_MAX_OUTPUT
         );
+        let mut bounded = routed.clone();
+        bounded.provider_routes.get_mut("alternate").unwrap().context_windows.insert("mapped-model".into(), 65_536);
+        assert_eq!(context_window(&bounded, "alias"), 65_536);
+        assert_eq!(input_budget(&bounded, "mapped-model"), 49_152);
+        assert_eq!(output_tokens(&bounded, "mapped-model", 49_152, 49_152),16_384);
+        assert_eq!(context_window(&bounded, "missing"), crate::context_window::MAX_TOKENS);
 
         let inherited = ModelSettings::default()
             .resolve(&main, "turn-model")
@@ -195,6 +225,8 @@ mod tests {
             .is_err()
         );
         assert_eq!(config.input_budget(231424), 475424);
+        assert_eq!(config.resolved_input_budget(&main,"turn-model"),475424);
+        assert_eq!(config.resolved_input_budget(&bounded,"mapped-model"),49152);
         assert_eq!(main.reasoning_effort.as_deref(), Some("high"));
         assert_ne!(main.default_model, child.default_model);
         let mut invalid = config.clone();

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, type Dispatch, type SetStateAction } from 'react'
 import clsx from 'clsx'
-import logoImg from '../assets/sprout.svg'
+import { useBrandIcon, usePalette } from '../brand.ts'
 import { taskTitle, workspaceName } from './Sidebar.tsx'
 import { TaskBoardCard } from './TaskBoardCard.tsx'
 import { FlowView } from './FlowView.tsx'
@@ -25,6 +25,9 @@ interface PageProps {
 export function HeroPage({ workspace, renderSlot }: PageProps) {
   const currentWs = workspace.projects.find(project => project.path === workspace.activeWorkspace)?.path ?? ''
   const wsName = workspaceName(currentWs)
+  const logoImg = useBrandIcon()
+  // 新芽 plants, 银杏 harvests: the greeting follows the season of the theme.
+  const verb = usePalette() === 'ginkgo' ? '收获' : '种'
 
   return (
     <main className={welcomeCss.page} data-phase="hero">
@@ -32,7 +35,7 @@ export function HeroPage({ workspace, renderSlot }: PageProps) {
         <div className={welcomeCss.heading}>
           <img src={logoImg} className={welcomeCss.logo} alt="" />
           <h1 className={welcomeCss.title}>
-            {workspace.sidebarMode === 'chat' ? '今天想聊点什么？' : !currentWs ? '今天想一起做点什么？' : <>今天想在 <span className={welcomeCss.workspace}>{wsName}</span> 里种点什么？</>}
+            {workspace.sidebarMode === 'chat' ? '今天想聊点什么？' : !currentWs ? '今天想一起做点什么？' : <>今天想在 <span className={welcomeCss.workspace}>{wsName}</span> 里{verb}点什么？</>}
           </h1>
         </div>
         {renderSlot('agent.composer', {

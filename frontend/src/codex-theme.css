@@ -41,6 +41,18 @@
   --codex-diff-del: #dc2626;
   --codex-diff-del-bg: #fee2e2;
 
+  /* Theme-aware illustration and status colours: leaf icons, leaf cards
+     and the context usage ring. The 银杏 theme re-points them below. */
+  --codex-leaf-border: #9fe1cb;
+  --codex-leaf-bg: #f2fbf7;
+  --theme-leaf-light: #5dcaa5;
+  --theme-leaf-mid: #1d9e75;
+  --theme-leaf-dark: #0f6e56;
+  --theme-leaf-vein: #e1f5ee;
+  --theme-ring-low: #1d9e75;
+  --theme-ring-mid: #5dcaa5;
+  --theme-ring-high: #d97706;
+
   /* Harmonize DSH tokens with Codex aesthetic */
   --dsw-alias-bg-base: #ffffff;
   --dsw-specific-sidebar-fill: #f6f8f6;
@@ -74,6 +86,10 @@ body[data-ds-dark-theme] {
   --codex-amber-circle: #f59e0b;
   --codex-amber-bg: #78350f33;
   --codex-amber-border: #b45309;
+  --codex-leaf-border: #0f6e56;
+  --codex-leaf-bg: #0f6e5622;
+  --theme-on-soft: #e1f5ee;
+  --theme-soft-border: #2d5a47;
 
   --dsw-alias-bg-base: #18181b;
   --dsw-specific-sidebar-fill: #151917;
@@ -129,4 +145,76 @@ html body[data-ds-dark-theme] {
   --dsw-specific-bubble: #1f3029;
   --dsw-specific-bubble-highlight: #24493a;
   --dsw-specific-sidebar-nav-item-active-accent: #1d3a2e;
+}
+
+/* ==========================================================================
+   银杏 (Ginkgo) theme: autumn, crisp and calm. Maple red carries actions,
+   links and focus; ginkgo gold carries the brand mark, task marks and
+   selection. Surfaces stay near-white (light) or neutral zinc (dark) so the
+   two warm accents read quietly. body[data-theme] is set by theme.ts.
+   ========================================================================== */
+html body[data-theme='ginkgo'] {
+  --dsw-static-deepseek-50: #fdf4f1;
+  --dsw-static-deepseek-100: #fae5de;
+  --dsw-static-deepseek-200: #f3c9bc;
+  --dsw-static-deepseek-300: #e9a693;
+  --dsw-static-deepseek-400: #db7a62;
+  --dsw-static-deepseek-450: #cc5f45;
+  --dsw-static-deepseek-500: #b5452c;
+  --dsw-static-deepseek-600: #933520;
+  --dsw-static-deepseek-700-delete: #722818;
+  --dsw-static-deepseek-800: #3b1d16;
+  --dsw-static-deepseek-900: #28140f;
+
+  --theme-leaf-light: #f2c14e;
+  --theme-leaf-mid: #e2a52e;
+  --theme-leaf-dark: #a8740b;
+  --theme-leaf-vein: #fff4d6;
+  --theme-ring-low: #d4a017;
+  --theme-ring-mid: #e9c46a;
+  --theme-ring-high: #c0462f;
+}
+
+html body[data-theme='ginkgo']:not([data-ds-dark-theme]) {
+  --codex-sidebar-bg: #f8f6f2;
+  --codex-panel-bg: #f8f6f2;
+  --codex-hover-bg: #f3eee7;
+  --codex-active-pill: #f7ebd0;
+  --codex-active-hover: #f1dfb6;
+  --codex-blue-primary: #b5452c;
+  --codex-blue-hover: #933520;
+  --sprout-strong: #9a6a0c;
+  --sprout-soft: #f8eccd;
+  --codex-leaf-border: #ead39a;
+  --codex-leaf-bg: #fdf8ea;
+
+  --dsw-specific-sidebar-fill: #f8f6f2;
+  --dsw-alias-interactive-bg-hover: #f3eee7;
+  --dsw-alias-state-business-primary: #b5452c;
+  --dsw-specific-bubble: #f8f1e1;
+  --dsw-specific-bubble-highlight: #f1e1bc;
+  --dsw-specific-sidebar-nav-item-active-accent: #f7ebd0;
+}
+
+html body[data-theme='ginkgo'][data-ds-dark-theme] {
+  --codex-sidebar-bg: #19181a;
+  --codex-panel-bg: #19181a;
+  --codex-hover-bg: #29241f;
+  --codex-active-pill: #3a3020;
+  --codex-active-hover: #4a3c25;
+  --codex-blue-primary: #d9694d;
+  --codex-blue-hover: #e8856a;
+  --sprout-strong: #f0c24f;
+  --sprout-soft: #3a3020;
+  --codex-leaf-border: #8a6a24;
+  --codex-leaf-bg: #2a2418;
+  --theme-on-soft: #fbefd2;
+  --theme-soft-border: #5c4a24;
+
+  --dsw-specific-sidebar-fill: #19181a;
+  --dsw-alias-interactive-bg-hover: #29241f;
+  --dsw-alias-state-business-primary: #d9694d;
+  --dsw-specific-bubble: #2c261c;
+  --dsw-specific-bubble-highlight: #3d3322;
+  --dsw-specific-sidebar-nav-item-active-accent: #3a3020;
 }

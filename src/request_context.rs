@@ -31,7 +31,32 @@ fn connection(root: &Path) -> Result<Connection> {
             actor TEXT NOT NULL, turn INTEGER NOT NULL, step INTEGER NOT NULL, node_id TEXT NOT NULL,
             metadata TEXT NOT NULL, request_json TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_request_context_task ON agent_request_contexts(task_id,id);")?;
+    for (column, definition) in [("recording", "INTEGER NOT NULL DEFAULT 1"), ("retention_days", "INTEGER NOT NULL DEFAULT 7")] {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_context_debug') WHERE name=?1)", [column], |row| row.get(0))?;
+        if !exists {
+            let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_context_debug') WHERE name=?1)", [column], |row| row.get(0))?;
+            if !exists { tx.execute(&format!("ALTER TABLE agent_context_debug ADD COLUMN {column} {definition}"), [])?; }
+            tx.commit()?;
+        }
+    }
     Ok(conn)
+}
+
+fn policy(conn: &Connection, task: &str) -> Result<Value> {
+    let current_schema: bool = conn.query_row("SELECT COUNT(*)=2 FROM pragma_table_info('agent_context_debug') WHERE name IN ('recording','retention_days')", [], |row|row.get(0))?;
+    if !current_schema { return Ok(json!({"enabled":true,"recording":true,"retention_days":7})); }
+    let (enabled, recording, days) = conn.query_row("SELECT enabled,recording,retention_days FROM agent_context_debug WHERE task_id=?1", [task],
+        |row| Ok((row.get::<_,bool>(0)?,row.get::<_,bool>(1)?,row.get::<_,u32>(2)?))).optional()?.unwrap_or((true,true,7));
+    Ok(json!({"enabled":enabled,"recording":recording,"retention_days":days}))
+}
+
+fn expire_bodies(tx: &Connection, task: &str, days: u64, at: i64) -> Result<()> {
+    let cutoff = at.saturating_sub(days.saturating_mul(86_400_000).min(i64::MAX as u64) as i64);
+    tx.execute("UPDATE agent_request_contexts SET request_json='null',metadata=json_set(metadata,'$.body_recorded',json('false'),'$.body_expired',json('true'))
+        WHERE task_id=?1 AND request_json<>'null' AND COALESCE(json_extract(metadata,'$.created_at'),0)<?2 AND json_extract(metadata,'$.status')<>'pending'",
+        params![task,cutoff])?;
+    Ok(())
 }
 
 fn exists(conn: &Connection, task_id: &str) -> Result<()> {
@@ -55,15 +80,7 @@ pub async fn setting(
         tokio::task::spawn_blocking(move || -> Result<Value> {
             let conn = connection(&root)?;
             exists(&conn, &task_id)?;
-            let enabled = conn
-                .query_row(
-                    "SELECT enabled FROM agent_context_debug WHERE task_id=?1",
-                    [&task_id],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?
-                .unwrap_or(true);
-            Ok(json!({"enabled":enabled,"recording":true}))
+            policy(&conn, &task_id)
         })
         .await,
     )
@@ -71,21 +88,32 @@ pub async fn setting(
 
 #[derive(Deserialize)]
 pub struct DebugSetting {
-    enabled: bool,
+    enabled: Option<bool>,
+    recording: Option<bool>,
+    retention_days: Option<u32>,
 }
 
 // The legacy context-debug endpoint now controls panel visibility only.
-// Hiding a panel must not stop recording any role's actual model inputs.
+// Panel visibility and full-body retention are independent settings.
 pub async fn set_setting(
     State(state): State<AgentServiceState>,
     RoutePath(task_id): RoutePath<String>,
     Json(input): Json<DebugSetting>,
 ) -> Response {
+    if input.retention_days.is_some_and(|days| !(1..=365).contains(&days)) {
+        return (StatusCode::BAD_REQUEST,Json(json!({"error":"retention_days must be between 1 and 365"}))).into_response();
+    }
     let root = state.workspace.root().to_path_buf();
     respond(tokio::task::spawn_blocking(move || -> Result<Value> {
-        let conn = connection(&root)?; exists(&conn, &task_id)?;
-        conn.execute("INSERT INTO agent_context_debug(task_id,enabled) VALUES (?1,?2) ON CONFLICT(task_id) DO UPDATE SET enabled=excluded.enabled", params![task_id,input.enabled])?;
-        Ok(json!({"enabled":input.enabled,"recording":true}))
+        let mut conn = connection(&root)?; exists(&conn, &task_id)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let old = policy(&tx, &task_id)?;
+        tx.execute("INSERT INTO agent_context_debug(task_id,enabled,recording,retention_days) VALUES (?1,?2,?3,?4) ON CONFLICT(task_id) DO UPDATE SET enabled=excluded.enabled,recording=excluded.recording,retention_days=excluded.retention_days",
+            params![task_id,input.enabled.unwrap_or(old["enabled"].as_bool().unwrap()),input.recording.unwrap_or(old["recording"].as_bool().unwrap()),input.retention_days.unwrap_or(old["retention_days"].as_u64().unwrap() as u32)])?;
+        let result = policy(&tx, &task_id)?;
+        expire_bodies(&tx, &task_id, result["retention_days"].as_u64().unwrap(), now())?;
+        tx.commit()?;
+        Ok(result)
     }).await)
 }
 
@@ -102,6 +130,7 @@ pub async fn list(
     let root = state.workspace.root().to_path_buf();
     respond(tokio::task::spawn_blocking(move || -> Result<Value> {
         let conn = connection(&root)?; exists(&conn, &task_id)?;
+        expire_bodies(&conn, &task_id, policy(&conn, &task_id)?["retention_days"].as_u64().unwrap(), now())?;
         let mut stmt = conn.prepare("SELECT id,metadata FROM agent_request_contexts WHERE task_id=?1 AND id<?2 ORDER BY id DESC LIMIT 201")?;
         let raw = stmt.query_map(params![task_id,query.before.unwrap_or(i64::MAX)], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let has_more = raw.len() > 200;
@@ -119,6 +148,7 @@ pub async fn get(
     respond(
         tokio::task::spawn_blocking(move || -> Result<Value> {
             let conn = connection(&root)?;
+            expire_bodies(&conn, &task_id, policy(&conn, &task_id)?["retention_days"].as_u64().unwrap(), now())?;
             saved_context(&conn, &task_id, id)?.context("request context not found")
         })
         .await,
@@ -132,6 +162,7 @@ pub fn saved_context(conn: &Connection, task_id: &str, id: i64) -> Result<Option
     if !exists {
         return Ok(None);
     }
+    let days = policy(conn, task_id)?["retention_days"].as_u64().unwrap();
     let row: Option<(String, String)> = conn
         .query_row(
             "SELECT metadata,request_json FROM agent_request_contexts WHERE task_id=?1 AND id=?2",
@@ -141,7 +172,13 @@ pub fn saved_context(conn: &Connection, task_id: &str, id: i64) -> Result<Option
         .optional()?;
     row.map(|(meta,body)| {
         let mut metadata:Value=serde_json::from_str(&meta)?;metadata["id"]=json!(id);
-        Ok(json!({"record_kind":"model_input","metadata":metadata,"body":serde_json::from_str::<Value>(&body)?}))
+        let expired = metadata["status"]!="pending" && metadata["created_at"].as_i64().unwrap_or(0) < now().saturating_sub((days*86_400_000) as i64);
+        let body = if expired {
+            metadata["body_expired"] = json!(true);
+            metadata["body_recorded"] = json!(false);
+            Value::Null
+        } else { serde_json::from_str::<Value>(&body)? };
+        Ok(json!({"record_kind":"model_input","metadata":metadata,"body":body}))
     }).transpose()
 }
 
@@ -238,7 +275,7 @@ async fn persist_outcome(root: PathBuf, task_id: String, id: i64, metadata: Valu
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         ensure!(tx.execute("UPDATE agent_request_contexts SET metadata=?1 WHERE id=?2 AND task_id=?3",
             params![metadata.to_string(),id,task_id])? == 1, "request context disappeared");
-        crate::agent_service::append_event_tx(&tx,&task_id,"debug/context_end",&json!({"id":id}),None)?;
+        crate::agent_service::append_event_tx(&tx,&task_id,"debug/context_end",&json!({"id":id,"task_node_id":metadata["task_node_id"]}),None)?;
         if metadata["request_flow"] == true {
             let status = match metadata["status"].as_str() {
                 Some("completed") => "done",
@@ -246,7 +283,7 @@ async fn persist_outcome(root: PathBuf, task_id: String, id: i64, metadata: Valu
                 _ => "failed",
             };
             crate::agent_service::append_event_tx(&tx,&task_id,"flow/node_state",
-                &json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":status,"context_id":id}),None)?;
+                &json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":status,"context_id":id,"task_node_id":metadata["task_node_id"]}),None)?;
         }
         tx.commit()?;
         Ok(())
@@ -280,7 +317,7 @@ pub(crate) fn recover_interrupted(conn: &mut Connection, task: &str) -> Result<(
             &tx,
             task,
             "debug/context_end",
-            &json!({"id":id}),
+            &json!({"id":id,"task_node_id":metadata["task_node_id"]}),
             None,
         )?;
         if metadata["request_flow"] == true {
@@ -288,7 +325,7 @@ pub(crate) fn recover_interrupted(conn: &mut Connection, task: &str) -> Result<(
                 &tx,
                 task,
                 "flow/node_state",
-                &json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":"interrupted","context_id":id}),
+                &json!({"turn":metadata["turn"],"id":metadata["nodeId"],"status":"interrupted","context_id":id,"task_node_id":metadata["task_node_id"]}),
                 None,
             )?;
         }
@@ -367,17 +404,21 @@ pub async fn record(
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         // This cutoff describes the available pool, not a claim that every
         // earlier event was selected into the request. The exact view is body.
-        let seq:i64=tx.query_row("SELECT COALESCE(MAX(seq),-1)+1 FROM agent_task_events WHERE task_id=?1",[&db_id],|row|row.get(0))?;
+        let seq=crate::agent_service::next_event_seq(&tx, &db_id)?;
         let mut db_meta=db_meta;
+        let settings = policy(&tx, &db_id)?;
+        let recording = settings["recording"].as_bool().unwrap();
+        db_meta["body_recorded"] = json!(recording);
+        expire_bodies(&tx, &db_id, settings["retention_days"].as_u64().unwrap(), now())?;
         db_meta["history_pool"]=json!({"scope":"conversation","task_id":db_id,"before_seq":seq});
         db_meta["history_reference"]=json!({"scope":"conversation","task_id":db_id,"event_seq":seq});
         tx.execute("INSERT INTO agent_request_contexts(task_id,actor,turn,step,node_id,metadata,request_json) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![db_id,
             db_meta["actor"].as_str().unwrap_or("worker"),db_meta["turn"].as_u64().unwrap_or(0),db_meta["step"].as_u64().unwrap_or(0),
-            db_meta["nodeId"].as_str().unwrap_or(""),db_meta.to_string(),body_text])?;
+            db_meta["nodeId"].as_str().unwrap_or(""),db_meta.to_string(),if recording {body_text.as_str()} else {"null"}])?;
         let id=tx.last_insert_rowid();
         crate::agent_service::append_event_tx(&tx,&db_id,"debug/context_request",&json!({
             "id":id,"record_kind":"model_input","actor":db_meta["actor"],"turn":db_meta["turn"],
-            "step":db_meta["step"],"nodeId":db_meta["nodeId"],"workId":db_meta["workId"],
+            "step":db_meta["step"],"nodeId":db_meta["nodeId"],"workId":db_meta["workId"],"task_node_id":db_meta["task_node_id"],
             "identity":{"task_id":db_id,"request_id":db_meta["request_id"],"node_id":db_meta["nodeId"]},
             "history_pool":db_meta["history_pool"],"history_reference":db_meta["history_reference"],
             "note":"Exact role input view; references shared history, not a new tool action or independent observation."
@@ -387,12 +428,12 @@ pub async fn record(
             let mut edges = Vec::new();
             if let Some(previous) = db_meta["previous_node_id"].as_str() {
                 edges.push(json!({"source":previous,"target":node,"label":"next request"}));
-            } else if let Some(parent) = db_meta["parent_node_id"].as_str() {
+            } else if let Some(parent) = db_meta["task_node_id"].as_str().or_else(||db_meta["parent_node_id"].as_str()) {
                 let label = if db_meta["actor"] == "worker" { "task delegate" } else { "context subagent" };
                 edges.push(json!({"source":parent,"target":node,"label":label}));
             }
             crate::agent_service::append_event_tx(&tx,&db_id,"flow/node_add",&json!({"turn":db_meta["turn"],
-                "node":{"id":node,"kind":db_meta["actor"],"title":format!("{} · {}",db_meta["actor"].as_str().unwrap_or("agent"),id),
+                "task_node_id":db_meta["task_node_id"],"node":{"id":node,"kind":db_meta["actor"],"title":format!("{} · {}",db_meta["actor"].as_str().unwrap_or("agent"),id),"task_node_id":db_meta["task_node_id"],
                     "status":"running","parent_id":db_meta["parent_node_id"],"agent_id":db_meta["agent_id"],"request_id":db_meta["request_id"],"context_id":id},
                 "edges":edges}),None)?;
         }
@@ -429,6 +470,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn body_recording_can_be_disabled_without_losing_flow_or_audit_identity() {
+        let root = std::env::temp_dir().join(format!("request-policy-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = connection(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)", []).unwrap();
+        conn.execute("INSERT INTO agent_context_debug(task_id,enabled,recording,retention_days) VALUES ('task',1,0,1)", []).unwrap();
+        let trace = record(&root,"task",json!({"actor":"agent","turn":1,"step":1,"nodeId":"request-a","request_flow":true}),
+            &json!({"model":"fake","messages":[{"role":"user","content":"private full input"}]})).await.unwrap();
+        let id = trace.id();
+        trace.finish_checked("completed",json!({})).await.unwrap();
+        let saved = saved_context(&conn,"task",id).unwrap().unwrap();
+        assert!(saved["body"].is_null());
+        assert_eq!(saved["metadata"]["body_recorded"],false);
+        assert_eq!(saved["metadata"]["status"],"completed");
+        let nodes:usize = conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE kind='flow/node_add'", [], |row|row.get(0)).unwrap();
+        assert_eq!(nodes,1);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retention_expires_bodies_but_keeps_pending_inputs_and_history_references() {
+        let root = std::env::temp_dir().join(format!("request-retention-{}",crate::visual_artifacts::new_id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut conn = connection(&root).unwrap();
+        for (id,status,created) in [(1,"completed",0),(2,"pending",0),(3,"completed",172_800_000)] {
+            conn.execute("INSERT INTO agent_request_contexts(id,task_id,actor,turn,step,node_id,metadata,request_json) VALUES (?1,'task','agent',1,1,'n',?2,?3)",
+                params![id,json!({"status":status,"created_at":created,"history_reference":{"event_seq":id}}).to_string(),json!({"messages":["full input"]}).to_string()]).unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        expire_bodies(&tx,"task",1,172_800_000).unwrap();
+        tx.commit().unwrap();
+        let rows: Vec<(i64,String,String)> = conn.prepare("SELECT id,request_json,metadata FROM agent_request_contexts ORDER BY id").unwrap()
+            .query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows[0].1,"null");
+        assert_eq!(serde_json::from_str::<Value>(&rows[0].2).unwrap()["history_reference"]["event_seq"],1);
+        assert_ne!(rows[1].1,"null");
+        assert_ne!(rows[2].1,"null");
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn roles_record_exact_views_of_one_shared_fact_even_when_panel_is_hidden() {
         let root = std::env::temp_dir().join(format!(
             "role-context-pool-{}",
@@ -438,7 +522,7 @@ mod tests {
         {
             let mut conn = connection(&root).unwrap();
             conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','check collision','fake','running',0,0)",[]).unwrap();
-            conn.execute("INSERT INTO agent_context_debug VALUES ('task',0)", [])
+            conn.execute("INSERT INTO agent_context_debug(task_id,enabled) VALUES ('task',0)", [])
                 .unwrap();
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
             crate::agent_service::append_event_tx(

@@ -21,6 +21,8 @@ pub fn require_generation(root:&Path,task:&str)->Result<Value>{
 pub fn guard(root:&Path,task:&str,name:&str)->Result<()> {
     if matches!(name.trim_start_matches("ppt_master__"),"apply_html"|"manage_design_pages"|"apply_edits"|"build_deck") {
         require_generation(root,task)?;
+        let conn=crate::agent_service::open_db(root)?;
+        if let Some(active)=crate::task_tree::active(&conn,task)? {crate::task_tree::validate_plan_version(&conn,task,&active)?;}
     }
     Ok(())
 }

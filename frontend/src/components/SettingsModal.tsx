@@ -31,7 +31,7 @@ import modelsCss from '../dsh/settings/ModelsSection.module.css'
 import pluginsCss from '../dsh/settings/PluginInventorySettingsTab.module.css'
 import rootCss from '../dsh/settings/SettingsRoot.module.css'
 import subagentCss from '../dsh/settings/SubagentCard.module.css'
-import { getThemeMode, setThemeMode, type ThemeMode } from '../theme.ts'
+import { brandIcon, getPalette, getThemeMode, setPalette, setThemeMode, type ThemeMode, type ThemePalette } from '../theme.ts'
 import type { SettingsTab } from '../useAgentWorkspace.ts'
 
 interface DraftProvider {
@@ -138,6 +138,7 @@ export function SettingsModal({
   onSaved: () => void
 }) {
   const [themeMode, setThemeModeState] = useState<ThemeMode>(getThemeMode)
+  const [palette, setPaletteState] = useState<ThemePalette>(getPalette)
   const [draft, setDraft] = useState<DraftSettings | null>(null)
   const [openProviderId, setOpenProviderId] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -180,6 +181,7 @@ export function SettingsModal({
   useEffect(() => {
     if (!open) return
     setThemeModeState(getThemeMode())
+    setPaletteState(getPalette())
     loadSettings()
     loadPlugins()
   }, [open, loadSettings, loadPlugins])
@@ -462,6 +464,34 @@ export function SettingsModal({
                       >
                         {option.icon}
                         <span>{option.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className={appearanceCss.group}>
+                  <div className={appearanceCss.title}>主题</div>
+                  <div className={appearanceCss.cubeRow}>
+                    {([
+                      { palette: 'sprout', label: '新芽', hint: '生机 · 青绿', swatches: ['#1d9e75', '#5dcaa5', '#e3f1ea'] },
+                      { palette: 'ginkgo', label: '银杏', hint: '秋日 · 清爽冷静 · 枫叶红与银杏黄', swatches: ['#b5452c', '#e2a52e', '#f8eccd'] },
+                    ] as const).map(option => (
+                      <button
+                        key={option.palette}
+                        type="button"
+                        title={option.hint}
+                        aria-pressed={palette === option.palette}
+                        className={clsx(appearanceCss.themeCube, palette === option.palette && appearanceCss.selected)}
+                        onClick={() => {
+                          setPaletteState(option.palette)
+                          setPalette(option.palette)
+                        }}
+                      >
+                        <img src={brandIcon(option.palette)} width={24} height={24} alt="" />
+                        <span>{option.label}</span>
+                        <span className={appearanceCss.swatches} aria-hidden="true">
+                          {option.swatches.map(color => <i key={color} style={{ background: color }} />)}
+                        </span>
                       </button>
                     ))}
                   </div>

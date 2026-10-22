@@ -61,7 +61,8 @@ function mentionInsert(path: string): string {
 export type DshPermissionMode = 'read_only' | 'workspace_write' | 'ask' | 'full_access'
 
 const FULL_ACCESS_ICON = <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" aria-hidden="true"><path d="M9 1.5 3.5 9H8l-1 5.5L12.5 7H8l1-5.5Z" /></svg>
-const ASK_ICON = <svg width="14" height="14" viewBox="0 0 64 64" aria-hidden="true"><path d="M14 50C10 28 26 12 52 12c0 26-16 42-38 38Z" fill="currentColor" opacity="0.85" /><path d="M14 50 40 24" stroke="#fff" strokeWidth="4" strokeLinecap="round" /></svg>
+// Same shield as 仅可查看, with a question mark: commands and the browser ask first.
+const ASK_ICON = <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true"><path d="M6.59624 2.14853C7.50155 1.80917 8.49914 1.80919 9.40444 2.14859L13.9245 3.84317V7.11961C13.9245 11.6089 10.5565 13.5975 8.00035 14.5779C5.44423 13.5975 2.07544 11.6089 2.07544 7.11961V3.84317L6.59624 2.14853Z" strokeLinejoin="round" /><path d="M6.6 6.55a1.45 1.45 0 0 1 2.82.48c0 .96-1.42 1.2-1.42 2.08" strokeLinecap="round" strokeLinejoin="round" /><circle cx="8" cy="11.15" r="0.55" fill="currentColor" stroke="none" /></svg>
 
 export function Composer({
   variant,

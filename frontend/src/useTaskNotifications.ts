@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { Task } from './api.ts'
 import { taskTitle } from './sidebarModel.ts'
-import sproutIcon from './assets/sprout.svg'
+import { brandIcon } from './theme.ts'
 
 type Watched = { readonly running: boolean; readonly awaiting: boolean }
 
@@ -41,7 +41,7 @@ function notify(title: string, body: string, onClick: () => void): void {
   chime()
   try {
     if (!('Notification' in window) || Notification.permission !== 'granted') return
-    const note = new Notification(title, { body, icon: sproutIcon, tag: title + body })
+    const note = new Notification(title, { body, icon: brandIcon(), tag: title + body })
     note.onclick = () => { window.focus(); onClick(); note.close() }
   } catch { /* notifications unavailable */ }
 }

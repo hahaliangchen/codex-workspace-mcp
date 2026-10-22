@@ -1,10 +1,7 @@
-import { memo, useMemo, type ReactNode } from 'react'
+import { memo, useMemo } from 'react'
 import clsx from 'clsx'
 import {
-  DiffBlock, DisclosureRow, IconCordisPluginOutlineRegular,
-  IconDatabaseOutlineRegular,
-  IconFlatListOutlineRegular,
-  IconWorkspaceTreeOutlineRegular, ReadBlock, SearchBlock, TerminalBlock,
+  DiffBlock, DisclosureRow, ReadBlock, SearchBlock, TerminalBlock,
   TextShimmer, diffTotals, languageForPath,
   type DiffBlockLabels, type DiffHunk, type ReadBlockLabels, type ReadBlockLine,
   type SearchBlockLabels, type TerminalBlockLabels,
@@ -24,62 +21,9 @@ import { t } from '../i18n.ts'
 import type { ToolResult } from '../model.ts'
 import { VisualArtifactPreview } from './VisualMaterials.tsx'
 import type { VisualRecord } from '../visual.ts'
+import { toolVisual } from './toolVisuals.tsx'
 
 const SUMMARY_FIELDS = ['path', 'file_path', 'TargetFile', 'AbsolutePath', 'query', 'pattern', 'command', 'CommandLine', 'program', 'symbol', 'symbol_id', 'name', 'prompt', 'area']
-
-function iconFor(name: string): ReactNode {
-  if (name === 'run_program' || name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) {
-    return (
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
-        <rect x="1.5" y="1.5" width="13" height="13" rx="3" stroke="currentColor" />
-        <path d="M4.5 5.5L7 8L4.5 10.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
-        <line x1="8.5" y1="10.5" x2="11.5" y2="10.5" stroke="currentColor" strokeLinecap="round" />
-      </svg>
-    )
-  }
-  if (/write|edit|replace|apply|patch|create|delete/.test(name)) {
-    return (
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
-        <rect x="1.5" y="1.5" width="13" height="13" rx="3" stroke="currentColor" />
-        <path d="M5.5 10.5L10 6L9 5L4.5 9.5V11.5H6.5L5.5 10.5Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    )
-  }
-  if (/read|open|view/.test(name)) {
-    return (
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
-        <rect x="2" y="1.5" width="12" height="13" rx="2.5" stroke="currentColor" />
-        <path d="M5 5H11M5 8H11M5 11H8.5" stroke="currentColor" strokeLinecap="round" />
-      </svg>
-    )
-  }
-  if (/search|find|grep/.test(name)) {
-    return (
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3">
-        <rect x="1.5" y="1.5" width="13" height="13" rx="3" stroke="currentColor" />
-        <circle cx="7.5" cy="7.5" r="2.8" stroke="currentColor" />
-        <line x1="9.5" y1="9.5" x2="12" y2="12" stroke="currentColor" strokeLinecap="round" />
-      </svg>
-    )
-  }
-  if (/symbol|index/.test(name)) return <IconWorkspaceTreeOutlineRegular size={14} />
-  if (/memory|architecture|business/.test(name)) return <IconDatabaseOutlineRegular size={14} />
-  if (/list/.test(name)) return <IconFlatListOutlineRegular size={14} />
-  return <IconCordisPluginOutlineRegular size={14} />
-}
-
-function titleFor(name: string): string {
-  if (name === 'read_skill') return '读取了技能'
-  if (name === 'run_program') return '运行了程序'
-  if (name === 'run_command' || /bash|shell|exec|powershell|cmd/.test(name)) return '运行了命令'
-  if (/write|edit|replace|apply|patch/.test(name)) return '编辑了文件'
-  if (/read|view_file/.test(name)) return '读取了文件'
-  if (/search|grep/.test(name)) return '搜索了代码'
-  if (/symbol|index/.test(name)) return '检索了符号'
-  if (/list|find/.test(name)) return '浏览了目录'
-  if (/memory|architecture|business/.test(name)) return '读取了工作区记忆'
-  return name
-}
 
 function parse(raw: string): unknown {
   try { return JSON.parse(raw) } catch { return raw }
@@ -246,6 +190,7 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
 }) {
   const { expanded, toggle } = useDisclosure()
   const args = useMemo(() => parse(rawArguments), [rawArguments])
+  const visual = useMemo(() => toolVisual(name, args, result && !result.isError ? parse(result.text) : undefined), [name, args, result])
   const state = result === undefined ? (stopped ? 'stopped' : 'running') : result.isError ? 'error' : 'ok'
   const running = state === 'running'
   const nativeParsed = name === 'run_program' && result ? parse(result.text) : undefined
@@ -275,7 +220,7 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
       ? `退出码 ${String(nativeResult.process_exit_code ?? '未知')}${nativeDiagnostics.length > 0 ? ` · ${nativeDiagnostics.length} 项输出诊断` : ''}`
       : `${String(nativeResult.outcome ?? '未启动')}${nativeResult.error_message ? ` · ${String(nativeResult.error_message)}` : ''}${nativeDiagnostics.length > 0 ? ` · ${nativeDiagnostics.length} 项输出诊断` : ''}`
     : ''
-  const summaryText = name === 'run_program' ? nativeSummary : errorLine !== '' ? errorLine : summaryOf(args)
+  const summaryText = name === 'run_program' ? nativeSummary : errorLine !== '' ? errorLine : visual.summary ?? summaryOf(args)
   const duration = result?.durationMs === undefined ? null : `${result.durationMs} ms`
 
   const diffs = useMemo(() => extractDiffHunks(name, args, result), [name, args, result])
@@ -387,15 +332,15 @@ export const ToolRow = memo(function ToolRow({ name, rawArguments, result, stopp
   const nativeExitCode = typeof nativeResult?.process_exit_code === 'number' ? nativeResult.process_exit_code : null
 
   return (
-    <div className={css.root} data-variant="generic" data-tool={name} data-state={state}>
+    <div className={css.root} data-variant="generic" data-tool={name} data-tone={visual.tone} data-state={state}>
       {running && <span className={css.visuallyHidden}>{t('row.running')}</span>}
       <DisclosureRow
         rowClassName={css.row}
         leadingClassName={css.leading}
         titleClassName={css.title}
         chevronClassName={css.chevron}
-        icon={iconFor(name)}
-        title={titleFor(name)}
+        icon={visual.icon}
+        title={visual.title}
         running={running}
         open={expanded}
         expandable

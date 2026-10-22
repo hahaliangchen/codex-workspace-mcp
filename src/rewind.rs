@@ -18,6 +18,7 @@ fn schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_window_snapshots(task_id TEXT NOT NULL,turn INTEGER NOT NULL,state TEXT,PRIMARY KEY(task_id,turn));",
     )?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_frame_snapshots(task_id TEXT NOT NULL,turn INTEGER NOT NULL,frames TEXT NOT NULL,PRIMARY KEY(task_id,turn));")?;
     Ok(())
 }
 
@@ -28,6 +29,12 @@ pub fn snapshot(conn: &Connection, task: &str, turn: usize, state: Option<&str>)
         "INSERT OR REPLACE INTO agent_window_snapshots(task_id,turn,state) VALUES (?1,?2,?3)",
         params![task, turn as i64, state],
     )?;
+    let mut frames=conn.prepare("SELECT scope,state FROM agent_runtime_windows WHERE task_id=?1")?
+        .query_map([task],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    frames.retain(|(scope,_)|scope!="main");
+    if let Some(state)=state {frames.push(("main".into(),state.into()));}
+    conn.execute("INSERT OR REPLACE INTO agent_frame_snapshots VALUES (?1,?2,?3)",params![task,turn as i64,serde_json::to_string(&frames)?])?;
     Ok(())
 }
 
@@ -83,6 +90,7 @@ pub fn rewind(root: &std::path::Path, task: &str, turn: usize) -> Result<Value> 
     let Some(snapshot) = snapshot else {
         bail!("conflict: 这一轮是在支持回退之前进行的，无法恢复当时的对话状态");
     };
+    let frames:Option<String>=conn.query_row("SELECT frames FROM agent_frame_snapshots WHERE task_id=?1 AND turn=?2",params![task,turn as i64],|r|r.get(0)).optional()?;
     let start: i64 = conn
         .query_row(
             "SELECT MIN(seq) FROM agent_task_events WHERE task_id=?1 AND json_extract(data,'$.turn')>=?2",
@@ -108,6 +116,10 @@ pub fn rewind(root: &std::path::Path, task: &str, turn: usize) -> Result<Value> 
 
     let mut conn = conn;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // Old databases may have events inserted outside the allocator. Preserve
+    // their identities before deleting them, too.
+    tx.execute("UPDATE agent_tasks SET event_high_water=MAX(event_high_water,COALESCE((SELECT MAX(seq) FROM agent_task_events WHERE task_id=?1),-1)) WHERE id=?1", [task])?;
+    crate::context_assets::rewind(&tx, task, start)?;
     tx.execute("DELETE FROM agent_task_events WHERE task_id=?1 AND seq>=?2", params![task, start])?;
     // Every per-turn table (file changes, attachments, request logs, jobs…)
     // forgets turn N onward, or the replayed turn N would collide with it.
@@ -130,6 +142,12 @@ pub fn rewind(root: &std::path::Path, task: &str, turn: usize) -> Result<Value> 
             tx.execute("DELETE FROM agent_runtime_windows WHERE task_id=?1 AND scope='main'", [task])?;
         }
     }
+    if let Some(raw)=frames {
+        let frames:Vec<(String,String)>=serde_json::from_str(&raw)?;
+        tx.execute("DELETE FROM agent_runtime_windows WHERE task_id=?1",[task])?;
+        for (scope,state) in frames {tx.execute("INSERT INTO agent_runtime_windows VALUES (?1,?2,?3)",params![task,scope,state])?;}
+    }
+    crate::task_tree::rebuild(&tx,task)?;
     tx.execute("DELETE FROM agent_window_snapshots WHERE task_id=?1 AND turn>=?2", params![task, turn as i64])?;
     tx.execute("UPDATE agent_tasks SET status=CASE WHEN ?2=1 THEN 'draft' ELSE status END,updated_at=?3 WHERE id=?1",
         params![task, turn as i64, agent_service::now()])?;
@@ -200,6 +218,45 @@ mod tests {
         rewind(&root, "t", 1).unwrap();
         let windows: i64 = conn.query_row("SELECT COUNT(*) FROM agent_runtime_windows WHERE task_id='t'", [], |r| r.get(0)).unwrap();
         assert_eq!(windows, 0);
+        drop(conn);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rewind_never_reuses_event_ids_and_invalidates_only_later_assets_and_materials() {
+        let root = std::env::temp_dir().join(format!("rewind-assets-{}", agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut conn = agent_service::open_db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','p','fake','completed',0,0)", []).unwrap();
+        conn.execute_batch("CREATE TABLE agent_runtime_windows(task_id TEXT,scope TEXT,state TEXT,PRIMARY KEY(task_id,scope));
+            CREATE TABLE agent_context_materials(task_id TEXT,id TEXT,data TEXT,PRIMARY KEY(task_id,id));").unwrap();
+        let tx = conn.transaction().unwrap();
+        let first = agent_service::append_event_tx(&tx, "t", "user/message", &json!({"turn":1,"message":{"content":"first"}}), None).unwrap();
+        let second = agent_service::append_event_tx(&tx, "t", "user/message", &json!({"turn":2,"message":{"content":"second"}}), None).unwrap();
+        let last = agent_service::append_event_tx(&tx, "t", "tool/result", &json!({"turn":2}), None).unwrap();
+        tx.commit().unwrap();
+        let kept = crate::context_assets::register(&root, "t", first, "read_file", &json!({"path":"a"}), &json!({"content":"old"})).unwrap();
+        let removed = crate::context_assets::register(&root, "t", last, "read_file", &json!({"path":"b"}), &json!({"content":"future"})).unwrap();
+        for (id, through) in [("old",first),("new",second)] {
+            conn.execute("INSERT INTO agent_context_materials VALUES ('t',?1,?2)", params![id,json!({"through":through}).to_string()]).unwrap();
+        }
+        snapshot(&conn, "t", 2, Some("old-window")).unwrap();
+        rewind(&root, "t", 2).unwrap();
+        let ids: Vec<String> = conn.prepare("SELECT asset_id FROM agent_context_assets WHERE task_id='t'").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ids, vec![kept["asset_id"].as_str().unwrap()]);
+        assert!(!ids.contains(&removed["asset_id"].as_str().unwrap().to_owned()));
+        let materials: usize = conn.query_row("SELECT COUNT(*) FROM agent_context_materials", [], |row| row.get(0)).unwrap();
+        assert_eq!(materials, 1);
+        let tx = conn.transaction().unwrap();
+        let next = agent_service::append_event_tx(&tx, "t", "user/message", &json!({"turn":2}), None).unwrap();
+        tx.commit().unwrap();
+        assert!(next > last);
+        drop(conn);
+        let conn = agent_service::open_db(&root).unwrap();
+        let next_after_reopen = conn.query_row("SELECT event_high_water FROM agent_tasks WHERE id='t'", [], |row| row.get::<_,i64>(0)).unwrap();
+        assert_eq!(next_after_reopen, next);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

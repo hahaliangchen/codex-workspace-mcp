@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "pages": [
+    {"id": 1, "title": "Project Overview", "layout": "overview", "points": ["Task ownership", "Observable progress", "Verified delivery"]},
+    {"id": 2, "title": "Current Workflow", "layout": "columns", "points": ["Linear history", "Repeated material reads", "Implicit progress"]},
+    {"id": 3, "title": "Target Outcomes", "layout": "checklist", "points": ["Complete all deliverables", "Preserve user requirements", "Recover interrupted work"]},
+    {"id": 4, "title": "Task Boundaries", "layout": "columns", "points": ["One verifiable result", "Explicit completion conditions", "Multiple actions per node"]},
+    {"id": 5, "title": "Planning", "layout": "checklist", "points": ["Ordered tasks", "Declared dependencies", "Named outputs"]},
+    {"id": 6, "title": "Working Materials", "layout": "columns", "points": ["Declared inputs", "Inherited design rules", "References to earlier evidence"]},
+    {"id": 7, "title": "Unexpected Repairs", "layout": "repair-grid", "points": ["Suspend the parent", "Repair shared styling", "Verify before resuming"]},
+    {"id": 8, "title": "Branch Results", "layout": "columns", "points": ["Concise conclusion", "Evidence references", "Unresolved limitations"]},
+    {"id": 9, "title": "State Tracking", "layout": "checklist", "points": ["Completed tasks", "Active task", "Pending tasks"]},
+    {"id": 10, "title": "Midpoint Review", "layout": "overview", "points": ["Review the first ten pages", "Check shared materials", "Receive the user update"]},
+    {"id": 11, "title": "User Instructions", "layout": "columns", "points": ["Preserve original wording", "Declare the instruction scope", "Propagate to later tasks"]},
+    {"id": 12, "title": "Recovery", "layout": "checklist", "points": ["Restore the active frame", "Keep event identities unique", "Inspect uncertain actions"]},
+    {"id": 13, "title": "Context Pressure", "layout": "columns", "points": ["Monitor the model budget", "Split completed work", "Compress within a node"]},
+    {"id": 14, "title": "Evidence Ownership", "layout": "columns", "points": ["Attribute events to nodes", "Review delegated results", "Avoid duplicate token accounting"]},
+    {"id": 15, "title": "Parallel Work", "layout": "checklist", "points": ["Independent deliverables", "Separate mutable resources", "Explicit acceptance"]},
+    {"id": 16, "title": "Material Versions", "layout": "columns", "points": ["Immutable saved references", "Explicit refresh", "Current version checks"]},
+    {"id": 17, "title": "Error Handling", "layout": "checklist", "points": ["Preserve diagnostics", "Keep successful progress", "Report the concrete blocker"]},
+    {"id": 18, "title": "Verification", "layout": "columns", "points": ["Check every page", "Validate footer scope", "Recheck shared repairs"]},
+    {"id": 19, "title": "Measurement", "layout": "columns", "points": ["Tokens per page", "Repeated reads", "Completion and acceptance"]},
+    {"id": 20, "title": "Final Delivery", "layout": "overview", "points": ["Twenty complete pages", "All checks passed", "Evidence available by reference"]}
+  ]
+}

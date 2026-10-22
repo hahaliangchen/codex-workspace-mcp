@@ -36,7 +36,7 @@
 }
 .input:focus {
   outline: none;
-  border-color: #1d9e75;
+  border-color: var(--codex-blue-primary, #1d9e75);
 }
 .error {
   margin: 0;
@@ -57,11 +57,11 @@
 }
 .primary {
   border: none;
-  background: #1d9e75;
+  background: var(--codex-blue-primary, #1d9e75);
   color: #ffffff;
 }
 .primary:hover:not(:disabled) {
-  background: #0f6e56;
+  background: var(--codex-blue-hover, #0f6e56);
 }
 .secondary {
   border: 1px solid var(--codex-card-border, #e5e7eb);
@@ -82,10 +82,6 @@
   margin: 4px 0 8px;
   font-size: 13px;
   color: var(--codex-text-muted, #6b7280);
-}
-:global(body[data-ds-dark-theme]) .card {
-  --codex-leaf-bg: #0f6e5622;
-  --codex-leaf-border: #0f6e56;
 }
 .done svg {
   flex: none;

@@ -163,6 +163,10 @@ pub(crate) fn apply_agent_config(
                     api_key: provider.api_key.clone(),
                     models: provider.model_map.clone(),
                     max_output_tokens: provider.max_output_tokens.clone(),
+                    context_windows: provider.model_metadata.iter().filter_map(|(id, metadata)| {
+                        let tokens = metadata["contextWindow"].as_u64().and_then(|n| usize::try_from(n).ok())?;
+                        (tokens > 0).then(|| (provider.model_map.get(id).cloned().unwrap_or_else(|| id.clone()), tokens))
+                    }).collect(),
                     context_request_options: provider
                         .extra
                         .get("contextRequestOptions")
@@ -2397,6 +2401,13 @@ mod tests {
         assert_eq!(view["models"][0]["name"], "Visible model");
         assert_eq!(view["models"][0]["context_window"], 500000);
         assert_eq!(view["models"][0]["max_output_tokens"], 65536);
+        let root = std::env::temp_dir().join(format!("catalog-budget-{}",crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = crate::agent_service::tests::test_state(&root,"127.0.0.1:1".parse().unwrap());
+        apply_agent_config(&mut state,&config);
+        assert_eq!(crate::model_settings::context_window(&state,"upstream-m"),500000);
+        assert_eq!(crate::model_settings::context_window(&state,"m"),500000);
+        let _ = std::fs::remove_dir_all(root);
         assert_eq!(view["defaults"]["visual_tool"]["model"], "m");
         let encoded = view.to_string();
         for private in [

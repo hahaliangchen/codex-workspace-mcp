@@ -27,7 +27,7 @@ export function ContextRing({ usage }: { usage: ContextUsage | undefined }) {
   if (!usage) return null
   // Fullness is measured against the point where automatic compression starts.
   const ratio = Math.min(1, usage.used / usage.compactAt)
-  const tone = ratio >= 0.85 ? '#d97706' : ratio >= 0.6 ? '#5dcaa5' : '#1d9e75'
+  const tone = ratio >= 0.85 ? 'var(--theme-ring-high)' : ratio >= 0.6 ? 'var(--theme-ring-mid)' : 'var(--theme-ring-low)'
   const radius = 7
   const circumference = 2 * Math.PI * radius
   const label = ratio >= 0.85
@@ -37,7 +37,7 @@ export function ContextRing({ usage }: { usage: ContextUsage | undefined }) {
     <span role="img" aria-label={label} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--codex-text-muted, #6b7280)' }}>
       <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
         <circle cx="9" cy="9" r={radius} fill="none" stroke="var(--codex-card-border, #e5e7eb)" strokeWidth="2.2" />
-        <circle cx="9" cy="9" r={radius} fill="none" stroke={tone} strokeWidth="2.2" strokeLinecap="round"
+        <circle cx="9" cy="9" r={radius} fill="none" style={{ stroke: tone }} strokeWidth="2.2" strokeLinecap="round"
           strokeDasharray={`${circumference * ratio} ${circumference}`} transform="rotate(-90 9 9)" />
       </svg>
       {ratio >= 0.85 && <span style={{ color: tone }}>{Math.round(ratio * 100)}%</span>}

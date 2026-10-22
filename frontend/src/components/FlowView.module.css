@@ -11,6 +11,7 @@
 /* Minimal sleek top bar - keeps canvas at 100% height focus */
 .topBar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   padding: 6px 16px;
@@ -68,13 +69,23 @@
 
 .topBarActions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
-  flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
+  flex-shrink: 1;
+}
+
+.activeTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .topBarPillBtn {
   display: inline-flex;
+  max-width: 100%;
   align-items: center;
   gap: 6px;
   padding: 3px 10px;
@@ -206,7 +217,7 @@
   right: 0;
   bottom: 0;
   width: 450px;
-  max-width: 92vw;
+  max-width: min(92vw, 100%);
   background: var(--dsw-alias-bg-layer-1, #ffffff);
   border-left: 1px solid var(--dsw-alias-border-l2, rgba(0, 0, 0, 0.1));
   box-shadow: -6px 0 24px rgba(0, 0, 0, 0.08);
@@ -766,10 +777,10 @@
   gap: 12px;
   max-width: calc(100% - 32px);
   padding: 8px 8px 8px 16px;
-  border: 1px solid #c8e6d8;
+  border: 1px solid color-mix(in srgb, var(--codex-leaf-border, #9fe1cb) 60%, var(--codex-card-bg, #ffffff));
   border-radius: 999px;
   background: var(--codex-card-bg, #ffffff);
-  box-shadow: 0 6px 20px rgba(15, 110, 86, 0.12);
+  box-shadow: 0 6px 20px color-mix(in srgb, var(--codex-blue-hover, #0f6e56) 12%, transparent);
   font-size: 13px;
   color: var(--codex-text-secondary, #374151);
 }
@@ -786,13 +797,13 @@
   padding: 0 16px;
   border: none;
   border-radius: 999px;
-  background: #1d9e75;
+  background: var(--codex-blue-primary, #1d9e75);
   color: #ffffff;
   font-size: 13px;
   cursor: pointer;
 }
 .pickBarPrimary:hover:not(:disabled) {
-  background: #0f6e56;
+  background: var(--codex-blue-hover, #0f6e56);
 }
 .pickBarPrimary:disabled {
   opacity: 0.5;

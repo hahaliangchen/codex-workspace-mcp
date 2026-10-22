@@ -9,6 +9,8 @@ mod builtin_plugins;
 mod code_map;
 mod composer_catalog;
 mod context_assets;
+#[cfg(test)]
+mod context_acceptance;
 mod context_rebuild;
 mod context_window;
 mod database;
@@ -47,6 +49,7 @@ mod rust_index;
 mod session_browser;
 mod session_history;
 mod single_agent;
+mod task_tree;
 mod main_task_anchor;
 mod collaboration_jobs;
 mod skill_packages;

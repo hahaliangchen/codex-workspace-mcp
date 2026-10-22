@@ -15,6 +15,7 @@ export interface RequestContextMeta {
   readonly turn: number
   readonly step: number
   readonly nodeId: string
+  readonly task_node_id?: string
   readonly workId?: string
   readonly request_id?: number
   readonly revision?: number

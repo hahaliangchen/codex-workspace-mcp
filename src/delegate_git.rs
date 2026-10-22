@@ -7,10 +7,19 @@ use std::{
     process::Command,
 };
 
+fn git_path(path: &Path) -> Result<String> {
+    let raw = path.to_str().context("Git path must be UTF-8")?;
+    if cfg!(windows) {
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") { return Ok(format!(r"\\{unc}")); }
+        return Ok(raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned());
+    }
+    Ok(raw.to_owned())
+}
+
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(root)
+        .arg(git_path(root)?)
         .args(args)
         .output()
         .with_context(|| format!("running git in {}", root.display()))?;
@@ -97,8 +106,8 @@ pub fn prepare(root: &Path, id: &str) -> Result<Option<Value>> {
     let branch = format!("codex/delegate-{id}");
     let path = worktree_parent(root)?.join(id);
     std::fs::create_dir_all(path.parent().context("worktree parent missing")?)?;
-    let path_str = path.to_str().context("worktree path is not UTF-8")?;
-    git(root, &["worktree", "add", "-b", &branch, path_str, &base])?;
+    let path_str = git_path(&path)?;
+    git(root, &["worktree", "add", "-b", &branch, &path_str, &base])?;
     Ok(Some(
         json!({"branch":branch,"worktree":path,"base":base,"repository":top,"status":"active"}),
     ))
@@ -253,6 +262,7 @@ mod tests {
         for root in [&server, &project] {
             std::fs::create_dir_all(root).unwrap();
             git(root, &["init", "-b", "main"]).unwrap();
+            git(root, &["config", "core.autocrlf", "false"]).unwrap();
             std::fs::write(root.join("file.txt"), "before\n").unwrap();
             git(root, &["add", "-A"]).unwrap();
             git(root, &["-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "base"]).unwrap();
@@ -260,7 +270,7 @@ mod tests {
         let spec = json!({"git":prepare(&project, "child").unwrap().unwrap()});
         // Callers pass the server root; the recorded repository wins.
         let child = workspace(&server, &spec).unwrap();
-        assert!(child.starts_with(parent.join(".codex-workspace-mcp-worktrees").join("project")));
+        assert!(child.starts_with(parent.canonicalize().unwrap().join(".codex-workspace-mcp-worktrees").join("project")));
         std::fs::write(child.join("file.txt"), "after\n").unwrap();
         // Both checkouts have their own host state store; neither may be committed or clobbered.
         for dir in [&child, &project] {
@@ -288,6 +298,7 @@ mod tests {
         let root = parent.join("project");
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-b", "main"]).unwrap();
+        git(&root, &["config", "core.autocrlf", "false"]).unwrap();
         std::fs::write(root.join("file.txt"), "before\n").unwrap();
         git(&root, &["add", "-A"]).unwrap();
         git(

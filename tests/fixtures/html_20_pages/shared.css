@@ -1,0 +1,10 @@
+/* Intentionally missing .repair-grid. The page 7 check must expose this defect. */
+* { box-sizing: border-box; }
+body { margin: 0; color: #202424; background: #ffffff; font: 18px Arial, sans-serif; }
+.page { width: 1280px; min-height: 720px; margin: auto; padding: 48px; }
+.overview { display: block; border-top: 8px solid #267563; }
+.columns { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+.checklist { display: grid; gap: 20px; }
+.point { padding: 16px; border-bottom: 1px solid #d9dfdc; }
+.footer { margin-top: 32px; color: #525a55; font-size: 14px; }
+h1 { margin: 0 0 32px; font-size: 36px; }

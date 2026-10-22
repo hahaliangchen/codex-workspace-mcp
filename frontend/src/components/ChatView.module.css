@@ -164,11 +164,17 @@
   color: #e4e4e7;
 }
 
+/* Consecutive tool rows sit close together (32px pitch); text, cards and
+   interjections between them keep their own breathing room. */
 .toolsList {
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  margin: 8px 0 14px 0;
+  gap: 4px;
+  margin: 6px 0 12px 0;
+}
+
+.toolsList > :not([data-tool]) {
+  margin: 6px 0;
 }
 
 .inFlightAnalyzing {

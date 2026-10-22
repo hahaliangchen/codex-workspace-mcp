@@ -10,8 +10,8 @@ function wasDismissed(callId: string): boolean {
 }
 
 export const LEAF_ICON = <svg width="15" height="15" viewBox="0 0 64 64" aria-hidden="true">
-  <path d="M14 50C10 28 26 12 52 12c0 26-16 42-38 38Z" fill="#5DCAA5"/>
-  <path d="M14 50 40 24" stroke="#0F6E56" strokeWidth="4" strokeLinecap="round"/>
+  <path d="M14 50C10 28 26 12 52 12c0 26-16 42-38 38Z" style={{fill: 'var(--theme-leaf-light)'}}/>
+  <path d="M14 50 40 24" style={{stroke: 'var(--theme-leaf-dark)'}} strokeWidth="4" strokeLinecap="round"/>
 </svg>
 
 /** The agent's suggestion to keep a rule in AGENTS.md; nothing is written until the user adds it. */

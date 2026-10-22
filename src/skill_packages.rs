@@ -64,6 +64,12 @@ fn reload_package(package: &Package) -> Result<Package> {
     }
     load_with(&package.root, package.origin, package.native.clone())
 }
+fn frontmatter(raw: &str) -> Result<Value> {
+    let normalized = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    let front = normalized.strip_prefix("---\n").and_then(|text| text.split_once("\n---"))
+        .context("skill requires YAML frontmatter")?.0;
+    Ok(serde_yaml::from_str(front)?)
+}
 fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Result<Package> {
     let root = root.canonicalize()?;
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(root.join("plugin.json"))?)?;
@@ -73,12 +79,7 @@ fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Resu
     );
     let path = crate::file_edit::workspace_path(&root, &manifest.skill)?;
     let raw = std::fs::read_to_string(path)?;
-    let front = raw
-        .strip_prefix("---\n")
-        .and_then(|raw| raw.split_once("\n---"))
-        .context("skill requires YAML frontmatter")?
-        .0;
-    let fields: Value = serde_yaml::from_str(front)?;
+    let fields = frontmatter(&raw)?;
     ensure!(
         fields["name"] == manifest.id,
         "skill name must equal package ID"
@@ -854,6 +855,14 @@ pub(crate) fn test_runtime() -> (Arc<PluginRuntime>, Arc<ToolCatalog>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frontmatter_accepts_crlf_and_bom_without_changing_instruction_content() {
+        let lf = "---\nname: example\ndescription: Test skill\n---\nFull instructions\n";
+        let windows = format!("\u{feff}{}",lf.replace('\n',"\r\n"));
+        assert_eq!(frontmatter(lf).unwrap(),frontmatter(&windows).unwrap());
+        assert!(windows.ends_with("Full instructions\r\n"));
+        assert!(frontmatter("no frontmatter").is_err());
+    }
     #[test]
     fn skill_plugin_origin_is_explicit_and_native_contributions_use_the_common_protocol() {
         // Being downloaded inside this repository never makes a package builtin.

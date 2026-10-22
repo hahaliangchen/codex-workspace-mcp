@@ -4,6 +4,9 @@ import type { FlowNodeData } from '../model.ts'
 import styles from './TaskNode.module.css'
 
 const KIND_META: Record<string, { label: string; className: string; accentClass: string; icon: string }> = {
+  task_root: { label: '主任务', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_planned: { label: '待办', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_branch: { label: '分支', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '' },
   agent: { label: '主 Agent', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔵' },
   worker: { label: '任务分支', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔹' },
   context_agent: { label: '上下文子 Agent', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '🟣' },
@@ -55,11 +58,14 @@ export const TaskNode = memo(function TaskNode({
   }
   const isRunning = data.status === 'running'
   const isDone = data.status === 'done' || data.status === 'completed'
-  const isSkipped = data.status === 'skipped'
-  const isInterrupted = data.status === 'interrupted'
+  const isSkipped = data.status === 'skipped' || data.status === 'cancelled'
+  const isInterrupted = data.status === 'interrupted' || data.status === 'suspended'
   const isFailed = data.status === 'failed'
 
   const renderStatus = () => {
+    if (data.status === 'blocked' || data.status === 'needs_user') {
+      return <span className={styles.statusIcon} title={data.status === 'blocked' ? '阻塞' : '等待用户决定'}>{data.status === 'blocked' ? '!' : '?'}</span>
+    }
     if (isRunning) {
       return <div className={styles.spinner} title="进行中" />
     }
@@ -68,21 +74,21 @@ export const TaskNode = memo(function TaskNode({
         <span
           className={styles.statusIcon}
           style={{ color: '#9ca3af' }}
-          title="本次模型请求已结束"
+          title={data.id.startsWith('task:') ? '任务已完成' : '本次模型请求已结束'}
         >
           ↩
         </span>
       )
     }
     if (isSkipped) {
-      return <span className={styles.statusIcon} title="已跳过">—</span>
+      return <span className={styles.statusIcon} title={data.status === 'cancelled' ? '已取消' : '已跳过'}>—</span>
     }
     if (isInterrupted) {
       return (
         <span
           className={styles.statusIcon}
           style={{ color: 'var(--dsw-alias-state-warn-primary, #f59e0b)' }}
-          title="已中断 / 暂停"
+          title={data.status === 'suspended' ? '挂起，正在执行子任务' : '已中断 / 暂停'}
         >
           ⏸
         </span>

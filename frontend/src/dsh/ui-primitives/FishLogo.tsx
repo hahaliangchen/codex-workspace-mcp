@@ -1,5 +1,5 @@
 import type { IconProps } from './icons/props.ts'
-import starLogo from '../../assets/sprout.svg'
+import { useBrandIcon } from '../../brand.ts'
 
 /** Native viewBox of {@link FISH_LOGO_PATH} (width and height in user units). */
 export const FISH_LOGO_VIEWBOX = { width: 24, height: 24 }
@@ -12,13 +12,14 @@ export const FISH_LOGO_PATH = ''
  * @param props.className - extra class for layout placement.
  */
 export function FishLogo({ size = 24, className }: IconProps) {
+  const logo = useBrandIcon()
   return (
     <img
-      src={starLogo}
+      src={logo}
       width={size}
       height={size}
       className={className}
-      alt="Sprout logo"
+      alt=""
       style={{
         objectFit: 'contain',
         display: 'inline-block',
