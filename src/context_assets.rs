@@ -71,9 +71,6 @@ pub fn register(
     args: &Value,
     result: &Value,
 ) -> Result<Value> {
-    if let Some(reference) = register_remote_file(root, task, seq, tool, args, result)? {
-        return Ok(reference);
-    }
     let image_id = result["artifact_id"].as_str().or_else(|| {
         result
             .pointer("/visual_artifact/artifact_id")
@@ -229,100 +226,6 @@ pub fn register(
     let saved = lookup(&tx, task, &id)?.context("registered asset missing")?;
     tx.commit()?;
     Ok(saved)
-}
-/// Remote SVG source already belongs to the PPT service. Store only a handle
-/// and fingerprint, not another local copy. Original exchanges remain in audit
-/// history, including unsaved/failed write arguments.
-fn register_remote_file(
-    root: &Path,
-    task: &str,
-    seq: i64,
-    tool: &str,
-    args: &Value,
-    result: &Value,
-) -> Result<Option<Value>> {
-    let generated = tool == "tool_arguments"
-        && result["tool_calls"]
-            .as_array()
-            .is_some_and(|calls| calls.len() == 1)
-        && result["tool_calls"][0]["function"]["name"] == "ppt_master__write_file";
-    if !tool.starts_with("ppt_master__") && !generated {
-        return Ok(None);
-    }
-    let call_args: Value = if generated {
-        serde_json::from_str(
-            result["tool_calls"][0]["function"]["arguments"]
-                .as_str()
-                .unwrap_or("{}"),
-        )?
-    } else {
-        args.clone()
-    };
-    let data = result
-        .pointer("/result/data")
-        .or_else(|| result.get("data"))
-        .unwrap_or(result);
-    let path = data["path"].as_str().or_else(|| call_args["path"].as_str());
-    let content = data["content"]
-        .as_str()
-        .or_else(|| call_args["content"].as_str());
-    let (Some(path), Some(content)) = (path, content) else {
-        return Ok(None);
-    };
-    if !path.starts_with("svg_output/") || !path.ends_with(".svg") {
-        return Ok(None);
-    }
-    let project = result["project_id"]
-        .as_u64()
-        .or_else(|| data["project_id"].as_u64())
-        .or_else(|| call_args["project_id"].as_u64())
-        .or(crate::ppt_sessions::project(root, task)?);
-    let Some(project) = project.filter(|p| *p > 0) else {
-        return Ok(None);
-    };
-    let hash = crate::visual_artifacts::hash(content.as_bytes());
-    let identity =
-        json!({"task":task,"plugin":"ppt-master","project":project,"path":path,"hash":hash});
-    let id = format!(
-        "asset-{}",
-        crate::visual_artifacts::hash(identity.to_string().as_bytes())
-    );
-    let mut conn = connection(root)?;
-    if let Some(reference) = lookup(&conn, task, &id)? {
-        return Ok(Some(reference));
-    }
-    let mut reference = json!({"asset_id":id,"kind":"remote_file","storage":"plugin",
-        "plugin":"ppt-master","project_id":project,"source_path":path,"content_hash":hash,"bytes":content.len(),
-        "revision":data["revision"],"availability":"verify_on_read",
-        "history_reference":{"task_id":task,"event_seq":seq,"include_event":true},
-        "read_reference":{"tool":"read_asset","arguments":{"asset_id":id}},
-        "resource":{"entry":"resource","project_id":project,"path":path}});
-    if let Ok(Some(remote)) = crate::ppt_sessions::connection(root, task) {
-        reference["download_url"] = json!(remote.resource_url(project, path)?);
-    }
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let owner:Option<String>=tx.query_row("SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",params![task,seq],|r|r.get(0)).optional()?;
-    reference["task_node_id"]=json!(owner);
-    tx.execute(
-        "INSERT OR IGNORE INTO agent_context_assets VALUES (?1,?2,?3,?4,?5,'',?6)",
-        params![
-            task,
-            id,
-            reference.to_string(),
-            tool,
-            json!({"project_id":project,"path":path}).to_string(),
-            hash
-        ],
-    )?;
-    crate::agent_service::append_event_tx(
-        &tx,
-        task,
-        "asset/registered",
-        &json!({"reference":reference,"task_node_id":owner}),
-        None,
-    )?;
-    tx.commit()?;
-    Ok(Some(reference))
 }
 fn lookup(conn: &Connection, task: &str, id: &str) -> Result<Option<Value>> {
     let raw: Option<String> = conn
@@ -682,7 +585,7 @@ pub fn frame_index(root:&Path,task:&str,node:&str,messages:&[Value])->Result<Val
     }
     Ok(json!({"host_status":true,"not_a_user_request":true,"truncated":possibly_more||selected.len()<total,
         "assets":selected,"remaining_reference":{"tool":"read_session_history","arguments":{"node_id":node,"include_descendants":true}},
-        "instruction":"Asset handles only. Read bodies only when needed; a handle is not proof of successful completion."}))
+        "instruction":"Saved materials from this task. Reopen one by its reference when you need its full content."}))
 }
 
 /// The reviewer sees the entire conversation with asset bodies replaced by

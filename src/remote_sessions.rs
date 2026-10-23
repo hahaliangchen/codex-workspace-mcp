@@ -1,0 +1,598 @@
+//! Authenticated remote-plugin sessions. Business identifiers, selections and
+//! lifecycle rules live in the remote plugin; the host only owns chat identity.
+use crate::{
+    agent_service::AgentServiceState,
+    plugin_runtime::PluginRuntime,
+    skill_packages::remote::{self, Connection},
+};
+use anyhow::{Context, Result, ensure};
+use axum::{
+    Json,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use rusqlite::{OptionalExtension, params};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, OnceLock, RwLock},
+};
+
+type Credentials = BTreeMap<String, (String, String, Arc<Connection>)>;
+static CREDENTIALS: OnceLock<RwLock<Credentials>> = OnceLock::new();
+static ACTIVE: OnceLock<RwLock<BTreeMap<String, Arc<Connection>>>> = OnceLock::new();
+fn credentials() -> &'static RwLock<Credentials> {
+    CREDENTIALS.get_or_init(Default::default)
+}
+fn active() -> &'static RwLock<BTreeMap<String, Arc<Connection>>> {
+    ACTIVE.get_or_init(Default::default)
+}
+fn schema(root: &std::path::Path) -> Result<()> {
+    crate::agent_service::open_db(root)?.execute_batch(
+        "CREATE TABLE IF NOT EXISTS remote_plugin_sessions (
+        task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
+        plugin_id TEXT NOT NULL, subject TEXT NOT NULL, service_url TEXT NOT NULL);",
+    )?;
+    Ok(())
+}
+// Resolve the authenticated conversation for a child execution frame too.
+fn binding(root: &std::path::Path, task: &str) -> Result<Option<(String, String, String, String)>> {
+    schema(root)?;
+    Ok(crate::agent_service::open_db(root)?.query_row("WITH RECURSIVE lineage(id,depth) AS (
+        SELECT ?1,0 UNION ALL SELECT t.parent_task_id,l.depth+1 FROM agent_tasks t JOIN lineage l ON t.id=l.id
+        WHERE t.parent_task_id IS NOT NULL AND l.depth<32)
+        SELECT b.task_id,b.plugin_id,b.subject,b.service_url FROM lineage l JOIN remote_plugin_sessions b ON b.task_id=l.id
+        ORDER BY l.depth LIMIT 1", [task], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?)
+}
+fn bound(root: &std::path::Path, task: &str) -> Result<Option<(String, String, Arc<Connection>)>> {
+    let Some((conversation, plugin, subject, url)) = binding(root, task)? else {
+        return Ok(None);
+    };
+    let connection = active()
+        .read()
+        .unwrap()
+        .get(&conversation)
+        .cloned()
+        .context("Plugin login expired; reconnect from its page")?;
+    ensure!(
+        connection.subject == subject && connection.url() == url,
+        "Plugin session identity changed"
+    );
+    Ok(Some((conversation, plugin, connection)))
+}
+fn context(task: &str, conversation: &str) -> Value {
+    json!({"conversation_id":conversation,"execution_id":task})
+}
+fn save_binding(
+    root: &std::path::Path,
+    task: &str,
+    plugin: &str,
+    c: &Arc<Connection>,
+) -> Result<()> {
+    schema(root)?;
+    crate::agent_service::open_db(root)?.execute(
+        "INSERT INTO remote_plugin_sessions VALUES (?1,?2,?3,?4)",
+        params![task, plugin, c.subject, c.url()],
+    )?;
+    active().write().unwrap().insert(task.into(), c.clone());
+    Ok(())
+}
+fn check_binding(
+    root: &std::path::Path,
+    task: &str,
+    plugin: &str,
+    c: &Arc<Connection>,
+) -> Result<String> {
+    let (conversation, owner, subject, url) =
+        binding(root, task)?.context("Remote plugin conversation not found")?;
+    ensure!(
+        owner == plugin && subject == c.subject && url == c.url(),
+        "Conversation belongs to a different plugin or user"
+    );
+    crate::plugin_sessions::check(root, &conversation, plugin)?;
+    active()
+        .write()
+        .unwrap()
+        .insert(conversation.clone(), c.clone());
+    Ok(conversation)
+}
+/// Generic capability response. The plugin can propose a plan using the host's
+/// existing versioned confirmation UI; it cannot confirm it or change a goal.
+fn tool_value(root: &std::path::Path, task: &str, mut response: Value) -> Result<Value> {
+    ensure!(
+        response.is_object() && response.get("value").is_some(),
+        "Plugin tool response requires value"
+    );
+    if let Some(mut proposal) = response
+        .get_mut("plan_proposal")
+        .map(Value::take)
+        .filter(Value::is_object)
+    {
+        ensure!(
+            response["value"].is_object(),
+            "A plan proposal requires an object tool result"
+        );
+        let board = crate::main_task_anchor::board(root, task, None)?.unwrap_or(Value::Null);
+        proposal["definition_version"] = board["definition"]["version"].clone();
+        let saved = crate::main_task_anchor::propose_plan(root, task, proposal)?;
+        response["value"]["plan_confirmation"] =
+            json!({"version":saved["version"],"status":"awaiting_user_confirmation"});
+    }
+    response
+        .get_mut("value")
+        .map(Value::take)
+        .context("Plugin tool response requires value")
+}
+struct Transport;
+impl crate::plugin_io::SessionIo for Transport {
+    fn execute<'a>(
+        &'a self,
+        state: &'a AgentServiceState,
+        task: &'a str,
+        workspace: Arc<crate::tools::Workspace>,
+        name: &'a str,
+        args: Value,
+    ) -> futures::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let catalog = state
+                .tool_catalog
+                .as_ref()
+                .context("Tool registry unavailable")?;
+            if let Some((conversation, plugin, c)) = bound(state.workspace.root(), task)? {
+                if catalog.packages.owns_tool(&plugin, name) {
+                    let prefix = format!("{}__", plugin.replace('-', "_"));
+                    let raw = name.strip_prefix(&prefix).context("Tool owner mismatch")?;
+                    let result = c.call_in(raw, args, context(task, &conversation)).await?;
+                    sync(state, &conversation, &c).await?;
+                    return tool_value(state.workspace.root(), &conversation, result);
+                }
+            }
+            catalog.execute(workspace, name, args).await
+        })
+    }
+    fn sync_attachments<'a>(
+        &'a self,
+        state: &'a AgentServiceState,
+        task: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let Some((conversation, _, c)) = bound(state.workspace.root(), task)? {
+                sync(state, &conversation, &c).await?
+            }
+            Ok(())
+        })
+    }
+    fn read_asset<'a>(
+        &'a self,
+        state: &'a AgentServiceState,
+        task: &'a str,
+        reference: &'a Value,
+        args: &'a Value,
+    ) -> futures::future::BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            use base64::Engine;
+            let (conversation, _, c) =
+                bound(state.workspace.root(), task)?.context("Remote plugin login required")?;
+            let result = c
+                .rpc(
+                    "plugin/resource",
+                    json!({"context":context(task,&conversation),"reference":reference}),
+                )
+                .await?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result["data"].as_str().context("Resource data missing")?)?;
+            crate::context_assets::remote_delivery(reference, &bytes, args)
+        })
+    }
+    fn import_picture<'a>(
+        &'a self,
+        state: &'a AgentServiceState,
+        task: &'a str,
+        name: &'a str,
+        media: &'a str,
+        bytes: &'a [u8],
+    ) -> futures::future::BoxFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move {
+            use base64::Engine;
+            let Some((conversation, _, c)) = bound(state.workspace.root(), task)? else {
+                return Ok(None);
+            };
+            if !c.supports("attachments") {
+                return Ok(None);
+            };
+            let result=c.rpc("plugin/importAttachment",json!({"context":context(task,&conversation),"name":name,"mediaType":media,"data":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
+            Ok(result["path"].is_string().then_some(result))
+        })
+    }
+}
+async fn sync(state: &AgentServiceState, task: &str, c: &Connection) -> Result<()> {
+    use base64::Engine;
+    if !c.supports("attachments") {
+        return Ok(());
+    }
+    for (receipt, reference, media, bytes) in
+        crate::attachments::pending_imports(state, task, task)?
+    {
+        let result=c.rpc("plugin/importAttachment",json!({"context":context(task,task),"attachmentId":reference["attachmentId"],"name":reference["name"],"mediaType":media,"data":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
+        if let Some(path) = result["path"].as_str() {
+            crate::attachments::imported(state, &receipt, task, path)?;
+        }
+    }
+    Ok(())
+}
+pub async fn request(
+    runtime: &PluginRuntime,
+    state: AgentServiceState,
+    plugin: &str,
+    method: &str,
+    headers: HeaderMap,
+    args: Value,
+) -> Response {
+    match handle(runtime, state, plugin, method, headers, args).await {
+        Ok(value) => value,
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
+    }
+}
+async fn handle(
+    runtime: &PluginRuntime,
+    state: AgentServiceState,
+    plugin: &str,
+    method: &str,
+    headers: HeaderMap,
+    mut args: Value,
+) -> Result<Response> {
+    ensure!(args.is_object(), "Object request required");
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|v| !v.is_empty())
+        .context("Plugin login required")?;
+    let hash = crate::visual_artifacts::hash(token.as_bytes());
+    let registry = &state
+        .tool_catalog
+        .as_ref()
+        .context("Tool registry unavailable")?
+        .packages;
+    if method == "connect" {
+        // URL is administrator-configured, never selected by an untrusted page.
+        let url = remote::configured_url(registry,plugin)?;
+        let package = remote::connect_user(
+            remote::Config {
+                url,
+                token: token.into(),
+            },
+            true,
+        )
+        .await?;
+        ensure!(package.manifest.id == plugin, "Plugin identity mismatch");
+        let c = remote::mount_user_package(runtime, registry, package)?;
+        crate::plugin_io::register(plugin, Arc::new(Transport));
+        let handle = crate::agent_service::uuid_like();
+        let mut cache = credentials().write().unwrap();
+        ensure!(
+            cache.len() < 4096,
+            "Too many plugin login connections; restart or disconnect unused sessions"
+        );
+        cache.insert(handle.clone(), (hash, plugin.into(), c.clone()));
+        return Ok(Json(json!({"connection_handle":handle,"subject":c.subject})).into_response());
+    }
+    let handle = args["connection_handle"]
+        .as_str()
+        .context("Plugin connection required")?;
+    let (saved, owner, c) = credentials()
+        .read()
+        .unwrap()
+        .get(handle)
+        .cloned()
+        .context("Plugin connection expired; reconnect")?;
+    ensure!(
+        saved == hash && owner == plugin,
+        "Plugin login changed; reconnect"
+    );
+    let identity = c.rpc("plugin/identity", json!({})).await?;
+    let subject = identity["subject"]
+        .as_str()
+        .context("Plugin identity missing")?;
+    ensure!(
+        c.subject == crate::visual_artifacts::hash(format!("{}:{subject}", c.url()).as_bytes()),
+        "Plugin identity changed"
+    );
+    if let Some(object) = args.as_object_mut() {
+        object.remove("connection_handle");
+    }
+    let scope = registry
+        .scopes(&std::collections::BTreeSet::from([plugin.into()]))
+        .get(plugin)
+        .copied()
+        .context("Plugin disabled")?;
+    args["package_scope"] = json!(scope);
+    if method == "session" && args["method"] == "models" {
+        return crate::plugin_sessions::handle(state, plugin, args).await;
+    }
+    if method == "session" && matches!(args["method"].as_str(), Some("open" | "create")) {
+        // The plugin resolves its own document/history IDs to a conversation.
+        let lookup = c
+            .rpc(
+                "plugin/session",
+                json!({"method":"resolve","arguments":args,"context":{}}),
+            )
+            .await?;
+        if let Some(task) = lookup["conversation_id"]
+            .as_str()
+            .or_else(|| args["task_id"].as_str())
+        {
+            let conversation = if binding(state.workspace.root(), task)?.is_none() {
+                // An existing plugin-owned chat may predate remote bindings.
+                // Only the authenticated plugin can authorize its adoption.
+                crate::plugin_sessions::check(state.workspace.root(), task, plugin)?;
+                c.rpc(
+                    "plugin/session",
+                    json!({"method":"open","arguments":args,"context":context(task,task)}),
+                )
+                .await?;
+                save_binding(state.workspace.root(), task, plugin, &c)?;
+                task.to_owned()
+            } else {
+                check_binding(state.workspace.root(), task, plugin, &c)?
+            };
+            let extra = c
+                .rpc(
+                    "plugin/session",
+                    json!({"method":"open","arguments":args,"context":context(task,&conversation)}),
+                )
+                .await?;
+            return Ok(Json(json!({"task_id":conversation,"plugin_state":extra})).into_response());
+        }
+        let response = crate::plugin_sessions::handle(
+            state.clone(),
+            plugin,
+            json!({"method":"create","package_scope":scope}),
+        )
+        .await?;
+        let created: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 65536).await?)?;
+        let task = created["task_id"]
+            .as_str()
+            .context("Session creation failed")?;
+        let extra = c
+            .rpc(
+                "plugin/session",
+                json!({"method":"bind","arguments":args,"context":context(task,task)}),
+            )
+            .await?;
+        save_binding(state.workspace.root(), task, plugin, &c)?;
+        return Ok(Json(json!({"task_id":task,"plugin_state":extra})).into_response());
+    }
+    let task = args["task_id"]
+        .as_str()
+        .context("task_id required")?
+        .to_owned();
+    let conversation = check_binding(state.workspace.root(), &task, plugin, &c)?;
+    if method == "decide_definition" {
+        return Ok(Json(crate::main_task_anchor::decide_definition(
+            state.workspace.root(),
+            &task,
+            args["version"]
+                .as_i64()
+                .context("Proposal version required")?,
+            args["approve"]
+                .as_bool()
+                .context("approve must be boolean")?,
+            &c.subject,
+        )?)
+        .into_response());
+    }
+    if method == "confirm_plan" {
+        return Ok(Json(crate::main_task_anchor::confirm_plan(
+            state.workspace.root(),
+            &task,
+            args["version"].as_i64().context("Plan version required")?,
+            &c.subject,
+        )?)
+        .into_response());
+    }
+    if method == "upload" {
+        return Ok(Json(crate::attachments::encoded(&state, &task, &args)?).into_response());
+    }
+    if method == "attachment" {
+        return Ok(Json(crate::attachments::preview(
+            &state,
+            &task,
+            args["receiptId"].as_str().context("receiptId required")?,
+        )?)
+        .into_response());
+    }
+    if method == "session" {
+        let operation = args["method"]
+            .as_str()
+            .context("Session method required")?
+            .to_owned();
+        let extra = if matches!(operation.as_str(), "prompt" | "status") {
+            c.rpc(
+                "plugin/session",
+                json!({"method":operation,"arguments":args,"context":context(&task,&conversation)}),
+            )
+            .await?
+        } else {
+            Value::Null
+        };
+        let board = crate::main_task_anchor::board(state.workspace.root(), &task, None)?;
+        let response = crate::plugin_sessions::handle(state, plugin, args).await?;
+        if operation == "status" {
+            let status = response.status();
+            let mut value: Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024).await?,
+            )?;
+            value["plugin_state"] = extra;
+            value["task_board"] = json!(board);
+            return Ok((status, Json(value)).into_response());
+        }
+        return Ok(response);
+    }
+    ensure!(method == "service", "Unknown remote plugin operation");
+    Ok(Json(c.rpc("plugin/service",json!({"method":args["method"],"arguments":args["arguments"],"context":context(&task,&conversation)})).await?).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        extract::Path,
+        routing::{get, post},
+    };
+    async fn value(response: Response) -> Value {
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    fn headers(user: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {user}").parse().unwrap());
+        h
+    }
+    #[tokio::test]
+    async fn authenticated_generic_sessions_preserve_context_and_isolate_users() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let received = calls.clone();
+        let app=Router::new().route("/api/plugin/{method}",post(move|Path(method):Path<String>,h:HeaderMap,Json(body):Json<Value>| {
+            let received=received.clone();async move {
+                let user=h["authorization"].to_str().unwrap().strip_prefix("Bearer ").unwrap();
+                let args=&body["payload"]["args"];
+                let result=match method.as_str() {
+                    "handshake"=>json!({"version":1,"subject":user,"state":"awaiting_confirmation","connection_id":format!("c-{user}"),"plugin":{"id":"notes-test","title":"Notes","skill":"skill:SKILL.md","pages":[],"tools":[{"name":"save","description":"Save note","inputSchema":{"type":"object","properties":{}}}]}}),
+                    "confirm"=>json!({"state":"ready"}),"identity"=>json!({"subject":user}),
+                    "session"=>{received.lock().unwrap().push(args.clone());json!({"document_key":"plugin-owned","project_id":"opaque-state"})},
+                    "call"=>{received.lock().unwrap().push(args.clone());json!({"value":{"saved":true},"plan_proposal":{"title":"Notes","items":[{"id":"a","title":"First note","requirements":"Contains the requested text"}]}})},
+                    "service"=>json!({"echo":args}),_=>panic!("unexpected {method}")
+                };
+                Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":result}}))
+            }
+        })).route("/resource",get(||async{"---\nname: notes-test\ndescription: Write notes\n---\nUse save."}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!(
+            "remote-session-{}",
+            crate::agent_service::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let (runtime, catalog) = crate::skill_packages::test_runtime();
+        let package = remote::connect_user(
+            remote::Config {
+                url: format!("http://{address}"),
+                token: "admin".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        remote::mount_user_package(&runtime, &catalog.packages, package).unwrap();
+        let mut state = crate::agent_service::tests::test_state(&root, address);
+        state.tool_catalog = Some(catalog.clone());
+        let alice = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "notes-test",
+                "connect",
+                headers("alice"),
+                json!({}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let bob = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "notes-test",
+                "connect",
+                headers("bob"),
+                json!({}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        let created=value(handle(&runtime,state.clone(),"notes-test","session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"method":"create","document":"D1"})).await.unwrap()).await;
+        let task = created["task_id"].as_str().unwrap();
+        assert_eq!(created["plugin_state"]["project_id"], "opaque-state");
+        assert!(handle(&runtime,state.clone(),"notes-test","session",headers("bob"),json!({"connection_handle":bob["connection_handle"],"task_id":task,"method":"events"})).await.is_err());
+        assert!(handle(&runtime,state.clone(),"other","session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"method":"events"})).await.is_err());
+        let db = crate::agent_service::open_db(&root).unwrap();
+        db.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at,parent_task_id) VALUES ('child','','fake','draft',0,0,?1)",[task]).unwrap();
+        let args = json!({"project_id":"business-string","text":"你好"});
+        let result = crate::plugin_io::execute(
+            &state,
+            "child",
+            state.workspace.clone(),
+            "notes_test__save",
+            args.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["saved"], true);
+        assert!(result["plan_confirmation"]["version"].is_i64());
+        assert!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["tool"] == "save"
+                    && call["arguments"] == args
+                    && call["context"] == context("child", task))
+        );
+        let board = crate::main_task_anchor::board(&root, task, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(board["plan"]["plan"]["items"][0]["id"], "a");
+        assert_eq!(board["plan_confirmed"], false);
+        // Re-authentication restores an existing binding without accepting a different subject.
+        active().write().unwrap().remove(task);
+        let opened=value(handle(&runtime,state.clone(),"notes-test","session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"method":"open"})).await.unwrap()).await;
+        assert_eq!(opened["task_id"], task);
+        runtime.shutdown().unwrap();
+        server.abort();
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn host_transport_contains_no_business_adapter() {
+        for source in [
+            include_str!("skill_packages/remote.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+            include_str!("remote_sessions.rs")
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap(),
+        ] {
+            for forbidden in [
+                "ppt/",
+                "ppt-master",
+                "PPT_PLUGIN_URL",
+                "project_id",
+                "template_id",
+                "commit_design_spec",
+                "init_project",
+                "X-Ppt-",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "business coupling: {forbidden}"
+                );
+            }
+        }
+    }
+}

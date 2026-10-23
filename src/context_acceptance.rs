@@ -104,8 +104,14 @@ fn initialize(state: &mut AgentServiceState) -> Result<()> {
     Ok(())
 }
 
+/// Windows installs `python`; most Linux distributions only `python3`.
+fn python() -> &'static str {
+    let found = |name: &str| std::process::Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success());
+    if found("python") { "python" } else { "python3" }
+}
+
 fn program(root: &Path, args: &[&str]) -> Result<Value> {
-    let output = std::process::Command::new("python")
+    let output = std::process::Command::new(python())
         .args(args)
         .current_dir(root)
         .output()
@@ -163,7 +169,7 @@ fn check_call(number: Option<u64>, footer: bool) -> (String, Value) {
 }
 
 #[tokio::test]
-async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjection() -> Result<()>
+async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection() -> Result<()>
 {
     let root = workspace("scripted-tree")?;
     let outline: Value = serde_json::from_slice(&std::fs::read(root.join("outline.json"))?)?;
@@ -174,10 +180,9 @@ async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjec
     for name in ["outline.json", "design_spec.md"] {
         queue.push_back(("read_file".into(), json!({"path":name})));
     }
-    queue.push_back(("plan_pages".into(), json!({})));
+    // The host starts each planned page in order; the script never calls start_task.
     for page in outline["pages"].as_array().unwrap() {
         let n = page["id"].as_u64().unwrap();
-        queue.push_back(("start_page".into(), json!({"page":n})));
         let title = page["title"].as_str().unwrap();
         let points = page["points"]
             .as_array()
@@ -201,7 +206,6 @@ async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjec
         ));
         queue.push_back(check_call(Some(n), n >= 11));
         if n == 7 {
-            queue.push_back(("branch_task".into(),json!({"title":"Repair shared stylesheet","goal":"Add the missing repair-grid class","done_when":"Page 7 check passes","reason":"Page 7 check failed because the shared class is missing","briefing":"Read and repair only shared.css, then recheck page 7","inputs":{"tool_groups":["files","execution"]}})));
             let mut css = std::fs::read_to_string(root.join("shared.css"))?;
             let expected = crate::symbol_description::content_hash(css.as_bytes());
             css.push_str(
@@ -213,16 +217,12 @@ async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjec
                 json!({"path":"shared.css","content":css,"expected_code_hash":expected}),
             ));
             queue.push_back(check_call(Some(n), false));
-            queue.push_back(("return_current".into(), json!({})));
-            queue.push_back(check_call(Some(n), false));
         }
         if n == 10 {
             queue.push_back(("inject_user_update".into(), json!({})));
         }
-        queue.push_back(("return_current".into(), json!({})));
     }
     queue.push_back(check_call(None, true));
-    queue.push_back(("return_current".into(), json!({})));
     let progress = Arc::new(Mutex::new((queue, 0usize, 0usize, false)));
     let captured = progress.clone();
     let working = root.clone();
@@ -253,17 +253,6 @@ async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjec
                     crate::interjections::submit(&working,TASK,UPDATE).unwrap();
                     progress.3 = true;
                     tool(round,"read_task_board",json!({}))
-                } else if name=="plan_pages" {
-                    let materials=conn.prepare("SELECT asset_id FROM agent_context_assets WHERE task_id=?1 AND source_tool='read_file'").unwrap().query_map([TASK],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-                    tool(round,"plan_tasks",json!({"tasks":(1..=20).map(|page|json!({"title":format!("Page {page}"),"goal":format!("Generate page {page} from its exact outline entry"),"done_when":"The saved HTML passes its page checker","inputs":{"assets":materials,"pinned":materials,"tool_groups":["files","execution"]}})).collect::<Vec<_>>()}))
-                } else if name=="start_page" {
-                    let page=args["page"].as_u64().unwrap();
-                    let node=crate::task_tree::nodes(&conn,TASK).unwrap().into_iter().find(|n|n.title==format!("Page {page}")).unwrap();
-                    tool(round,"start_task",json!({"node_id":node.node_id,"briefing":format!("Follow the shared outline and specification for page {page}; verify its actual saved file.")}))
-                } else if name=="return_current" {
-                    let active=active.as_ref().unwrap();
-                    let proof:i64=conn.query_row("SELECT seq FROM agent_task_events WHERE task_id=?1 AND node_id=?2 AND kind='tool/result' AND json_extract(data,'$.meta.result.process_exit_code')=0 ORDER BY seq DESC LIMIT 1",params![TASK,active.node_id],|r|r.get(0)).unwrap();
-                    tool(round,"return_task",json!({"status":"done","result":format!("{} verified against the saved files",active.title),"evidence":[proof]}))
                 } else {
                     if name=="write_file" && args["path"]=="page11.html" {
                         assert!(body.to_string().contains("内部资料"),"the mid-turn update must reach the next execution request");
@@ -301,17 +290,10 @@ async fn scripted_twenty_page_task_tree_repairs_a_branch_and_scopes_the_interjec
         "the script must finish and propagate the user update"
     );
     let conn = agent_service::open_db(&root)?;
-    let nodes = crate::task_tree::nodes(&conn, TASK)?;
+    // The loop ends when the model answers without tool calls; the host records it.
     ensure!(
-        nodes.len() == 22 && nodes.iter().all(|n| n.status == "done"),
-        "all 20 page nodes, the repair branch and root must finish"
-    );
-    let page7 = nodes.iter().find(|n| n.title == "Page 7").unwrap();
-    ensure!(
-        nodes
-            .iter()
-            .any(|n| n.kind == "branch" && n.parent_id.as_deref() == Some(&page7.node_id)),
-        "the stylesheet repair must belong to page 7"
+        crate::task_tree::get(&conn, TASK, crate::task_tree::ROOT)?.status == "done",
+        "the plain final answer must end the task"
     );
     let failures:i64 = conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.meta.result.process_exit_code')=1",[TASK],|r|r.get(0))?;
     ensure!(
@@ -376,5 +358,88 @@ async fn real_model_twenty_page_task_tree_acceptance() -> Result<()> {
         check["passed"] == true,
         "real-model run incomplete; inspect the saved metrics and event database"
     );
+    Ok(())
+}
+
+const BLOG_TASK: &str = "blog-build";
+const BLOG_PROMPT: &str = "Build the static blog described in SPEC.md: write build.py, generate site/, and finish when python check_site.py reports passed. Do not modify posts/, templates/, SPEC.md or check_site.py. The task definition is already confirmed by this acceptance harness.";
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A small code project with a defect the plan does not know about: the shared
+/// `lib/slug.py` drops Chinese characters, so some posts collide or get empty
+/// slugs. Watch whether the Agent yields a repair task from the step that hits
+/// it, resumes that step, and keeps each step's context to earlier results.
+#[tokio::test]
+#[ignore = "real configured model run; writes an isolated target/context-acceptance workspace and consumes provider tokens"]
+async fn real_model_blog_build_repairs_an_unexpected_dependency() -> Result<()> {
+    real_model_blog("blog_build").await
+}
+
+/// The shared Markdown helper memoizes on body length, so two posts of equal
+/// length share one rendering. Nothing in the code or checker names the helper;
+/// the defect appears only as missing body text after a build.
+#[tokio::test]
+#[ignore = "real configured model run; writes an isolated target/context-acceptance workspace and consumes provider tokens"]
+async fn real_model_blog_build_meets_a_runtime_only_defect() -> Result<()> {
+    real_model_blog("blog_runtime").await
+}
+
+async fn real_model_blog(fixture_name: &str) -> Result<()> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture_name);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/context-acceptance")
+        .join(format!("{fixture_name}-real-{}", agent_service::uuid_like()));
+    copy_tree(&fixture, &root)?;
+    let mut state = agent_service::tests::test_state(&root, "127.0.0.1:1".parse()?);
+    let config = crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
+    crate::ai_proxy::apply_agent_config(&mut state, &config);
+    state.default_model = state.model_map.get(&state.default_model).cloned().unwrap_or(state.default_model);
+    let mut conn = agent_service::open_db(&root)?;
+    conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,?2,?3,'running',0,0)", params![BLOG_TASK,BLOG_PROMPT,state.default_model])?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let seq = agent_service::append_event_tx(&tx, BLOG_TASK, "user/message", &json!({"turn":0,"message":{"role":"user","content":BLOG_PROMPT}}), None)?;
+    tx.commit()?;
+    let proposal = crate::main_task_anchor::update(&root, BLOG_TASK, &json!({"objective":"Build the static blog in SPEC.md with build.py","constraints":["Do not modify posts/, templates/, SPEC.md or check_site.py","Standard library only"],
+        "completion_conditions":["python check_site.py reports passed"],"source_event_seqs":[seq]}))?;
+    crate::main_task_anchor::decide_definition(&root, BLOG_TASK, proposal["version"].as_i64().unwrap(), true, "acceptance-harness")?;
+    let outcome = crate::single_agent::run_task(state.clone(), BLOG_TASK.into(), state.default_model.clone(), BLOG_PROMPT.into(), 120, CancellationToken::new(), 1, false).await;
+    let check = program(&root, &["check_site.py"]).unwrap_or_else(|error| json!({"passed":false,"error":format!("{error:#}")}));
+    let nodes = crate::task_tree::nodes(&conn, BLOG_TASK)?;
+    let usage = |node: &str| -> Result<(i64, i64, i64)> {
+        Ok(conn.query_row("SELECT COUNT(*), COALESCE(SUM(json_extract(data,'$.estimated_input_tokens')),0), COALESCE(MAX(json_extract(data,'$.estimated_input_tokens')),0) FROM agent_task_events WHERE task_id=?1 AND node_id=?2 AND kind='context/usage'",
+            params![BLOG_TASK,node],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?)
+    };
+    let tree = nodes.iter().map(|n| {
+        let (requests, total, peak) = usage(&n.node_id)?;
+        Ok(json!({"node_id":n.node_id,"parent_id":n.parent_id,"kind":n.kind,"title":n.title,"status":n.status,"reason":n.spawned_from,
+            "result":n.result.as_ref().map(|r|r["result"].clone()),"requests":requests,"estimated_input_total":total,"estimated_input_peak":peak}))
+    }).collect::<Result<Vec<_>>>()?;
+    let count = |kind: &str| -> Result<i64> {Ok(conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind=?2",params![BLOG_TASK,kind],|r|r.get(0))?)};
+    let tool_errors: Vec<String> = conn.prepare("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.message.isError')=1")?
+        .query_map([BLOG_TASK], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter().map(|raw| serde_json::from_str::<Value>(&raw).map(|v| v["meta"]["result"]["error"].to_string().chars().take(200).collect()).unwrap_or(raw)).collect();
+    let report = json!({"outcome":outcome.as_ref().map(|_|"ok".to_owned()).unwrap_or_else(|e|format!("{e:#}")),
+        "task_status":conn.query_row("SELECT status FROM agent_tasks WHERE id=?1",[BLOG_TASK],|r|r.get::<_,String>(0))?,
+        "check":check,"nodes":tree,"compressions":count("context/compression_start")?,"tool_calls":count("tool/call")?,"tool_errors":tool_errors,
+        "changed_shared":std::fs::read_dir(fixture.join("lib"))?.filter_map(|e|e.ok()).filter_map(|e| {
+            let name=e.file_name();(std::fs::read(e.path()).ok()!=std::fs::read(root.join("lib").join(&name)).ok()).then(||name.to_string_lossy().into_owned())
+        }).collect::<Vec<_>>()});
+    std::fs::write(root.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
+    eprintln!("Blog acceptance report: {}", root.join("report.json").display());
+    outcome?;
+    ensure!(check["passed"] == true, "blog build incomplete; inspect report.json and the event database");
     Ok(())
 }

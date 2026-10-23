@@ -367,19 +367,6 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
             task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
             plugin_id TEXT NOT NULL
          );
-         CREATE TABLE IF NOT EXISTS ppt_session_bindings (
-            task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
-            subject TEXT NOT NULL, project_id INTEGER NOT NULL DEFAULT 0
-         );
-         CREATE TABLE IF NOT EXISTS ppt_session_jobs (
-            host_task_id TEXT NOT NULL REFERENCES agent_tasks(id) ON DELETE CASCADE,
-            remote_task_id TEXT NOT NULL, tool TEXT NOT NULL,
-            PRIMARY KEY(host_task_id,remote_task_id)
-         );
-         CREATE TABLE IF NOT EXISTS ppt_template_pins (
-            task_id TEXT PRIMARY KEY REFERENCES agent_tasks(id) ON DELETE CASCADE,
-            selection TEXT NOT NULL
-         );
          CREATE TABLE IF NOT EXISTS agent_observations (
             task_id TEXT NOT NULL, review_id TEXT NOT NULL, request_id INTEGER NOT NULL,
             input TEXT NOT NULL, status TEXT NOT NULL, result TEXT,

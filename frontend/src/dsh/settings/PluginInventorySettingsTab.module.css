@@ -3,7 +3,7 @@
   flex-direction: column;
   gap: 14px;
   width: 100%;
-  max-width: 760px;
+  max-width: none;
   color: var(--dsw-alias-label-primary);
 }
 

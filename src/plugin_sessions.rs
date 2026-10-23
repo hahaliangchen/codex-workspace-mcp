@@ -14,7 +14,7 @@ pub fn owner(root: &std::path::Path, task: &str) -> Result<Option<String>> {
     let conn = agent_service::open_db(root)?;
     Ok(conn
         .query_row(
-            "SELECT plugin_id FROM plugin_sessions WHERE task_id=?1",
+            "WITH RECURSIVE lineage(id,depth) AS (SELECT ?1,0 UNION ALL SELECT t.parent_task_id,l.depth+1 FROM agent_tasks t JOIN lineage l ON t.id=l.id WHERE t.parent_task_id IS NOT NULL AND l.depth<32) SELECT p.plugin_id FROM lineage l JOIN plugin_sessions p ON p.task_id=l.id ORDER BY l.depth LIMIT 1",
             [task],
             |r| r.get(0),
         )
@@ -22,7 +22,7 @@ pub fn owner(root: &std::path::Path, task: &str) -> Result<Option<String>> {
 }
 /// Dedicated agent workspace for one plugin's chats, kept apart from the host
 /// project. Base: `PLUGIN_WORKSPACE_BASE`, else `<root>/.codex-workspace-mcp/plugins`.
-/// Deliverables (PPTs, templates) live in the plugin backend's object storage,
+/// Plugin deliverables live in the plugin backend's object storage,
 /// not here; this directory only holds scratch files the agent writes.
 pub fn workspace_dir(root: &std::path::Path, plugin: &str) -> Result<std::path::PathBuf> {
     ensure!(

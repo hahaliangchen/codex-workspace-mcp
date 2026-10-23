@@ -17,6 +17,8 @@ pub struct Manifest {
     pub version: u32,
     pub id: String,
     pub title: String,
+    /// Optional instructions for this plugin's own conversation.
+    #[serde(default)]
     pub skill: String,
     #[serde(default)]
     pub inject: Vec<String>,

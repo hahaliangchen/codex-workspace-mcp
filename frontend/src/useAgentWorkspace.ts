@@ -42,7 +42,7 @@ export function useAgentWorkspace() {
   const [notice, setNotice] = useState<string>()
   const [parent, setParent] = useState<Task>()
   const [settingsOpen, setSettingsOpen] = useState(isSettingsRoute)
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>(isSettingsRoute() ? 'models' : 'general')
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('general')
   const [selectedModelOverride, setSelectedModelOverride] = useState<string>()
   const [selectedEffortOverride, setSelectedEffortOverride] = useState<string | null>()
   const [selectedFastModeOverride, setSelectedFastModeOverride] = useState<boolean>()
@@ -186,8 +186,10 @@ export function useAgentWorkspace() {
     return () => { active = false }
   }, [api, parentId])
 
-  const openSettings = useCallback((tab: SettingsTab = 'models') => {
-    setSettingsTab(tab)
+  // Used directly as an onClick handler by some buttons, so `tab` may be a
+  // click event rather than a tab id.
+  const openSettings = useCallback((tab?: SettingsTab) => {
+    setSettingsTab(typeof tab === 'string' ? tab : 'general')
     setSettingsOpen(true)
   }, [])
 

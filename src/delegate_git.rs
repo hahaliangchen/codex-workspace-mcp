@@ -87,7 +87,10 @@ pub fn prepare(root: &Path, id: &str) -> Result<Option<Value>> {
         .context("Git is required to isolate delegates in a Git project")?;
     if !probe.status.success() {
         let stderr = String::from_utf8_lossy(&probe.stderr);
-        if !root.ancestors().any(|path| path.join(".git").exists()) {
+        // Only a real repository marker counts: a worktree's `.git` file or a
+        // `.git` directory with HEAD. A stray empty `.git` (e.g. in /tmp) is not one.
+        let repository = |dot: PathBuf| dot.is_file() || dot.join("HEAD").is_file();
+        if !root.ancestors().any(|path| repository(path.join(".git"))) {
             return Ok(None);
         }
         bail!("could not inspect Git workspace: {}", stderr.trim());

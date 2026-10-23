@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const ROOT: &str = "n0";
-pub const MAX_DEPTH: usize = 4;
+/// Each unexpected task adds a step and a branch level, so 6 allows three nested repairs.
+pub const MAX_DEPTH: usize = 6;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -111,6 +112,7 @@ pub fn active(conn: &Connection, task: &str) -> Result<Option<Node>> {
         chain
             .iter()
             .take(chain.len() - 1)
+            .filter(|n| n.kind != "step")
             .all(|n| n.status == "suspended"),
         "TASK_STACK_ANCESTOR_NOT_SUSPENDED"
     );
@@ -149,6 +151,7 @@ pub fn emit(
 
 pub fn ensure_root(tx: &Transaction<'_>, task: &str, turn: usize) -> Result<Node> {
     if let Ok(node) = get(tx, task, ROOT) {
+        ensure_end(tx,task,&node,turn)?;
         return Ok(node);
     }
     let mut node = Node {
@@ -176,6 +179,7 @@ pub fn ensure_root(tx: &Transaction<'_>, task: &str, turn: usize) -> Result<Node
         definition_version: definition_version(tx, task)?,
     };
     emit(tx, task, "task/node_planned", &mut node, turn)?;
+    ensure_end(tx, task, &node, turn)?;
     let originals=tx.prepare("SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 AND kind IN ('user/message','user/interjection') ORDER BY seq")?
         .query_map([task],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (seq, kind, raw) in originals {
@@ -210,6 +214,15 @@ pub fn validate_inputs(args: &Value) -> Result<Value> {
     };
     ensure!(inputs.is_object(), "inputs must be an object");
     crate::single_agent::tool_groups::requested(&inputs["tool_groups"])?;
+    if let Some(files) = inputs.get("files") {
+        let files = files.as_array().context("inputs.files must be an array of workspace paths")?;
+        ensure!(files.len() <= 128, "too many declared files");
+        ensure!(
+            files.iter().all(|f| f.as_str().is_some_and(|p| !p.trim().is_empty()
+                && !std::path::Path::new(p).components().any(|c| matches!(c, std::path::Component::ParentDir)))),
+            "inputs.files entries must be workspace paths without .."
+        );
+    }
     for field in ["assets", "nodes", "pinned", "history"] {
         if let Some(items) = inputs.get(field) {
             let items = items
@@ -229,6 +242,25 @@ pub fn validate_inputs(args: &Value) -> Result<Value> {
     Ok(inputs)
 }
 
+/// Every task ends at its end node; steps are inserted before it.
+pub const END_ORDINAL: usize = 1_000_000;
+
+/// The end node of a task (root or branch). A task finishes only when it
+/// reaches it through return_task; until then the host keeps it iterating.
+/// Created with the task, or lazily for tasks saved before end nodes existed.
+pub fn ensure_end(tx: &Transaction<'_>, task: &str, owner: &Node, turn: usize) -> Result<Node> {
+    if let Some(mut end) = nodes(tx, task)?.into_iter().find(|n| n.parent_id.as_deref() == Some(&owner.node_id) && n.kind == "end") {
+        if end.goal=="Finish this task: return_task with its result" {
+            end.goal="End of execution; recorded by the host when the loop finishes".into();
+            emit(tx,task,"task/node_revised",&mut end,turn)?;
+        }
+        return Ok(end);
+    }
+    let mut end = planned(owner, &json!({"title":"End","goal":"End of execution; recorded by the host when the loop finishes","done_when":owner.done_when}), END_ORDINAL, "end")?;
+    emit(tx, task, "task/node_planned", &mut end, turn)?;
+    Ok(end)
+}
+
 pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Result<Node> {
     let executor = args["executor"].as_str().unwrap_or("inline");
     ensure!(
@@ -242,7 +274,7 @@ pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Resul
         ordinal,
         title: text(args, "title")?,
         goal: text(args, "goal")?,
-        done_when: text(args, "done_when")?,
+        done_when: if args.get("done_when").is_some() {text(args, "done_when")?} else {text(args, "goal")?},
         inputs: validate_inputs(&args["inputs"])?,
         executor: executor.into(),
         agent_id: None,
@@ -261,153 +293,16 @@ pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Resul
     })
 }
 
-pub fn plan(
-    tx: &Transaction<'_>,
-    task: &str,
-    parent: &Node,
-    args: &Value,
-    turn: usize,
-) -> Result<Value> {
-    ensure!(
-        path(tx, task, &parent.node_id)?.len() <= MAX_DEPTH,
-        "TASK_DEPTH_LIMIT"
-    );
-    let items = args["tasks"].as_array().context("tasks must be an array")?;
-    ensure!(items.len() <= 128, "too many planned tasks");
-    let mut changed = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut next_ordinal = nodes(tx, task)?
-        .iter()
-        .filter(|n| n.parent_id.as_deref() == Some(&parent.node_id))
-        .map(|n| n.ordinal + 1)
-        .max()
-        .unwrap_or(0);
-    for item in items {
-        let mut node = if let Some(id) = item["node_id"].as_str() {
-            ensure!(seen.insert(id), "duplicate task update");
-            let mut node = get(tx, task, id)?;
-            ensure!(
-                node.parent_id.as_deref() == Some(&parent.node_id) && node.status == "pending",
-                "only unstarted direct children may be revised"
-            );
-            if item["cancel"].as_bool() == Some(true) {
-                node.status = "cancelled".into();
-            }
-            for (field, target) in [
-                ("title", &mut node.title),
-                ("goal", &mut node.goal),
-                ("done_when", &mut node.done_when),
-            ] {
-                if item.get(field).is_some() {
-                    *target = text(item, field)?;
-                }
-            }
-            if item.get("inputs").is_some() {
-                node.inputs = validate_inputs(&item["inputs"])?;
-            }
-            if let Some(executor) = item.get("executor") {
-                let executor = executor
-                    .as_str()
-                    .context("executor must be inline or delegate")?;
-                ensure!(
-                    matches!(executor, "inline" | "delegate"),
-                    "invalid executor"
-                );
-                node.executor = executor.into();
-            }
-            node
-        } else {
-            let node = planned(parent, item, next_ordinal, "planned")?;
-            next_ordinal += 1;
-            node
-        };
-        if let Some(ordinal) = item["ordinal"].as_u64() {
-            node.ordinal = usize::try_from(ordinal)?;
-        }
-        node.definition_version = definition_version(tx, task)?;
-        let kind = if item["node_id"].is_string() {
-            "task/node_revised"
-        } else {
-            "task/node_planned"
-        };
-        emit(tx, task, kind, &mut node, turn)?;
-        changed.push(
-            json!({"node_id":node.node_id,"title":node.title,"status":node.status,
-            "ordinal":node.ordinal,"executor":node.executor,"metadata":node.metadata}),
-        );
-    }
-    Ok(json!({"tasks":changed}))
-}
-
-pub fn confirmed_ppt_pages(
-    tx: &Transaction<'_>,
-    task: &str,
-    version: i64,
-    plan: &Value,
-) -> Result<()> {
-    if plan["domain"] != "ppt" {
-        return Ok(());
-    }
-    let turn=tx.query_row("SELECT COALESCE(MAX(json_extract(data,'$.turn')),0) FROM agent_task_events WHERE task_id=?1",[task],|r|r.get::<_,usize>(0))?;
-    let root = ensure_root(tx, task, turn)?;
-    let previous = nodes(tx, task)?;
-    for mut node in previous
-        .iter()
-        .filter(|n| {
-            n.metadata["domain"] == "ppt"
-                && n.metadata["plan_version"] != version
-                && n.status == "pending"
-        })
-        .cloned()
-    {
-        node.status = "cancelled".into();
-        emit(tx, task, "task/node_revised", &mut node, turn)?;
-    }
-    for (index, item) in plan["items"]
-        .as_array()
-        .context("PPT plan items missing")?
-        .iter()
-        .enumerate()
-    {
-        if previous.iter().any(|n| {
-            n.metadata["plan_version"] == version && n.metadata["plan_page_id"] == item["id"]
-        }) {
-            continue;
-        }
-        let mut node = planned(
-            &root,
-            &json!({"title":format!("Page {}: {}",index+1,item["title"].as_str().unwrap_or("")),
-            "goal":item["requirements"],"done_when":"Saved page matches the confirmed requirements and current visual checks pass"}),
-            index,
-            "planned",
-        )?;
-        node.metadata = json!({"domain":"ppt","plan_version":version,"project_id":plan["project_id"],
-            "page_index":index+1,"plan_page_id":item["id"],"requirements":item["requirements"]});
-        emit(tx, task, "task/node_planned", &mut node, turn)?;
-    }
-    Ok(())
-}
-
-pub fn current_ppt_page(conn: &Connection, task: &str, id: &str) -> Result<Option<Value>> {
-    Ok(path(conn, task, id)?
-        .into_iter()
-        .rev()
-        .find(|n| n.metadata["domain"] == "ppt")
-        .map(|n| n.metadata))
-}
-
 pub fn validate_plan_version(conn: &Connection, task: &str, node: &Node) -> Result<()> {
     ensure!(
         crate::main_task_anchor::definition_matches(conn, task, node.definition_version)?,
         "TASK_DEFINITION_SUPERSEDED: return blocked and revise the plan from the parent"
     );
-    let page = if node.metadata["domain"] == "ppt" {
+    let page = if node.metadata["plan_version"].is_i64() {
         Some(node.metadata.clone())
-    } else if let Some(parent) = node.parent_id.as_deref() {
-        current_ppt_page(conn, task, parent)?
-    } else {
-        None
-    };
+    } else if let Some(parent)=node.parent_id.as_deref() {
+        path(conn,task,parent)?.into_iter().rev().find(|n|n.metadata["plan_version"].is_i64()).map(|n|n.metadata)
+    } else {None};
     if let Some(page) = page {
         let version:Option<i64>=conn.query_row("SELECT seq FROM agent_task_events WHERE task_id=?1 AND kind='task/plan' ORDER BY seq DESC LIMIT 1",[task],|r|r.get(0)).optional()?;
         ensure!(
@@ -452,9 +347,12 @@ pub fn register_user(
     content: &Value,
 ) -> Result<()> {
     let id = format!("u{seq}");
+    // A message received at the root can only be scoped to the root (scope is
+    // the current node or an ancestor), so there is nothing for the model to decide.
+    let scope = (origin == ROOT).then_some(ROOT);
     tx.execute(
-        "INSERT OR IGNORE INTO agent_user_instructions VALUES (?1,?2,?3,?4,NULL,?5)",
-        params![task, id, seq, origin, content.to_string()],
+        "INSERT OR IGNORE INTO agent_user_instructions VALUES (?1,?2,?3,?4,?5,?6)",
+        params![task, id, seq, origin, scope, content.to_string()],
     )?;
     Ok(())
 }
@@ -471,49 +369,6 @@ pub fn instructions(conn: &Connection, task: &str, id: &str) -> Result<Vec<Value
         .map(|(id,seq,origin,scope,raw)|Ok(json!({"id":id,"event_seq":seq,"origin_node":origin,"scope_node":scope,
             "scope_pending":scope.is_none(),"original":serde_json::from_str::<Value>(&raw)?,
             "instruction":if scope.is_none(){"Scope pending. Visible for awareness; only the main Agent may assign scope. Do not treat this notice as global execution permission."}else{"Apply the original instruction, including its conditions, within this subtree."}}))).collect()
-}
-
-pub fn scope_message(
-    tx: &Transaction<'_>,
-    task: &str,
-    current: &Node,
-    args: &Value,
-    turn: usize,
-) -> Result<Value> {
-    let id = text(args, "instruction_id")?;
-    let scope = text(args, "node_id")?;
-    ensure!(
-        path(tx, task, &current.node_id)?
-            .iter()
-            .any(|n| n.node_id == scope),
-        "scope must be current node or ancestor"
-    );
-    let old: Option<Option<String>> = tx
-        .query_row(
-            "SELECT scope_node FROM agent_user_instructions WHERE task_id=?1 AND id=?2",
-            params![task, id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let old = old.context("instruction not found")?;
-    ensure!(
-        old.as_ref().is_none_or(|s| s == &scope),
-        "instruction already scoped; original scope cannot be silently changed"
-    );
-    tx.execute(
-        "UPDATE agent_user_instructions SET scope_node=?3 WHERE task_id=?1 AND id=?2",
-        params![task, id, scope],
-    )?;
-    let result =
-        json!({"instruction_id":id,"node_id":scope,"task_node_id":current.node_id,"turn":turn});
-    crate::agent_service::append_event_tx(
-        tx,
-        task,
-        "task/message_scoped",
-        &result,
-        Some("append"),
-    )?;
-    Ok(result)
 }
 
 pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value) -> Result<()> {
@@ -549,7 +404,7 @@ pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value)
     }
     validate_plan_version(conn, task, node)?;
     ensure!(
-        !children.iter().any(|n| n.status == "pending"),
+        !children.iter().any(|n| n.status == "pending" && n.kind != "end"),
         "PENDING_CHILD_TASKS: finish or cancel outstanding work"
     );
     ensure!(
@@ -558,6 +413,11 @@ pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value)
             && n.review.as_deref() != Some("accepted")),
         "UNACCEPTED_DELEGATE_RESULT: inspect and review child output first"
     );
+    // A task is done only when its planned steps are. A branch is a yielded
+    // call: its outcome, done or not, was already handed back to the caller,
+    // which decided how to continue.
+    ensure!(status != "done" || !children.iter().any(|n| n.kind == "planned" && matches!(n.status.as_str(),"failed"|"blocked"|"needs_user")),
+        "UNRESOLVED_CHILD_TASKS: retry failed or blocked steps with start_task, or cancel them with plan_tasks, before completing the task");
     let accepted = |id: &str| {
         children.iter().any(|n| {
             n.node_id == id
@@ -607,8 +467,15 @@ pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value)
         count += 1;
     }
     for value in args["outputs"].as_array().into_iter().flatten() {
-        let id = value.as_str().context("outputs must contain asset IDs")?;
-        let origin:Option<(String,i64)>=conn.query_row("SELECT COALESCE(e.node_id,'n0'),e.seq FROM agent_context_assets a JOIN agent_task_events e ON e.task_id=a.task_id AND e.seq=json_extract(a.reference_json,'$.history_reference.event_seq') WHERE a.task_id=?1 AND a.asset_id=?2",params![task,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let id = value.as_str().context("outputs must contain asset IDs or workspace file paths")?;
+        if !id.starts_with("asset-") {
+            output_file(conn, task, node, id, &accepted)?;
+            count += 1;
+            continue;
+        }
+        let origin:Option<(String,i64)>=conn.query_row("SELECT COALESCE(e.node_id,'n0'),e.seq FROM agent_context_assets a JOIN agent_task_events e ON e.task_id=a.task_id AND e.seq=json_extract(a.reference_json,'$.history_reference.event_seq') WHERE a.task_id=?1 AND a.asset_id=?2",params![task,id],|r|Ok((r.get(0)?,r.get(1)?))).optional()
+            // The asset table is created with the first saved asset.
+            .or_else(|e| if e.to_string().contains("no such table") {Ok(None)} else {Err(e)})?;
         let (owner, seq) = origin.context("output asset not found")?;
         let source = node.source.as_ref().is_some_and(|s| {
             s["node_id"] == owner
@@ -622,6 +489,43 @@ pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value)
         count += 1;
     }
     ensure!(count > 0, "DONE_REQUIRES_EVIDENCE");
+    Ok(())
+}
+
+/// A workspace file named as a node's output must exist and come from this
+/// node or an accepted child: a successful write of that path, or, for files a
+/// program generated, a successful program run in this node.
+fn output_file(conn: &Connection, task: &str, node: &Node, path: &str, accepted: &dyn Fn(&str) -> bool) -> Result<()> {
+    let root = conn.path().map(std::path::Path::new)
+        .and_then(|db| db.parent()?.parent()).context("workspace root unavailable")?;
+    let relative = std::path::Path::new(path).strip_prefix(root).unwrap_or(std::path::Path::new(path))
+        .components().filter_map(|c| match c {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => Some("..".into()),
+            _ => None,
+        }).collect::<Vec<_>>();
+    ensure!(!relative.is_empty() && !relative.iter().any(|p| p == ".."), "OUTPUT_PATH_INVALID: {path}");
+    let relative = relative.join("/");
+    ensure!(root.join(&relative).exists(), "OUTPUT_FILE_MISSING: {relative} does not exist in the workspace");
+    let mine = |owner: &str, seq: i64| owner == node.node_id || accepted(owner) || node.source.as_ref().is_some_and(|s| {
+        s["node_id"] == owner && seq >= s["after_seq"].as_i64().unwrap_or(0) && seq <= s["through_seq"].as_i64().unwrap_or(-1)
+    });
+    let rows = conn.prepare("SELECT COALESCE(node_id,'n0'),seq,data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result'")?
+        .query_map([task], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut generated = false;
+    for (owner, seq, raw) in rows {
+        if !mine(&owner, seq) { continue; }
+        let data: Value = serde_json::from_str(&raw)?;
+        let result = &data["meta"]["result"];
+        if data["message"]["isError"] == true || result.get("error").is_some() { continue; }
+        let written = result["path"].as_str().map(|p| p.replace('\\', "/").trim_start_matches("./").to_owned());
+        if written.as_deref() == Some(relative.as_str()) && result.get("code_hash").is_some() {
+            return Ok(());
+        }
+        generated |= owner == node.node_id && result["process_exit_code"].as_i64() == Some(0);
+    }
+    ensure!(generated, "OUTPUT_NOT_PRODUCED_HERE: {relative} was not written by this node or an accepted child, and this node ran no successful program that could have generated it");
     Ok(())
 }
 
@@ -731,58 +635,16 @@ pub fn rebuild(tx: &Transaction<'_>, task: &str) -> Result<()> {
     Ok(())
 }
 
+/// Task-tree tools. The main loop has branch_task to start a task with its own
+/// context; a delegate hands its result back with return_task.
 pub fn is_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "plan_tasks"
-            | "start_task"
-            | "branch_task"
-            | "return_task"
-            | "split_task"
-            | "scope_message"
-    )
+    matches!(name, "branch_task" | "return_task")
 }
 
 pub fn tools() -> Vec<Value> {
-    let task = json!({"type":"object","properties":{"node_id":{"type":"string"},"title":{"type":"string"},"goal":{"type":"string"},"done_when":{"type":"string"},"inputs":{"type":"object","description":"Declared assets, pinned materials, nodes, history, and optional tool_groups IDs for this child frame. Omitted tool_groups starts with core tools only."},"executor":{"type":"string","enum":["inline","delegate"]},"ordinal":{"type":"integer","minimum":0},"cancel":{"type":"boolean"}}});
-    let ret = json!({"status":{"type":"string","enum":["done","failed","blocked","needs_user"]},"result":{"type":"string"},"facts":{"type":"array","items":{"type":"object"}},"outputs":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"integer"}},"open_issues":{"type":"string"},"question":{"type":"string"}});
-    let entries = [
-        (
-            "plan_tasks",
-            "Create, revise, reorder or cancel unstarted direct child tasks. A node is a verifiable unit of work, not an AI request. IDs are assigned by the host.",
-            json!({"tasks":{"type":"array","items":task}}),
-            json!(["tasks"]),
-        ),
-        (
-            "start_task",
-            "Enter one planned direct child. Supply a briefing after reviewing relevant prior results. Parent frame is suspended until return_task.",
-            json!({"node_id":{"type":"string"},"briefing":{"type":"string"},"inputs":{"type":"object"}}),
-            json!(["node_id", "briefing"]),
-        ),
-        (
-            "branch_task",
-            "Insert and immediately enter an unexpected subtask, such as repairing a failing dependency. Parent frame resumes after return.",
-            json!({"title":{"type":"string"},"goal":{"type":"string"},"done_when":{"type":"string"},"reason":{"type":"string"},"briefing":{"type":"string"},"inputs":{"type":"object"}}),
-            json!(["title", "goal", "done_when", "reason", "briefing"]),
-        ),
-        (
-            "return_task",
-            "Finish this node with a concise result and verifiable evidence. done requires successful own tool events, accepted direct child returns, or output assets. needs_user returns the question to the parent and ends this turn. Local clarifications use ordinary text and keep the node running. Resolve pending instruction scopes first.",
-            ret,
-            json!(["status", "result"]),
-        ),
-        (
-            "split_task",
-            "Fold completed work into a done child, retaining every original user message, child result, declared input, pinned material and this native tool exchange. Plan remaining direct children. Resolve pending instruction scopes first.",
-            json!({"title":{"type":"string"},"completed":{"type":"object"},"tasks":{"type":"array","items":task}}),
-            json!(["title", "completed", "tasks"]),
-        ),
-        (
-            "scope_message",
-            "Assign an original user instruction to this node, an ancestor subtree or n0 (root). Preserve its original conditions. Only main execution assigns scope. Must be called alone.",
-            json!({"instruction_id":{"type":"string"},"node_id":{"type":"string"}}),
-            json!(["instruction_id", "node_id"]),
-        ),
-    ];
-    entries.into_iter().map(|(name,description,properties,required)|json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":properties,"required":required}}})).collect()
+    let ret = json!({"status":{"type":"string","enum":["done","failed","blocked","needs_user"]},"result":{"type":"string"},"facts":{"type":"array","items":{"type":"object"}},"outputs":{"type":"array","items":{"type":"string"},"description":"What this delegate produced: workspace file paths it wrote or generated, or asset IDs (asset-...)."},"evidence":{"type":"array","items":{"type":"integer"}},"open_issues":{"type":"string"},"question":{"type":"string"}});
+    vec![json!({"type":"function","function":{"name":"branch_task","description":"Start a separate task for something unexpected that deserves its own context, such as repairing a broken dependency. It runs in a fresh context with the task goal and your briefing; when it answers without tool calls, that answer comes back here as its result and this task continues where it was. Call it alone.",
+        "parameters":{"type":"object","properties":{"title":{"type":"string"},"goal":{"type":"string"},"reason":{"type":"string","description":"Why it needs its own task"},"briefing":{"type":"string","description":"What it needs to know from here"}},"required":["title","goal","reason"]}}}),
+        json!({"type":"function","function":{"name":"return_task","description":"Finish this delegated assignment with its result. result and facts are what the main Agent sees: state what changed, not how. done requires successful tool events of this assignment or its output files/assets; failed/blocked state what went wrong in open_issues; needs_user returns a question.",
+        "parameters":{"type":"object","properties":ret,"required":["status","result"]}}})]
 }

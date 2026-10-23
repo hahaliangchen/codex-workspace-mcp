@@ -83,7 +83,7 @@ pub async fn prepare_turn(
     use rusqlite::OptionalExtension;
     let saved:Option<(String,Option<String>,Option<String>,bool)>=crate::agent_service::open_db(state.workspace.root())?
         .query_row("SELECT model,provider_name,reasoning_effort,fast_mode FROM agent_tasks WHERE id=?1",[task],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
-    let saved = saved.context("PPT conversation not found")?;
+    let saved = saved.context("plugin conversation not found")?;
     let explicit = request.provider.is_some() || request.model.is_some();
     let provider = request
         .provider

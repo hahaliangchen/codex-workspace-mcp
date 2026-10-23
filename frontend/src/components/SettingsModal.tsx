@@ -30,7 +30,6 @@ import appearanceCss from '../dsh/settings/AppearanceRow.module.css'
 import modelsCss from '../dsh/settings/ModelsSection.module.css'
 import pluginsCss from '../dsh/settings/PluginInventorySettingsTab.module.css'
 import rootCss from '../dsh/settings/SettingsRoot.module.css'
-import subagentCss from '../dsh/settings/SubagentCard.module.css'
 import { brandIcon, getPalette, getThemeMode, setPalette, setThemeMode, type ThemeMode, type ThemePalette } from '../theme.ts'
 import type { SettingsTab } from '../useAgentWorkspace.ts'
 
@@ -141,6 +140,7 @@ export function SettingsModal({
   const [palette, setPaletteState] = useState<ThemePalette>(getPalette)
   const [draft, setDraft] = useState<DraftSettings | null>(null)
   const [openProviderId, setOpenProviderId] = useState<string | null>(null)
+  const [baseline, setBaseline] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [probingImage, setProbingImage] = useState<string | null>(null)
   const [statusMsg, setStatusMsg] = useState<{ text: string; error: boolean } | null>(null)
@@ -158,6 +158,7 @@ export function SettingsModal({
       (data) => {
         const next = toDraft(data)
         setDraft(next)
+        setBaseline(JSON.stringify(next))
         if (next.providers.length === 1 && openProviderId === null) {
           setOpenProviderId(next.providers[0]?._draftId ?? null)
         }
@@ -263,7 +264,9 @@ export function SettingsModal({
         observer_provider: draft.observer_provider || null,
         observer_model: draft.observer_model || null,
       })
-      setDraft(toDraft(saved))
+      const savedDraft = toDraft(saved)
+      setDraft(savedDraft)
+      setBaseline(JSON.stringify(savedDraft))
       setStatusMsg({ text: '设置已保存并立即对新任务生效。', error: false })
       onSaved()
       return saved
@@ -284,10 +287,15 @@ export function SettingsModal({
       const result = await api.probeImage({ revision: saved.revision, provider: provider.id.trim(), model })
       const verified = result.settings.providers.find(p => p.id === provider.id.trim())?.model_capabilities[model]
       if (!verified) throw new Error('验证返回缺少模型能力记录')
-      setDraft(current => current && ({ ...current, revision: result.settings.revision,
-        providers: current.providers.map(item => item.id.trim() === provider.id.trim()
-          ? { ...item, model_capabilities: { ...item.model_capabilities, [model]: verified } }
-          : item) }))
+      setDraft(current => {
+        if (!current) return current
+        const next = { ...current, revision: result.settings.revision,
+          providers: current.providers.map(item => item.id.trim() === provider.id.trim()
+            ? { ...item, model_capabilities: { ...item.model_capabilities, [model]: verified } }
+            : item) }
+        setBaseline(JSON.stringify(next))
+        return next
+      })
       const capability = result.probe.capability
       setStatusMsg({ text: capability === 'supported' ? '模型正确识别了测试图片，已接通真实图片输入。'
         : capability === 'unsupported' ? '接口明确拒绝图片，已保存原始原因。'
@@ -384,11 +392,13 @@ export function SettingsModal({
 
   if (!open) return null
 
+  const dirty = draft !== null && baseline !== null && JSON.stringify(draft) !== baseline
+
   const navItems: readonly { id: SettingsTab; label: string; icon: JSX.Element }[] = [
     { id: 'general', label: '通用', icon: <IconSettingsOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'models', label: '模型与提供商', icon: <IconDatabaseOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'observer', label: 'Observer', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
-    { id: 'tools', label: '专用模型', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
+    { id: 'tools', label: '专用模型', icon: <IconCodeOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'plugins', label: '插件状态', icon: <IconCordisPluginOutlineRegular className={rootCss.navIcon} size={18} /> },
   ]
 
@@ -416,7 +426,7 @@ export function SettingsModal({
         <div className={rootCss.content}>
           <header className={rootCss.header}>
             <div className={rootCss.actions}>
-              {activeTab !== 'plugins' && (
+              {dirty && (
                 <button
                   type="button"
                   className={modelsCss.primaryButton}
@@ -439,39 +449,55 @@ export function SettingsModal({
               </p>
             )}
 
+            {draft === null && statusMsg === null && (activeTab === 'models' || activeTab === 'tools' || activeTab === 'observer') && (
+              <p className={modelsCss.intro}>正在加载设置…</p>
+            )}
+
             {activeTab === 'general' && (
               <div className={modelsCss.section}>
-                <h2 className={modelsCss.title}>通用设置</h2>
-                <p className={modelsCss.intro}>自定义 DeepSeek Harness 风格界面的外观主题与工作区环境。</p>
+                <div className={modelsCss.pageHead}>
+                  <h2 className={modelsCss.title}>通用设置</h2>
+                  <p className={modelsCss.intro}>自定义界面的外观主题，并查看当前工作区环境。</p>
+                </div>
 
-                <div className={appearanceCss.group}>
-                  <div className={appearanceCss.title}>外观</div>
-                  <div className={appearanceCss.cubeRow}>
-                    {([
-                      { mode: 'light', label: '浅色', icon: <IconLightOutlineRegular size={22} /> },
-                      { mode: 'dark', label: '深色', icon: <IconDarkOutlineRegular size={22} /> },
-                      { mode: 'system', label: '跟随系统', icon: <IconCodeOutlineRegular size={22} /> },
-                    ] as const).map(option => (
-                      <button
-                        key={option.mode}
-                        type="button"
-                        className={clsx(appearanceCss.themeCube, themeMode === option.mode && appearanceCss.selected)}
-                        onClick={() => {
-                          setThemeModeState(option.mode)
-                          setThemeMode(option.mode)
-                          onThemeChanged()
-                        }}
-                      >
-                        {option.icon}
-                        <span>{option.label}</span>
-                      </button>
-                    ))}
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>外观</div>
+                  <div className={appearanceCss.group}>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>外观模式</span>
+                        <span className={appearanceCss.rowHint}>浅色、深色，或跟随系统自动切换</span>
+                      </div>
+                      <div className={appearanceCss.segmented} role="radiogroup" aria-label="外观模式">
+                        {([
+                          { mode: 'light', label: '浅色', icon: <IconLightOutlineRegular size={16} /> },
+                          { mode: 'dark', label: '深色', icon: <IconDarkOutlineRegular size={16} /> },
+                          { mode: 'system', label: '跟随系统', icon: <IconSettingsOutlineRegular size={16} /> },
+                        ] as const).map(option => (
+                          <button
+                            key={option.mode}
+                            type="button"
+                            role="radio"
+                            aria-checked={themeMode === option.mode}
+                            className={clsx(appearanceCss.segment, themeMode === option.mode && appearanceCss.segmentOn)}
+                            onClick={() => {
+                              setThemeModeState(option.mode)
+                              setThemeMode(option.mode)
+                              onThemeChanged()
+                            }}
+                          >
+                            {option.icon}
+                            <span>{option.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                <div className={appearanceCss.group}>
-                  <div className={appearanceCss.title}>主题</div>
-                  <div className={appearanceCss.cubeRow}>
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>主题色</div>
+                  <div className={appearanceCss.group} role="radiogroup" aria-label="主题色">
                     {([
                       { palette: 'sprout', label: '新芽', hint: '生机 · 青绿', swatches: ['#1d9e75', '#5dcaa5', '#e3f1ea'] },
                       { palette: 'ginkgo', label: '银杏', hint: '秋日 · 清爽冷静 · 枫叶红与银杏黄', swatches: ['#b5452c', '#e2a52e', '#f8eccd'] },
@@ -479,34 +505,38 @@ export function SettingsModal({
                       <button
                         key={option.palette}
                         type="button"
-                        title={option.hint}
-                        aria-pressed={palette === option.palette}
-                        className={clsx(appearanceCss.themeCube, palette === option.palette && appearanceCss.selected)}
+                        role="radio"
+                        aria-checked={palette === option.palette}
+                        className={clsx(appearanceCss.row, appearanceCss.rowButton)}
                         onClick={() => {
                           setPaletteState(option.palette)
                           setPalette(option.palette)
                         }}
                       >
-                        <img src={brandIcon(option.palette)} width={24} height={24} alt="" />
-                        <span>{option.label}</span>
+                        <img className={appearanceCss.brand} src={brandIcon(option.palette)} width={28} height={28} alt="" />
+                        <div className={appearanceCss.rowText}>
+                          <span className={appearanceCss.rowTitle}>{option.label}</span>
+                          <span className={appearanceCss.rowHint}>{option.hint}</span>
+                        </div>
                         <span className={appearanceCss.swatches} aria-hidden="true">
                           {option.swatches.map(color => <i key={color} style={{ background: color }} />)}
                         </span>
+                        <span className={clsx(appearanceCss.check, palette === option.palette && appearanceCss.checkOn)} aria-hidden="true" />
                       </button>
                     ))}
                   </div>
                 </div>
 
-                <div className={modelsCss.rowCard} style={{ marginTop: 8 }}>
-                  <div className={modelsCss.rowHead}>
-                    <div className={modelsCss.rowIdentity}>
-                      <span className={clsx(modelsCss.credentialDot, modelsCss.credentialDotConfigured)} />
-                      <span className={modelsCss.rowName}>当前工作区目录</span>
-                      <span className={modelsCss.rowTag}>Rust Workspace</span>
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>工作区</div>
+                  <div className={appearanceCss.group}>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>当前工作区目录</span>
+                        <span className={appearanceCss.rowHint}>Rust Workspace</span>
+                      </div>
+                      <span className={appearanceCss.path} title={workspacePath}>{workspacePath || '连接中…'}</span>
                     </div>
-                  </div>
-                  <div className={modelsCss.editorRoute} style={{ fontFamily: 'var(--ds-font-family-code)', wordBreak: 'break-all' }}>
-                    {workspacePath || '连接中…'}
                   </div>
                 </div>
               </div>
@@ -514,318 +544,284 @@ export function SettingsModal({
 
             {activeTab === 'models' && draft !== null && (
               <div className={modelsCss.section}>
-                <h2 className={modelsCss.title}>模型与提供商</h2>
-                <p className={modelsCss.intro}>
-                  配置模型提供商端点、API 协议及模型目录。API 密钥安全存储在本地凭据文件中，不会在前端回显。
-                </p>
+                <div className={modelsCss.pageHead}>
+                  <h2 className={modelsCss.title}>模型与提供商</h2>
+                  <p className={modelsCss.intro}>
+                    配置模型提供商端点、API 协议及模型目录。API 密钥安全存储在本地凭据文件中，不会在前端回显。
+                  </p>
+                </div>
 
-                {/* Primary Orchestrator Route Card */}
-                <div className={modelsCss.setupCard}>
-                  <div className={modelsCss.editorHeader}>
-                    <span className={modelsCss.editorTitle}>默认主代理路由</span>
-                    <span className={modelsCss.editorRoute}>新会话与主任务默认使用的提供商和模型</span>
-                  </div>
-                  <div className={modelsCss.modelAdvanced}>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>主代理提供商</span>
-                      <select
-                        className={clsx(modelsCss.input, modelsCss.selectInput)}
-                        style={{ maxWidth: '100%' }}
-                        value={draft.orchestrator_provider}
-                        onChange={(e) => {
-                          const nextProviderId = e.target.value
-                          const prov = draft.providers.find(p => p.id === nextProviderId)
-                          const firstModel = prov ? parseModels(prov.models_text)[0] ?? '' : ''
-                          const capability = prov?.model_capabilities[firstModel]
-                          updateDraft({
-                            orchestrator_provider: nextProviderId,
-                            orchestrator_model: firstModel,
-                            reasoning_effort: capability?.default_effort ?? '',
-                            fast_mode: false,
-                          })
-                        }}
-                      >
-                        <option value="">未选择提供商</option>
-                        {draft.providers.map(p => (
-                          <option key={p._draftId} value={p.id}>
-                            {p.display_name || p.id} ({p.id})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>主代理模型 ID</span>
-                      <input
-                        className={modelsCss.input}
-                        list="dsh-main-model-list"
-                        placeholder="输入或选择模型 ID"
-                        value={draft.orchestrator_model}
-                        onChange={(e) => {
-                          const model = e.target.value
-                          const capability = mainProviderObj?.model_capabilities[model]
-                          updateDraft({
-                            orchestrator_model: model,
-                            reasoning_effort: capability?.default_effort ?? '',
-                            fast_mode: false,
-                          })
-                        }}
-                      />
-                      <datalist id="dsh-main-model-list">
-                        {mainModels.map(m => <option key={m} value={m} />)}
-                      </datalist>
-                    </label>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>思考等级</span>
-                      <select
-                        className={clsx(modelsCss.input, modelsCss.selectInput)}
-                        value={mainCapability?.reasoning_efforts.includes(draft.reasoning_effort) ? draft.reasoning_effort : ''}
-                        disabled={!mainCapability?.reasoning_efforts.length}
-                        onChange={(e) => { updateDraft({ reasoning_effort: e.target.value }) }}
-                      >
-                        <option value="">模型默认</option>
-                        {(mainCapability?.reasoning_efforts ?? []).map(level => (
-                          <option key={level} value={level}>{level}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>⚡ 请求加速</span>
-                      <input
-                        type="checkbox"
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>默认主代理</div>
+                  <div className={appearanceCss.group}>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>提供商</span>
+                        <span className={appearanceCss.rowHint}>新会话与主任务默认使用的提供商</span>
+                      </div>
+                      <div className={appearanceCss.control}>
+                        <select
+                          className={clsx(modelsCss.input, modelsCss.selectInput)}
+                          aria-label="主代理提供商"
+                          value={draft.orchestrator_provider}
+                          onChange={(e) => {
+                            const nextProviderId = e.target.value
+                            const prov = draft.providers.find(p => p.id === nextProviderId)
+                            const firstModel = prov ? parseModels(prov.models_text)[0] ?? '' : ''
+                            const capability = prov?.model_capabilities[firstModel]
+                            updateDraft({
+                              orchestrator_provider: nextProviderId,
+                              orchestrator_model: firstModel,
+                              reasoning_effort: capability?.default_effort ?? '',
+                              fast_mode: false,
+                            })
+                          }}
+                        >
+                          <option value="">未选择提供商</option>
+                          {draft.providers.map(p => (
+                            <option key={p._draftId} value={p.id}>
+                              {p.display_name || p.id} ({p.id})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>模型 ID</span>
+                        <span className={appearanceCss.rowHint}>可输入，也可从该提供商的目录中选择</span>
+                      </div>
+                      <div className={appearanceCss.control}>
+                        <input
+                          className={modelsCss.input}
+                          aria-label="主代理模型 ID"
+                          list="dsh-main-model-list"
+                          placeholder="输入或选择模型 ID"
+                          value={draft.orchestrator_model}
+                          onChange={(e) => {
+                            const model = e.target.value
+                            const capability = mainProviderObj?.model_capabilities[model]
+                            updateDraft({
+                              orchestrator_model: model,
+                              reasoning_effort: capability?.default_effort ?? '',
+                              fast_mode: false,
+                            })
+                          }}
+                        />
+                        <datalist id="dsh-main-model-list">
+                          {mainModels.map(m => <option key={m} value={m} />)}
+                        </datalist>
+                      </div>
+                    </div>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>思考等级</span>
+                        <span className={appearanceCss.rowHint}>可选等级取决于模型声明的能力</span>
+                      </div>
+                      <div className={appearanceCss.control}>
+                        <select
+                          className={clsx(modelsCss.input, modelsCss.selectInput)}
+                          aria-label="思考等级"
+                          value={mainCapability?.reasoning_efforts.includes(draft.reasoning_effort) ? draft.reasoning_effort : ''}
+                          disabled={!mainCapability?.reasoning_efforts.length}
+                          onChange={(e) => { updateDraft({ reasoning_effort: e.target.value }) }}
+                        >
+                          <option value="">模型默认</option>
+                          {(mainCapability?.reasoning_efforts ?? []).map(level => (
+                            <option key={level} value={level}>{level}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>⚡ 请求加速</span>
+                        <span className={appearanceCss.rowHint}>
+                          {mainCapability?.fast_mode ? '代理是否实际加速，以响应返回的服务档位为准。' : '当前模型不支持请求加速。'}
+                        </span>
+                      </div>
+                      <Switch
                         checked={Boolean(mainCapability?.fast_mode && draft.fast_mode)}
                         disabled={!mainCapability?.fast_mode}
-                        onChange={(e) => { updateDraft({ fast_mode: e.target.checked }) }}
+                        label="请求加速"
+                        onChange={(checked) => { updateDraft({ fast_mode: checked }) }}
                       />
-                      <span className={modelsCss.editorRoute}>代理是否实际加速，以响应返回的服务档位为准。</span>
-                    </label>
+                    </div>
                   </div>
                 </div>
 
-                {/* Provider List */}
-                <ul className={modelsCss.rows}>
-                  {draft.providers.map((provider) => {
-                    const isOpen = openProviderId === provider._draftId
-                    const configured = (Boolean(provider.api_key) || provider.has_api_key) && !provider.clear_api_key
-                    const modelsCount = parseModels(provider.models_text).length
-                    const candidates = discoveredModels[provider._draftId] ?? []
-                    const activeModelsSet = new Set(parseModels(provider.models_text))
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>提供商</div>
+                  <div className={appearanceCss.group}>
+                    {draft.providers.map((provider) => {
+                      const isOpen = openProviderId === provider._draftId
+                      const configured = (Boolean(provider.api_key) || provider.has_api_key) && !provider.clear_api_key
+                      const modelsCount = parseModels(provider.models_text).length
+                      const candidates = discoveredModels[provider._draftId] ?? []
+                      const activeModelsSet = new Set(parseModels(provider.models_text))
 
-                    return (
-                      <li key={provider._draftId} className={modelsCss.rowCard}>
-                        <div className={modelsCss.rowHead}>
-                          <div className={modelsCss.rowIdentity}>
+                      return (
+                        <div key={provider._draftId} className={appearanceCss.item}>
+                          <div className={appearanceCss.row}>
                             <span
-                              className={clsx(
-                                modelsCss.credentialDot,
-                                configured ? modelsCss.credentialDotConfigured : modelsCss.credentialDotMissing,
-                              )}
+                              className={clsx(appearanceCss.status, configured ? appearanceCss.statusOn : appearanceCss.statusOff)}
                               title={configured ? '密钥已配置' : '未配置密钥'}
                             />
-                            <span className={modelsCss.rowName}>
-                              {provider.display_name || provider.id || '新提供商'}
-                            </span>
-                            <span className={modelsCss.rowTag}>{protocolTag(provider.api_type)}</span>
-                            <span className={modelsCss.editorRoute}>
-                              {provider.url || '未设置地址'} · {modelsCount} 个模型
-                            </span>
-                          </div>
-                          <div className={modelsCss.rowActions}>
+                            <div className={appearanceCss.rowText}>
+                              <span className={appearanceCss.rowTitle}>
+                                {provider.display_name || provider.id || '新提供商'}
+                                {' '}
+                                <span className={appearanceCss.tag}>{protocolTag(provider.api_type)}</span>
+                              </span>
+                              <span className={clsx(appearanceCss.rowHint, appearanceCss.ellipsis)}>
+                                {provider.url || '未设置地址'} · {modelsCount} 个模型
+                              </span>
+                            </div>
                             <button
                               type="button"
-                              className={modelsCss.secondaryButton}
+                              className={appearanceCss.link}
                               onClick={() => { setOpenProviderId(isOpen ? null : provider._draftId) }}
                             >
                               {isOpen ? '收起' : '编辑'}
                             </button>
                             <button
                               type="button"
-                              className={modelsCss.dangerButton}
+                              className={clsx(appearanceCss.link, appearanceCss.linkDanger)}
                               onClick={() => { handleDeleteProvider(provider) }}
                             >
                               删除
                             </button>
                           </div>
-                        </div>
 
-                        {isOpen && (
-                          <div className={modelsCss.editor}>
-                            <div className={modelsCss.modelAdvanced}>
-                              <label className={modelsCss.field}>
-                                <span className={modelsCss.fieldLabel}>Provider ID</span>
-                                <input
-                                  className={modelsCss.input}
-                                  readOnly={!provider._new}
-                                  placeholder="例如 deepseek"
-                                  value={provider.id}
-                                  onChange={(e) => { updateProvider(provider._draftId, { id: e.target.value }) }}
-                                />
-                              </label>
-                              <label className={modelsCss.field}>
-                                <span className={modelsCss.fieldLabel}>显示名称</span>
-                                <input
-                                  className={modelsCss.input}
-                                  placeholder="例如 DeepSeek Official"
-                                  value={provider.display_name}
-                                  onChange={(e) => { updateProvider(provider._draftId, { display_name: e.target.value }) }}
-                                />
-                              </label>
-                            </div>
-
-                            <div className={modelsCss.modelAdvanced}>
-                              <label className={modelsCss.field}>
-                                <span className={modelsCss.fieldLabel}>API 基础地址 (Base URL)</span>
-                                <input
-                                  className={modelsCss.input}
-                                  placeholder="https://api.deepseek.com/v1"
-                                  value={provider.url}
-                                  onChange={(e) => { updateProvider(provider._draftId, { url: e.target.value }) }}
-                                />
-                              </label>
-                              <label className={modelsCss.field}>
-                                <span className={modelsCss.fieldLabel}>接口协议</span>
-                                <select
-                                  className={clsx(modelsCss.input, modelsCss.selectInput)}
-                                  style={{ maxWidth: '100%' }}
-                                  value={provider.api_type}
-                                  onChange={(e) => {
-                                    updateProvider(provider._draftId, { api_type: e.target.value as ProviderApiType })
-                                  }}
-                                >
-                                  <option value="openai-completions">OpenAI Chat Completions</option>
-                                  <option value="openai-responses">OpenAI Responses</option>
-                                  <option value="anthropic-messages">Anthropic Messages</option>
-                                </select>
-                              </label>
-                            </div>
-
-                            <label className={modelsCss.field}>
-                              <span><input type="checkbox" checked={provider.prefix_system_messages} onChange={e=>updateProvider(provider._draftId,{prefix_system_messages:e.target.checked})}/> 系统消息集中到开头（适用于要求此前缀的模型服务）</span>
-                            </label>
-                            <label className={modelsCss.field}>
-                              <span className={modelsCss.fieldLabel}>
-                                API 密钥
-                                {provider.has_api_key && !provider.clear_api_key && (
-                                  <button
-                                    type="button"
-                                    className={modelsCss.linkButton}
-                                    onClick={() => { updateProvider(provider._draftId, { clear_api_key: true, api_key: '' }) }}
-                                  >
-                                    清除已存密钥
-                                  </button>
-                                )}
-                              </span>
-                              <input
-                                type="password"
-                                className={modelsCss.input}
-                                placeholder={
-                                  provider.clear_api_key
-                                    ? '保存后将清除已存密钥'
-                                    : provider.has_api_key
-                                      ? '已配置密钥（留空保持不变，输入新值则覆盖）'
-                                      : 'sk-...'
-                                }
-                                value={provider.api_key}
-                                onChange={(e) => {
-                                  updateProvider(provider._draftId, { api_key: e.target.value, clear_api_key: false })
-                                }}
-                              />
-                            </label>
-
-                            <div className={modelsCss.modelCatalog}>
-                              <div className={modelsCss.modelListHead}>
-                                <div className={modelsCss.modelCatalogHeading}>
-                                  <span className={modelsCss.modelCatalogTitle}>模型目录（每行一个模型 ID）</span>
-                                  <span className={modelsCss.modelCatalogMeta}>
-                                    可手动输入或从上游 `/v1/models` 端点自动拉取可用模型。
-                                  </span>
+                          {isOpen && (
+                            <div className={appearanceCss.expand}>
+                              <div className={appearanceCss.row}>
+                                <span className={appearanceCss.rowTitle}>Provider ID</span>
+                                <div className={appearanceCss.control}>
+                                  <input
+                                    className={modelsCss.input}
+                                    readOnly={!provider._new}
+                                    placeholder="例如 deepseek"
+                                    value={provider.id}
+                                    onChange={(e) => { updateProvider(provider._draftId, { id: e.target.value }) }}
+                                  />
                                 </div>
-                                <button
-                                  type="button"
-                                  className={modelsCss.addModelButton}
-                                  disabled={discoveringId === provider._draftId}
-                                  onClick={() => { void handleDiscover(provider) }}
-                                >
-                                  <IconPlusOutlineRegular size={12} />
-                                  {discoveringId === provider._draftId ? '正在查询…' : '从端点拉取模型'}
-                                </button>
+                              </div>
+                              <div className={appearanceCss.row}>
+                                <span className={appearanceCss.rowTitle}>显示名称</span>
+                                <div className={appearanceCss.control}>
+                                  <input
+                                    className={modelsCss.input}
+                                    placeholder="例如 DeepSeek Official"
+                                    value={provider.display_name}
+                                    onChange={(e) => { updateProvider(provider._draftId, { display_name: e.target.value }) }}
+                                  />
+                                </div>
+                              </div>
+                              <div className={appearanceCss.row}>
+                                <span className={appearanceCss.rowTitle}>API 基础地址</span>
+                                <div className={appearanceCss.control}>
+                                  <input
+                                    className={modelsCss.input}
+                                    placeholder="https://api.deepseek.com/v1"
+                                    value={provider.url}
+                                    onChange={(e) => { updateProvider(provider._draftId, { url: e.target.value }) }}
+                                  />
+                                </div>
+                              </div>
+                              <div className={appearanceCss.row}>
+                                <span className={appearanceCss.rowTitle}>接口协议</span>
+                                <div className={appearanceCss.control}>
+                                  <select
+                                    className={clsx(modelsCss.input, modelsCss.selectInput)}
+                                    value={provider.api_type}
+                                    onChange={(e) => {
+                                      updateProvider(provider._draftId, { api_type: e.target.value as ProviderApiType })
+                                    }}
+                                  >
+                                    <option value="openai-completions">OpenAI Chat Completions</option>
+                                    <option value="openai-responses">OpenAI Responses</option>
+                                    <option value="anthropic-messages">Anthropic Messages</option>
+                                  </select>
+                                </div>
+                              </div>
+                              <div className={appearanceCss.row}>
+                                <div className={appearanceCss.rowText}>
+                                  <span className={appearanceCss.rowTitle}>系统消息集中到开头</span>
+                                  <span className={appearanceCss.rowHint}>适用于要求此前缀的模型服务</span>
+                                </div>
+                                <Switch
+                                  checked={provider.prefix_system_messages}
+                                  label="系统消息集中到开头"
+                                  onChange={(checked) => { updateProvider(provider._draftId, { prefix_system_messages: checked }) }}
+                                />
+                              </div>
+                              <div className={appearanceCss.row}>
+                                <div className={appearanceCss.rowText}>
+                                  <span className={appearanceCss.rowTitle}>API 密钥</span>
+                                  {provider.has_api_key && !provider.clear_api_key && (
+                                    <button
+                                      type="button"
+                                      className={clsx(appearanceCss.link, appearanceCss.linkMuted)}
+                                      style={{ alignSelf: 'flex-start', padding: 0 }}
+                                      onClick={() => { updateProvider(provider._draftId, { clear_api_key: true, api_key: '' }) }}
+                                    >
+                                      清除已存密钥
+                                    </button>
+                                  )}
+                                </div>
+                                <div className={appearanceCss.control}>
+                                  <input
+                                    type="password"
+                                    className={modelsCss.input}
+                                    placeholder={
+                                      provider.clear_api_key
+                                        ? '保存后将清除已存密钥'
+                                        : provider.has_api_key
+                                          ? '已配置（留空保持不变）'
+                                          : 'sk-...'
+                                    }
+                                    value={provider.api_key}
+                                    onChange={(e) => {
+                                      updateProvider(provider._draftId, { api_key: e.target.value, clear_api_key: false })
+                                    }}
+                                  />
+                                </div>
                               </div>
 
-                              <textarea
-                                className={modelsCss.input}
-                                style={{ height: 92, padding: '8px 10px', fontFamily: 'var(--ds-font-family-code)', resize: 'vertical' }}
-                                placeholder="deepseek-chat&#10;deepseek-reasoner"
-                                value={provider.models_text}
-                                onChange={(e) => { updateProvider(provider._draftId, { models_text: e.target.value }) }}
-                              />
-
-                              <div className={modelsCss.modelCatalogMeta}>图片支持需通过实际图片验证。验证会保存当前设置，并向此模型发送一张随机测试图。</div>
-                              {parseModels(provider.models_text).map(model => {
-                                const capability = provider.model_capabilities[model] ?? { reasoning_efforts: [], default_effort: null, fast_mode: false }
-                                return (
-                                  <details key={model} className={modelsCss.rowCard}>
-                                    <summary>{model} · 思考等级 {capability.reasoning_efforts.length ? capability.reasoning_efforts.join(', ') : '未声明'}</summary>
-                                    <div className={modelsCss.modelAdvanced}>
-                                      <label className={modelsCss.field}>
-                                        <span className={modelsCss.fieldLabel}>图片输入能力</span>
-                                        <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={capability.image_input ?? 'unknown'} onChange={event => { updateModelCapability(provider, model, { image_input: event.target.value as 'supported' | 'unsupported' | 'unknown' }) }}>
-                                          <option value="unknown">未知：保留材料，报告限制</option><option value="supported" disabled>已验证支持：发送真实图片</option><option value="unsupported">不支持</option>
-                                        </select>
-                                      </label>
-                                      <button type="button" className={modelsCss.secondaryButton} disabled={saving || probingImage !== null || provider.api_type !== 'openai-completions'} onClick={() => { void handleProbeImage(provider, model) }}>
-                                        {probingImage === `${provider._draftId}:${model}` ? '正在验证图片…' : '验证图片输入'}
-                                      </button>
-                                      {capability.image_probe && <details>
-                                        <summary>上次图片验证：{capability.image_probe.status} · {capability.image_probe.elapsed_ms} ms</summary>
-                                        <p>{new Date(capability.image_probe.checked_at).toLocaleString()}</p>
-                                        {capability.image_probe.error && <p>{capability.image_probe.error}</p>}
-                                        <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>{capability.image_probe.response_body}</pre>
-                                      </details>}
-                                      <div className={modelsCss.field}>
-                                        <span className={modelsCss.fieldLabel}>支持的等级</span>
-                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                          {REASONING_LEVELS.map(level => (
-                                            <label key={level}>
-                                              <input type="checkbox" checked={capability.reasoning_efforts.includes(level)} onChange={event => {
-                                                const levels = event.target.checked
-                                                  ? REASONING_LEVELS.filter(value => value === level || capability.reasoning_efforts.includes(value))
-                                                  : capability.reasoning_efforts.filter(value => value !== level)
-                                                updateModelCapability(provider, model, {
-                                                  reasoning_efforts: levels,
-                                                  default_effort: levels.includes(capability.default_effort ?? '') ? capability.default_effort : null,
-                                                })
-                                              }} /> {level}
-                                            </label>
-                                          ))}
-                                        </div>
-                                      </div>
-                                      <label className={modelsCss.field}>
-                                        <span className={modelsCss.fieldLabel}>默认等级</span>
-                                        <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={capability.default_effort ?? ''} onChange={event => { updateModelCapability(provider, model, { default_effort: event.target.value || null }) }}>
-                                          <option value="">模型默认</option>
-                                          {capability.reasoning_efforts.map(level => <option key={level} value={level}>{level}</option>)}
-                                        </select>
-                                      </label>
-                                      <label className={modelsCss.field}>
-                                        <span className={modelsCss.fieldLabel}>支持请求加速</span>
-                                        <input type="checkbox" checked={capability.fast_mode} onChange={event => { updateModelCapability(provider, model, { fast_mode: event.target.checked }) }} />
-                                      </label>
-                                    </div>
-                                  </details>
-                                )
-                              })}
+                              <div className={clsx(appearanceCss.row, appearanceCss.rowStack)}>
+                                <div className={appearanceCss.rowTop}>
+                                  <div className={appearanceCss.rowText}>
+                                    <span className={appearanceCss.rowTitle}>模型目录</span>
+                                    <span className={appearanceCss.rowHint}>每行一个模型 ID，可手动输入或从上游 `/v1/models` 拉取。</span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className={appearanceCss.link}
+                                    disabled={discoveringId === provider._draftId}
+                                    onClick={() => { void handleDiscover(provider) }}
+                                  >
+                                    {discoveringId === provider._draftId ? '正在查询…' : '从端点拉取'}
+                                  </button>
+                                </div>
+                                <textarea
+                                  className={appearanceCss.textarea}
+                                  placeholder="deepseek-chat&#10;deepseek-reasoner"
+                                  value={provider.models_text}
+                                  onChange={(e) => { updateProvider(provider._draftId, { models_text: e.target.value }) }}
+                                />
+                              </div>
 
                               {candidates.length > 0 && (
-                                <div className={modelsCss.rowCard} style={{ background: 'var(--dsw-alias-bg-layer-1)' }}>
-                                  <div className={modelsCss.candidateToolbar}>
-                                    <input
-                                      type="search"
-                                      className={clsx(modelsCss.input, modelsCss.candidateSearch)}
-                                      placeholder={`筛选发现的 ${candidates.length} 个模型…`}
-                                      value={discoverFilter}
-                                      onChange={(e) => { setDiscoverFilter(e.target.value) }}
-                                    />
-                                  </div>
-                                  <ul className={modelsCss.candidateList}>
+                                <div className={clsx(appearanceCss.row, appearanceCss.rowStack)}>
+                                  <input
+                                    type="search"
+                                    className={modelsCss.input}
+                                    placeholder={`筛选发现的 ${candidates.length} 个模型…`}
+                                    value={discoverFilter}
+                                    onChange={(e) => { setDiscoverFilter(e.target.value) }}
+                                  />
+                                  <ul className={clsx(modelsCss.candidateList, appearanceCss.candidates)}>
                                     {candidates
                                       .filter(id => id.toLowerCase().includes(discoverFilter.toLowerCase()))
                                       .map(id => (
@@ -843,79 +839,203 @@ export function SettingsModal({
                                   </ul>
                                 </div>
                               )}
-                            </div>
-                          </div>
-                        )}
-                      </li>
-                    )
-                  })}
-                </ul>
 
-                <div className={modelsCss.addActions}>
-                  <button type="button" className={modelsCss.addButton} onClick={handleAddProvider}>
-                    <IconPlusOutlineRegular size={16} />
-                    <span>添加模型提供商</span>
-                  </button>
-                </div>
-                <h3>插件可用模型</h3>
-                <p className={modelsCss.intro}>未限制时可使用全部模型；开启限制后仅允许勾选的模型，主对话、视觉和压缩任务共同遵守。取消全部勾选会禁止该插件调用模型。</p>
-                {[...packages,...Object.keys(draft.plugin_models).filter(id=>!packages.some(p=>p.id===id)).map(id=>({id,title:`${id}（尚未连接）`}))].map(plugin=>{
-                  const selected=draft.plugin_models[plugin.id]
-                  const setModels=(models:readonly ModelRef[]|undefined)=>{const next={...draft.plugin_models};if(models===undefined)delete next[plugin.id];else next[plugin.id]=models;updateDraft({plugin_models:next})}
-                  return <div key={plugin.id} className={modelsCss.rowCard}>
-                    <h4>{plugin.title || plugin.id}</h4>
-                    <label><input type="checkbox" checked={selected!==undefined} onChange={e=>setModels(e.target.checked?draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=>({provider:p.id,model}))):undefined)}/> 限制 {plugin.id} 可用模型</label>
-                    {selected!==undefined&&draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=><label key={JSON.stringify([p.id,model])} style={{display:'block',marginTop:8}}>
-                      <input type="checkbox" checked={selected.some(r=>r.provider===p.id&&r.model===model)} onChange={e=>setModels(e.target.checked?[...selected,{provider:p.id,model}]:selected.filter(r=>r.provider!==p.id||r.model!==model))}/> {p.display_name||p.id} / {model}
-                    </label>))}
+                              {parseModels(provider.models_text).map(model => {
+                                const capability = provider.model_capabilities[model] ?? { reasoning_efforts: [], default_effort: null, fast_mode: false }
+                                return (
+                                  <details key={model} className={appearanceCss.row} style={{ display: 'block', padding: 0 }}>
+                                    <summary className={appearanceCss.modelSummary}>
+                                      <span>{model}</span>
+                                      <span className={appearanceCss.modelMeta}>
+                                        思考等级 {capability.reasoning_efforts.length ? capability.reasoning_efforts.join(', ') : '未声明'}
+                                      </span>
+                                    </summary>
+                                    <div className={appearanceCss.expand} style={{ margin: '0 8px 8px', background: 'var(--dsw-alias-bg-module-platform)' }}>
+                                      <div className={appearanceCss.row}>
+                                        <div className={appearanceCss.rowText}>
+                                          <span className={appearanceCss.rowTitle}>图片输入能力</span>
+                                          <span className={appearanceCss.rowHint}>图片支持需通过实际图片验证，验证会保存当前设置并发送一张随机测试图。</span>
+                                        </div>
+                                        <div className={appearanceCss.control}>
+                                          <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={capability.image_input ?? 'unknown'} onChange={event => { updateModelCapability(provider, model, { image_input: event.target.value as 'supported' | 'unsupported' | 'unknown' }) }}>
+                                            <option value="unknown">未知：保留材料，报告限制</option><option value="supported" disabled>已验证支持：发送真实图片</option><option value="unsupported">不支持</option>
+                                          </select>
+                                        </div>
+                                      </div>
+                                      <div className={appearanceCss.row}>
+                                        <div className={appearanceCss.rowText}>
+                                          <span className={appearanceCss.rowTitle}>验证图片输入</span>
+                                          {capability.image_probe && (
+                                            <span className={appearanceCss.rowHint}>
+                                              上次：{capability.image_probe.status} · {capability.image_probe.elapsed_ms} ms · {new Date(capability.image_probe.checked_at).toLocaleString()}
+                                              {capability.image_probe.error ? ` · ${capability.image_probe.error}` : ''}
+                                            </span>
+                                          )}
+                                        </div>
+                                        <button type="button" className={appearanceCss.link} disabled={saving || probingImage !== null || provider.api_type !== 'openai-completions'} onClick={() => { void handleProbeImage(provider, model) }}>
+                                          {probingImage === `${provider._draftId}:${model}` ? '正在验证图片…' : '开始验证'}
+                                        </button>
+                                      </div>
+                                      {capability.image_probe && (
+                                        <details className={appearanceCss.row} style={{ display: 'block' }}>
+                                          <summary className={appearanceCss.rowHint} style={{ cursor: 'pointer' }}>查看验证响应</summary>
+                                          <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: '8px 0 0', fontSize: 12 }}>{capability.image_probe.response_body}</pre>
+                                        </details>
+                                      )}
+                                      <div className={clsx(appearanceCss.row, appearanceCss.rowStack)}>
+                                        <span className={appearanceCss.rowTitle}>支持的思考等级</span>
+                                        <div className={appearanceCss.chips}>
+                                          {REASONING_LEVELS.map(level => (
+                                            <label key={level} className={appearanceCss.chip}>
+                                              <input type="checkbox" checked={capability.reasoning_efforts.includes(level)} onChange={event => {
+                                                const levels = event.target.checked
+                                                  ? REASONING_LEVELS.filter(value => value === level || capability.reasoning_efforts.includes(value))
+                                                  : capability.reasoning_efforts.filter(value => value !== level)
+                                                updateModelCapability(provider, model, {
+                                                  reasoning_efforts: levels,
+                                                  default_effort: levels.includes(capability.default_effort ?? '') ? capability.default_effort : null,
+                                                })
+                                              }} />
+                                              {level}
+                                            </label>
+                                          ))}
+                                        </div>
+                                      </div>
+                                      <div className={appearanceCss.row}>
+                                        <span className={appearanceCss.rowTitle}>默认等级</span>
+                                        <div className={appearanceCss.control}>
+                                          <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={capability.default_effort ?? ''} onChange={event => { updateModelCapability(provider, model, { default_effort: event.target.value || null }) }}>
+                                            <option value="">模型默认</option>
+                                            {capability.reasoning_efforts.map(level => <option key={level} value={level}>{level}</option>)}
+                                          </select>
+                                        </div>
+                                      </div>
+                                      <div className={appearanceCss.row}>
+                                        <span className={appearanceCss.rowTitle}>支持请求加速</span>
+                                        <Switch
+                                          checked={capability.fast_mode}
+                                          label={`${model} 支持请求加速`}
+                                          onChange={checked => { updateModelCapability(provider, model, { fast_mode: checked }) }}
+                                        />
+                                      </div>
+                                    </div>
+                                  </details>
+                                )
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                    <button type="button" className={clsx(appearanceCss.row, appearanceCss.addRow)} onClick={handleAddProvider}>
+                      <IconPlusOutlineRegular size={16} />
+                      <span>添加模型提供商</span>
+                    </button>
                   </div>
-                })}
+                </div>
+
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>插件可用模型</div>
+                  <div className={appearanceCss.group}>
+                    {[...packages,...Object.keys(draft.plugin_models).filter(id=>!packages.some(p=>p.id===id)).map(id=>({id,title:`${id}（尚未连接）`}))].map(plugin=>{
+                      const selected=draft.plugin_models[plugin.id]
+                      const setModels=(models:readonly ModelRef[]|undefined)=>{const next={...draft.plugin_models};if(models===undefined)delete next[plugin.id];else next[plugin.id]=models;updateDraft({plugin_models:next})}
+                      return <div key={plugin.id} className={appearanceCss.item}>
+                        <div className={appearanceCss.row}>
+                          <div className={appearanceCss.rowText}>
+                            <span className={appearanceCss.rowTitle}>{plugin.title || plugin.id}</span>
+                            <span className={appearanceCss.rowHint}>{selected===undefined?'未限制，可使用全部模型':`仅允许 ${selected.length} 个模型`}</span>
+                          </div>
+                          <Switch
+                            checked={selected!==undefined}
+                            label={`限制 ${plugin.id} 可用模型`}
+                            onChange={checked=>setModels(checked?draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=>({provider:p.id,model}))):undefined)}
+                          />
+                        </div>
+                        {selected!==undefined&&<div className={appearanceCss.checkGrid}>
+                          {draft.providers.filter(p=>p.api_type==='openai-completions').flatMap(p=>parseModels(p.models_text).map(model=><label key={JSON.stringify([p.id,model])} className={modelsCss.checkRow}>
+                            <input type="checkbox" checked={selected.some(r=>r.provider===p.id&&r.model===model)} onChange={e=>setModels(e.target.checked?[...selected,{provider:p.id,model}]:selected.filter(r=>r.provider!==p.id||r.model!==model))}/>
+                            <span>{p.display_name||p.id} / {model}</span>
+                          </label>))}
+                        </div>}
+                      </div>
+                    })}
+                  </div>
+                  <p className={appearanceCss.footnote}>未限制时可使用全部模型；开启限制后仅允许勾选的模型，主对话、视觉和压缩任务共同遵守。取消全部勾选会禁止该插件调用模型。</p>
+                </div>
               </div>
             )}
 
             {activeTab === 'tools' && draft !== null && (
               <section className={modelsCss.section}>
-                <h2 className={modelsCss.title}>专用模型</h2>
-                <p className={modelsCss.intro}>视觉分析、上下文压缩和协作子 Agent 可以单独选模型，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
+                <div className={modelsCss.pageHead}>
+                  <h2 className={modelsCss.title}>专用模型</h2>
+                  <p className={modelsCss.intro}>视觉分析、上下文压缩和协作子 Agent 可以单独选模型，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
+                </div>
                 {(['visual_tool', 'context_agent', 'delegate_agent'] as const).map(kind => {
                   const config = draft[kind]
                   const provider = draft.providers.find(p => p.id === (config.provider || draft.orchestrator_provider))
                   const capability = provider?.model_capabilities[config.model || draft.orchestrator_model]
                   const levels = capability?.reasoning_efforts.length ? capability.reasoning_efforts : ['none','low','medium','high','xhigh','max']
                   const update = (patch: Partial<ModelUseSettings>) => updateDraft({ [kind]: { ...config, ...patch } })
+                  const customized = Boolean(config.provider || config.model || config.reasoning_effort || config.context_window)
                   return (
-                    <div key={kind} className={modelsCss.rowCard}>
-                      <h3>{{ visual_tool: '视觉分析工具', context_agent: '上下文压缩子 Agent', delegate_agent: '协作子 Agent' }[kind]}</h3>
-                      <p className={modelsCss.intro}>{{
+                    <div key={kind} className={appearanceCss.block}>
+                      <div className={appearanceCss.labelRow}>
+                        <div className={appearanceCss.label}>{{ visual_tool: '视觉分析工具', context_agent: '上下文压缩子 Agent', delegate_agent: '协作子 Agent' }[kind]}</div>
+                        <button
+                          type="button"
+                          className={clsx(appearanceCss.link, appearanceCss.linkMuted)}
+                          disabled={!customized}
+                          onClick={() => updateDraft({ [kind]: {} })}
+                        >
+                          {customized ? '恢复为跟随主 Agent' : '跟随主 Agent'}
+                        </button>
+                      </div>
+                      <div className={appearanceCss.group}>
+                        <div className={appearanceCss.row}>
+                          <span className={appearanceCss.rowTitle}>提供商</span>
+                          <div className={appearanceCss.control}>
+                            <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null, model: null, reasoning_effort: null })}>
+                              <option value="">跟随主 Agent</option>
+                              {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => <option key={p._draftId} value={p.id}>{p.display_name || p.id}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                        <div className={appearanceCss.row}>
+                          <span className={appearanceCss.rowTitle}>模型 ID</span>
+                          <div className={appearanceCss.control}>
+                            <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={config.model || ''} onChange={e => update({ model: e.target.value || null, reasoning_effort: null })}>
+                              <option value="">跟随主 Agent</option>
+                              {config.model && !parseModels(provider?.models_text ?? '').includes(config.model) && <option value={config.model} disabled>{config.model}（未在模型目录中，请先添加）</option>}
+                              {(provider ? parseModels(provider.models_text) : []).map(m => <option key={m} value={m}>{m}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                        <div className={appearanceCss.row}>
+                          <span className={appearanceCss.rowTitle}>推理档位</span>
+                          <div className={appearanceCss.control}>
+                            <select className={clsx(modelsCss.input, modelsCss.selectInput)} value={config.reasoning_effort || ''} onChange={e => update({ reasoning_effort: e.target.value || null })}>
+                              <option value="">跟随主 Agent</option>
+                              {levels.map(level => <option key={level} value={level}>{({ none:'无', low:'轻度', medium:'中档', high:'高', xhigh:'更高', max:'最高' } as Record<string,string>)[level]}</option>)}
+                            </select>
+                          </div>
+                        </div>
+                        <div className={appearanceCss.row}>
+                          <div className={appearanceCss.rowText}>
+                            <span className={appearanceCss.rowTitle}>最大上下文</span>
+                            <span className={appearanceCss.rowHint}>单位 tokens</span>
+                          </div>
+                          <div className={appearanceCss.control}>
+                            <input className={modelsCss.input} type="number" min={32768} max={1050000} step={1} placeholder="留空跟随主 Agent" value={config.context_window ?? ''} onChange={e => update({ context_window: e.target.value === '' ? null : Number(e.target.value) })} />
+                          </div>
+                        </div>
+                      </div>
+                      <p className={appearanceCss.footnote}>{{
                         visual_tool: '分析已保存图片，结果通过普通工具返回。',
                         context_agent: '只整理当前任务上下文，提交后继续由主 Agent 执行。',
                         delegate_agent: '主 Agent 派出去并行干活的子 Agent 用这个模型。可以让主 Agent 用强模型负责拆分、审查和集成，子 Agent 用更省的模型执行。留空则和主 Agent 用同一个。',
                       }[kind]}</p>
-                      <div className={modelsCss.modelAdvanced}>
-                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>提供商</span>
-                          <select className={modelsCss.select} value={config.provider || ''} onChange={e => update({ provider: e.target.value || null, model: null, reasoning_effort: null })}>
-                            <option value="">跟随主 Agent</option>
-                            {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => <option key={p._draftId} value={p.id}>{p.display_name || p.id}</option>)}
-                          </select>
-                        </label>
-                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>模型 ID</span>
-                          <select className={modelsCss.select} value={config.model || ''} onChange={e => update({ model: e.target.value || null, reasoning_effort: null })}>
-                            <option value="">跟随主 Agent</option>
-                            {config.model && !parseModels(provider?.models_text ?? '').includes(config.model) && <option value={config.model} disabled>{config.model}（未在模型目录中，请先添加）</option>}
-                            {(provider ? parseModels(provider.models_text) : []).map(m => <option key={m} value={m}>{m}</option>)}
-                          </select>
-                        </label>
-                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>推理档位</span>
-                          <select className={modelsCss.select} value={config.reasoning_effort || ''} onChange={e => update({ reasoning_effort: e.target.value || null })}>
-                            <option value="">跟随主 Agent</option>
-                            {levels.map(level => <option key={level} value={level}>{({ none:'无', low:'轻度', medium:'中档', high:'高', xhigh:'更高', max:'最高' } as Record<string,string>)[level]}</option>)}
-                          </select>
-                        </label>
-                        <label className={modelsCss.field}><span className={modelsCss.fieldLabel}>最大上下文（tokens）</span>
-                          <input className={modelsCss.input} type="number" min={32768} max={1050000} step={1} placeholder="留空跟随主 Agent" value={config.context_window ?? ''} onChange={e => update({ context_window: e.target.value === '' ? null : Number(e.target.value) })} />
-                        </label>
-                      </div>
-                      <button type="button" className={modelsCss.secondaryButton} onClick={() => updateDraft({ [kind]: {} })}>全部跟随主 Agent</button>
                     </div>
                   )
                 })}
@@ -924,18 +1044,21 @@ export function SettingsModal({
 
             {activeTab === 'observer' && draft !== null && (
               <div className={modelsCss.section}>
-                <h2 className={modelsCss.title}>Observer 结束复盘</h2>
-                <p className={modelsCss.intro}>
-                  Observer 只在执行结束后读取本任务的原始过程，复盘完成情况、失败恢复、重复操作和汇总是否准确，提出下次更直接的做法。需要核对时可读取 Worker、Organizer 当时实际收到的完整上下文。复盘显示在聊天中，不参与运行中的调度，也不自动写入记忆。
-                </p>
+                <div className={modelsCss.pageHead}>
+                  <h2 className={modelsCss.title}>Observer 结束复盘</h2>
+                  <p className={modelsCss.intro}>
+                    执行结束后读取本任务的原始过程，复盘完成情况、失败恢复、重复操作和汇总是否准确，提出下次更直接的做法。复盘显示在聊天中，不参与运行中的调度，也不自动写入记忆。
+                  </p>
+                </div>
 
-                <div className={modelsCss.rowCard}>
-                  <div className={modelsCss.rowHead}>
-                    <div className={modelsCss.rowIdentity}>
-                      <span className={modelsCss.rowName}>启用 Observer</span>
-                      <span className={modelsCss.rowTag}>全局观察</span>
-                    </div>
-                    <div className={modelsCss.rowActions}>
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>复盘</div>
+                  <div className={appearanceCss.group}>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>启用 Observer</span>
+                        <span className={appearanceCss.rowHint}>全局观察，每次执行结束时启动一次复盘</span>
+                      </div>
                       <Switch
                         checked={draft.observer_enabled}
                         label="启用 Observer"
@@ -943,54 +1066,62 @@ export function SettingsModal({
                       />
                     </div>
                   </div>
-                  <p className={modelsCss.advancedHint}>
-                    启用后，执行结束时启动一次复盘；需要补充证据时，复盘可按需读取历史。复盘失败不会改变执行结果。取消或中断不会启动新的复盘请求。
+                  <p className={appearanceCss.footnote}>
+                    需要补充证据时可按需读取历史，包括 Worker、Organizer 实际收到的完整上下文。复盘失败不会改变执行结果；取消或中断不会启动新的复盘请求。
                   </p>
                 </div>
 
-                <div className={clsx(subagentCss.section, modelsCss.setupCard)}>
-                  <div className={modelsCss.editorHeader}>
-                    <span className={modelsCss.editorTitle}>Observer 模型</span>
-                    <span className={modelsCss.editorRoute}>默认使用当前任务 Worker 的模型，也可单独选择模型路由</span>
+                <div className={appearanceCss.block}>
+                  <div className={appearanceCss.label}>Observer 模型</div>
+                  <div className={appearanceCss.group}>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>模型提供商</span>
+                        <span className={appearanceCss.rowHint}>默认使用当前任务 Worker 的模型</span>
+                      </div>
+                      <div className={appearanceCss.control}>
+                        <select
+                          className={clsx(modelsCss.input, modelsCss.selectInput)}
+                          aria-label="模型提供商"
+                          value={draft.observer_provider}
+                          onChange={(e) => {
+                            const nextProviderId = e.target.value
+                            const provider = draft.providers.find(p => p.id === nextProviderId)
+                            const firstModel = provider ? parseModels(provider.models_text)[0] ?? '' : ''
+                            updateDraft({ observer_provider: nextProviderId, observer_model: firstModel })
+                          }}
+                        >
+                          <option value="">跟随 Worker（{draft.orchestrator_provider || '主模型未设置'}）</option>
+                          {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => (
+                            <option key={p._draftId} value={p.id}>
+                              {p.display_name || p.id} ({p.id})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div className={appearanceCss.row}>
+                      <div className={appearanceCss.rowText}>
+                        <span className={appearanceCss.rowTitle}>模型 ID</span>
+                        <span className={appearanceCss.rowHint}>选择或输入该提供商中的模型</span>
+                      </div>
+                      <div className={appearanceCss.control}>
+                        <input
+                          className={modelsCss.input}
+                          aria-label="模型 ID"
+                          list="dsh-observer-model-list"
+                          placeholder={draft.observer_provider ? '选择或输入模型 ID' : (draft.orchestrator_model || '跟随 Worker 模型')}
+                          value={draft.observer_model}
+                          disabled={!draft.observer_provider}
+                          onChange={(e) => { updateDraft({ observer_model: e.target.value }) }}
+                        />
+                        <datalist id="dsh-observer-model-list">
+                          {observerModels.map(m => <option key={m} value={m} />)}
+                        </datalist>
+                      </div>
+                    </div>
                   </div>
-                  <div className={modelsCss.modelAdvanced}>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>模型提供商</span>
-                      <select
-                        className={clsx(modelsCss.input, modelsCss.selectInput)}
-                        style={{ maxWidth: '100%' }}
-                        value={draft.observer_provider}
-                        onChange={(e) => {
-                          const nextProviderId = e.target.value
-                          const provider = draft.providers.find(p => p.id === nextProviderId)
-                          const firstModel = provider ? parseModels(provider.models_text)[0] ?? '' : ''
-                          updateDraft({ observer_provider: nextProviderId, observer_model: firstModel })
-                        }}
-                      >
-                        <option value="">跟随 Worker（{draft.orchestrator_provider || '主模型未设置'}）</option>
-                        {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => (
-                          <option key={p._draftId} value={p.id}>
-                            {p.display_name || p.id} ({p.id})
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className={modelsCss.field}>
-                      <span className={modelsCss.fieldLabel}>模型 ID</span>
-                      <input
-                        className={modelsCss.input}
-                        list="dsh-observer-model-list"
-                        placeholder={draft.observer_provider ? '选择或输入该提供商中的模型 ID' : (draft.orchestrator_model || '跟随 Worker 模型')}
-                        value={draft.observer_model}
-                        disabled={!draft.observer_provider}
-                        onChange={(e) => { updateDraft({ observer_model: e.target.value }) }}
-                      />
-                      <datalist id="dsh-observer-model-list">
-                        {observerModels.map(m => <option key={m} value={m} />)}
-                      </datalist>
-                    </label>
-                  </div>
-                  <p className={modelsCss.advancedHint}>
+                  <p className={appearanceCss.footnote}>
                     单独选择时会复用该提供商已保存的 URL 和 API Key；提供商与模型需同时配置。当前任务开始后，模型路由会写入轨迹。
                   </p>
                 </div>
@@ -999,8 +1130,8 @@ export function SettingsModal({
 
             {activeTab === 'plugins' && (
               <div className={pluginsCss.section}>
-                <div className={modelsCss.modelListHead}>
-                  <div>
+                <div className={clsx(modelsCss.modelListHead, modelsCss.pageHead)}>
+                  <div className={modelsCss.cardHeadText}>
                     <h2 className={modelsCss.title}>Cordis 插件树</h2>
                     <p className={modelsCss.intro}>检视 Rust 运行时与浏览器 Cordis 挂载的插件实例、依赖服务与生命周期事件。</p>
                   </div>

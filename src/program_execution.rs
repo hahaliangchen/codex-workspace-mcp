@@ -425,13 +425,17 @@ fn resolve_program(program: &str) -> Result<PathBuf> {
     } else {
         program.to_owned()
     };
+    // Many Linux distributions install Python 3 only as `python3`.
+    let fallback = (program == "python" && !cfg!(windows)).then_some("python3");
     let paths = std::env::var_os("PATH")
         .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
         .unwrap_or_default();
-    for directory in paths {
-        let candidate = directory.join(&executable);
-        if candidate.is_file() {
-            return Ok(candidate.canonicalize().unwrap_or(candidate));
+    for name in std::iter::once(executable.as_str()).chain(fallback) {
+        for directory in &paths {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Ok(candidate.canonicalize().unwrap_or(candidate));
+            }
         }
     }
     anyhow::bail!("supported program '{program}' was not found in the host PATH")

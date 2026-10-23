@@ -70,6 +70,16 @@ fn frontmatter(raw: &str) -> Result<Value> {
         .context("skill requires YAML frontmatter")?.0;
     Ok(serde_yaml::from_str(front)?)
 }
+/// An absent instruction file is a normal plugin capability, not a failure.
+fn optional_instructions(root: &Path, entry: &str) -> Result<Option<(PathBuf, String)>> {
+    if entry.trim().is_empty() { return Ok(None); }
+    let path = crate::file_edit::workspace_path(root, entry)?;
+    match std::fs::read_to_string(&path) {
+        Ok(body) => {ensure!(body.len() <= 128000, "skill body too large"); Ok((!body.trim().is_empty()).then_some((path, body)))},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Result<Package> {
     let root = root.canonicalize()?;
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(root.join("plugin.json"))?)?;
@@ -77,18 +87,11 @@ fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Resu
         manifest.version == 1 && identifier(&manifest.id),
         "invalid skill package version or ID"
     );
-    let path = crate::file_edit::workspace_path(&root, &manifest.skill)?;
-    let raw = std::fs::read_to_string(path)?;
-    let fields = frontmatter(&raw)?;
-    ensure!(
-        fields["name"] == manifest.id,
-        "skill name must equal package ID"
-    );
-    let description = fields["description"]
-        .as_str()
-        .filter(|text| !text.trim().is_empty())
-        .context("skill description required")?
-        .to_owned();
+    let description = if let Some((_, raw)) = optional_instructions(&root, &manifest.skill)? {
+        let fields = frontmatter(&raw)?;
+        ensure!(fields["name"] == manifest.id, "skill name must equal package ID");
+        fields["description"].as_str().filter(|text| !text.trim().is_empty()).context("skill description required")?.to_owned()
+    } else { manifest.title.clone() };
     let mut ids = std::collections::BTreeSet::new();
     for page in &manifest.pages {
         ensure!(
@@ -299,7 +302,7 @@ impl Registry {
         ensure!(package.scope.is_some(), "skill package is disabled");
         if let Some(remote) = &package.remote {
             return Ok(
-                json!({"skill":name,"content":remote.skill,"tools":package.manifest.tools,"activation_scope":"current_user_turn","package_scope":package.scope}),
+                json!({"skill":name,"content":remote.skill,"tools":package.manifest.tools,"activation_scope":"conversation","package_scope":package.scope}),
             );
         }
         let current = reload_package(&package)?;
@@ -307,14 +310,12 @@ impl Registry {
             serde_json::to_value(&current.manifest)? == serde_json::to_value(&package.manifest)?,
             "package manifest changed; reload it before loading"
         );
-        let path = crate::file_edit::workspace_path(&package.root, &package.manifest.skill)?;
-        let content = std::fs::read_to_string(&path)?;
-        ensure!(content.len() <= 128000, "skill body too large");
-        Ok(
-            json!({"skill":name,"content":content,"tools":package.manifest.tools,"source":path,
-            "content_hash":crate::symbol_description::content_hash(content.as_bytes()),"activation_scope":"current_user_turn","package_scope":package.scope}),
-        )
+        let instructions = optional_instructions(&package.root, &package.manifest.skill)?;
+        let (source, content) = instructions.map(|(path, body)|(Some(path), body)).unwrap_or_default();
+        Ok(json!({"skill":name,"content":content,"tools":package.manifest.tools,"source":source,
+            "content_hash":crate::symbol_description::content_hash(content.as_bytes()),"activation_scope":"conversation","package_scope":package.scope}))
     }
+
     pub fn attachment_extensions(&self, name: &str) -> Result<Vec<String>> {
         let entries = self.entries.read().unwrap();
         let package = entries.get(name).context("plugin unavailable")?;
@@ -855,6 +856,22 @@ pub(crate) fn test_runtime() -> (Arc<PluginRuntime>, Arc<ToolCatalog>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plugins_without_instruction_files_still_mount_and_expose_their_pages() {
+        let root=std::env::temp_dir().join(format!("optional-skill-{}",crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();std::fs::write(root.join("index.html"),"<p>Plugin</p>").unwrap();
+        for entry in [None,Some("missing.md"),Some("empty.md")] {
+            std::fs::write(root.join("empty.md")," ").unwrap();
+            let mut manifest=json!({"version":1,"id":"optional","title":"Optional page","pages":[{"id":"main","title":"Main","entry":"index.html","renderer":"html"}]});
+            if let Some(entry)=entry {manifest["skill"]=json!(entry)}
+            std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
+            let mut package=load(&root).unwrap();package.scope=Some(42);
+            let registry=Registry::default();registry.entries.write().unwrap().insert("optional".into(),package);
+            assert_eq!(registry.read("optional").unwrap()["content"],"");
+            assert!(registry.page("optional","main",None).unwrap().is_file());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn frontmatter_accepts_crlf_and_bom_without_changing_instruction_content() {
         let lf = "---\nname: example\ndescription: Test skill\n---\nFull instructions\n";

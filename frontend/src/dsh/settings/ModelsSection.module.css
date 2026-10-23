@@ -6,16 +6,17 @@
 .section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  max-width: 720px;
+  gap: 16px;
+  max-width: none;
   color: var(--dsw-alias-label-primary);
 }
 
 .title {
   margin: 0;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 500;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--dsw-alias-label-primary);
 }
 
@@ -47,7 +48,7 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 /* A configured provider: outlined on the panel fill, so the filled editor
@@ -55,10 +56,10 @@
 .rowCard {
   border: 0.5px solid var(--dsw-alias-border-l4);
   border-radius: 16px;
-  padding: 12px 14px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
 
 .rowHead {
@@ -135,6 +136,7 @@
   padding: 0 14px;
   border: none;
   border-radius: 18px;
+  white-space: nowrap;
   font: inherit;
   font-size: 14px;
   line-height: 22px;
@@ -505,8 +507,8 @@
 .modelAdvanced {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  padding: 8px 4px 2px;
+  gap: 14px 12px;
+  padding: 0;
 }
 
 .modelField {
@@ -575,10 +577,10 @@
 .input {
   box-sizing: border-box;
   width: 100%;
-  height: 32px;
-  padding: 0 10px;
+  height: 36px;
+  padding: 0 12px;
   border: 0.5px solid var(--dsw-alias-border-l4);
-  border-radius: 8px;
+  border-radius: 10px;
   font: inherit;
   font-size: 14px;
   line-height: 22px;
@@ -589,7 +591,7 @@
 /* Enum pickers hold a handful of short options; a field-width dropdown reads
    as a text field the user is expected to fill. */
 select.input {
-  max-width: 240px;
+  max-width: none;
   cursor: pointer;
 }
 
@@ -610,7 +612,8 @@ select.input {
 /* Select variant of .input: replaces the OS arrow (which sits flush against
    the right edge) with the shared 12px chevron inset like the composer's
    .select chips; the right pad reserves its cell. */
-.selectInput {
+.selectInput,
+.select {
   appearance: none;
   padding-right: 32px;
   /* Data-URI SVGs cannot resolve CSS variables; #81858C is the caption gray
@@ -721,4 +724,212 @@ select.input {
   font-size: 13px;
   line-height: 20px;
   text-align: center;
+}
+
+
+/* ---- Redesign layer: shared page, card and control vocabulary ---- */
+
+/* Page header: title + one-line description, hairline below so every tab
+   opens the same way. */
+.pageHead {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 16px;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.pageHead .intro {
+  max-width: 640px;
+}
+
+/* Group heading inside a page (e.g. 插件可用模型): quiet, sentence-sized. */
+.groupHead {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 12px;
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Card title row: name on the left, state/action on the right. */
+.cardHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cardHeadText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cardTitle {
+  margin: 0;
+  font-size: 15px;
+  line-height: 22px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+
+.cardDesc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.cardFields {
+  padding-top: 14px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+/* Small status chip ("跟随主 Agent" / "已自定义"). */
+.chip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  font-size: 12px;
+  line-height: 18px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.chipActive {
+  background: var(--dsw-alias-brand-primary);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+
+/* Switch / checkbox row that fills the card width. */
+.toggleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.toggleText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* Checkbox choice: a rounded tile, clickable across its whole width. */
+.checkRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-primary);
+  cursor: pointer;
+}
+
+.checkRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.checkList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 8px;
+  padding-top: 10px;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.checkRowStrong {
+  font-weight: 500;
+  padding-left: 0;
+}
+
+.checkRowStrong:hover {
+  background: none;
+}
+
+/* Native checkboxes everywhere in the settings pages: one 16px rounded box
+   in the brand color instead of the OS widget. */
+.section input[type='checkbox'],
+.checkRow input[type='checkbox'] {
+  appearance: none;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+  display: inline-grid;
+  place-content: center;
+}
+
+.section input[type='checkbox']:checked {
+  border-color: var(--dsw-alias-brand-primary);
+  background: var(--dsw-alias-brand-primary);
+}
+
+.section input[type='checkbox']:checked::after {
+  content: '';
+  width: 4px;
+  height: 8px;
+  margin-top: -1px;
+  border-right: 1.5px solid #fff;
+  border-bottom: 1.5px solid #fff;
+  transform: rotate(45deg);
+}
+
+.section input[type='checkbox']:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.section input[type='checkbox']:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);
+}
+
+.section textarea.input {
+  height: auto;
+  padding: 8px 12px;
+}
+
+/* Full-width ghost button used as a card footer action. */
+.footerLink {
+  align-self: flex-start;
+}
+
+@media (max-width: 720px) {
+  .modelAdvanced,
+  .checkList {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.toggleSpan {
+  grid-column: 1 / -1;
+  padding-top: 4px;
+}
+
+.modelListHead.pageHead {
+  flex-direction: row;
+  align-items: flex-start;
+  justify-content: space-between;
 }

@@ -303,9 +303,6 @@ mod tests {
         let full = available_tools(&s, &w);
         let core = super::super::tools(&s, &w);
         for name in [
-            "plan_tasks",
-            "branch_task",
-            "return_task",
             "read_asset",
             "read_session_history",
             "read_skill",
@@ -315,6 +312,9 @@ mod tests {
             assert!(has(&core, name), "missing core tool {name}");
         }
         for name in [
+            "plan_tasks",
+            "branch_task",
+            "next_step",
             "read_file",
             "write_file",
             "run_program",

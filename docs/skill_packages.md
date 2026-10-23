@@ -52,11 +52,20 @@ frontend/src/builtin_plugins/
 }
 ```
 
-SKILL.md 的 YAML frontmatter 必须有相同的 `name: example` 和适用描述 `description`。工具名必须唯一，不得覆盖其他已安装插件或宿主工具。清单 `inject` 是后端服务依赖；每个插件发布 `plugin:{id}` 服务，可声明 `inject: ["plugin:other"]`。缺少依赖不能激活，被依赖的插件不能在使用者仍运行时停用。
+`skill` 为可选字段；未声明、文件不存在或为空时，插件仍可正常挂载、打开页面和调用声明工具，不生成替代业务提示词。提供非空 SKILL.md 时，其 YAML frontmatter 必须有相同的 `name: example` 和适用描述 `description`。工具名必须唯一，不得覆盖其他已安装插件或宿主工具。清单 `inject` 是后端服务依赖；每个插件发布 `plugin:{id}` 服务，可声明 `inject: ["plugin:other"]`。缺少依赖不能激活，被依赖的插件不能在使用者仍运行时停用。
 
 `tools` 是完整声明。实现可由项目的原生贡献适配器提供，或通过 `command_tools` 的独立程序适配器提供。两者都经过相同清单校验、注册和清理；通用加载器没有 code-flow 特例。原生适配器提供工具 schema、handler 和权限等级，外置包不能借用项目的原生实现。
 
 `renderer: react` 表示 Cordis 页面模块：内置模块的 entry 为项目注册键（例如 `code-flow.architecture`），外置 entry 为包内已构建 JS/MJS 模块。`renderer: html` 是通用 HTML 页面适配器，内置外置均可使用。资源路径不得越出包或页面目录。
+
+## 插件页面的业务指令
+
+只有明确归属于插件的会话（进入插件页面后发起的聊天）自动启用自己的工具和指令。
+宿主在第一次模型请求之前完成激活，将该插件非空 MD 正文作为 `plugin_instructions`
+系统消息；后续轮次及子步骤按同一插件身份重新提供，独立于可压缩聊天历史。
+没有 MD 时不注入该系统消息，页面和声明工具照常可用，不要求模型调用 read_skill。
+模型不能在插件页面里卸载自己的技能；离开页面不向主聊天注入指令，停用插件则撤销能力。
+普通主聊天不会因为安装或启用了某插件就自动加载它，仍保留按需 read_skill/unload_skill。
 
 ## 前端 Cordis 贡献
 
@@ -100,7 +109,7 @@ export default {
 
 ## 生命周期与技能激活
 
-插件专用会话每轮模型请求显式说明当前轮次与工具可用状态。用户确认方案、追加修改等新轮次也须重新 `read_skill`，旧历史中的技能正文不能充当本轮激活。主 Agent 提前调用已安装但尚未激活的工具时返回 `SKILL_NOT_ACTIVE`，提示独立读取对应技能后再调用；权限拒绝、插件作用域拒绝和只读上下文子 Agent 限制分别报告，不把它们统称为子 Agent 递归错误。未激活的调用不会到达远程插件。
+插件专用会话每轮模型请求说明当前工具可用状态。成功 `read_skill` 后，技能在同一会话的步骤和后续用户轮次中持续启用，确认方案或追加修改无需重读。显式 `unload_skill`、插件停用或重新加载产生的包作用域变化会使原激活失效；重新启用必须读取新包说明。只有历史正文而没有有效激活记录，不会获得工具。未激活调用返回 `SKILL_NOT_ACTIVE`，不会到达远程插件；权限、插件会话隔离和只读限制仍独立校验。
 
 - `GET /agent/skill-packages`：共同目录，包含来源 origin、依赖、作用域、工具和页面声明。
 - `POST /agent/skill-packages`，`{"path":"/absolute/package/path"}`：安装外置包，保存配置。
@@ -110,7 +119,7 @@ export default {
 - `POST /agent/skill-packages/{id}/tools/{name}`：所属页面调用工具。
 - `GET /agent/skill-packages/{id}/pages/{page}/{resource}`：外置模块、HTML 与资源。
 
-Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文后才提供专用工具；主 Agent 按用户轮次隔离。重载产生新作用域，旧激活失效。MCP 按 Mcp-Session-Id 隔离，通过 GET SSE 发送工具列表变化通知，unload_skill 隐藏一个技能，reset_skill_activation 清空会话技能。MCP 没有用户轮次信号，调用者显式重置。两小时无请求的会话失效。
+Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文后才提供专用工具；主 Agent 在同一会话中持续保存有效激活，显式卸载后失效。重载产生新作用域，旧激活失效。MCP 按 Mcp-Session-Id 隔离，通过 GET SSE 发送工具列表变化通知，unload_skill 隐藏一个技能，reset_skill_activation 清空会话技能。MCP 没有用户轮次信号，调用者显式重置。两小时无请求的会话失效。
 
 本实现参考本机 DSH 的 client/modules、ui-renderer、slots.register，以及 Cordis 的 Service、inject、plugin、effect 生命周期。协议与 Rust/前端适配器共享上述思想；DSH npm 包的完整配置和远程服务 wire 协议不是本插件清单。
 
@@ -149,19 +158,30 @@ Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文
 - Rust 插件：声明依赖 `model-catalog`，注入 `ModelCatalog` 后调用 `list().await`。
 - Cordis 页面：`ctx.pluginHost.models()`，等价于 `session('models')`。
 - iframe 页面：`skillPackage.models()`，通过同一个归属与作用域检查。
-- 独立 PPT 页面：认证后的 `/agent/ppt/session`，传 `connection_handle` 和 `method: "models"`，不要求先创建 PPT 会话。
+- 独立插件页面：认证后的 `/agent/plugins/{id}/session`，传 `connection_handle` 和 `method: "models"`，不要求先创建业务文档。
 
 响应包含 `version`、`models` 和 `defaults`。模型按提供商和 ID 唯一标识，包含显示名、协议、当前 Agent 是否支持该协议、已声明的上下文/输出上限、视觉与推理能力。未知能力/上限保留 `unknown` 或 `null`；在目录中并不表示全部功能已通过实测。`verification` 只描述对应图片探测证据，不代表完整模型验证。
 `defaults.visual_tool` 等是模型引用；字段为空时跟随当前主 Agent。不会向插件返回供应商地址、凭据、凭据环境变量或探测响应正文。每次查询读取当前配置，目录修改不需要各插件分别维护列表。本接口提供只读查询，不授予插件修改全局模型设置的权限。
 
 这沿用 DSH 的提供商/模型标识和声明式目录；以上 HTTP/页面桥接接口是本项目适配层，不宣称等同于 DSH 全部 LLM wire API。
 
-`POST /agent/skill-packages/remote` 接收 `{url, token}`，其中 url 为 PPT 服务的
-`.../aiPpt/plugin`。使用 DSH Connection 包络进行 `ppt/handshake`、`ppt/confirm`；
-确认 ready 并取得技能正文后才挂载贡献。远程包仍是 external，`remote:true`；
-不创建本地包目录。配置仅在宿主保存，目录接口、模块和 iframe 不返回认证凭证。
-重载会重新握手；连接过期、服务重启后可重载恢复。离线服务不会阻塞宿主启动。
-当前远程适配器实现的是 PPT Remote 契约，不声称可直接运行任意 DSH 服务。
+`POST /agent/skill-packages/remote` 接收 `{url, token}`，url 是插件服务基址。
+使用 Connection 请求/响应包络调用 `plugin/handshake`、`plugin/confirm`；
+握手返回 `version:1`、`state:awaiting_confirmation`、`connection_id`、不透明的
+`subject` 和插件清单（`id/title/tools/pages` 及可选 `skill/attachment_extensions/capabilities`）。
+确认 ready 后，通过 `/resource?path=<skill>` 取得技能正文并挂载贡献。
+认证头为 `Authorization: Bearer ...` 和 `X-Plugin-Connection`。
+这些是本项目的通用远程插件契约，参考 DSH 的分层和 Connection 包络，
+不声称能直接运行任意 DSH 服务。配置仅在宿主保存，页面及目录不返回认证凭证。
+重载会重新握手；离线服务不会阻塞宿主启动。
+
+宿主只注册清单实际声明的工具，不补充任何业务工具或参数。
+工具通过 `plugin/call` 接收 `{tool, arguments, context}`，其中 arguments 原样转发；
+context 的 `conversation_id` 是根聊天，`execution_id` 是当前执行节点。
+返回 `{value: <工具结果>}`；需要展示计划确认卡时可附带通用 `plan_proposal`
+（`items` 每项含 `id/title/requirements`）。保存提案不代表用户确认。
+可选 `capabilities` 中声明 `attachments` 才转送附件；插件返回 `path/src`，宿主不拼业务 URI。
+`plugin/service`、`plugin/resource` 的业务方法、标识、资源归属均由插件检查。
 
 远程清单可同时声明 `react/module.js` 和 `html/page`。模块注入的 `pluginHost`
 按 Cordis isolation 绑定所属插件；iframe 的消息桥转到同一 facade。
@@ -188,7 +208,7 @@ render_slide 的服务端 PNG 由宿主读取并注册为当前任务的视觉�
 ## 验证（包含远程页面）
 
 `cargo test plugin_conversation_cannot_escape` 验证伪造写文件、终端、跨技能、跨
-会话读取及新一轮权限提升被拒绝。`cargo test remote_handshake_registers` 验证
+会话读取及新一轮权限提升被拒绝。`cargo test remote_` 验证
 Remote 包络、确认、工具映射、页面声明、凭证隔离与卸载。
 `node --test tests/plugin-host.test.mjs tests/plugin-pages.test.mjs` 验证 Cordis 服务
 隔离及页面生命周期。PPT 前端的 `npm run test:ppt-plugin` 在 Chromium 中验证
@@ -196,19 +216,22 @@ Remote 包络、确认、工具映射、页面声明、凭证隔离与卸载。
 
 `cargo test skill_ -- --nocapture` 验证共同后端协议、来源、依赖、权限、激活与清理。`node --test tests/plugin-pages.test.mjs tests/code-flow.test.mjs` 验证实际 Cordis 的前端依赖、页面归属、卸载和图布局。构建 Rust 后，`python3 scripts/skill_packages_smoke.py` 在临时 profile/工作区验证安装、RPC、SSE、重载和持久化，不调用模型。MCP 接口参考 [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports) 与 [Tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)。
 
-## 原站登录接入
+## 独立插件页面登录接入
 
-AI PPT 原站通过 `POST /agent/ppt/{connect,session,service,tool}` 接入，当前 JWT 放在
-Authorization。宿主使用 `PPT_PLUGIN_URL` 或已注册 PPT 服务地址，不能由浏览器指定
-任意远程地址。握手验证 `user_id`，每次页面请求通过 ppt/identity 再验证凭证。
-首次登录可在内存注册需要用户会话绑定的 PPT 插件，无需把用户 JWT 保存为全局配置。
-通用工具入口不能执行这类插件的业务工具。
+页面通过 `POST /agent/plugins/{id}/{connect,session,service,upload,attachment,decide_definition,confirm_plan}`
+接入，当前用户凭证放在 Authorization。连接地址必须已由管理员注册，页面不能指定任意地址。
+宿主使用通用 `plugin/identity` 每次验证 subject；用户凭证仅存内存，不替换管理员配置。
+SQLite 的 `remote_plugin_sessions` 只保存聊天、插件、subject 与服务地址。
+业务文档、模板、异步任务关联只存在插件自己的存储。
 
-用户会话、PPT project_id 与已接收的异步任务归属存入 SQLite，用户 JWT 仅存内存。
-后台 Agent 使用所属会话的连接执行工具，验证目标项目及任务归属。异步初始化在
-原始任务完成后绑定实际 project_id；进程重启后先由原站重新认证，不使用共享凭证。
-原站部署只公开 `/agent/ppt/*`，宿主通用管理及开发工具接口继续留在本机。
-前端配置与代理示例见 ai-ppt-view/docs/ppt-host-agent.md。
+`plugin/session` 的 `resolve/bind/open/prompt/status` 由插件处理业务状态；
+宿主响应将状态放在 `plugin_state` 中，宿主不解释其中字段。
+子执行节点携带同一根 conversation_id。重启后须重新认证。
+旧的插件聊天只有通过插件自己的 open 归属验证后，才能建立新的通用身份绑定。
+通用任务定义和计划确认仍由宿主按版本执行，不解析聊天里的“确认”字样。
+
+PPT 专有的旧协议兼容与项目绑定已迁到 AI PPT 插件仓库，Agent 没有对应适配器。
+部署须同步更新插件后端、插件前端和 Agent；旧 `/agent/ppt/*` 路由已删除。
 
 ## 会话附件
 

@@ -1,7 +1,7 @@
 //! Remote service adapter for DSH Connection envelopes. No plugin installation.
 use super::*;
 use crate::plugin_protocol::{NativeContributions, NativeTool, Page};
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +16,7 @@ pub struct Connection {
     pub skill: String,
     pub subject: String,
     pub require_binding: bool,
+    capabilities: BTreeSet<String>,
 }
 impl Connection {
     pub fn authenticated(&self) -> Arc<Self> {
@@ -26,49 +27,46 @@ impl Connection {
             skill: self.skill.clone(),
             subject: self.subject.clone(),
             require_binding: false,
+            capabilities: self.capabilities.clone(),
         })
+    }
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.contains(capability)
     }
     pub fn url(&self) -> &str {
         &self.config.url
     }
-    pub fn resource_url(&self, project: u64, path: &str) -> Result<String> {
-        let mut url = reqwest::Url::parse(&format!("{}/resource", self.config.url))?;
-        url.query_pairs_mut()
-            .append_pair("project_id", &project.to_string())
-            .append_pair("path", path);
-        Ok(url.into())
+    /// Arguments are plugin-owned data and cross the transport unchanged.
+    pub async fn call(&self, raw: &str, args: Value) -> Result<Value> {
+        self.call_in(raw, args, json!({}))
+            .await?
+            .get("value")
+            .cloned()
+            .context("Plugin tool response requires value")
     }
-    pub async fn call(&self, raw: &str, mut args: Value) -> Result<Value> {
-        if matches!(raw, "project" | "task" | "cancel" | "events") {
-            return self.rpc(&format!("ppt/{raw}"), args).await;
-        }
-        let project = args
-            .as_object_mut()
-            .context("object arguments required")?
-            .remove("project_id")
-            .unwrap_or(json!(0));
+    pub async fn call_in(&self, raw: &str, args: Value, context: Value) -> Result<Value> {
         self.rpc(
-            "ppt/call",
-            json!({"project_id":project,"tool":raw,"arguments":args}),
+            "plugin/call",
+            json!({"tool":raw,"arguments":args,"context":context}),
         )
         .await
     }
     pub async fn rpc(&self, method: &str, args: Value) -> Result<Value> {
         ensure!(
             !self.require_binding,
-            "PPT service requires an authenticated user session"
+            "Plugin service requires an authenticated user session"
         );
         let rpc_id = crate::agent_service::uuid_like();
         let request = self
             .client
             .post(format!("{}/api/{method}", self.config.url));
-        let request = if matches!(method, "ppt/handshake" | "ppt/confirm") {
+        let request = if matches!(method, "plugin/handshake" | "plugin/confirm") {
             request.timeout(Duration::from_secs(10))
         } else {
             request
         };
         let response: Value = request
-            .bearer_auth(&self.config.token).header("X-Ppt-Connection",&self.connection_id)
+            .bearer_auth(&self.config.token).header("X-Plugin-Connection",&self.connection_id)
             .json(&json!({"type":"client-request","rpcId":rpc_id,"method":method,"payload":{"args":args}}))
             .send().await.context("remote plugin request failed")?.error_for_status().context("remote plugin HTTP error")?.json().await?;
         ensure!(
@@ -87,7 +85,7 @@ impl Connection {
     pub async fn asset(&self, entry: &str, query: &[(&str, String)]) -> Result<(String, Vec<u8>)> {
         ensure!(
             !self.require_binding || matches!(entry, "page" | "module.js"),
-            "PPT resources require an authenticated user session"
+            "Plugin resources require an authenticated user session"
         );
         ensure!(
             matches!(entry, "page" | "module.js" | "resource"),
@@ -98,7 +96,7 @@ impl Connection {
             .get(format!("{}/{entry}", self.config.url))
             .query(query)
             .bearer_auth(&self.config.token)
-            .header("X-Ppt-Connection", &self.connection_id)
+            .header("X-Plugin-Connection", &self.connection_id)
             .send()
             .await
             .context("remote resource request failed")?
@@ -128,7 +126,7 @@ impl Connection {
         Ok((mime, bytes))
     }
 }
-pub(crate) fn mount_user_template(
+pub(crate) fn mount_user_package(
     runtime: &PluginRuntime,
     registry: &Registry,
     package: Package,
@@ -140,24 +138,21 @@ pub(crate) fn mount_user_template(
         .authenticated();
     ensure!(
         !connection.subject.is_empty(),
-        "PPT server must report authenticated user_id"
+        "Plugin server must report an authenticated subject"
     );
-    ensure!(
-        package.manifest.id == "ppt-master",
-        "unexpected PPT plugin identity"
-    );
+    let id = &package.manifest.id;
     let _transition = registry.transition.lock().unwrap();
-    if let Some(old) = registry.entries.read().unwrap().get("ppt-master") {
+    if let Some(old) = registry.entries.read().unwrap().get(id) {
         ensure!(
             old.remote
                 .as_ref()
                 .is_some_and(|c| c.url() == connection.url()),
-            "PPT service URL differs from registered plugin"
+            "Plugin service URL differs from registered plugin"
         );
-        ensure!(old.scope.is_some(), "PPT plugin disabled");
+        ensure!(old.scope.is_some(), "Plugin disabled");
         ensure!(
             old.manifest.tools == package.manifest.tools,
-            "PPT tool manifest changed; reload plugin"
+            "Plugin tool manifest changed; reload plugin"
         );
         return Ok(connection);
     }
@@ -194,8 +189,9 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         skill: String::new(),
         subject: String::new(),
         require_binding: false,
+        capabilities: BTreeSet::new(),
     };
-    let hello = remote.rpc("ppt/handshake", json!({"version":1})).await?;
+    let hello = remote.rpc("plugin/handshake", json!({"version":1})).await?;
     ensure!(
         hello["version"] == 1 && hello["state"] == "awaiting_confirmation",
         "unsupported remote handshake"
@@ -204,9 +200,9 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         .as_str()
         .context("missing connection ID")?
         .to_owned();
-    if let Some(user) = hello["user_id"].as_u64().filter(|id| *id > 0) {
+    if let Some(subject) = hello["subject"].as_str().filter(|s| !s.is_empty()) {
         remote.subject =
-            crate::visual_artifacts::hash(format!("{}:{user}", remote.config.url).as_bytes());
+            crate::visual_artifacts::hash(format!("{}:{subject}", remote.config.url).as_bytes());
     }
     let plugin = &hello["plugin"];
     let id = plugin["id"]
@@ -215,61 +211,37 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         .to_owned();
     ensure!(identifier(&id), "invalid remote plugin ID");
     let confirmed = remote
-        .rpc("ppt/confirm", json!({"connection_id":remote.connection_id}))
-        .await?;
-    ensure!(confirmed["state"] == "ready", "remote plugin not ready");
-    let (_, body) = remote
-        .asset(
-            "resource",
-            &[
-                ("project_id", "0".into()),
-                (
-                    "path",
-                    plugin["skill"]
-                        .as_str()
-                        .context("missing skill resource")?
-                        .into(),
-                ),
-            ],
+        .rpc(
+            "plugin/confirm",
+            json!({"connection_id":remote.connection_id}),
         )
         .await?;
-    ensure!(body.len() <= 128000, "remote skill body too large");
-    remote.skill = String::from_utf8(body)?;
-    let fields = super::frontmatter(&remote.skill)?;
-    ensure!(fields["name"] == id, "remote skill ID mismatch");
-    let description = fields["description"]
-        .as_str()
-        .context("skill description required")?
-        .to_owned();
+    ensure!(confirmed["state"] == "ready", "remote plugin not ready");
+    let skill_entry = plugin["skill"].as_str().unwrap_or_default();
+    if !skill_entry.trim().is_empty() {
+        match remote.asset("resource", &[("path", skill_entry.into())]).await {
+            Ok((_, body)) => {ensure!(body.len() <= 128000, "remote skill body too large"); remote.skill = String::from_utf8(body)?;},
+            Err(error) if error.downcast_ref::<reqwest::Error>().is_some_and(|e|e.status()==Some(reqwest::StatusCode::NOT_FOUND)) => {},
+            Err(error) => return Err(error),
+        }
+    }
+    let description = if !remote.skill.trim().is_empty() {
+        let fields = super::frontmatter(&remote.skill)?;
+        ensure!(fields["name"] == id, "remote skill ID mismatch");
+        fields["description"].as_str().context("skill description required")?.to_owned()
+    } else { plugin["description"].as_str().or_else(||plugin["title"].as_str()).unwrap_or("Remote plugin").to_owned() };
+    remote.capabilities = plugin["capabilities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
     let prefix = id.replace('-', "_");
-    let mut definitions = plugin["tools"]
+    let definitions = plugin["tools"]
         .as_array()
         .context("remote tools required")?
         .clone();
-    for (name, description, schema) in [
-        (
-            "project",
-            "Read the PPT project and current slide revisions",
-            json!({"type":"object","properties":{"project_id":{"type":"integer","minimum":1}},"required":["project_id"]}),
-        ),
-        (
-            "task",
-            "Inspect an asynchronous PPT task before proceeding",
-            json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]}),
-        ),
-        (
-            "events",
-            "Read persistent PPT project events",
-            json!({"type":"object","properties":{"project_id":{"type":"integer","minimum":1},"after":{"type":"integer","minimum":0}},"required":["project_id"]}),
-        ),
-        (
-            "cancel",
-            "Cancel an asynchronous PPT task",
-            json!({"type":"object","properties":{"task_id":{"type":"string"}},"required":["task_id"]}),
-        ),
-    ] {
-        definitions.push(json!({"name":name,"description":description,"inputSchema":schema}));
-    }
     let mut names = Vec::new();
     let mut mapped = Vec::new();
     for mut definition in definitions {
@@ -296,28 +268,13 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
             definition["executor"].is_null() || page || definition["executor"] == "service",
             "unknown tool executor"
         );
-        // Page tools act on what the page has open; they take no service project.
-        if !page
-            && !matches!(
-                raw.as_str(),
-                "init_project" | "project" | "task" | "cancel" | "events"
-            )
-        {
-            let skill_read = matches!(raw.as_str(), "read_file" | "read_files" | "list_dir");
-            definition["inputSchema"]["properties"]["project_id"] = json!({"type":"integer","minimum":1,"description":if skill_read {"PPT project ID. Omit for skill: resources before initialization completes; required for project files."} else {"PPT project ID, never a filesystem path"}});
-            let required = definition["inputSchema"]["required"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let mut required = required;
-            if !skill_read && !required.contains(&json!("project_id")) {
-                required.push(json!("project_id"));
-            }
-            definition["inputSchema"]["required"] = json!(required);
+        // Tool input schemas belong to the plugin. Transport/session binding
+        // must not inject business parameters into the model's contract.
+        if !remote.skill.trim().is_empty() {
+            remote.skill.push_str(&format!(
+                "\nHost tool mapping: `{raw}` → `{name}`. Use the host name when calling.\n"
+            ));
         }
-        remote.skill.push_str(&format!(
-            "\nHost tool mapping: `{raw}` → `{name}`. Use the host name when calling.\n"
-        ));
         names.push(name.clone());
         mapped.push((name, raw, definition));
     }
@@ -332,31 +289,14 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
             NativeTool {
                 definition,
                 permission: ToolPermission::WorkspaceWrite,
-                handler: Arc::new(move |_, _, mut args| {
+                handler: Arc::new(move |_, _, args| {
                     let connection = connection.clone();
                     let raw = raw.clone();
                     let page = page_tool;
                     Box::pin(async move {
                         // The Agent loop routes page tools to the task's page before this.
                         ensure!(!page, "this tool runs in the plugin page of an open task");
-                        ensure!(
-                            !connection.require_binding,
-                            "PPT tools require an authenticated user session"
-                        );
-                        if matches!(raw.as_str(), "project" | "task" | "cancel" | "events") {
-                            return connection.rpc(&format!("ppt/{raw}"), args).await;
-                        }
-                        let project = args
-                            .as_object_mut()
-                            .context("object arguments required")?
-                            .remove("project_id")
-                            .unwrap_or(json!(0));
-                        connection
-                            .rpc(
-                                "ppt/call",
-                                json!({"project_id":project,"tool":raw,"arguments":args}),
-                            )
-                            .await
+                        connection.call(&raw, args).await
                     })
                 }),
             },
@@ -377,7 +317,7 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
             version: 1,
             id,
             title: plugin["title"].as_str().unwrap_or("Remote plugin").into(),
-            skill: plugin["skill"].as_str().unwrap().into(),
+            skill: skill_entry.into(),
             inject: vec![],
             tools: names,
             command_tools: vec![],
@@ -396,6 +336,14 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         native: Some(Arc::new(native)),
         remote: Some(remote),
     })
+}
+/// An administrator may register just a service address. User credentials are
+/// supplied when its page connects, never persisted as shared plugin identity.
+pub(crate) fn configured_url(registry: &Registry, id: &str) -> Result<String> {
+    if let Ok(connection)=registry.remote(id) {return Ok(connection.url().to_owned())}
+    let configured=settings()?;
+    ensure!(configured.enabled.get(id)!=Some(&false) && !configured.removed.contains(id),"Plugin disabled");
+    configured.remotes.get(id).map(|c|c.url.clone()).context("Plugin service address is not configured")
 }
 pub async fn install(
     runtime: &PluginRuntime,
@@ -504,23 +452,30 @@ pub async fn service(
     axum::Json(args): axum::Json<Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let result=async {
-        let catalog=state.tool_catalog.context("tool registry unavailable")?;
-        ensure!(args["package_scope"].is_u64() && catalog.packages.scopes(&std::collections::BTreeSet::from([id.clone()])).get(&id).copied()==args["package_scope"].as_u64(),"plugin page is unavailable or stale");
-        let connection=catalog.packages.remote(&id)?;
-        let method=args["method"].as_str().context("method required")?;
-        let input=&args["arguments"];
-        ensure!(input.is_object(),"object arguments required");
-        if method=="resource" {
-            use base64::Engine;
-            let project=input["project_id"].as_u64().context("project_id required")?;
-            let path=input["path"].as_str().context("resource path required")?;
-            let (mime,bytes)=connection.asset("resource",&[("project_id",project.to_string()),("path",path.into())]).await?;
-            return Ok(json!({"data_url":format!("data:{mime};base64,{}",base64::engine::general_purpose::STANDARD.encode(bytes))}));
-        }
-        ensure!(matches!(method,"project"|"task"|"events"),"page service method unavailable");
-        connection.rpc(&format!("ppt/{method}"),input.clone()).await
-    }.await;
+    let result = async {
+        let catalog = state.tool_catalog.context("tool registry unavailable")?;
+        ensure!(
+            args["package_scope"].is_u64()
+                && catalog
+                    .packages
+                    .scopes(&std::collections::BTreeSet::from([id.clone()]))
+                    .get(&id)
+                    .copied()
+                    == args["package_scope"].as_u64(),
+            "plugin page is unavailable or stale"
+        );
+        let connection = catalog.packages.remote(&id)?;
+        let method = args["method"].as_str().context("method required")?;
+        let input = &args["arguments"];
+        ensure!(input.is_object(), "object arguments required");
+        connection
+            .rpc(
+                "plugin/service",
+                json!({"method":method,"arguments":input,"context":{}}),
+            )
+            .await
+    }
+    .await;
     match result {
         Ok::<Value, anyhow::Error>(value) => axum::Json(value).into_response(),
         Err(error) => (
@@ -541,34 +496,53 @@ mod tests {
         routing::{get, post},
     };
     #[tokio::test]
-    async fn remote_handshake_registers_namespaced_tools_and_both_page_adapters_without_files() {
-        let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let captured = calls.clone();
-        let app=Router::new().route("/api/ppt/{method}",post(move|Path(method):Path<String>, headers:HeaderMap, Json(body):Json<Value>|{
-            let captured=captured.clone(); async move {
-                assert_eq!(headers["authorization"],"Bearer private-token");
-                assert_eq!(body["type"],"client-request"); assert_eq!(body["method"],format!("ppt/{method}"));
+    async fn remote_plugins_may_omit_or_not_have_a_skill_resource() {
+        for entry in [None,Some("skill:missing.md")] {
+            let app=Router::new().route("/api/plugin/{method}",post(move|Path(method):Path<String>,Json(body):Json<Value>|async move {
+                let value=if method=="handshake" {
+                    let mut plugin=json!({"id":"plain-page","title":"No instructions","pages":[],"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]});
+                    if let Some(entry)=entry {plugin["skill"]=json!(entry)}
+                    json!({"version":1,"subject":"user","state":"awaiting_confirmation","connection_id":"c","plugin":plugin})
+                } else {assert_eq!(method,"confirm");json!({"state":"ready"})};
+                Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":value}}))
+            }));
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
+            let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+            let package=connect(Config{url:format!("http://{address}"),token:"test".into()}).await.unwrap();
+            assert!(package.remote.as_ref().unwrap().skill.is_empty(),"tool mapping must not fabricate missing MD");
+            assert_eq!(package.manifest.tools,vec!["plain_page__ping"]);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn remote_contract_is_generic_and_preserves_business_arguments() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let received = captured.clone();
+        let app=Router::new().route("/api/plugin/{method}",post(move|Path(method):Path<String>,headers:HeaderMap,Json(body):Json<Value>| {
+            let received=received.clone();async move {
+                assert_eq!(headers["authorization"],"Bearer test-secret");
+                assert!(!headers.contains_key("x-ppt-connection"));
+                assert_eq!(body["method"],format!("plugin/{method}"));
                 let value=match method.as_str() {
-                    "handshake"=>json!({"version":1,"state":"awaiting_confirmation","connection_id":"connection-test","plugin":{"id":"ppt-master","title":"PPT","skill":"skill:SKILL.md","tools":[{"name":"write_file","description":"Write a project SVG","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}],"pages":[{"id":"preview","title":"iframe","entry":"page","renderer":"html"},{"id":"workspace","title":"Module","entry":"module.js","renderer":"react"}]}}),
-                    "confirm"=>{assert_eq!(body["payload"]["args"]["connection_id"],"connection-test");json!({"state":"ready"})},
-                    "call"=>{assert_eq!(headers["x-ppt-connection"],"connection-test");assert_eq!(body["payload"]["args"],json!({"project_id":7,"tool":"write_file","arguments":{"path":"svg_output/01_title.svg"}}));json!({"status":"accepted","project_id":7,"task_id":"remote-task"})},
-                    _=>panic!("unexpected method"),
+                    "handshake"=>json!({"version":1,"subject":"user-a","state":"awaiting_confirmation","connection_id":"test-connection","plugin":{"id":"note-book","title":"Notes","skill":"skill:SKILL.md","pages":[],"tools":[{"name":"read_file","description":"Read a note","inputSchema":{"type":"object","properties":{"document":{"type":"string"}},"required":["document"],"additionalProperties":false}}]}}),
+                    "confirm"=>json!({"state":"ready"}),
+                    "call"=>{assert_eq!(headers["x-plugin-connection"],"test-connection");received.lock().unwrap().push(body["payload"]["args"].clone());json!({"value":{"content":"note text"}})},
+                    _=>panic!("unexpected method {method}")
                 };
-                captured.lock().unwrap().push(body.clone());
                 Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":value}}))
             }
-        })).route("/resource",get(||async{"---\nname: ppt-master\ndescription: PPT creation only\n---\nCall write_file."}));
+        })).route("/resource",get(||async{"---\nname: note-book\ndescription: Notes only\n---\nUse read_file."}));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let package = connect(Config {
             url: format!("http://{address}"),
-            token: "private-token".into(),
+            token: "test-secret".into(),
         })
         .await
         .unwrap();
+        assert_eq!(package.manifest.tools, vec!["note_book__read_file"]);
         assert!(package.root.as_os_str().is_empty());
-        assert_eq!(package.manifest.pages.len(), 2);
         let (runtime, catalog) = test_runtime();
         let parent = runtime
             .snapshot()
@@ -577,40 +551,43 @@ mod tests {
             .unwrap()
             .scope;
         let scope = runtime.mount(parent, PackagePlugin(package)).unwrap();
-        let read = catalog.packages.read("ppt-master").unwrap();
+        let read = catalog.packages.read("note-book").unwrap();
         assert!(
             read["content"]
                 .as_str()
                 .unwrap()
-                .contains("ppt_master__write_file")
+                .contains("`read_file` → `note_book__read_file`")
         );
-        assert!(!read.to_string().contains("private-token"));
-        assert!(
-            !catalog
-                .packages
-                .catalog()
-                .to_string()
-                .contains("private-token")
+        assert!(!read.to_string().contains("test-secret"));
+        let tools = catalog
+            .packages
+            .tools(&std::collections::BTreeSet::from(["note-book".into()]));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["additionalProperties"],
+            false
         );
         let root = std::env::temp_dir().join(format!(
-            "ppt-remote-test-{}",
+            "generic-remote-{}",
             crate::agent_service::uuid_like()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let workspace = Arc::new(crate::tools::Workspace::new(&root).unwrap());
+        let args = json!({"document":"doc-a","project_id":"this-is-opaque","nested":{"task":"business-data"}});
         let result = catalog
             .execute(
-                workspace,
-                "ppt_master__write_file",
-                json!({"project_id":7,"path":"svg_output/01_title.svg"}),
+                Arc::new(crate::tools::Workspace::new(&root).unwrap()),
+                "note_book__read_file",
+                args.clone(),
             )
             .await
             .unwrap();
-        assert_eq!(result["status"], "accepted");
-        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!(result, json!({"content":"note text"}));
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![json!({"tool":"read_file","arguments":args,"context":{}})]
+        );
         runtime.unmount(scope).unwrap();
-        assert!(catalog.packages.read("ppt-master").is_err());
-        assert!(!catalog.contains("ppt_master__write_file"));
+        assert!(!catalog.contains("note_book__read_file"));
         runtime.shutdown().unwrap();
         server.abort();
         std::fs::remove_dir_all(root).unwrap();

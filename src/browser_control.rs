@@ -336,9 +336,9 @@ pub async fn validate_upload_receipt(root: &Path, task: &str, receipt: &Value) -
     let token = serde_json::to_string(attempt_id).unwrap_or_else(|_| "\"\"".to_owned());
     let expression = format!(
         r#"(()=>{{
-      const attempt=window.__codexDocumentUploadAttempts?.[{token}];
+      const attempt=window.__codexUploadAttempts?.[{token}];
       return {{url:location.href,attempt_id:attempt?.id||null,change_event_received:attempt?.change_event_received===true,
-        latest_attempt_id:window.__codexLatestDocumentUploadAttempt||null,file_name:attempt?.file_name||null,status:attempt?.status||null}};
+        latest_attempt_id:window.__codexLatestUploadAttempt||null,file_name:attempt?.file_name||null,status:attempt?.status||null}};
     }})()"#
     );
     let current = match eval(&session.ws, &expression).await {
@@ -406,8 +406,8 @@ pub fn definitions() -> Vec<Value> {
     let url = json!({"type":"string","description":"http(s) or file URL to open."});
     let mut definitions = vec![
         json!({"name":"browser_open","description":"Open a URL in the task-owned browser and return its identity, display mode, location, title and visible text. Set visible=true to show the controlled Chrome/Edge window to the user. This does not by itself prove a document or slide loaded.","inputSchema":{"type":"object","required":["url"],"properties":{"url":url,"visible":{"type":"boolean","description":"Show the task-owned browser window. Choose this on the first browser call when the user should see the page; it cannot be changed after the session starts."}}}}),
-        json!({"name":"browser_read","description":"Read the existing task browser page URL, title, visible text, controls, file inputs, slide count, page indicator and document load evidence. Resumes the original connection from this conversation after a host restart; never creates or navigates a page. browser_session_missing means no connection record; browser_reconnect_failed includes the actual failure reason. Use browser_open only when you intend to open/navigate a page. After a file change, generic DOM evidence without a load cycle tied to that upload is reported as unconfirmed. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
-        json!({"name":"browser_wait","description":"Wait up to timeout_ms for a selector, visible text, font loading state or an application-confirmed presentation load after the latest file change. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"document_loaded":{"type":"boolean","description":"Set true to wait for a confirmed upload change, a completed application loading cycle, a valid current/total page indicator, slides, and no explicit load error. A generic DOM snapshot without a correlated load cycle stays unconfirmed."},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
+        json!({"name":"browser_read","description":"Read the existing task browser page URL, title, visible text, controls, file inputs, alerts and font state. Resumes the original connection from this conversation after a host restart; never creates or navigates a page. browser_session_missing means no connection record; browser_reconnect_failed includes the actual failure reason. Use browser_open only when you intend to open/navigate a page. Set expect_text to a phrase that proves the requested page is visible.","inputSchema":{"type":"object","properties":{"expect_text":{"type":"string"}}}}),
+        json!({"name":"browser_wait","description":"Wait up to timeout_ms for an explicit selector, visible text or font loading state. A timeout is an unmet condition and is reported as a tool failure.","inputSchema":{"type":"object","properties":{"selector":{"type":"string"},"text":{"type":"string"},"state":{"type":"string","enum":["visible","exists","hidden"]},"font_status":{"type":"string","enum":["loading","loaded"]},"timeout_ms":{"type":"integer","minimum":100,"maximum":30000}}}}),
         json!({"name":"browser_diagnostics","description":"Read bounded console errors, page exceptions, and the page's recorded requests since navigation: every fetch/XHR call (method, URL, status, time, duration, failure) plus font/resource timing entries. Filter with url_contains (e.g. /api/fonts) and category. request_coverage states what the record cannot see; an empty result means nothing matched in that scope, not that no request happened. This tool does not execute worker-provided JavaScript.","inputSchema":{"type":"object","properties":{"url_contains":{"type":"string"},"category":{"type":"string","enum":["all","fetch","xhr","font","resource"]}}}}),
         json!({"name":"browser_click","description":"Click a visible, enabled control. text matches the same label browser_read lists under controls (exact label preferred, then containing); selector is an exact CSS selector and takes precedence. times (1-5) repeats the same click, e.g. to step through slides, before you read the result.","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"selector":{"type":"string"},"times":{"type":"integer","minimum":1,"maximum":5}}}}),
         json!({"name":"browser_press_key","description":"Press a supported key in this task's focused browser page, e.g. Delete after selecting a slide element. For a reported native JavaScript dialog, Enter accepts and Escape dismisses it; other keys do not dismiss it. Dialog text is preserved in the return. This is an interaction, not proof of its visible result.","inputSchema":{"type":"object","required":["key"],"properties":{"key":{"type":"string","enum":["Delete","Backspace","Enter","Escape","Tab","ArrowLeft","ArrowRight","ArrowUp","ArrowDown"]}}}}),
@@ -716,94 +716,42 @@ fn page_url_matches(href: &str, url: &str) -> bool {
 }
 
 async fn read(ws: &str, expect: &str) -> Result<Value> {
-    let value = eval(ws, r#"(()=>{
+    let mut value = eval(ws, r#"(()=>{
       const visible=el=>{const s=getComputedStyle(el);return !!(el.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0)};
       const controls=[...document.querySelectorAll('button,a,[role=button],input,select,textarea')].slice(0,40).map(el=>({tag:el.tagName.toLowerCase(),type:el.type||'',text:(el.getAttribute('aria-label')||el.innerText||el.value||'').trim().slice(0,120),id:el.id||'',name:el.name||'',selector:el.id?'#'+CSS.escape(el.id):'',disabled:!!el.disabled,visible:visible(el)}));
       const file_inputs=[...document.querySelectorAll('input[type=file]')].slice(0,12).map(el=>({id:el.id||'',name:el.name||'',accept:el.accept||'',multiple:!!el.multiple,disabled:!!el.disabled,visible:visible(el),files_length:el.files?.length||0,selector:el.id?'#'+CSS.escape(el.id):'input[type=file]'}));
-      const slide_count=document.querySelectorAll('#slide-list .slide-item,.slide-item,[data-slide-index]').length;
-      const page_indicator=[...document.querySelectorAll('#page-indicator,.page-number,.slide-number,[aria-current="page"]')].filter(visible).map(el=>(el.innerText||el.textContent||'').trim().slice(0,80)).filter(Boolean).slice(0,4);
-      const loading_indicators=[...document.querySelectorAll('[aria-busy="true"],[data-loading="true"],[role="progressbar"],.loading,.loading-overlay,.spinner')].filter(visible).slice(0,8).map(el=>({selector:el.id?'#'+CSS.escape(el.id):el.tagName.toLowerCase(),text:(el.innerText||el.getAttribute('aria-label')||'').trim().slice(0,120)}));
-      const parsePage=value=>{const normalized=String(value||'').trim().replace(/^slide\s+/i,'');const m=normalized.match(/^(\d+)\s*(?:\/|of)\s*(\d+)$/i);if(!m)return null;const current=Number(m[1]),total=Number(m[2]);return Number.isSafeInteger(current)&&Number.isSafeInteger(total)&&current>=1&&total>=1&&current<=total?{current,total}:null};
-      const page_numbers=page_indicator.map(parsePage).filter(Boolean);const valid_page_indicator=page_numbers.length>0;
-      const error_indicators=[...document.querySelectorAll('#page-indicator,[role="alert"],.error-message,[data-error]')].filter(visible).map(el=>({selector:el.id?'#'+CSS.escape(el.id):el.getAttribute('role')==='alert'?'[role="alert"]':el.className?.toString().slice(0,100)||el.tagName.toLowerCase(),text:(el.innerText||el.textContent||el.getAttribute('aria-label')||'').trim().slice(0,160)})).filter(x=>/打开失败|上传失败|解析失败|导入失败|failed to (open|load|parse|import)|invalid (pptx|presentation)|cannot (read|open)|unable to (read|open)/i.test(x.text)).slice(0,8);
-      const upload_attempt_id=window.__codexLatestDocumentUploadAttempt||null;const upload_attempt=upload_attempt_id?(window.__codexDocumentUploadAttempts||{})[upload_attempt_id]||null:null;
-      const explicit_error=error_indicators.length>0||upload_attempt?.status==='failed';
-      const inferred_loaded=slide_count>0&&valid_page_indicator&&!loading_indicators.length&&!explicit_error;
-      const correlated_loaded=!!(upload_attempt&&upload_attempt.change_event_received&&upload_attempt.status==='loaded'&&slide_count>0&&valid_page_indicator&&!loading_indicators.length&&!explicit_error);
-      const document_status=explicit_error?'failed':loading_indicators.length||upload_attempt?.status==='loading'?'loading':upload_attempt?(correlated_loaded?'loaded':'unconfirmed'):inferred_loaded?'loaded':slide_count>0?'unconfirmed':'not_loaded';
-      return{url:location.href,title:document.title,text:(document.body&&document.body.innerText||'').slice(0,4000),controls,file_inputs,slide_count,page_indicator,page_numbers,valid_page_indicator,loading_indicators,error_indicators,document_loaded:{status:document_status,confirmation:correlated_loaded?'application_load_cycle':inferred_loaded?'dom_inference':'unconfirmed',upload_attempt_id:upload_attempt?.id||null,upload_file_name:upload_attempt?.file_name||null,upload_change_observed:upload_attempt?.change_event_received===true,upload_load_status:upload_attempt?.status||null,slides_detected:slide_count,page_indicator,page_numbers,valid_page_indicator,loading_indicators,error_indicators,ready_state:document.readyState},font_state:document.fonts?document.fonts.status:'unsupported'}
+      const alerts=[...document.querySelectorAll('[role=alert]')].filter(visible).map(el=>(el.innerText||el.textContent||'').trim()).slice(0,8);
+      return{url:location.href,title:document.title,text:(document.body&&document.body.innerText||'').slice(0,4000),controls,file_inputs,alerts,ready_state:document.readyState,font_state:document.fonts?document.fonts.status:'unsupported'}
     })()"#).await?;
-    let text = value["text"].as_str().unwrap_or("");
-    let matched = expect.is_empty() || text.contains(expect);
-    Ok(
-        json!({"ok":value["document_loaded"]["status"]!="failed","status":value["document_loaded"]["status"],"url":value["url"],"title":value["title"],"text":text,"controls":value["controls"],"file_inputs":value["file_inputs"],"slide_count":value["slide_count"],"page_indicator":value["page_indicator"],"loading_indicators":value["loading_indicators"],"error_indicators":value["error_indicators"],"document_loaded":value["document_loaded"],"font_state":value["font_state"],"expect_text":expect,"matched":matched,
-        "page_state":if matched {"visible"} else {"expect_text missing"}}),
-    )
+    let matched = expect.is_empty() || value["text"].as_str().unwrap_or("").contains(expect);
+    value["ok"]=json!(true);value["status"]=json!("read");value["matched"]=json!(matched);
+    value["expect_text"]=json!(expect);
+    Ok(value)
 }
 
 async fn wait_for(ws: &str, args: &Value) -> Result<Value> {
-    let selector = args["selector"].as_str().unwrap_or("");
-    let text = args["text"].as_str().unwrap_or("");
-    let font_status = args["font_status"].as_str().unwrap_or("");
-    let require_document_loaded = args["document_loaded"] == true;
-    if selector.trim().is_empty()
-        && text.is_empty()
-        && font_status.is_empty()
-        && !require_document_loaded
-    {
-        return Ok(
-            json!({"ok":false,"status":"invalid_condition","error_code":"wait_condition_required","needed":"Set selector, text, font_status or document_loaded=true."}),
-        );
+    let selector=args["selector"].as_str().unwrap_or("");
+    let text=args["text"].as_str().unwrap_or("");
+    let font_status=args["font_status"].as_str().unwrap_or("");
+    if selector.trim().is_empty() && text.is_empty() && font_status.is_empty() {
+        return Ok(json!({"ok":false,"status":"invalid_condition","error_code":"wait_condition_required","needed":"Set selector, text or font_status."}));
     }
-    let state = match args["state"].as_str().unwrap_or("visible") {
-        "visible" => "visible",
-        "exists" => "exists",
-        "hidden" => "hidden",
-        _ => "visible",
-    };
-    let timeout_ms = args["timeout_ms"]
-        .as_u64()
-        .unwrap_or(10000)
-        .clamp(100, 30000);
-    let started = tokio::time::Instant::now();
-    let deadline = started + Duration::from_millis(timeout_ms);
+    let state=match args["state"].as_str().unwrap_or("visible") {"hidden"=>"hidden","exists"=>"exists",_=>"visible"};
+    let timeout_ms=args["timeout_ms"].as_u64().unwrap_or(10000).clamp(100,30000);
+    let started=tokio::time::Instant::now();
     loop {
-        let expression = format!(
-            r#"(()=>{{const selector={};const text={};const state={};const font_status={};const require_document_loaded={};let el=null;let selector_error=null;if(selector){{try{{el=document.querySelector(selector)}}catch(e){{selector_error=String(e)}}}}const style=el?getComputedStyle(el):null;const visible=!!(el&&el.getClientRects().length&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||1)>0);const text_match=!text||(document.body&&document.body.innerText||'').includes(text);const selector_match=!selector||(state==='hidden'?!visible:(state==='exists'?!!el:visible));const actual_font_status=document.fonts?document.fonts.status:'unsupported';const font_match=!font_status||actual_font_status===font_status;const slide_count=document.querySelectorAll('#slide-list .slide-item,.slide-item,[data-slide-index]').length;const page_indicator=[...document.querySelectorAll('#page-indicator,.page-number,.slide-number,[aria-current="page"]')].filter(n=>{{const s=getComputedStyle(n);return n.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0}}).map(n=>(n.innerText||n.textContent||'').trim()).filter(Boolean);const parsePage=value=>{{const normalized=String(value||'').trim().replace(/^slide\s+/i,'');const m=normalized.match(/^(\d+)\s*(?:\/|of)\s*(\d+)$/i);if(!m)return null;const current=Number(m[1]),total=Number(m[2]);return Number.isSafeInteger(current)&&Number.isSafeInteger(total)&&current>=1&&total>=current?{{current,total}}:null}};const page_numbers=page_indicator.map(parsePage).filter(Boolean);const valid_page_indicator=page_numbers.length>0;const loading=[...document.querySelectorAll('[aria-busy="true"],[data-loading="true"],[role="progressbar"],.loading,.loading-overlay,.spinner')].filter(n=>{{const s=getComputedStyle(n);return n.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0}});const error_indicators=[...document.querySelectorAll('#page-indicator,[role="alert"],.error-message,[data-error]')].filter(n=>{{const s=getComputedStyle(n);return n.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0}}).map(n=>(n.innerText||n.textContent||'').trim()).filter(t=>/打开失败|上传失败|解析失败|导入失败|failed to (open|load|parse|import)|invalid (pptx|presentation)|cannot (read|open)|unable to (read|open)/i.test(t));const attempt_id=window.__codexLatestDocumentUploadAttempt||null;const attempt=attempt_id?(window.__codexDocumentUploadAttempts||{{}})[attempt_id]||null:null;const failed=error_indicators.length>0||attempt?.status==='failed';const inferred=slide_count>0&&valid_page_indicator&&!loading.length&&!failed;const loaded=!failed&&!loading.length&&(attempt?(attempt.change_event_received&&attempt.status==='loaded'&&slide_count>0&&valid_page_indicator):inferred);const document_status=failed?'failed':loading.length||attempt?.status==='loading'?'loading':loaded?'loaded':attempt?'unconfirmed':slide_count>0?'unconfirmed':'not_loaded';return{{selector_error,selector_found:!!el,visible,text_match,font_status:actual_font_status,font_match,document_loaded:loaded,document_status,upload_attempt_id:attempt?.id||null,upload_file_name:attempt?.file_name||null,upload_change_observed:attempt?.change_event_received===true,upload_load_status:attempt?.status||null,slide_count,page_indicator,page_numbers,valid_page_indicator,loading_count:loading.length,error_indicators,matched:selector_match&&text_match&&font_match&&(!require_document_loaded||loaded),title:document.title,url:location.href}}}})()"#,
-            serde_json::to_string(selector)?,
-            serde_json::to_string(text)?,
-            serde_json::to_string(state)?,
-            serde_json::to_string(font_status)?,
-            require_document_loaded
-        );
-        let value = eval(ws, &expression).await?;
-        if let Some(error) = value["selector_error"].as_str() {
-            return Ok(
-                json!({"ok":false,"status":"invalid_selector","error_code":"invalid_selector","selector":selector,"error":error,"elapsed_ms":started.elapsed().as_millis()}),
-            );
-        }
-        if value["document_status"] == "failed" && require_document_loaded {
-            return Ok(
-                json!({"ok":false,"status":"failed","matched":false,"error_code":"document_load_failed","needed":"The application reported a document load error; the current slides cannot confirm the uploaded file.","page_state":value,"elapsed_ms":started.elapsed().as_millis()}),
-            );
-        }
-        if value["matched"] == true {
-            return Ok(
-                json!({"ok":true,"status":"matched","matched":true,"selector":selector,"text":text,"font_status":font_status,"document_loaded":require_document_loaded,"state":state,"elapsed_ms":started.elapsed().as_millis(),"page":value}),
-            );
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(
-                json!({"ok":false,"status":"timeout","matched":false,"error_code":"wait_timeout","needed":"The requested page condition did not become true; inspect the returned page state and diagnostics.","selector":selector,"text":text,"font_status":font_status,"document_loaded":require_document_loaded,"state":state,"timeout_ms":timeout_ms,"elapsed_ms":started.elapsed().as_millis(),"page_state":value}),
-            );
-        }
+        let expression=format!(r#"(()=>{{const selector={};const text={};const state={};const font_status={};let el=null;let selector_error=null;if(selector){{try{{el=document.querySelector(selector)}}catch(e){{selector_error=String(e)}}}}const style=el?getComputedStyle(el):null;const visible=!!(el&&el.getClientRects().length&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||1)>0);const text_match=!text||(document.body&&document.body.innerText||'').includes(text);const selector_match=!selector||(state==='hidden'?!visible:(state==='exists'?!!el:visible));const actual_font_status=document.fonts?document.fonts.status:'unsupported';return{{selector_error,selector_found:!!el,visible,text_match,font_status:actual_font_status,matched:selector_match&&text_match&&(!font_status||actual_font_status===font_status),url:location.href,title:document.title}}}})()"#,
+            serde_json::to_string(selector)?,serde_json::to_string(text)?,serde_json::to_string(state)?,serde_json::to_string(font_status)?);
+        let value=eval(ws,&expression).await?;
+        if let Some(error)=value["selector_error"].as_str() {return Ok(json!({"ok":false,"status":"invalid_selector","error":error}));}
+        if value["matched"]==true {return Ok(json!({"ok":true,"status":"matched","matched":true,"page":value,"elapsed_ms":started.elapsed().as_millis()}));}
+        if started.elapsed()>=Duration::from_millis(timeout_ms) {return Ok(json!({"ok":false,"status":"timeout","matched":false,"error_code":"wait_timeout","page_state":value,"timeout_ms":timeout_ms}));}
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 const REQUEST_LIMIT: usize = 60;
 
-/// Coverage of `requests`; repeating the read never widens it.
 fn request_coverage(captured: bool) -> Value {
     json!({"captured_since_navigation":captured,
         "recorded":"in-page fetch and XMLHttpRequest calls (every status) since the last navigation, plus Resource Timing entries for fetch/xhr/font/css/link",
@@ -1249,66 +1197,18 @@ async fn upload(ws: &str, root: &Path, args: &Value) -> Result<Value> {
         };
         let marker = format!("upload_{}", crate::visual_artifacts::new_id());
         let upload_observer = r#"function(token,fileName){
-          const el=this;
           window.__codexUploadEvents=window.__codexUploadEvents||{};
           window.__codexUploadEvents[token]={seen:false};
-          window.__codexDocumentUploadAttempts=window.__codexDocumentUploadAttempts||{};
-          const attempt={id:token,file_name:fileName,change_event_received:false,busy_seen:false,status:'waiting_for_change',error:null};
-          window.__codexDocumentUploadAttempts[token]=attempt;
-          window.__codexLatestDocumentUploadAttempt=token;
-          const visible=n=>{const s=getComputedStyle(n);return !!(n.getClientRects().length&&s.display!=='none'&&s.visibility!=='hidden'&&Number(s.opacity||1)>0)};
-          const parsePage=value=>{
-            const normalized=String(value||'').trim().replace(/^slide\s+/i,'');
-            const match=normalized.match(/^(\d+)\s*(?:\/|of)\s*(\d+)$/i);
-            if(!match)return null;
-            const current=Number(match[1]),total=Number(match[2]);
-            return Number.isSafeInteger(current)&&Number.isSafeInteger(total)&&current>0&&total>=current?{current,total}:null;
-          };
-          const inspect=()=>{
-            if(!attempt.change_event_received)return;
-            const errors=[...document.querySelectorAll('#page-indicator,[role=alert],.error-message,[data-error]')].filter(visible).map(n=>(n.innerText||n.textContent||'').trim()).filter(t=>/打开失败|上传失败|解析失败|导入失败|failed to (open|load|parse|import)|invalid (pptx|presentation)|cannot (read|open)|unable to (read|open)/i.test(t));
-            if(errors.length){
-              attempt.status='failed';
-              attempt.error=errors[0].slice(0,160);
-              attempt.completed_at=Date.now();
-              observer.disconnect();
-              clearTimeout(attempt.timer);
-              return;
-            }
-            const busy=[...document.querySelectorAll('[aria-busy=true],[data-loading=true],[role=progressbar],.loading,.loading-overlay,.spinner')].some(visible);
-            if(busy){
-              attempt.busy_seen=true;
-              attempt.status='loading';
-              return;
-            }
-            if(attempt.busy_seen){
-              const page_indicator=document.querySelector('#page-indicator')?.innerText||'';
-              const valid=!!parsePage(page_indicator);
-              const slides=document.querySelectorAll('#slide-list .slide-item,.slide-item,[data-slide-index]').length;
-              attempt.status=slides>0&&valid?'loaded':'unconfirmed';
-              attempt.completed_at=Date.now();
-              observer.disconnect();
-              clearTimeout(attempt.timer);
-            }
-          };
-          const observer=new MutationObserver(inspect);
-          observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,characterData:true,attributeFilter:['aria-busy','data-loading','class','hidden']});
-          el.addEventListener('change',()=>{
-            window.__codexUploadEvents[token]={seen:true,name:el.files&&el.files[0]?el.files[0].name:null,count:el.files?el.files.length:0};
-            attempt.change_event_received=true;
-            attempt.file_name=el.files&&el.files[0]?el.files[0].name:fileName;
-            inspect();
-          },{once:true});
-          attempt.timer=setTimeout(()=>{
-            if(attempt.status==='loading'||attempt.status==='waiting_for_change'){
-              attempt.status='unconfirmed';
-              attempt.completed_at=Date.now();
-            }
-            observer.disconnect();
-          },60000);
-          return true;
-        }"#;
-        let listen=cdp.call("Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":upload_observer,"arguments":[{"value":marker},{"value":name}],"returnByValue":true})).await;
+          window.__codexUploadAttempts=window.__codexUploadAttempts||{};
+          window.__codexUploadAttempts[token]={id:token,file_name:fileName,change_event_received:false,status:'waiting_for_change'};
+          window.__codexLatestUploadAttempt=token;
+          this.addEventListener('change',()=>{
+            const old=window.__codexUploadEvents[token];
+            window.__codexUploadAttempts[token].change_event_received=true;
+            window.__codexUploadAttempts[token].status='file_assigned';
+            window.__codexUploadEvents[token]={seen:true,count:(old.count||0)+1,name:this.files?.[0]?.name||null};
+          });
+        }"#;        let listen=cdp.call("Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":upload_observer,"arguments":[{"value":marker},{"value":name}],"returnByValue":true})).await;
         if let Err(error) = listen {
             if is_stale_node_error(&error) && attempt == 0 {
                 continue;
@@ -1397,11 +1297,11 @@ async fn upload(ws: &str, root: &Path, args: &Value) -> Result<Value> {
         let input_info = json!({"selector":selector,"multiple":state["multiple"],"change_event_received":state["change_event_received"]});
         if state["change_event_received"] != true {
             return Ok(
-                json!({"ok":false,"status":"file_assigned_unconfirmed","error_code":"upload_change_event_not_received","stage":"verify_change","needed":"The file is assigned but the page did not receive its change event. Do not upload it again; wait for the page state or inspect browser_diagnostics.","uploaded":relative,"upload_attempt_id":marker,"matched":false,"file":file_info,"input":input_info,"document_loaded":{"status":"not_verified","slides_detected":null},"next_step":"Do not repeat upload. Wait for a document loading state or inspect browser diagnostics."}),
+                json!({"ok":false,"status":"file_assigned_unconfirmed","error_code":"upload_change_event_not_received","stage":"verify_change","needed":"The file is assigned but the page did not receive its change event. Do not upload it again; wait for the page state or inspect browser_diagnostics.","uploaded":relative,"upload_attempt_id":marker,"matched":false,"file":file_info,"input":input_info,"application_result":"not_checked","next_step":"Do not repeat upload. Wait for a document loading state or inspect browser diagnostics."}),
             );
         }
         return Ok(
-            json!({"ok":true,"status":"file_assigned","uploaded":relative,"upload_attempt_id":marker,"matched":true,"file":file_info,"input":input_info,"document_loaded":{"status":"not_verified","slides_detected":null},"next_step":"Wait until browser_read reports a load cycle tied to this upload attempt, then verify page state, font requests and a screenshot."}),
+            json!({"ok":true,"status":"file_assigned","uploaded":relative,"upload_attempt_id":marker,"matched":true,"file":file_info,"input":input_info,"application_result":"not_checked","next_step":"Inspect the application result using explicit page selectors, text, diagnostics or screenshots. File assignment does not prove application processing succeeded."}),
         );
     }
     Ok(upload_failure(
@@ -2580,13 +2480,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(page["matched"], true, "{page}");
-        assert_eq!(page["slide_count"], 1);
-        assert_eq!(page["page_indicator"][0], "1 / 1");
-        assert_eq!(page["document_loaded"]["status"], "loaded");
+        assert!(page.get("document_loaded").is_none());
+        assert!(page.get("slide_count").is_none());
         let waited = execute(
             &workspace,
             "browser_wait",
-            &json!({"document_loaded":true,"timeout_ms":3000}),
+            &json!({"selector":"#page-indicator","text":"1 / 1","timeout_ms":3000}),
         )
         .await
         .unwrap();
@@ -2696,7 +2595,7 @@ mod tests {
             assigned["input"]["change_event_received"], true,
             "{assigned}"
         );
-        assert_eq!(assigned["document_loaded"]["status"], "not_verified");
+        assert_eq!(assigned["application_result"], "not_checked");
         let observed = execute_scoped(
             &workspace,
             &context,

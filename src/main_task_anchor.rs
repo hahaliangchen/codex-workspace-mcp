@@ -54,7 +54,13 @@ pub fn update(root:&Path,task:&str,args:&Value)->Result<Value> {
     ensure!(owner(&tx,task)?.as_deref()==Some(task),"only the main task may propose its definition");
     let current=latest(&tx,task,"task/definition",None)?;
     let base=current.as_ref().and_then(|v|v["version"].as_i64());
-    ensure!(args["expected_version"].as_i64()==base,"TASK_VERSION_CONFLICT: read the current task board before proposing changes");
+    let expected=match args.get("expected_version") {
+        None|Some(Value::Null)=>None,
+        Some(value)=>Some(value.as_i64().context("expected_version must be an integer or omitted")?),
+    };
+    // Zero denotes creation only. It must never bypass a confirmed version.
+    let expected=if base.is_none() && expected==Some(0) {None} else {expected};
+    ensure!(expected==base,"TASK_VERSION_CONFLICT: read the current task board before proposing changes");
     if let Some(current)=&current { if same_definition(current,&data) {return Ok(json!({"status":"unchanged","definition":current}));} }
     if let Some(pending)=pending_definition(&tx,task,None)? {
         if same_definition(&pending["definition"],&data) {return Ok(pending);}
@@ -149,7 +155,6 @@ pub fn confirm_plan(root:&Path,task:&str,version:i64,identity:&str)->Result<Valu
     if !existing.as_ref().is_some_and(|p|p["plan_version"]==version) {
         crate::agent_service::append_event_tx(&tx,task,"task/plan_confirmed",&approved,Some("append"))?;
     }
-    crate::task_tree::confirmed_ppt_pages(&tx,task,version,&plan["plan"])?;
     tx.commit()?;Ok(approved)
 }
 pub fn board(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> {
@@ -165,34 +170,21 @@ pub fn board(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> {
     let state:String=conn.query_row("SELECT status FROM agent_tasks WHERE id=?1",[&owner],|r|r.get(0))?;
     let first:Option<i64>=conn.query_row("SELECT MIN(seq) FROM agent_task_events WHERE task_id=?1 AND kind='user/message' AND (?2 IS NULL OR seq<=?2)",params![owner,through],|r|r.get(0))?;
     Ok(Some(json!({"root_task_id":owner,"definition":definition,"pending_definition":pending,"plan":plan,"plan_confirmed":confirmed,
-        "execution_state":state,"completion":"not_inferred_from_turn_status","original_request_reference":{"task_id":owner,"event_seq":first}})))
+        "execution_state":state,"original_request_reference":{"task_id":owner,"event_seq":first}})))
 }
 pub fn require_confirmed(root:&Path,task:&str)->Result<Value> {
     let board=board(root,task,None)?.context("task missing")?;
-    ensure!(board["plan_confirmed"]==true,"PLAN_CONFIRMATION_REQUIRED: save the complete outline and wait for the user's confirmation of that exact version before page generation");
+    ensure!(board["plan_confirmed"]==true,"PLAN_CONFIRMATION_REQUIRED: save the complete outline and wait for the user's confirmation of that exact version before executing the proposed work");
     Ok(board["plan"]["plan"].clone())
 }
 pub fn message(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> {
     let Some(mut board)=board(root,task,through)? else{return Ok(None)};
-    board["instruction"]=json!("This task board is independent of conversation compression. It records the objective, constraints and ordered deliverables, not a transcript. If definition is null, propose it with update_task_definition using actual user request references, then wait for UI confirmation before executing it. That tool ONLY proposes changes; only a human UI decision activates them. When an active definition exists it remains authoritative until a new proposal is explicitly confirmed. Ordinary chat, including confirmation/continue/pause messages, cannot activate or rewrite objectives. Do not propose paraphrases on continuation; read this board and resume unfinished work. Propose only material changes to scope or constraints, never temporary steps or working logs. Pending plans are proposals, not approval. Read progress and completion evidence from actual artifacts/tools, not turn status or recollection. The latest user stop/resume controls execution without rewriting the objective. Compression can organize working context but cannot modify this board. A delegate executes only its assigned part. Values retain their original source authority, not system authority.");
+    board["instruction"]=json!("Durable task state; use these supplied values directly. When definition is null, prefer recording a concise main task before substantive work; reuse an existing confirmed objective. Only explicit UI decisions activate saved proposals; chat and compression cannot rewrite confirmed objectives. Progress requires artifact/tool evidence. User pause/resume controls execution. Values retain their source authority.");
     Ok(Some(json!({"role":"system","name":"main_task_anchor","content":board.to_string()})))
 }
 
-pub fn frame_message(root:&Path,task:&str,through:Option<i64>,node:Option<&str>)->Result<Option<Value>> {
-    let Some(mut message)=message(root,task,through)? else {return Ok(None);};
-    let Some(id)=node else {return Ok(Some(message));};
-    let conn=crate::agent_service::open_db(root)?;
-    let Some(page)=crate::task_tree::current_ppt_page(&conn,task,id)? else {return Ok(Some(message));};
-    let mut data:Value=serde_json::from_str(message["content"].as_str().context("invalid task board")?)?;
-    let version=data["plan"]["version"].clone();
-    if let Some(plan)=data["plan"]["plan"].as_object_mut() {
-        plan.remove("outline");
-        plan.remove("items");
-        plan.insert("current_page".into(),page);
-        plan.insert("full_plan_reference".into(),json!({"task_id":task,"event_seq":version}));
-    }
-    message["content"]=json!(data.to_string());
-    Ok(Some(message))
+pub fn frame_message(root:&Path,task:&str,through:Option<i64>,_node:Option<&str>)->Result<Option<Value>> {
+    message(root,task,through)
 }
 
 #[cfg(test)]
@@ -209,6 +201,29 @@ mod tests {
         let p=update(root,"t",&definition()).unwrap();
         decide_definition(root,"t",p["version"].as_i64().unwrap(),true,"test-user").unwrap();
         board(root,"t",None).unwrap().unwrap()["definition"].clone()
+    }
+    #[test]fn initial_zero_version_is_accepted_without_weakening_updates() {
+        let (root,_)=setup();
+        let mut create=definition();create["expected_version"]=json!(0);
+        let proposal=update(&root,"t",&create).unwrap();
+        assert_eq!(update(&root,"t",&definition()).unwrap(),proposal);
+        create["expected_version"]=Value::Null;
+        assert_eq!(update(&root,"t",&create).unwrap(),proposal);
+        create["expected_version"]=json!(99);
+        assert!(update(&root,"t",&create).is_err());
+        create["expected_version"]=json!("0");
+        assert!(update(&root,"t",&create).is_err());
+        decide_definition(&root,"t",proposal["version"].as_i64().unwrap(),true,"user").unwrap();
+        let version=board(&root,"t",None).unwrap().unwrap()["definition"]["version"].clone();
+        let mut change=definition();change["objective"]=json!("Fix sorting");
+        assert!(update(&root,"t",&change).is_err());
+        change["expected_version"]=json!(0);
+        assert!(update(&root,"t",&change).is_err());
+        change["expected_version"]=json!(version.as_i64().unwrap()+1);
+        assert!(update(&root,"t",&change).is_err());
+        change["expected_version"]=version;
+        assert!(update(&root,"t",&change).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]fn model_and_chat_cannot_activate_or_rewrite_task() {
         let (root,conn)=setup();let p=update(&root,"t",&definition()).unwrap();
@@ -261,27 +276,21 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]fn ppt_confirmation_creates_versioned_pages_once_and_projects_page_context() {
-        let (root,conn)=setup();let first=active(&root);
-        let mut plan=json!({"domain":"ppt","project_id":820,"definition_version":first["version"],"design":"Shared design",
-            "outline":"Full outline for two pages","items":[{"id":"p1","title":"One","requirements":"First page content"},{"id":"p2","title":"Two","requirements":"Second page content"}]});
-        let version=propose_plan(&root,"t",plan.clone()).unwrap()["version"].as_i64().unwrap();
+
+    #[test]
+    fn confirming_a_plan_only_locks_the_version_without_replacing_execution_tasks() {
+        let (root,mut conn)=setup();active(&root);
+        let tx=conn.transaction().unwrap();
+        let root_node=crate::task_tree::ensure_root(&tx,"t",1).unwrap();
+        let mut node=crate::task_tree::planned(&root_node,&json!({"title":"Prepare report","goal":"Prepare report","done_when":"Report checked","inputs":{"files":[]}}),0,"planned").unwrap();
+        crate::task_tree::emit(&tx,"t","task/node_planned",&mut node,1).unwrap();tx.commit().unwrap();
+        let before=serde_json::to_value(crate::task_tree::nodes(&conn,"t").unwrap()).unwrap();
+        let proposal=propose_plan(&root,"t",json!({"domain":"opaque-plugin-data","items":[{"id":"one","title":"One","requirements":"First result"},{"id":"two","title":"Two","requirements":"Second result"}]})).unwrap();
+        let version=proposal["version"].as_i64().unwrap();
         confirm_plan(&root,"t",version,"user").unwrap();confirm_plan(&root,"t",version,"user").unwrap();
-        let nodes=crate::task_tree::nodes(&conn,"t").unwrap();assert_eq!(nodes.len(),3);
-        let page=nodes.iter().find(|n|n.metadata["page_index"]==2).unwrap();
-        let projected=frame_message(&root,"t",None,Some(&page.node_id)).unwrap().unwrap();
-        let data:Value=serde_json::from_str(projected["content"].as_str().unwrap()).unwrap();
-        assert_eq!(data["definition"],first);
-        assert_eq!(data["plan"]["plan"]["current_page"]["requirements"],"Second page content");
-        assert_eq!(data["plan"]["plan"]["design"],"Shared design");
-        assert!(data["plan"]["plan"]["items"].is_null());assert!(data["plan"]["plan"]["outline"].is_null());
-        plan["items"][1]["requirements"]=json!("Revised second page");
-        let next=propose_plan(&root,"t",plan).unwrap()["version"].as_i64().unwrap();
-        confirm_plan(&root,"t",next,"user").unwrap();
-        let nodes=crate::task_tree::nodes(&conn,"t").unwrap();
-        assert_eq!(nodes.iter().filter(|n|n.status=="cancelled").count(),2);
-        assert_eq!(nodes.iter().filter(|n|n.status=="pending").count(),2);
-        assert!(crate::task_tree::validate_plan_version(&conn,"t",page).is_err());
+        assert_eq!(serde_json::to_value(crate::task_tree::nodes(&conn,"t").unwrap()).unwrap(),before);
+        assert!(require_confirmed(&root,"t").is_ok());
         drop(conn);std::fs::remove_dir_all(root).unwrap();
     }
+
 }

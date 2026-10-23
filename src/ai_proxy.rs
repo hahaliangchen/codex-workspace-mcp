@@ -1774,9 +1774,9 @@ async fn connect_remote_package(
             .await,
     )
 }
-async fn ppt_page_request(
+async fn remote_page_request(
     State(state): State<AiProxyState>,
-    axum::extract::Path(method): axum::extract::Path<String>,
+    axum::extract::Path((id, method)): axum::extract::Path<(String, String)>,
     headers: HeaderMap,
     Json(args): Json<Value>,
 ) -> Response {
@@ -1800,7 +1800,7 @@ async fn ppt_page_request(
                 .into_response();
         }
     };
-    crate::ppt_sessions::request(&state.runtime, (*agent).clone(), &method, headers, args).await
+    crate::remote_sessions::request(&state.runtime, (*agent).clone(), &id, &method, headers, args).await
 }
 async fn reload_skill_package(
     State(state): State<AiProxyState>,
@@ -2146,8 +2146,8 @@ pub async fn run(
         )
         .route("/agent/skill-packages/remote", post(connect_remote_package))
         .route(
-            "/agent/ppt/{method}",
-            post(ppt_page_request).layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)),
+            "/agent/plugins/{id}/{method}",
+            post(remote_page_request).layer(axum::extract::DefaultBodyLimit::max(30 * 1024 * 1024)),
         )
         .route(
             "/agent/skill-packages/{id}",

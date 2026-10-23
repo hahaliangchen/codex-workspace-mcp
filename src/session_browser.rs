@@ -302,7 +302,7 @@ pub fn delete(conn: &mut Connection, id: &str) -> Result<Vec<String>> {
     }
     // Several legacy runtime tables predate foreign keys. Remove their records
     // explicitly as well as the tables that already declare cascading deletes.
-    let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name GLOB 'agent_*' OR name GLOB 'ppt_session_*' OR name='plugin_sessions')")?;
+    let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'")?;
     let tables = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
