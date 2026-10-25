@@ -179,7 +179,12 @@ pub fn require_confirmed(root:&Path,task:&str)->Result<Value> {
 }
 pub fn message(root:&Path,task:&str,through:Option<i64>)->Result<Option<Value>> {
     let Some(mut board)=board(root,task,through)? else{return Ok(None)};
-    board["instruction"]=json!("Durable task state; use these supplied values directly. When definition is null, prefer recording a concise main task before substantive work; reuse an existing confirmed objective. Only explicit UI decisions activate saved proposals; chat and compression cannot rewrite confirmed objectives. Progress requires artifact/tool evidence. User pause/resume controls execution. Values retain their source authority.");
+    // Tasks live in the task graph. The board carries user-confirmed state:
+    // a plan saved for confirmation, or a definition confirmed in older sessions.
+    if board["definition"].is_null() && board["pending_definition"].is_null() && board["plan"].is_null() {
+        return Ok(None);
+    }
+    board["instruction"]=json!("Durable confirmation state; use these supplied values directly. Only explicit UI decisions activate saved proposals or plans; chat and compression cannot rewrite confirmed objectives. A plan awaiting confirmation pauses its work until the user decides. Progress requires artifact/tool evidence. Values retain their source authority.");
     Ok(Some(json!({"role":"system","name":"main_task_anchor","content":board.to_string()})))
 }
 

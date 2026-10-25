@@ -582,13 +582,23 @@ pub(crate) fn append_event_tx(
     } else {
         crate::task_tree::active(tx,task_id)?.map(|n|n.node_id)
     };
+    // Work done inside a task belongs to the step it is executing. Task graph
+    // events name their own node.
+    let node = match node {
+        Some(id) if !kind.starts_with("task/") => tx
+            .query_row(
+                "SELECT node_id FROM agent_task_nodes WHERE task_id=?1 AND parent_id=?2 AND status='current' AND json_extract(data,'$.kind')='step' LIMIT 1",
+                params![task_id, id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .or(Some(id)),
+        other => other,
+    };
     tx.execute(
         "INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data,surface_op,node_id) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![task_id, seq, now(), kind, serde_json::to_string(&data)?, surface_op,node],
     )?;
-    if matches!(kind,"user/message"|"user/interjection") && let Some(node) = &node {
-        crate::task_tree::register_user(tx,task_id,seq,node,data.get("message").map(|m|&m["content"]).unwrap_or(&data["text"]))?;
-    }
     tx.execute(
         "UPDATE agent_tasks SET updated_at=?2,event_high_water=?3 WHERE id=?1",
         params![task_id, now(), seq],

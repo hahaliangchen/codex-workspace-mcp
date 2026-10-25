@@ -650,6 +650,8 @@ export interface FlowNodeData {
   readonly kind: FlowNodeKind
   readonly status: FlowNodeStatus
   readonly description?: string | undefined
+  readonly response?: string | undefined
+  readonly ordinal?: number | undefined
   readonly parentId?: string | undefined
   readonly agentId?: string | undefined
   readonly agentName?: string | undefined
@@ -711,6 +713,8 @@ function extractFilesFromArgs(argsStr: string): string[] {
 
 function flowStatus(value: unknown): FlowNodeStatus {
   switch (value) {
+    // The step a task is executing.
+    case 'current': return 'running'
     case 'suspended': return 'suspended'
     case 'needs_user': return 'needs_user'
     case 'cancelled': return 'cancelled'
@@ -732,6 +736,20 @@ function flowStatus(value: unknown): FlowNodeStatus {
   }
 }
 
+/** Task graph node kinds: the conversation, main and temporary tasks, their steps and finish nodes. */
+function taskNodeKind(data: Record<string, unknown>): string {
+  const metadata = (data.metadata ?? {}) as Record<string, unknown>
+  switch (data.kind) {
+    case 'root': return 'task_root'
+    case 'task': return data.executor === 'delegate' ? 'task_delegate' : metadata.role === 'temp' ? 'task_temp' : 'task_main'
+    case 'branch': return 'task_temp'
+    case 'step': return 'task_step'
+    case 'finish':
+    case 'end': return 'task_finish'
+    default: return data.executor === 'delegate' ? 'task_delegate' : 'task_planned'
+  }
+}
+
 function createFlowNode(
   id: string,
   turn?: number,
@@ -745,6 +763,8 @@ function createFlowNode(
   kind: string
   status: FlowNodeStatus
   description?: string | undefined
+  response?: string | undefined
+  ordinal?: number | undefined
   parentId?: string | undefined
   agentId?: string | undefined
   agentName?: string | undefined
@@ -775,6 +795,17 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
   events = events.map(event => event.type === 'subagent/event'
     ? { ...event, type: String(event.data.event_type), data: { agent_id: event.data.agent_id, ...event.data.event as Record<string, unknown> } }
     : event)
+  // Step results reference original response events, including execution drafts.
+  const responsesBySeq = new Map<number, string>()
+  const responsesByStep = new Map<string, string>()
+  for (const event of events) {
+    if (event.type !== 'assistant/message' && event.type !== 'assistant/draft') continue
+    const message = messageOf(event)
+    const text = assistantDisplay(textOf(message.content), '').text
+    if (event.seq !== undefined) responsesBySeq.set(event.seq, text)
+    const step = stringOf(event.data.task_node_id)
+    if (step) responsesByStep.set(step, text)
+  }
   let currentTurn = 1
   let taskLabel = ''
   let observerEnabled: boolean | undefined
@@ -805,9 +836,16 @@ export function flowState(events: readonly AgentEvent[]): FlowState {
         const id = `task:${rawId}`
         const node = nodeMap.get(id) ?? createFlowNode(id, turn)
         node.title = stringOf(data.title) ?? node.title
-        node.kind = data.kind === 'root' ? 'task_root' : data.kind === 'branch' ? 'task_branch' : 'task_planned'
+        node.kind = taskNodeKind(data)
         const result = data.result as Record<string, unknown> | undefined
         node.description = stringOf(result?.result) ?? stringOf(data.goal) ?? node.description
+        node.ordinal = numberOf(data.ordinal) ?? node.ordinal
+        if (node.kind === 'task_step') {
+          const response = result?.response as Record<string, unknown> | undefined
+          const seq = numberOf(response?.event_seq)
+          node.response = (seq !== undefined ? responsesBySeq.get(seq) : undefined) ?? responsesByStep.get(rawId)
+            ?? stringOf(result?.result) ?? node.response // Older steps saved the AI's own result text.
+        }
         node.status = flowStatus(data.status)
         node.agentId = stringOf(data.agent_id)
         const parent = stringOf(data.parent_id)

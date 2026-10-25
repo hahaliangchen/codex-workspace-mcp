@@ -11,6 +11,10 @@ pub trait SessionIo: Send + Sync {
     fn sync_attachments<'a>(&'a self, _state:&'a AgentServiceState, _task:&'a str) -> BoxFuture<'a,Result<()>> {Box::pin(async {Ok(())})}
     fn read_asset<'a>(&'a self, _state:&'a AgentServiceState, _task:&'a str, _reference:&'a Value, _args:&'a Value) -> BoxFuture<'a,Result<Value>> {Box::pin(async {anyhow::bail!("remote resource transport unavailable")})}
     fn import_picture<'a>(&'a self, _state:&'a AgentServiceState, _task:&'a str, _name:&'a str, _media:&'a str, _bytes:&'a [u8]) -> BoxFuture<'a,Result<Option<Value>>> {Box::pin(async {Ok(None)})}
+    /// Review instructions the plugin attaches to the images its page tool `tool`
+    /// produced (`images`: each image's own meta, in order):
+    /// `{instructions, subjects: [one per image]}`, or None when it attaches none.
+    fn review_brief<'a>(&'a self, _state:&'a AgentServiceState, _task:&'a str, _tool:&'a str, _args:&'a Value, _document:&'a Value, _images:&'a Value) -> BoxFuture<'a,Result<Option<Value>>> {Box::pin(async {Ok(None)})}
 }
 fn adapters() -> &'static RwLock<BTreeMap<String,Arc<dyn SessionIo>>> {
     static ADAPTERS:OnceLock<RwLock<BTreeMap<String,Arc<dyn SessionIo>>>>=OnceLock::new();
@@ -38,6 +42,9 @@ pub async fn read_asset(state:&AgentServiceState, task:&str, reference:&Value, a
 pub async fn import_picture(state:&AgentServiceState, task:&str, name:&str, media:&str, bytes:&[u8]) -> Result<Option<Value>> {
     match adapter(state,task)? {Some(adapter)=>adapter.import_picture(state,task,name,media,bytes).await,None=>Ok(None)}
 }
+pub async fn review_brief(state:&AgentServiceState, task:&str, tool:&str, args:&Value, document:&Value, images:&Value) -> Result<Option<Value>> {
+    match adapter(state,task)? {Some(adapter)=>adapter.review_brief(state,task,tool,args,document,images).await,None=>Ok(None)}
+}
 
 #[cfg(test)]
 mod tests {
@@ -49,6 +56,7 @@ mod tests {
             ("browser",include_str!("browser_control.rs")),
             ("attachments",include_str!("attachments.rs")),
             ("task frames",include_str!("single_agent/task_frames.rs")),
+            ("step context",include_str!("single_agent/step_context.rs")),
             ("task tree",include_str!("task_tree.rs")),
             ("task board",include_str!("main_task_anchor.rs")),
             ("context assets",include_str!("context_assets.rs")),

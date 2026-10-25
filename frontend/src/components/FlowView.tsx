@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ReactFlow,
   Background,
   Controls,
   MiniMap,
   type Node,
+  type NodeChange,
   type Edge,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
@@ -89,6 +90,22 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
   // Picking mode: clicks collect steps to save as a project skill instead of opening details.
   const [picking, setPicking] = useState(false)
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set())
+  // Controlled node props are rebuilt on selection and history updates. Retain
+  // measured sizes so those updates cannot reset the canvas to hidden nodes.
+  const [nodeMeasurements, setNodeMeasurements] = useState<Record<string, { width: number; height: number }>>({})
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setNodeMeasurements(previous => {
+      let next = previous
+      for (const change of changes) {
+        if (change.type !== 'dimensions' || !change.dimensions) continue
+        const old = previous[change.id]
+        if (old?.width === change.dimensions.width && old.height === change.dimensions.height) continue
+        if (next === previous) next = { ...previous }
+        next[change.id] = change.dimensions
+      }
+      return next
+    })
+  }, [])
   const [skillInput, setSkillInput] = useState<SkillDraftInput>()
   useEffect(() => { setSelectedNodeId(null); setPicking(false); setPicked(new Set()) }, [task?.task_id, flow.organizedTurn])
   const canSaveSkill = !!task?.workspace && !running
@@ -111,6 +128,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
       type: 'taskNode',
       position: positions.get(n.id) ?? { x: 60, y: 100 },
       data: n,
+      ...(nodeMeasurements[n.id] ? { measured: nodeMeasurements[n.id] } : {}),
       selected: picking ? picked.has(n.id) : n.id === selectedNodeId,
     }))
 
@@ -122,7 +140,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
     }))
 
     return { nodes: flowNodes, edges: flowEdges }
-  }, [flow, selectedNodeId, picking, picked])
+  }, [flow, selectedNodeId, picking, picked, nodeMeasurements])
   const togglePicked = (id: string) => setPicked(current => {
     const next = new Set(current)
     if (!next.delete(id)) next.add(id)
@@ -253,6 +271,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
           onNodeClick={(_, node) => { if (picking) { togglePicked(node.id); return } setSelectedNodeId(node.id); setShowRequests(false) }}
           onPaneClick={() => { if (picking) return; setSelectedNodeId(null); setShowRequests(false) }}
           fitView
@@ -316,7 +335,7 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <div className={styles.nodeMetaBar}>
                 <span className={`${styles.nodeStatusBadge} ${styles['status_' + selectedNode.status] ?? ''}`}>
                   {selectedNode.status === 'running' && '⟳ 进行中'}
-                  {(selectedNode.status === 'done' || selectedNode.status === 'completed') && (selectedNode.id.startsWith('task:') ? '任务已完成' : '↩ 执行已结束')}
+                  {(selectedNode.status === 'done' || selectedNode.status === 'completed') && (selectedNode.id.startsWith('task:') ? '任务已结束' : '↩ 执行已结束')}
                   {(selectedNode.status === 'ready' || selectedNode.status === 'pending') && '○ 待执行'}
                   {selectedNode.status === 'paused' && '⏸ 待继续'}
                   {selectedNode.status === 'suspended' && '挂起，等待子任务'}
@@ -516,10 +535,12 @@ export function FlowView({ events, task, running, onInterruptNode }: FlowViewPro
               <div className={styles.section}>
                 <div className={styles.sectionTitle}>
                   <span>📋</span>
-                  <span>步骤说明</span>
+                  <span>{selectedNode.kind === 'task_step' ? '本轮 AI 回复' : '步骤说明'}</span>
                 </div>
                 <div className={styles.contextBox}>
-                  {selectedNode.description || '本次模型请求未提供额外说明。'}
+                  {selectedNode.kind === 'task_step'
+                    ? selectedNode.response || (selectedNode.tools.length > 0 ? '本轮调用了工具，未提供文字回复；执行结果见下方工具明细。' : '本轮 AI 回复暂未载入。')
+                    : selectedNode.description || '本次模型请求未提供额外说明。'}
                 </div>
               </div>
 

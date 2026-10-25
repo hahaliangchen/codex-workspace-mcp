@@ -4,9 +4,14 @@ import type { FlowNodeData } from '../model.ts'
 import styles from './TaskNode.module.css'
 
 const KIND_META: Record<string, { label: string; className: string; accentClass: string; icon: string }> = {
-  task_root: { label: '主任务', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_root: { label: '会话', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_main: { label: '主任务', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_temp: { label: '临时任务', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '' },
+  task_step: { label: '步骤', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_finish: { label: '结束', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
+  task_delegate: { label: '委派', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '' },
   task_planned: { label: '待办', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '' },
-  task_branch: { label: '分支', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '' },
+  task_branch: { label: '临时任务', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '' },
   agent: { label: '主 Agent', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔵' },
   worker: { label: '任务分支', className: styles.kindCoding ?? '', accentClass: styles.accentCoding ?? '', icon: '🔹' },
   context_agent: { label: '上下文子 Agent', className: styles.kindResearch ?? '', accentClass: styles.accentResearch ?? '', icon: '🟣' },
@@ -74,7 +79,7 @@ export const TaskNode = memo(function TaskNode({
         <span
           className={styles.statusIcon}
           style={{ color: '#9ca3af' }}
-          title={data.id.startsWith('task:') ? '任务已完成' : '本次模型请求已结束'}
+          title={data.id.startsWith('task:') ? '任务已结束' : '本次模型请求已结束'}
         >
           ↩
         </span>
@@ -119,7 +124,7 @@ export const TaskNode = memo(function TaskNode({
   const fileCount = data.files ? data.files.length : 0
   const toolCount = data.tools ? data.tools.length : 0
   const consultCount = data.consults ? data.consults.length : 0
-  const displayDesc = cleanDescription(data.description)
+  const displayDesc = cleanDescription(data.response ?? data.description)
 
   return (
     <div

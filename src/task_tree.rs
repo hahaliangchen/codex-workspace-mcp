@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const ROOT: &str = "n0";
-/// Each unexpected task adds a step and a branch level, so 6 allows three nested repairs.
-pub const MAX_DEPTH: usize = 6;
+/// Guard against corrupt parent links. Real nesting is bounded by MAX_TEMP_TASKS.
+pub const MAX_DEPTH: usize = 16;
+/// Temporary tasks may nest this deep below a main task.
+pub const MAX_TEMP_TASKS: usize = 3;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -62,6 +64,53 @@ pub fn nodes(conn: &Connection, task: &str) -> Result<Vec<Node>> {
         .collect()
 }
 
+/// Direct children of a node, in planning order.
+pub fn children(conn: &Connection, task: &str, parent: &str) -> Result<Vec<Node>> {
+    let rows = conn
+        .prepare("SELECT data FROM agent_task_nodes WHERE task_id=?1 AND parent_id=?2 ORDER BY rowid")?
+        .query_map(params![task, parent], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut nodes = rows
+        .iter()
+        .map(|raw| Ok(serde_json::from_str::<Node>(raw)?))
+        .collect::<Result<Vec<_>>>()?;
+    nodes.sort_by_key(|n| n.ordinal);
+    Ok(nodes)
+}
+
+/// Main and temporary tasks are context boundaries; legacy branches were temporary tasks.
+pub fn is_task(node: &Node) -> bool {
+    matches!(node.kind.as_str(), "task" | "branch")
+}
+
+pub fn is_temp(node: &Node) -> bool {
+    node.kind == "branch" || node.metadata["role"] == "temp"
+}
+
+/// The step a task is executing. Steps share their task's context.
+pub fn current_step(conn: &Connection, task: &str, owner: &str) -> Result<Option<Node>> {
+    Ok(children(conn, task, owner)?
+        .into_iter()
+        .find(|n| n.kind == "step" && n.status == "current"))
+}
+
+/// The finish node created with a task; legacy tasks called it "end".
+pub fn finish_node(conn: &Connection, task: &str, owner: &str) -> Result<Option<Node>> {
+    Ok(children(conn, task, owner)?
+        .into_iter()
+        .find(|n| matches!(n.kind.as_str(), "finish" | "end")))
+}
+
+/// The window that holds a node's context. The conversation level and its
+/// main task share the main window; temporary tasks get their own.
+pub fn frame_scope(node: &Node) -> String {
+    if node.node_id == ROOT || (node.kind == "task" && !is_temp(node)) {
+        "main".into()
+    } else {
+        scope(&node.node_id)
+    }
+}
+
 pub fn get(conn: &Connection, task: &str, id: &str) -> Result<Node> {
     let raw: String = conn
         .query_row(
@@ -101,7 +150,7 @@ pub fn path(conn: &Connection, task: &str, id: &str) -> Result<Vec<Node>> {
 pub fn active(conn: &Connection, task: &str) -> Result<Option<Node>> {
     let running = nodes(conn, task)?
         .into_iter()
-        .filter(|n| n.executor == "inline" && n.status == "running")
+        .filter(|n| n.executor == "inline" && n.agent_id.is_none() && n.status == "running")
         .collect::<Vec<_>>();
     ensure!(running.len() <= 1, "TASK_STACK_MULTIPLE_RUNNING_NODES");
     let Some(node) = running.into_iter().next() else {
@@ -149,9 +198,10 @@ pub fn emit(
     Ok(seq)
 }
 
+/// The conversation node. It is a container, not a task: each user request
+/// becomes a main task the agent creates under it with create_task.
 pub fn ensure_root(tx: &Transaction<'_>, task: &str, turn: usize) -> Result<Node> {
     if let Ok(node) = get(tx, task, ROOT) {
-        ensure_end(tx,task,&node,turn)?;
         return Ok(node);
     }
     let mut node = Node {
@@ -159,9 +209,9 @@ pub fn ensure_root(tx: &Transaction<'_>, task: &str, turn: usize) -> Result<Node
         parent_id: None,
         kind: "root".into(),
         ordinal: 0,
-        title: "Main task".into(),
-        goal: "Use the confirmed task definition and original user instructions".into(),
-        done_when: "Verify the user's requested outcome".into(),
+        title: "Conversation".into(),
+        goal: "Each user request becomes a main task created by the agent".into(),
+        done_when: "The conversation ends".into(),
         inputs: json!({}),
         executor: "inline".into(),
         agent_id: None,
@@ -179,18 +229,6 @@ pub fn ensure_root(tx: &Transaction<'_>, task: &str, turn: usize) -> Result<Node
         definition_version: definition_version(tx, task)?,
     };
     emit(tx, task, "task/node_planned", &mut node, turn)?;
-    ensure_end(tx, task, &node, turn)?;
-    let originals=tx.prepare("SELECT seq,kind,data FROM agent_task_events WHERE task_id=?1 AND kind IN ('user/message','user/interjection') ORDER BY seq")?
-        .query_map([task],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for (seq, kind, raw) in originals {
-        let event: Value = serde_json::from_str(&raw)?;
-        let content = if kind == "user/message" {
-            &event["message"]["content"]
-        } else {
-            &event["text"]
-        };
-        register_user(tx, task, seq, ROOT, content)?;
-    }
     Ok(node)
 }
 
@@ -242,23 +280,49 @@ pub fn validate_inputs(args: &Value) -> Result<Value> {
     Ok(inputs)
 }
 
-/// Every task ends at its end node; steps are inserted before it.
-pub const END_ORDINAL: usize = 1_000_000;
+/// Every task ends at its finish node; steps are ordered before it.
+pub const FINISH_ORDINAL: usize = 1_000_000;
 
-/// The end node of a task (root or branch). A task finishes only when it
-/// reaches it through return_task; until then the host keeps it iterating.
-/// Created with the task, or lazily for tasks saved before end nodes existed.
-pub fn ensure_end(tx: &Transaction<'_>, task: &str, owner: &Node, turn: usize) -> Result<Node> {
-    if let Some(mut end) = nodes(tx, task)?.into_iter().find(|n| n.parent_id.as_deref() == Some(&owner.node_id) && n.kind == "end") {
-        if end.goal=="Finish this task: return_task with its result" {
-            end.goal="End of execution; recorded by the host when the loop finishes".into();
-            emit(tx,task,"task/node_revised",&mut end,turn)?;
-        }
-        return Ok(end);
+fn clip(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
     }
-    let mut end = planned(owner, &json!({"title":"End","goal":"End of execution; recorded by the host when the loop finishes","done_when":owner.done_when}), END_ORDINAL, "end")?;
-    emit(tx, task, "task/node_planned", &mut end, turn)?;
-    Ok(end)
+    format!("{}…", text.chars().take(limit).collect::<String>())
+}
+
+/// Where execution stands in the task graph, rebuilt from durable nodes for
+/// every request so compression can never drop the goals above the current step.
+pub fn path_status(conn: &Connection, task: &str, id: &str) -> Result<Value> {
+    let node = get(conn, task, id)?;
+    if !is_task(&node) {
+        return Ok(json!({"task":null,"instruction":"No task is running. To answer without tools, reply directly. Before using tools, call create_task alone with goal and necessary background; no planned steps are required."}));
+    }
+    let mut tasks = Vec::new();
+    for ancestor in path(conn, task, id)?.into_iter().filter(is_task) {
+        let waiting = if ancestor.node_id == id {
+            None
+        } else {
+            current_step(conn, task, &ancestor.node_id)?.map(|step| clip(&step.title, 160))
+        };
+        tasks.push(json!({"node_id":ancestor.node_id,"role":if is_temp(&ancestor) {"temporary"} else {"main"},
+            "goal":clip(&ancestor.goal,400),"reason":ancestor.spawned_from,"suspended_at_step":waiting}));
+    }
+    let steps = children(conn, task, id)?
+        .into_iter()
+        .filter(|n| n.kind == "step")
+        .collect::<Vec<_>>();
+    let omitted = steps.len().saturating_sub(30);
+    let listed = steps[omitted..]
+        .iter()
+        .map(|step| json!({"node_id":step.node_id,"title":clip(&step.title,160),"status":step.status,
+            "result":step.result.as_ref().and_then(|r|r["result"].as_str()).map(|text|clip(text,200))}))
+        .collect::<Vec<_>>();
+    let current = steps
+        .iter()
+        .find(|n| n.status == "current")
+        .map(|step| json!({"node_id":step.node_id,"title":step.title}));
+    Ok(json!({"task_path":tasks,"steps":listed,"earlier_steps_omitted":omitted,"current_step":current,
+        "instruction":"Execute the current task. The host records each AI call, response, tool calls and results as one step. Units of work that need their own materials and return results can run as child tasks: call create_task alone with tasks, each with its goal, briefing and asset_ids; they run in order in their own scopes and return their summaries here so you can resume. No tool calls triggers a host completion check in this same task context. On that check, continue using tools if work remains, otherwise summarize; finish itself never calls AI."}))
 }
 
 pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Result<Node> {
@@ -326,53 +390,7 @@ pub fn definition_changed(tx: &Transaction<'_>, task: &str, version: i64) -> Res
     Ok(())
 }
 
-pub fn no_unscoped(conn: &Connection, task: &str) -> Result<()> {
-    let count: i64 = conn.query_row(
-        "SELECT count(*) FROM agent_user_instructions WHERE task_id=?1 AND scope_node IS NULL",
-        [task],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        count == 0,
-        "UNSCOPED_USER_MESSAGES: call scope_message before return_task or split_task"
-    );
-    Ok(())
-}
-
-pub fn register_user(
-    tx: &Transaction<'_>,
-    task: &str,
-    seq: i64,
-    origin: &str,
-    content: &Value,
-) -> Result<()> {
-    let id = format!("u{seq}");
-    // A message received at the root can only be scoped to the root (scope is
-    // the current node or an ancestor), so there is nothing for the model to decide.
-    let scope = (origin == ROOT).then_some(ROOT);
-    tx.execute(
-        "INSERT OR IGNORE INTO agent_user_instructions VALUES (?1,?2,?3,?4,?5,?6)",
-        params![task, id, seq, origin, scope, content.to_string()],
-    )?;
-    Ok(())
-}
-
-pub fn instructions(conn: &Connection, task: &str, id: &str) -> Result<Vec<Value>> {
-    let chain = path(conn, task, id)?
-        .iter()
-        .map(|n| n.node_id.clone())
-        .collect::<Vec<_>>();
-    let rows=conn.prepare("SELECT id,event_seq,origin_node,scope_node,content FROM agent_user_instructions WHERE task_id=?1 ORDER BY event_seq")?
-        .query_map([task],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().filter(|(_,_,_,scope,_)|scope.as_ref().is_none_or(|s|chain.contains(s)))
-        .map(|(id,seq,origin,scope,raw)|Ok(json!({"id":id,"event_seq":seq,"origin_node":origin,"scope_node":scope,
-            "scope_pending":scope.is_none(),"original":serde_json::from_str::<Value>(&raw)?,
-            "instruction":if scope.is_none(){"Scope pending. Visible for awareness; only the main Agent may assign scope. Do not treat this notice as global execution permission."}else{"Apply the original instruction, including its conditions, within this subtree."}}))).collect()
-}
-
 pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value) -> Result<()> {
-    no_unscoped(conn, task)?;
     let status = args["status"].as_str().context("status required")?;
     ensure!(
         matches!(status, "done" | "failed" | "blocked" | "needs_user"),
@@ -417,7 +435,7 @@ pub fn validate_return(conn: &Connection, task: &str, node: &Node, args: &Value)
     // call: its outcome, done or not, was already handed back to the caller,
     // which decided how to continue.
     ensure!(status != "done" || !children.iter().any(|n| n.kind == "planned" && matches!(n.status.as_str(),"failed"|"blocked"|"needs_user")),
-        "UNRESOLVED_CHILD_TASKS: retry failed or blocked steps with start_task, or cancel them with plan_tasks, before completing the task");
+        "UNRESOLVED_CHILD_TASKS: resolve failed or blocked child work before completing the task");
     let accepted = |id: &str| {
         children.iter().any(|n| {
             n.node_id == id
@@ -580,15 +598,15 @@ pub fn finish_delegate(
 ) -> Result<()> {
     let Some(mut node) = nodes(tx, task)?
         .into_iter()
-        .find(|n| n.agent_id.as_deref() == Some(agent))
+        .find(|n| n.executor == "delegate" && n.agent_id.as_deref() == Some(agent))
     else {
         return Ok(());
     };
-    if node.status == "running" {
-        node.status = "blocked".into();
-        node.result = Some(
-            json!({"status":"blocked","result":"Delegate ended without a verified return","open_issues":result}),
-        );
+    if matches!(node.status.as_str(), "running" | "suspended") {
+        // Normal completion already passed through task_frames::finish. A
+        // stopped executor must not manufacture a finish without confirmation.
+        node.status = "interrupted".into();
+        node.result = Some(json!({"result":result["report"],"execution":result}));
         emit(tx, task, "task/node_returned", &mut node, turn)?;
     }
     Ok(())
@@ -605,46 +623,28 @@ pub fn rebuild(tx: &Transaction<'_>, task: &str) -> Result<()> {
         let data = row.data()?;
         if row.kind.starts_with("task/node_") && data["executor"].is_string() {
             cache(tx, task, &serde_json::from_value::<Node>(data)?)?;
-        } else if matches!(row.kind.as_str(), "user/message" | "user/interjection") {
-            let owner: String = tx.query_row(
-                "SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",
-                params![task, row.seq],
-                |r| r.get(0),
-            )?;
-            register_user(
-                tx,
-                task,
-                row.seq,
-                &owner,
-                data.get("message")
-                    .map(|m| &m["content"])
-                    .unwrap_or(&data["text"]),
-            )?;
-        } else if row.kind == "task/message_scoped" {
-            tx.execute(
-                "UPDATE agent_user_instructions SET scope_node=?3 WHERE task_id=?1 AND id=?2",
-                params![
-                    task,
-                    data["instruction_id"].as_str(),
-                    data["node_id"].as_str()
-                ],
-            )?;
         }
     }
     active(tx, task)?;
     Ok(())
 }
 
-/// Task-tree tools. The main loop has branch_task to start a task with its own
-/// context; a delegate hands its result back with return_task.
+/// The model creates goals; the host owns execution steps and finish.
 pub fn is_tool(name: &str) -> bool {
-    matches!(name, "branch_task" | "return_task")
+    name == "create_task"
 }
 
 pub fn tools() -> Vec<Value> {
-    let ret = json!({"status":{"type":"string","enum":["done","failed","blocked","needs_user"]},"result":{"type":"string"},"facts":{"type":"array","items":{"type":"object"}},"outputs":{"type":"array","items":{"type":"string"},"description":"What this delegate produced: workspace file paths it wrote or generated, or asset IDs (asset-...)."},"evidence":{"type":"array","items":{"type":"integer"}},"open_issues":{"type":"string"},"question":{"type":"string"}});
-    vec![json!({"type":"function","function":{"name":"branch_task","description":"Start a separate task for something unexpected that deserves its own context, such as repairing a broken dependency. It runs in a fresh context with the task goal and your briefing; when it answers without tool calls, that answer comes back here as its result and this task continues where it was. Call it alone.",
-        "parameters":{"type":"object","properties":{"title":{"type":"string"},"goal":{"type":"string"},"reason":{"type":"string","description":"Why it needs its own task"},"briefing":{"type":"string","description":"What it needs to know from here"}},"required":["title","goal","reason"]}}}),
-        json!({"type":"function","function":{"name":"return_task","description":"Finish this delegated assignment with its result. result and facts are what the main Agent sees: state what changed, not how. done requires successful tool events of this assignment or its output files/assets; failed/blocked state what went wrong in open_issues; needs_user returns a question.",
-        "parameters":{"type":"object","properties":ret,"required":["status","result"]}}})]
+    vec![json!({"type":"function","function":{"name":"create_task",
+        "description":"Create tasks and execute them now. A task is a scope: materials loaded while it runs stay in its context until it ends, subject to context capacity. Without a running task, goal creates the main task, and tasks may also list its first child tasks. Inside a task, tasks creates serial child tasks under it; goal alone is shorthand for one. Units of work you can already see fit one call with several tasks. Work you meet unexpectedly inside a task can become that task's own child task. Children run in order, each in its own scope with its goal, briefing, the user's words, loaded skills, the materials in its asset_ids and the returns of the earlier children; your other working records stay with you while they run. After the last one, their working contexts are released and this call returns their summaries with handles to what they saved. The host creates one step per AI request. A no-tool reply triggers completion confirmation in the current task before host finish. Call alone.",
+        "parameters":{"type":"object","properties":{
+            "goal":{"type":"string","description":"Without a running task: the main task's objective. Inside a task: one child's objective, shorthand for tasks with one entry."},
+            "reason":{"type":"string","description":"Optional: why this work runs in its own scope."},
+            "briefing":{"type":"string","description":"Optional background for the main task or the single child. The host supplies chronological caller tool activity and saved-result references automatically; full caller working records are not inherited."},
+            "asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Saved materials the child tasks need. The host loads complete bodies when the whole child request fits; otherwise supplies references and total_chars for explicit read_asset pages (max_chars up to 24000). A child can process oversized material and return only the needed result. With tasks, shared by every child."},
+            "tasks":{"type":"array","minItems":1,"maxItems":64,"description":"Serial child tasks, run in this order, each in its own scope.","items":{"type":"object","properties":{
+                "goal":{"type":"string"},"briefing":{"type":"string"},
+                "asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Materials only this child needs, in addition to the shared ones."}},
+                "required":["goal"]}}},
+            "required":[]}}})]
 }

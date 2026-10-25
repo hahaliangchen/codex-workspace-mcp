@@ -63,6 +63,23 @@ fn bound(root: &std::path::Path, task: &str) -> Result<Option<(String, String, A
 fn context(task: &str, conversation: &str) -> Value {
     json!({"conversation_id":conversation,"execution_id":task})
 }
+/// Vision analyses a call names by `analysis_id` / `analysis_ids` travel with it
+/// as host evidence, so the plugin reads what the vision model actually said.
+fn analysis_ids(args: &Value) -> Vec<String> {
+    let mut ids = Vec::<String>::new();
+    for id in args["analysis_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(args.get("analysis_id"))
+        .filter_map(Value::as_str)
+    {
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
+}
 fn save_binding(
     root: &std::path::Path,
     task: &str,
@@ -142,7 +159,16 @@ impl crate::plugin_io::SessionIo for Transport {
                 if catalog.packages.owns_tool(&plugin, name) {
                     let prefix = format!("{}__", plugin.replace('-', "_"));
                     let raw = name.strip_prefix(&prefix).context("Tool owner mismatch")?;
-                    let result = c.call_in(raw, args, context(task, &conversation)).await?;
+                    let mut call_context = context(task, &conversation);
+                    let ids = analysis_ids(&args);
+                    if !ids.is_empty() {
+                        call_context["analyses"] = json!(crate::image_analysis::analyses(
+                            state.workspace.root(),
+                            &[task, conversation.as_str()],
+                            &ids,
+                        )?);
+                    }
+                    let result = c.call_in(raw, args, call_context).await?;
                     sync(state, &conversation, &c).await?;
                     return tool_value(state.workspace.root(), &conversation, result);
                 }
@@ -202,6 +228,48 @@ impl crate::plugin_io::SessionIo for Transport {
             };
             let result=c.rpc("plugin/importAttachment",json!({"context":context(task,&conversation),"name":name,"mediaType":media,"data":base64::engine::general_purpose::STANDARD.encode(bytes)})).await?;
             Ok(result["path"].is_string().then_some(result))
+        })
+    }
+    fn review_brief<'a>(
+        &'a self,
+        state: &'a AgentServiceState,
+        task: &'a str,
+        tool: &'a str,
+        args: &'a Value,
+        document: &'a Value,
+        images: &'a Value,
+    ) -> futures::future::BoxFuture<'a, Result<Option<Value>>> {
+        Box::pin(async move {
+            let Some((conversation, plugin, c)) = bound(state.workspace.root(), task)? else {
+                return Ok(None);
+            };
+            if !c.supports("visual_review") {
+                return Ok(None);
+            }
+            let prefix = format!("{}__", plugin.replace('-', "_"));
+            let raw = tool.strip_prefix(&prefix).unwrap_or(tool);
+            // The plugin writes instructions against the plan the user confirmed here.
+            let board = crate::main_task_anchor::board(state.workspace.root(), &conversation, None)?
+                .unwrap_or(Value::Null);
+            let plan = json!({"confirmed":board["plan_confirmed"],"version":board["plan"]["version"],"plan":board["plan"]["plan"]});
+            let brief = c
+                .rpc(
+                    "plugin/reviewBrief",
+                    json!({"context":context(task,&conversation),"tool":raw,"arguments":args,"document":document,"images":images,"plan":plan}),
+                )
+                .await?;
+            let Some(instructions) = brief["instructions"].as_str().filter(|text| !text.trim().is_empty()) else {
+                return Ok(None);
+            };
+            // One subject per image; a single `subject` describes every image.
+            let count = images.as_array().map_or(1, Vec::len);
+            let subjects = (0..count)
+                .map(|index| match brief["subjects"].as_array() {
+                    Some(subjects) => subjects.get(index).cloned().unwrap_or(Value::Null),
+                    None => brief["subject"].clone(),
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(json!({"instructions":instructions,"subjects":subjects})))
         })
     }
 }
@@ -557,6 +625,11 @@ mod tests {
             .unwrap();
         assert_eq!(board["plan"]["plan"]["items"][0]["id"], "a");
         assert_eq!(board["plan_confirmed"], false);
+        // A plugin that does not declare visual_review is never asked for review instructions.
+        assert!(crate::plugin_io::review_brief(&state, "child", "notes_test__save", &json!({}), &json!({}), &json!([]))
+            .await
+            .unwrap()
+            .is_none());
         // Re-authentication restores an existing binding without accepting a different subject.
         active().write().unwrap().remove(task);
         let opened=value(handle(&runtime,state.clone(),"notes-test","session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"method":"open"})).await.unwrap()).await;
@@ -566,6 +639,163 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }
+    /// The real loop: a page tool renders an image, the plugin attaches its review
+    /// instructions, analyze_images sends them as the vision system message, and
+    /// the plugin's record tool receives the stored analysis as host evidence.
+    #[tokio::test]
+    async fn rendered_images_carry_plugin_review_instructions_into_vision_and_back_as_evidence() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const INSTRUCTIONS: &str = "Transcribe every visible text, then list defects, grade them against the outline, then conclude.";
+        const VISION: &str = "Transcript: Cover title; Contents.\n```json\n{\"images\":[{\"image\":1,\"conclusion\":\"pass\"},{\"image\":2,\"conclusion\":\"pass\"}]}\n```";
+        fn subject(page: &Value) -> String {
+            format!("Page {page}: outline entry {page}.")
+        }
+        let plugin_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let vision_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let ids_in = |body: &Value, prefix: &str| -> Vec<String> {
+            let pattern = regex::Regex::new(&format!(r"{prefix}\d+-\d+-\d+")).unwrap();
+            let mut ids = Vec::<String>::new();
+            for found in pattern.find_iter(&body.to_string()) {
+                if !ids.iter().any(|id| id == found.as_str()) {
+                    ids.push(found.as_str().to_owned());
+                }
+            }
+            ids
+        };
+        let call = |name: &str, args: Value, n: usize| json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+        let app = Router::new()
+            .route("/api/plugin/{method}", post({
+                let plugin_calls = plugin_calls.clone();
+                move |Path(method): Path<String>, Json(body): Json<Value>| {
+                    let plugin_calls = plugin_calls.clone();
+                    async move {
+                        let args = body["payload"]["args"].clone();
+                        plugin_calls.lock().unwrap().push((method.clone(), args.clone()));
+                        let result = match method.as_str() {
+                            "handshake" => json!({"version":1,"subject":"alice","state":"awaiting_confirmation","connection_id":"c-alice",
+                                "plugin":{"id":"review-lab","title":"Visual check","pages":[],"capabilities":["visual_review"],"tools":[
+                                    {"name":"render","description":"Render pages","executor":"page","inputSchema":{"type":"object","properties":{"slides":{"type":"array","items":{"type":"integer"}}}}},
+                                    {"name":"record","description":"Record a review","inputSchema":{"type":"object","properties":{"analysis_ids":{"type":"array"}}}}]}}),
+                            "confirm" => json!({"state":"ready"}),
+                            "identity" => json!({"subject":"alice"}),
+                            "session" => json!({}),
+                            "reviewBrief" => json!({"instructions":INSTRUCTIONS,
+                                "subjects":args["images"].as_array().unwrap().iter().map(|meta| subject(&meta["slide"])).collect::<Vec<_>>()}),
+                            "call" => json!({"value":{"recorded":true}}),
+                            _ => panic!("unexpected {method}"),
+                        };
+                        Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":result}}))
+                    }
+                }
+            }))
+            .route("/v1/chat/completions", post({
+                let vision_bodies = vision_bodies.clone();
+                let rounds = rounds.clone();
+                move |Json(body): Json<Value>| {
+                    let vision_bodies = vision_bodies.clone();
+                    let rounds = rounds.clone();
+                    async move {
+                        if body["model"] == "vision-only" {
+                            vision_bodies.lock().unwrap().push(body);
+                            return Json(json!({"choices":[{"message":{"role":"assistant","content":VISION},"finish_reason":"stop"}]}));
+                        }
+                        let n = rounds.fetch_add(1, Ordering::SeqCst);
+                        let message = match n {
+                            0 => call("create_task", json!({"goal":"Render and review page 1"}), n),
+                            1 => call("load_tool_group", json!({"group":"vision"}), n),
+                            2 => call("review_lab__render", json!({"slides":[1,2]}), n),
+                            3 => call("analyze_images", json!({"artifact_ids":ids_in(&body, "visual-"),"question":"I just changed the subtitle."}), n),
+                            4 => call("review_lab__record", json!({"analysis_ids":ids_in(&body, "analysis-")}), n),
+                            _ => json!({"role":"assistant","content":"Page 1 reviewed."}),
+                        };
+                        Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let root = std::env::temp_dir().join(format!("remote-review-{}", crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (runtime, catalog) = crate::skill_packages::test_runtime();
+        let package = remote::connect_user(remote::Config { url: format!("http://{address}"), token: "admin".into() }, true)
+            .await
+            .unwrap();
+        remote::mount_user_package(&runtime, &catalog.packages, package).unwrap();
+        let mut state = crate::agent_service::tests::test_state(&root, address);
+        state.tool_catalog = Some(catalog.clone());
+        state.visual_tool_settings.model = Some("vision-only".into());
+        let alice = value(handle(&runtime, state.clone(), "review-lab", "connect", headers("alice"), json!({})).await.unwrap()).await;
+        let created = value(handle(&runtime, state.clone(), "review-lab", "session", headers("alice"),
+            json!({"connection_handle":alice["connection_handle"],"method":"create","document":"D1"})).await.unwrap()).await;
+        let task = created["task_id"].as_str().unwrap().to_owned();
+        crate::agent_service::open_db(&root).unwrap()
+            .execute("UPDATE agent_tasks SET status='running',model='fake' WHERE id=?1", [&task]).unwrap();
+        crate::page_tools::claim(&task, "page-1").unwrap();
+        let page = {
+            let task = task.clone();
+            tokio::spawn(async move {
+                let mut png = Vec::new();
+                image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+                let data = base64::engine::general_purpose::STANDARD.encode(png);
+                loop {
+                    let taken = crate::page_tools::poll(&task, "page-1", std::time::Duration::from_secs(2)).await.unwrap();
+                    for call in taken["calls"].as_array().into_iter().flatten() {
+                        let mut content = call["arguments"]["slides"].as_array().unwrap().iter()
+                            .map(|slide| json!({"type":"image","mimeType":"image/png","data":data,"meta":{"slide":slide}}))
+                            .collect::<Vec<_>>();
+                        content.push(json!({"type":"text","text":"rendered"}));
+                        crate::page_tools::reply(&task, "page-1", call["call_id"].as_str().unwrap(),
+                            json!({"ok":true,"content":content,"document":{"revision":2,"stable":true}})).unwrap();
+                    }
+                }
+            })
+        };
+        crate::single_agent::run_task(state.clone(), task.clone(), "fake".into(), "Review page 1".into(), 12,
+            tokio_util::sync::CancellationToken::new(), 1, false).await.unwrap();
+        page.abort();
+
+        let calls = plugin_calls.lock().unwrap().clone();
+        let (_, brief_request) = calls.iter().find(|(method, _)| method == "reviewBrief").expect("plugin was asked for review instructions");
+        assert_eq!(brief_request["tool"], "render");
+        assert_eq!(brief_request["arguments"], json!({"slides":[1,2]}));
+        assert_eq!(brief_request["images"], json!([{"slide":1},{"slide":2}]), "each image says which page it shows");
+        assert_eq!(brief_request["document"], json!({"revision":2,"stable":true}));
+        assert_eq!(brief_request["context"], context(&task, &task));
+        assert!(brief_request["plan"].get("plan").is_some());
+
+        let vision = vision_bodies.lock().unwrap().clone();
+        assert_eq!(vision.len(), 1);
+        let messages = vision[0]["messages"].as_array().unwrap();
+        assert_eq!(messages[0], json!({"role":"system","content":format!(
+            "{INSTRUCTIONS}\n\nImage 1:\n{}\n\nImage 2:\n{}", subject(&json!(1)), subject(&json!(2)))}),
+            "each image is reviewed against its own outline entry");
+        assert_eq!(messages[1]["content"][0], json!({"type":"text","text":"I just changed the subtitle."}));
+        assert_eq!(messages[1]["content"][1], json!({"type":"text","text":"Image 1"}));
+        assert_eq!(messages[1]["content"][3], json!({"type":"text","text":"Image 2"}));
+
+        let (_, record) = calls.iter().find(|(method, args)| method == "call" && args["tool"] == "record").expect("record call");
+        let evidence = &record["context"]["analyses"][0];
+        assert_eq!(evidence["analysis"], VISION, "the plugin reads the vision model's own text");
+        assert_eq!(evidence["analysis_id"], record["arguments"]["analysis_ids"][0]);
+        assert_eq!(evidence["images"][0]["source"]["meta"], json!({"slide":1}));
+        assert_eq!(evidence["images"][1]["source"]["meta"], json!({"slide":2}));
+        assert_eq!(evidence["images"][1]["source"]["arguments"], json!({"slides":[1,2]}));
+        assert_eq!(evidence["images"][0]["source"]["document"]["revision"], 2);
+        assert_eq!(evidence["images"][0]["source"]["tool"], "review_lab__render");
+
+        let forged = crate::plugin_io::execute(&state, &task, state.workspace.clone(), "review_lab__record",
+            json!({"analysis_ids":["analysis-forged"]})).await.unwrap_err().to_string();
+        assert!(forged.contains("Unknown analysis_id"), "{forged}");
+        crate::page_tools::forget_task(&task);
+        runtime.shutdown().unwrap();
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn host_transport_contains_no_business_adapter() {
         for source in [

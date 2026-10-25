@@ -211,6 +211,7 @@ pub(super) async fn execute(
         Ok((next, result)) => (next, result, false),
         Err(error) => (w.clone(), json!({"error":format!("{error:#}")}), true),
     };
+    let description = task_frames::tool_description(definitions, &call.name, &call.arguments);
     let (task, scope, agent, turn, call, request_id) = (
         s.task.to_owned(),
         s.scope.clone(),
@@ -224,15 +225,15 @@ pub(super) async fn execute(
         // Persist the native exchange and capability state together for restart/rewind.
         let event = |kind: &str, mut data: Value| -> Result<i64> {
             data["turn"]=json!(turn);
-            data["task_node_id"]=json!(next.task_node_id);
+            data["task_node_id"]=json!(next.current_step_node_id.as_ref().or(next.task_node_id.as_ref()));
             if let Some(agent)=&agent {
                 let local:i64=tx.query_row("UPDATE agent_delegates SET event_count=event_count+1 WHERE task_id=?1 AND id=?2 RETURNING event_count-1",params![task,agent],|r|r.get(0))?;
-                agent_service::append_event_tx(&tx,&task,"subagent/event",&json!({"agent_id":agent,"agent_seq":local,"turn":turn,"event_type":kind,"event":data}),Some("append"))
+                agent_service::append_event_tx(&tx,&task,"subagent/event",&json!({"agent_id":agent,"agent_seq":local,"turn":turn,"task_node_id":data["task_node_id"],"event_type":kind,"event":data}),Some("append"))
             } else {agent_service::append_event_tx(&tx,&task,kind,&data,Some("append"))}
         };
         let actor=if agent.is_some(){"worker"}else{"agent"};
         event("tool/call",json!({"actor":actor,"step":step,"flowNodeId":request_id,
-            "callId":call.call_id,"name":call.name,"arguments":call.arguments}))?;
+            "callId":call.call_id,"name":call.name,"arguments":call.arguments,"description":description}))?;
         let seq=event("tool/result",json!({"actor":actor,"step":step,"flowNodeId":request_id,
             "message":{"role":"tool","toolCallId":call.call_id,"isError":is_error,"content":[{"type":"text","text":result.to_string()}]},"meta":{"result":result}}))?;
         next.messages.push(sourced(json!({"role":"tool","tool_call_id":call.call_id,
@@ -270,7 +271,7 @@ mod tests {
             }
         }
         fn session(&self) -> Session<'_> {
-            Session {
+            Session {agent_id:None,task_node_id:None,step_node_id:None,
                 plugin: None,
                 state: &self.state,
                 task: "t",
@@ -281,7 +282,6 @@ mod tests {
                 mode: Mode::Main,
                 scope: "main".into(),
                 parent: None,
-                material: None,
                 input_budget: INPUT_BUDGET,
             }
         }
@@ -393,11 +393,6 @@ mod tests {
                 .any(|t| t["function"]["name"] == "read_file")
         );
         s.plugin = None;
-        s.mode = Mode::Context;
-        let definitions = super::super::tools(&s, &w);
-        assert!(!has(&definitions, "load_tool_group"));
-        assert!(validate_tool(&s, &w, &definitions, "load_tool_group").is_err());
-        s.mode = Mode::Main;
         s.input_budget = 1000;
         w.loaded_tool_groups.clear();
         let call = crate::model_stream::ToolCall {
@@ -444,14 +439,15 @@ mod tests {
                 let definitions=body["tools"].as_array().unwrap();
                 let call=|name:&str,args:Value|json!({"role":"assistant","tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
                 let message=match n {
-                    0=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked.txt","content":"must not run"}))},
-                    1=>{assert!(body.to_string().contains("TOOL_GROUP_NOT_LOADED"));call("load_tool_group",json!({"group":"files"}))},
-                    2=>{assert!(has(definitions,"write_file") && !has(definitions,"run_program"));
+                    0=>call("create_task",json!({"goal":"Verify lazy tools","first_step":"Try a file tool"})),
+                    1=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked.txt","content":"must not run"}))},
+                    2=>{assert!(body.to_string().contains("TOOL_GROUP_NOT_LOADED"));call("load_tool_group",json!({"group":"files"}))},
+                    3=>{assert!(has(definitions,"write_file") && !has(definitions,"run_program"));
                         let mut response=call("load_tool_group",json!({"group":"execution"}));
                         response["tool_calls"].as_array_mut().unwrap().push(json!({"id":"parallel-program","type":"function","function":{"name":"run_program","arguments":json!({"program":"does-not-exist"}).to_string()}}));response},
-                    3=>{assert!(!has(definitions,"run_program"));call("write_file",json!({"path":"saved.txt","content":"loaded tool worked"}))},
-                    4=>call("unload_tool_group",json!({"group":"files"})),
-                    5=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked-again.txt","content":"must not run"}))},
+                    4=>{assert!(!has(definitions,"run_program"));call("write_file",json!({"path":"saved.txt","content":"loaded tool worked"}))},
+                    5=>call("unload_tool_group",json!({"group":"files"})),
+                    6=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked-again.txt","content":"must not run"}))},
                     _=>json!({"role":"assistant","content":"Verified tool loading and unloading."}),
                 };
                 requests.push(body);
@@ -466,7 +462,7 @@ mod tests {
             "t".into(),
             "fake".into(),
             "Verify lazy tools".into(),
-            8,
+            9,
             h.cancel.clone(),
             1,
             false,
@@ -474,7 +470,7 @@ mod tests {
         .await
         .unwrap();
         server.abort();
-        assert_eq!(captured.lock().unwrap().len(), 7);
+        assert_eq!(captured.lock().unwrap().len(), 9);
         assert_eq!(
             std::fs::read_to_string(h.root.join("saved.txt")).unwrap(),
             "loaded tool worked"

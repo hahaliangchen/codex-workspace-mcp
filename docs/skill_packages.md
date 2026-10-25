@@ -133,10 +133,18 @@ Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文
   iframe 和 Cordis 页面都可以通过 `pluginHost.session` 使用这两个方法。
 - 发送 `prompt` 时带上 `page_id` 的页面，负责这个任务的页面工具；同一任务只认最后一个发送 prompt 的页面。其他页面也可以轮询，但领不到调用。任务还没有负责的页面时（例如宿主刚重启），由第一个来轮询的页面负责。
 - 调用已经排队、但负责的页面 45 秒没有来轮询，或者页面领走调用后 180 秒没有交回结果，工具就返回 `PAGE_CLOSED`，宿主结束这个任务：关闭页面即视为放弃任务。
-- 页面交回的结果格式为 `{ok, content: [{type: "text", text} | {type: "image", mimeType, data}]}`。图片存成任务的视觉素材，结果中给出 `artifact_id`；JSON 文本原样作为 `data` 传给 Agent。
+- 页面交回的结果格式为 `{ok, content: [{type: "text", text} | {type: "image", mimeType, data, meta?}]}`。图片存成任务的视觉素材（`meta` 存为素材元数据 `image_meta`，例如 `{slide: 3}` 表示这张图是第 3 页），结果中给出 `artifact_id` 和 `images:[{artifact_id, mime_type, meta}]`；JSON 文本原样作为 `data` 传给 Agent。
 - 远程插件的页面工具不会被注入 `project_id`，也不会发送到插件服务；如果绕过 Agent 直接调用，宿主会拒绝。
+- 页面结果里有图片、且远程插件在 `capabilities` 中声明了 `visual_review` 时，宿主调用插件 `plugin/reviewBrief`，参数为 `{context, tool, arguments, document, images, plan}`：`tool` 是去掉宿主前缀的工具名，`document` 是页面结果里的 `document` 原样，`images` 是各图的 `meta`（按顺序），`plan` 是任务看板上的计划 `{confirmed, version, plan}`。插件返回 `{instructions, subjects}`（每张图一个 subject；只返回单个 `subject` 时用于所有图；不适用时返回空对象），宿主把 `instructions` 和该图的 subject 存进各图的视觉素材元数据 `review`。获取失败时图片照常保存，工具结果附 `review_instructions_unavailable` 说明原因。
 
 插件增加或修改页面工具，只需改插件自己的清单和页面，宿主不需要改动。实现见 `src/page_tools.rs`。
+
+### 图片审查说明与分析证据
+
+- `analyze_images` 发现所选图片带有 `review` 时，把各图不同的 `instructions` 原样拼接（相同的只出现一次），再按图片顺序附上 `Image N:` 加该图的 `subject`，作为视觉请求的 system 消息；调用方的问题仍是 user 消息的第一段，每张图前插入 `Image N` 文字。没有 `review` 的图片维持原来的单条 user 消息。宿主不理解说明内容。
+- 一次 `analyze_images` 最多 9 张图。1–2 张照原样发送；3 张及以上拼成一张编号大图（最多 3 列，每格上方黑条写白色编号，留灰色间隔；图片保持原尺寸，整张超过 4 百万像素或 8 MiB 时等比例缩小），user 消息说明「Images 1-N are tiled on this sheet…」。这张大图另存为视觉素材（`source: analysis_sheet`），就是视觉模型实际收到的那张。
+- 每次分析完成后，宿主保存 `{analysis_id, analysis, images:[{artifact_id, source:{tool, arguments, document, meta}}], sheet}`，结果返回 `analysis_id`。
+- 远程插件工具的参数顶层出现 `analysis_id`（字符串）或 `analysis_ids`（数组）时，宿主按 ID 读取本任务（及其根会话）保存的分析，放进 `plugin/call` 的 `context.analyses`；参数本身原样转发。ID 不属于本任务时调用直接失败。插件据此读取视觉模型的原文，不依赖调用方转述。实现见 `src/image_analysis.rs`、`src/remote_sessions.rs`。
 
 ## 远程页面和插件会话
 
@@ -181,6 +189,7 @@ context 的 `conversation_id` 是根聊天，`execution_id` 是当前执行节�
 返回 `{value: <工具结果>}`；需要展示计划确认卡时可附带通用 `plan_proposal`
 （`items` 每项含 `id/title/requirements`）。保存提案不代表用户确认。
 可选 `capabilities` 中声明 `attachments` 才转送附件；插件返回 `path/src`，宿主不拼业务 URI。
+声明 `visual_review` 才会收到 `plugin/reviewBrief`（见“图片审查说明与分析证据”）。
 `plugin/service`、`plugin/resource` 的业务方法、标识、资源归属均由插件检查。
 
 远程清单可同时声明 `react/module.js` 和 `html/page`。模块注入的 `pluginHost`

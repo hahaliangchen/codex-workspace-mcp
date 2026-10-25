@@ -282,6 +282,7 @@ pub fn submit(
     } else { None };
     let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
     let mut spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
+    spec["caller_task_node_id"]=shared_context["caller_task_node_id"].clone();
     if let Some(node)=shared_context.get("task_node") {
         let mut node:crate::task_tree::Node=serde_json::from_value(node.clone())?;
         let saved=crate::task_tree::get(&tx,task,&node.node_id)?;
@@ -465,6 +466,12 @@ pub fn outstanding(root: &Path, task: &str) -> Result<bool> {
     reap(root, task)?;
     Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0 OR review IS NULL))",[task],|r|r.get(0))?)
 }
+/// Only work submitted by this task may delay or receive its completion.
+pub fn outstanding_for(root: &Path, task: &str, owner: &str) -> Result<bool> {
+    reap(root,task)?;
+    Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0) AND (json_extract(specification,'$.caller_task_node_id')=?2 OR json_extract(specification,'$.caller_task_node_id') IS NULL))",params![task,owner],|r|r.get(0))?)
+}
+
 pub async fn wait(root: &Path, task: &str, cancel: &CancellationToken, millis: u64) -> Result<()> {
     let deadline =
         tokio::time::Instant::now() + std::time::Duration::from_millis(millis.min(30000));

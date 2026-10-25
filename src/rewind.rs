@@ -237,6 +237,11 @@ mod tests {
         tx.commit().unwrap();
         let kept = crate::context_assets::register(&root, "t", first, "read_file", &json!({"path":"a"}), &json!({"content":"old"})).unwrap();
         let removed = crate::context_assets::register(&root, "t", last, "read_file", &json!({"path":"b"}), &json!({"content":"future"})).unwrap();
+        crate::context_assets::remember_deliveries(&root, "t", &json!([
+            {"reference":kept,"event_seq":first},
+            {"reference":kept,"event_seq":last},
+            {"reference":removed,"event_seq":last}
+        ])).unwrap();
         for (id, through) in [("old",first),("new",second)] {
             conn.execute("INSERT INTO agent_context_materials VALUES ('t',?1,?2)", params![id,json!({"through":through}).to_string()]).unwrap();
         }
@@ -246,6 +251,9 @@ mod tests {
             .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(ids, vec![kept["asset_id"].as_str().unwrap()]);
         assert!(!ids.contains(&removed["asset_id"].as_str().unwrap().to_owned()));
+        let deliveries: Vec<i64> = conn.prepare("SELECT event_seq FROM agent_context_asset_deliveries WHERE task_id='t'").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(deliveries, vec![first], "rewind drops future index facts and retains earlier deliveries");
         let materials: usize = conn.query_row("SELECT COUNT(*) FROM agent_context_materials", [], |row| row.get(0)).unwrap();
         assert_eq!(materials, 1);
         let tx = conn.transaction().unwrap();

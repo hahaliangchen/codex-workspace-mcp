@@ -1,6 +1,5 @@
-//! Durable, content-addressed material references. This module never ranks or
-//! evicts assets during execution. Compaction supplies references and restores
-//! only the model's requested bodies plus the currently active skill rules.
+//! Durable, content-addressed material references. Snapshots remain immutable;
+//! working views use handles and restore complete requested or referenced data.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -15,6 +14,7 @@ pub const REFERENCE: &str = "_asset_reference";
 pub fn rewind(tx: &rusqlite::Transaction, task: &str, start: i64) -> Result<()> {
     for (table, predicate) in [
         ("agent_context_assets", "json_extract(reference_json,'$.history_reference.event_seq')>=?2"),
+        ("agent_context_asset_deliveries", "event_seq>=?2"),
         ("agent_context_materials", "json_extract(data,'$.through')>=?2"),
     ] {
         let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0))?;
@@ -32,7 +32,10 @@ fn connection(root: &Path) -> Result<Connection> {
         task_id TEXT NOT NULL, asset_id TEXT NOT NULL, reference_json TEXT NOT NULL,
         source_tool TEXT NOT NULL, source_arguments TEXT NOT NULL,
         payload_path TEXT NOT NULL, payload_hash TEXT NOT NULL,
-        PRIMARY KEY(task_id,asset_id));",
+        PRIMARY KEY(task_id,asset_id));
+        CREATE TABLE IF NOT EXISTS agent_context_asset_deliveries(
+        task_id TEXT NOT NULL,asset_id TEXT NOT NULL,event_seq INTEGER NOT NULL,
+        PRIMARY KEY(task_id,asset_id,event_seq));",
     )?;
     Ok(conn)
 }
@@ -249,6 +252,22 @@ pub fn reference(root: &Path, task: &str, id: &str, through: Option<i64>) -> Res
     );
     Ok(result)
 }
+
+/// Load handles once for assembling a child task; asset bodies stay on disk.
+pub fn reference_index(root: &Path, task: &str) -> Result<BTreeMap<i64, Vec<Value>>> {
+    let conn = connection(root)?;
+    let rows = conn.prepare("SELECT reference_json FROM agent_context_assets WHERE task_id=?1")?
+        .query_map([task], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut index = BTreeMap::<i64, Vec<Value>>::new();
+    for raw in rows {
+        let reference: Value = serde_json::from_str(&raw)?;
+        if let Some(seq) = reference["history_reference"]["event_seq"].as_i64() {
+            index.entry(seq).or_default().push(reference);
+        }
+    }
+    Ok(index)
+}
 /// Always read the exact saved version. A live re-read requires refresh_asset.
 pub fn read(root: &Path, task: &str, args: &Value, through: Option<i64>) -> Result<Value> {
     let id = args["asset_id"].as_str().context("asset_id is required")?;
@@ -369,7 +388,7 @@ fn receipt(reference: &Value) -> String {
         "read_tool":"read_asset"})
     .to_string()
 }
-fn reference_only(message: &mut Value) {
+pub fn reference_only(message: &mut Value) {
     let receipt = receipt(&message[REFERENCE]);
     if message["role"] == "assistant" && message["tool_calls"].is_array() {
         // These are completed historical calls, never executable requests.
@@ -387,7 +406,7 @@ fn reference_only(message: &mut Value) {
         .unwrap()
         .remove("viewed_by_context_agent");
 }
-fn presentation_key(message: &Value) -> (String, String) {
+pub fn presentation_key(message: &Value) -> (String, String) {
     let payload = if let Some(calls) = message["tool_calls"].as_array() {
         Value::Array(calls.iter().map(|c| c["function"].clone()).collect())
     } else if let Some(text) = message["content"].as_str() {
@@ -424,114 +443,16 @@ pub fn release(messages: &mut [Value], ids: &[String]) -> Result<()> {
     }
     Ok(())
 }
-/// Preserve every asset exactly as currently loaded unless the AI explicitly
-/// requested reference-only. Compression turns completed tool results into
-/// attributed data messages, not summaries written by the host.
-pub fn retained(messages: &[Value], plan: &Value) -> Result<Vec<Value>> {
-    let mut decisions = BTreeMap::new();
-    let mut excerpts = BTreeMap::<String, BTreeSet<i64>>::new();
-    if !plan.is_null() {
-        for item in plan.as_array().context("asset_context must be an array")? {
-            let id = item["asset_id"]
-                .as_str()
-                .context("asset_context requires asset_id")?;
-            let mode = item["mode"]
-                .as_str()
-                .context("asset_context requires mode")?;
-            ensure!(
-                matches!(mode, "keep" | "reference" | "excerpt"),
-                "asset mode must be keep, reference or excerpt"
-            );
-            if mode == "excerpt" {
-                let selected=item["event_seqs"].as_array().context("excerpt mode requires event_seqs from already loaded delivery_reference values")?.iter()
-                    .map(|value|value.as_i64().context("excerpt event_seq must be an integer")).collect::<Result<BTreeSet<_>>>()?;
-                ensure!(!selected.is_empty(), "excerpt selection must not be empty");
-                for seq in &selected {
-                    ensure!(
-                        messages.iter().any(|m| m[REFERENCE]["asset_id"] == id
-                            && m["source"]["seq"] == *seq
-                            && m["_asset_state"] == "loaded"
-                            && m[REFERENCE]["kind"] != "image"),
-                        "EXCERPT_NOT_LOADED: asset {id}, event {seq}; read the desired page first, then select its delivery_reference"
-                    );
-                }
-                excerpts.insert(id.to_owned(), selected);
-            }
-            ensure!(
-                decisions.insert(id.to_owned(), mode.to_owned()).is_none(),
-                "duplicate asset_context decision: {id}"
-            );
-        }
-    }
-    let known: BTreeSet<_> = messages
-        .iter()
-        .filter_map(|m| m[REFERENCE]["asset_id"].as_str())
-        .collect();
-    for id in decisions.keys() {
-        ensure!(known.contains(id.as_str()), "ASSET_NOT_IN_CONTEXT: {id}");
-    }
-    let mut refs_written = BTreeSet::new();
-    let mut emitted_refs = BTreeSet::new();
-    let mut bodies_written = BTreeSet::new();
-    let mut kept = Vec::new();
-    for original in messages.iter().filter(|m| m[REFERENCE].is_object()) {
-        let reference = &original[REFERENCE];
-        let id = reference["asset_id"]
-            .as_str()
-            .context("asset reference has no id")?;
-        let mut message = original.clone();
-        if let Some(selected) = excerpts.get(id) {
-            let selected_body = original["source"]["seq"]
-                .as_i64()
-                .is_some_and(|seq| selected.contains(&seq))
-                && original["_asset_state"] == "loaded";
-            if !selected_body {
-                if !refs_written.insert(id.to_owned()) {
-                    continue;
-                }
-                reference_only(&mut message);
-            }
-        }
-        if decisions.get(id).is_some_and(|mode| mode == "reference") {
-            if !refs_written.insert(id.to_owned()) {
-                continue;
-            }
-            reference_only(&mut message);
-        }
-        // Keep distinct excerpts; deduplicate only identical payloads of the
-        // same asset, ignoring delivery metadata and native call identifiers.
-        if message["_asset_state"] != "reference_only"
-            && !bodies_written.insert(presentation_key(&message))
-        {
-            continue;
-        }
-        if message["_asset_state"] == "reference_only" {
-            if !emitted_refs.insert(id.to_owned()) {
-                continue;
-            }
-            reference_only(&mut message);
-        }
-        if let Some(calls) = message.as_object_mut().unwrap().remove("tool_calls") {
-            // An argument snapshot is data after a full narrative compaction,
-            // rather than an assistant call without native result partners.
-            message["content"] = if message["_asset_state"] == "reference_only" {
-                json!(receipt(reference))
-            } else {
-                json!(
-                    json!({"asset_reference":reference,
-                    "original_result":{"tool_calls":calls},"assistant_note":message["content"]})
-                    .to_string()
-                )
-            };
-            message.as_object_mut().unwrap().remove("reasoning_content");
-        }
-        let object = message.as_object_mut().unwrap();
-        object.remove("tool_call_id");
-        object.insert("role".into(), json!("user"));
-        object.insert("name".into(), json!("saved_asset"));
-        kept.push(message);
-    }
-    Ok(kept)
+
+/// Asset id of a complete saved result present as text in a working view;
+/// pages selected with char_offset/max_chars and receipts do not count.
+pub fn complete_body(message: &Value) -> Option<&str> {
+    let text = message["content"].as_str()?;
+    (message["_asset_state"] == "loaded"
+        && message["role"] != "assistant"
+        && serde_json::from_str::<Value>(text).is_ok_and(|v| v.get("original_result").is_some()))
+    .then(|| message[REFERENCE]["asset_id"].as_str())
+    .flatten()
 }
 
 /// Reports current placement only; it does not access the asset files.
@@ -554,38 +475,91 @@ pub fn catalog(messages: &[Value]) -> Value {
     json!({"assets":entries.into_values().collect::<Vec<_>>(),"note":"Loaded material remains in context until an explicit AI edit. image_selected is not proof of pixel delivery."})
 }
 
+/// Keep delivery order in the durable asset index when per-step records leave
+/// the working view. These are existing event facts, not new asset versions.
+pub fn remember_deliveries(root: &Path, task: &str, deliveries: &Value) -> Result<()> {
+    let mut conn = connection(root)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for delivery in deliveries.as_array().into_iter().flatten() {
+        if let (Some(id), Some(seq)) = (delivery["reference"]["asset_id"].as_str(), delivery["event_seq"].as_i64()) {
+            tx.execute("INSERT OR IGNORE INTO agent_context_asset_deliveries(task_id,asset_id,event_seq)
+                SELECT ?1,?2,seq FROM agent_task_events WHERE task_id=?1 AND seq=?3", params![task,id,seq])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn frame_index(root:&Path,task:&str,node:&str,messages:&[Value])->Result<Value> {
-    let conn=crate::agent_service::open_db(root)?;
-    let mut entries=BTreeMap::<String,Value>::new();
+    let conn=connection(root)?;
+    let mut entries=BTreeMap::<String,(Value,i64)>::new();
     for message in messages {
-        if let Some(id)=message[REFERENCE]["asset_id"].as_str() {entries.insert(id.to_owned(),message[REFERENCE].clone());}
+        if let Some(id)=message[REFERENCE]["asset_id"].as_str() {
+            let seq=message.pointer("/source/seq").or_else(||message.pointer("/source/history_reference/event_seq")).and_then(Value::as_i64)
+                .unwrap_or_else(||message[REFERENCE]["history_reference"]["event_seq"].as_i64().unwrap_or(-1));
+            if entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {entries.insert(id.to_owned(),(message[REFERENCE].clone(),seq));}
+        }
+        for delivery in message["_step_assets"].as_array().into_iter().flatten() {
+            if let (Some(id),Some(seq))=(delivery["reference"]["asset_id"].as_str(),delivery["event_seq"].as_i64())
+                && entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {
+                entries.insert(id.to_owned(),(delivery["reference"].clone(),seq));
+            }
+        }
     }
-    let rows=conn.prepare("SELECT a.reference_json FROM agent_context_assets a
-        JOIN agent_task_events e ON e.task_id=a.task_id AND e.seq=json_extract(a.reference_json,'$.history_reference.event_seq')
+    let rows=conn.prepare("WITH deliveries AS (
+        SELECT asset_id,json_extract(reference_json,'$.history_reference.event_seq') AS seq FROM agent_context_assets WHERE task_id=?1
+        UNION ALL SELECT asset_id,event_seq FROM agent_context_asset_deliveries WHERE task_id=?1
+        ), scoped AS (SELECT d.asset_id,MAX(e.seq) AS seq FROM deliveries d
+        JOIN agent_task_events e ON e.task_id=?1 AND e.seq=d.seq
         LEFT JOIN agent_task_nodes n ON n.task_id=e.task_id AND n.node_id=e.node_id
-        WHERE a.task_id=?1 AND (COALESCE(e.node_id,'n0')=?2 OR (n.parent_id=?2 AND n.status='done'
+        WHERE (COALESCE(e.node_id,'n0')=?2 OR (n.parent_id=?2 AND n.status IN ('done','current')
             AND (n.executor='inline' OR json_extract(n.data,'$.review')='accepted')))
-        ORDER BY e.seq DESC LIMIT 65")?.query_map(params![task,node],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        GROUP BY d.asset_id)
+        SELECT a.reference_json,s.seq FROM scoped s JOIN agent_context_assets a ON a.task_id=?1 AND a.asset_id=s.asset_id
+        ORDER BY s.seq DESC LIMIT 65")?.query_map(params![task,node],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let possibly_more=rows.len()==65;
-    for raw in rows {
+    for (raw,seq) in rows {
         let reference:Value=serde_json::from_str(&raw)?;
-        if let Some(id)=reference["asset_id"].as_str() {entries.entry(id.to_owned()).or_insert(reference);}
+        if let Some(id)=reference["asset_id"].as_str() {
+            if entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {
+                entries.insert(id.to_owned(),(reference,seq));
+            }
+        }
     }
-    let total=entries.len();
+    // A newer result of the same generic invocation replaces the old handle
+    // in this index only. Immutable snapshots and per-step references remain.
+    let mut latest=BTreeMap::<String,(Value,i64)>::new();
+    for (reference,seq) in entries.into_values() {
+        let id=reference["asset_id"].as_str().unwrap_or("");
+        let origin=conn.query_row("SELECT source_tool,source_arguments FROM agent_context_assets WHERE task_id=?1 AND asset_id=?2",
+            params![task,id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional()?;
+        let key=if let Some((tool,args))=origin {
+            let args:Value=serde_json::from_str(&args)?;
+            json!([tool,args,reference["operation"]]).to_string()
+        } else {id.to_owned()};
+        if latest.get(&key).is_none_or(|(_,previous)|*previous<=seq) {
+            latest.insert(key,(reference,seq));
+        }
+    }
+    let total=latest.len();
+    let mut entries=latest.into_values().collect::<Vec<_>>();
+    entries.sort_by_key(|(_,seq)|std::cmp::Reverse(*seq));
+    let present=messages.iter().filter_map(complete_body).collect::<BTreeSet<_>>();
     let mut selected=Vec::new();
     let mut tokens=0;
-    for reference in entries.into_values().take(64) {
+    for (reference,_) in entries.into_iter().take(64) {
         let mut item=json!({});
-        for key in ["asset_id","kind","source_tool","source_path","history_reference","read_reference","content_hash"] {
+        for key in ["asset_id","kind","source_tool","operation","source_path","revision"] {
             if let Some(value)=reference.get(key) {item[key]=value.clone();}
         }
+        item["in_context"]=json!(reference["asset_id"].as_str().is_some_and(|id|present.contains(id)));
         let size=crate::context_window::estimate(&item);
         if tokens+size>3000 {break;}
         tokens+=size;selected.push(item);
     }
     Ok(json!({"host_status":true,"not_a_user_request":true,"truncated":possibly_more||selected.len()<total,
         "assets":selected,"remaining_reference":{"tool":"read_session_history","arguments":{"node_id":node,"include_descendants":true}},
-        "instruction":"Saved materials from this task. Reopen one by its reference when you need its full content."}))
+        "instruction":"Latest saved snapshots per tool and arguments. in_context=true: its complete saved result is already in this request; reuse it. read_asset(asset_id) restores the complete recorded data of any other entry; old versions remain in step history."}))
 }
 
 /// The reviewer sees the entire conversation with asset bodies replaced by
@@ -813,69 +787,6 @@ pub fn active_instruction_ids(messages: &[Value], active: &BTreeSet<String>) -> 
         }
     }
     latest.into_values().collect()
-}
-
-/// Validate the complete decision before changing a single message. No heuristic
-/// chooses relevance; omitted/keep means retain exactly, including loaded pixels.
-pub fn apply_review(messages: &[Value], plan: &Value) -> Result<Vec<Value>> {
-    let mut seen = BTreeSet::new();
-    let mut released = Vec::new();
-    for item in plan.as_array().context("asset_context must be an array")? {
-        let id = item["asset_id"].as_str().context("asset_id required")?;
-        ensure!(seen.insert(id), "duplicate asset decision: {id}");
-        ensure!(
-            messages.iter().any(|m| m[REFERENCE]["asset_id"] == id),
-            "ASSET_NOT_IN_CONTEXT: {id}"
-        );
-        match item["mode"].as_str() {
-            Some("keep") => {}
-            Some("reference") => {
-                ensure!(
-                    item["reason"]
-                        .as_str()
-                        .is_some_and(|r| !r.trim().is_empty()),
-                    "reference decision requires a reason"
-                );
-                released.push(id.to_owned());
-            }
-            _ => anyhow::bail!("asset mode must be keep or reference"),
-        }
-    }
-    let mut result = messages.to_vec();
-    release(&mut result, &released)?;
-    let mut bodies = BTreeSet::new();
-    for message in &mut result {
-        if message[REFERENCE]["asset_id"].is_string() {
-            if message["_asset_state"] != "reference_only"
-                && !bodies.insert(presentation_key(message))
-            {
-                // Keep native call/result partners intact; only the duplicate
-                // payload becomes a receipt for the very same immutable asset.
-                reference_only(message);
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// A thorough review must account for every loaded asset, including explicit
-/// reasons to keep uncertain material. Partial decisions cannot look complete.
-pub fn validate_complete_review(messages: &[Value], plan: &Value) -> Result<()> {
-    let decisions = plan.as_array().context("asset_context must be an array")?;
-    let loaded: BTreeSet<_> = messages
-        .iter()
-        .filter(|m| m["_asset_state"] != "reference_only")
-        .filter_map(|m| m[REFERENCE]["asset_id"].as_str())
-        .collect();
-    for id in loaded {
-        ensure!(
-            decisions.iter().any(|d| d["asset_id"] == id
-                && matches!(d["mode"].as_str(), Some("keep" | "reference"))
-                && d["reason"].as_str().is_some_and(|r| !r.trim().is_empty())),
-            "ASSET_REVIEW_INCOMPLETE: decide keep/reference with a reason for loaded asset {id}; inspect every loaded asset in one plan"
-        );
-    }
-    Ok(())
 }
 
 /// Index generated code/SVG in historical arguments too. Reading an argument

@@ -23,6 +23,21 @@ const layout = events => {
   return { state, positions: layoutAgentFlow(state.nodes, state.edges) }
 }
 
+test('finish follows all host steps even when it is created first, including serial children', () => {
+  const task = (id, parent, kind, ordinal) => event('task/node_planned', { node_id: id, parent_id: parent, kind, ordinal,
+    executor: 'inline', status: 'pending' })
+  const { positions } = layout([
+    task('main', undefined, 'task', 0), task('finish', 'main', 'finish', 10000),
+    task('step2', 'main', 'step', 1), task('step1', 'main', 'step', 0),
+    task('repair', 'step1', 'task', 0), task('child-finish', 'repair', 'finish', 10000),
+    task('child-step', 'repair', 'step', 0),
+  ])
+  assert.ok(positions.get('task:step1').x < positions.get('task:step2').x)
+  assert.ok(positions.get('task:step2').x < positions.get('task:finish').x)
+  assert.ok(positions.get('task:child-step').x < positions.get('task:child-finish').x)
+  assert.ok(positions.get('task:repair').y > positions.get('task:step1').y)
+})
+
 test('old PPT records recover named independent branches and distinguish compression', () => {
   const { state, positions } = layout([
     node('m1', 'agent'), start('a', 'pages-1-2', 'm1'), node('a1', 'worker', 'm1'),

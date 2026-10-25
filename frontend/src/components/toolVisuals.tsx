@@ -67,7 +67,10 @@ const ReturnIcon = () => (
 )
 
 const EXACT: Record<string, Omit<ToolVisual, 'summary'>> = {
-  // Task tree: plan, enter, branch, fold and scope work.
+  // Task graph: the agent creates tasks and steps; the host iterates them.
+  create_task: { tone: 'task', icon: <IconGoalOutlineMedium />, title: '创建了任务' },
+  create_step: { tone: 'task', icon: <IconPlayOutlineMedium />, title: '进入下一步' },
+  // Older sessions: plan, enter, branch, fold and scope work.
   plan_tasks: { tone: 'task', icon: <IconChecklistOutlineMedium />, title: '规划了子任务' },
   start_task: { tone: 'task', icon: <IconPlayOutlineMedium />, title: '开始子任务' },
   branch_task: { tone: 'task', icon: <IconBranchOutlineMedium />, title: '插入分支任务' },
@@ -131,6 +134,8 @@ const shortNode = (value: unknown) => text(value) === 'n0' ? '主任务' : `子�
 
 function summaryFor(name: string, args: Record<string, unknown>): string | undefined {
   switch (name) {
+    case 'create_task': return [text(args.goal), text(args.reason) && `原因：${text(args.reason)}`].filter(Boolean).join(' · ')
+    case 'create_step': return [text(args.result) && `完成：${text(args.result)}`, text(args.next) && `下一步：${text(args.next)}`].filter(Boolean).join(' · ')
     case 'plan_tasks': {
       const tasks = Array.isArray(args.tasks) ? args.tasks : []
       const titles = tasks.map(task => text((task as Record<string, unknown> | null)?.title)).filter(Boolean)

@@ -1,9 +1,8 @@
 //! Mechanical access to the original conversation records. No task selection,
 //! summarization, role decisions, or message rewriting belongs in this layer.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, params, params_from_iter, types::Value as SqlValue};
-use serde_json::{Value, json};
-use std::path::Path;
+use serde_json::Value;
 
 #[derive(Default)]
 pub struct EventQuery<'a> {
@@ -29,6 +28,17 @@ impl StoredEvent {
     pub fn data(&self) -> Result<Value> {
         Ok(serde_json::from_str(&self.raw)?)
     }
+}
+
+/// Legacy jobs have no saved owner. Recover it only when history is unambiguous;
+/// call IDs are local to an AI response, not unique across Agents or requests.
+pub fn tool_call_node(conn: &Connection, task: &str, call_id: &str) -> Result<Option<String>> {
+    let owners = conn.prepare(
+        "SELECT DISTINCT node_id FROM agent_task_events WHERE task_id=?1 AND ((kind='tool/call' AND json_extract(data,'$.callId')=?2) OR (kind='subagent/event' AND json_extract(data,'$.event_type')='tool/call' AND json_extract(data,'$.event.callId')=?2)) LIMIT 2",
+    )?.query_map(params![task,call_id], |r| r.get::<_,Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(owners.len() <= 1, "ASYNC_JOB_OWNER_AMBIGUOUS: legacy call {call_id} belongs to multiple steps; resubmit the background task explicitly");
+    Ok(owners.into_iter().next().flatten())
 }
 
 /// All selections are explicit caller parameters. Results are always ascending
@@ -132,35 +142,6 @@ pub fn requirement_snapshot(conn: &Connection, task: &str) -> Result<(i64, Vec<i
     Ok((through, requirements))
 }
 
-/// Page exact stored JSON bytes as Unicode characters, without reserializing it.
-pub async fn read_event(
-    root: &Path,
-    task: &str,
-    seq: i64,
-    through: Option<i64>,
-    args: &Value,
-) -> Result<Value> {
-    ensure!(
-        through.is_none_or(|boundary| seq <= boundary),
-        "history reference is beyond the frozen snapshot"
-    );
-    let (root, task, args) = (root.to_owned(), task.to_owned(), args.clone());
-    tokio::task::spawn_blocking(move || {
-        let conn = crate::agent_service::open_db(&root)?;
-        let event = load_events(&conn, &task, &EventQuery {exact: Some(seq), ..Default::default()})?
-            .pop().context("history event not found in this conversation")?;
-        let start = args["char_offset"].as_u64().unwrap_or(0) as usize;
-        let limit = args["max_chars"].as_u64().unwrap_or(24000).clamp(1, 24000) as usize;
-        let total = event.raw.chars().count();
-        ensure!(start <= total, "history char_offset exceeds total_chars={total}");
-        let content: String = event.raw.chars().skip(start).take(limit).collect();
-        let end = start + content.chars().count();
-        Ok(json!({"event_seq":seq,"kind":event.kind,"content":content,"char_offset":start,
-            "total_chars":total,"returned_chars":end-start,"next_char_offset":if end<total{Some(end)}else{None},
-            "history_reference":{"task_id":task,"event_seq":seq,"include_event":true}}))
-    }).await?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,41 +200,6 @@ mod tests {
             .unwrap()[0]
                 .seq,
             12
-        );
-        let mut offset = 0;
-        let mut restored = String::new();
-        loop {
-            let page = read_event(
-                &root,
-                "a",
-                9,
-                Some(9),
-                &json!({"char_offset":offset,"max_chars":7}),
-            )
-            .await
-            .unwrap();
-            restored.push_str(page["content"].as_str().unwrap());
-            if let Some(next) = page["next_char_offset"].as_u64() {
-                offset = next;
-            } else {
-                break;
-            }
-        }
-        assert_eq!(restored, raw);
-        assert!(
-            read_event(&root, "a", 12, Some(9), &json!({}))
-                .await
-                .is_err()
-        );
-        assert!(
-            read_event(&root, "a", 9, None, &json!({"char_offset":999}))
-                .await
-                .is_err()
-        );
-        assert!(
-            read_event(&root, "missing", 9, None, &json!({}))
-                .await
-                .is_err()
         );
         drop(conn);
         std::fs::remove_dir_all(root).unwrap();

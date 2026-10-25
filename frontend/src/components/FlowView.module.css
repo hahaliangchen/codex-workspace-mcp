@@ -425,6 +425,8 @@
 }
 
 .contextBox {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   background: var(--dsw-static-neutral-bluish-50, #f9fafb);
   border: 1px solid var(--dsw-alias-border-l1, rgba(0, 0, 0, 0.08));
   border-radius: 8px;

@@ -7,6 +7,30 @@ const { outputText } = ts.transpileModule(source, { compilerOptions: { module: t
 const { flowState } = await import('data:text/javascript;base64,' + Buffer.from(outputText).toString('base64'))
 const event = (type, data) => ({ type, time: 0, data: { turn: 1, ...data } })
 
+test('host steps show their original AI response after reload, including delegated drafts and tool-only replies', () => {
+  const step = (id, agent, seq) => event('task/node_returned', { node_id: id, parent_id: 'main', kind: 'step', executor: 'inline', agent_id: agent,
+    status: 'done', goal: 'One AI request, its response, tool calls and results', result: { response: { event_seq: seq } } })
+  const events = [step('main-step', undefined, 7), step('worker-step', 'worker', 8), step('tools-only', 'worker', 9),
+    { ...event('assistant/draft', { message: { content: '检查到开关损坏，接下来修复。' } }), seq: 7 },
+    { ...event('subagent/event', { agent_id: 'worker', event_type: 'assistant/draft', event: { message: { content: '<thinking>private reasoning</thinking>已换好弹簧。' } } }), seq: 8 },
+    { ...event('subagent/event', { agent_id: 'worker', event_type: 'assistant/message', event: { message: { content: null, tool_calls: [{ id: 'call_1' }] } } }), seq: 9 },
+  ]
+  const state = flowState(JSON.parse(JSON.stringify(events)))
+  assert.equal(state.nodes.find(n => n.id === 'task:main-step').response, '检查到开关损坏，接下来修复。')
+  assert.equal(state.nodes.find(n => n.id === 'task:worker-step').response, '已换好弹簧。')
+  assert.equal(state.nodes.find(n => n.id === 'task:tools-only').response, '')
+  const legacy = flowState([event('task/node_returned', { node_id: 'old-step', kind: 'step', executor: 'inline', status: 'done', result: { result: '旧步骤的检查结果' } })])
+  assert.equal(legacy.nodes[0].response, '旧步骤的检查结果')
+})
+
+test('a running host step exposes its response before its result references are saved', () => {
+  const state = flowState([
+    event('task/node_started', { node_id: 'step', parent_id: 'main', kind: 'step', executor: 'inline', status: 'current' }),
+    event('assistant/draft', { task_node_id: 'step', message: { content: [{ type: 'text', text: '先检查电源。' }] } }),
+  ])
+  assert.equal(state.nodes.find(n => n.id === 'task:step').response, '先检查电源。')
+})
+
 test('task nodes persist across turns and finish only on an explicit return', () => {
   const state = flowState([
     event('task/node_planned', { node_id: 'n0', kind: 'root', executor: 'inline', status: 'running', title: 'Twenty pages' }),

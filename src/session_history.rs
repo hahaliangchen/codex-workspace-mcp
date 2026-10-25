@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 mod store;
-pub use store::{EventQuery, load_events, read_event, requirement_snapshot};
+pub use store::{EventQuery, load_events, requirement_snapshot, tool_call_node};
 
 /// Forward text unchanged; serialize original structured values without interpretation.
 /// Values are never summarized, shortened or interpreted here.

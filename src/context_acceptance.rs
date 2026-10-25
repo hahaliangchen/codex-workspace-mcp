@@ -168,19 +168,22 @@ fn check_call(number: Option<u64>, footer: bool) -> (String, Value) {
     )
 }
 
+/// Twenty pages as steps of one main task. The broken shared stylesheet found
+/// at page 7 is repaired by a temporary task under that step; the user's update
+/// at page 10 reaches every later page; finished page steps leave brief records.
 #[tokio::test]
-async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection() -> Result<()>
+async fn scripted_twenty_page_task_graph_repairs_and_applies_the_interjection() -> Result<()>
 {
     let root = workspace("scripted-tree")?;
     let outline: Value = serde_json::from_slice(&std::fs::read(root.join("outline.json"))?)?;
     let mut queue = VecDeque::new();
+    queue.push_back(("create_task".into(), json!({"goal":"Generate and verify all twenty HTML pages","first_step":"Load the tools and read the shared materials"})));
     for group in ["files", "execution"] {
         queue.push_back(("load_tool_group".into(), json!({"group":group})));
     }
     for name in ["outline.json", "design_spec.md"] {
         queue.push_back(("read_file".into(), json!({"path":name})));
     }
-    // The host starts each planned page in order; the script never calls start_task.
     for page in outline["pages"].as_array().unwrap() {
         let n = page["id"].as_u64().unwrap();
         let title = page["title"].as_str().unwrap();
@@ -206,16 +209,21 @@ async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection()
         ));
         queue.push_back(check_call(Some(n), n >= 11));
         if n == 7 {
+            // The shared stylesheet is broken: not this page's work, so a
+            // temporary task repairs it and the page step resumes.
             let mut css = std::fs::read_to_string(root.join("shared.css"))?;
             let expected = crate::symbol_description::content_hash(css.as_bytes());
             css.push_str(
                 "\n.repair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }\n",
             );
+            queue.push_back(("create_task".into(), json!({"goal":"Repair shared.css so the repair-grid layout exists","first_step":"Add the missing .repair-grid class",
+                "reason":"The page07 check fails because shared.css has no .repair-grid class","briefing":"page07.html uses the repair-grid layout; shared.css lacks that class"})));
             queue.push_back(("read_file".into(), json!({"path":"shared.css"})));
             queue.push_back((
                 "write_file".into(),
                 json!({"path":"shared.css","content":css,"expected_code_hash":expected}),
             ));
+            queue.push_back(("answer".into(), json!("shared.css now defines .repair-grid")));
             queue.push_back(check_call(Some(n), false));
         }
         if n == 10 {
@@ -234,25 +242,15 @@ async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection()
             progress.1 += 1;
             let round = progress.1;
             let messages = body["messages"].as_array().unwrap();
-            let conn=agent_service::open_db(&working).unwrap();
-            let active=crate::task_tree::active(&conn,TASK).unwrap();
-            let pending=active.as_ref().and_then(|node|crate::task_tree::instructions(&conn,TASK,&node.node_id).unwrap().into_iter().find(|instruction|instruction["scope_pending"]==true));
-            let message = if let Some(review) = messages.iter().find(|m|m["name"]=="context_review_input") {
-                progress.2 += 1;
-                let supplied: Value = serde_json::from_str(review["content"].as_str().unwrap()).unwrap();
-                let refs = supplied["original_user_requirements"].as_array().unwrap().iter().map(|r|r["event_seq"].clone()).collect::<Vec<_>>();
-                tool(round,"submit_context",json!({"original_purpose":"Generate and verify all twenty HTML pages","current_goal":"Continue the remaining page writes and verification",
-                    "requirement_changes":if progress.3 {UPDATE} else {"none"},"constraints":"Follow the outline and shared design specification. Preserve all successful saved pages.",
-                    "progress":"Completed pages and the shared repair remain on disk; use check_pages.py for evidence.","open_questions":"none",
-                    "next_steps":"Continue the scripted remaining work, apply the footer only from page 11, and verify all 20 pages.","tool_history":"Do not replay completed writes; inspect saved files when needed.",
-                    "source_event_seqs":refs,"visual_conclusions":[],"restore_assets":[]}))
-            } else if let Some(instruction)=pending {
-                tool(round,"scope_message",json!({"instruction_id":instruction["id"],"node_id":"n0"}))
+            let message = if messages.iter().rev().find(|m|m["role"]=="assistant" || m["role"]=="tool" || m["name"]=="task_completion_check").is_some_and(|m|m["name"]=="task_completion_check") {
+                json!({"role":"assistant","content":messages.iter().rev().find(|m|m["role"]=="assistant").unwrap()["content"]})
             } else if let Some((name,args)) = progress.0.pop_front() {
                 if name=="inject_user_update" {
                     crate::interjections::submit(&working,TASK,UPDATE).unwrap();
                     progress.3 = true;
                     tool(round,"read_task_board",json!({}))
+                } else if name=="answer" {
+                    json!({"role":"assistant","content":args})
                 } else {
                     if name=="write_file" && args["path"]=="page11.html" {
                         assert!(body.to_string().contains("内部资料"),"the mid-turn update must reach the next execution request");
@@ -274,7 +272,7 @@ async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection()
         TASK.into(),
         state.default_model.clone(),
         PROMPT.into(),
-        160,
+        200,
         CancellationToken::new(),
         1,
         false,
@@ -290,11 +288,23 @@ async fn scripted_twenty_page_loop_repairs_inline_and_applies_the_interjection()
         "the script must finish and propagate the user update"
     );
     let conn = agent_service::open_db(&root)?;
-    // The loop ends when the model answers without tool calls; the host records it.
+    let nodes = crate::task_tree::nodes(&conn, TASK)?;
+    // The loop ends when the model answers without tool calls: the main task reaches its finish node.
+    let main = nodes.iter().find(|n| n.kind == "task" && n.metadata["role"] == "main").context("main task missing")?;
+    ensure!(main.status == "done", "the plain final answer must finish the main task");
+    let steps = nodes.iter().filter(|n| n.kind == "step" && n.parent_id.as_deref() == Some(main.node_id.as_str())).count();
+    ensure!(steps >= 46, "every execution request has a host step; got {steps}");
+    let repair = nodes.iter().find(|n| n.kind == "task" && n.metadata["role"] == "temp").context("repair task missing")?;
+    let page7 = nodes.iter().find(|n| Some(n.node_id.as_str())==repair.parent_id.as_deref() && n.kind=="step").context("repair caller step missing")?;
     ensure!(
-        crate::task_tree::get(&conn, TASK, crate::task_tree::ROOT)?.status == "done",
-        "the plain final answer must end the task"
+        repair.parent_id.as_deref() == Some(page7.node_id.as_str()) && repair.status == "done",
+        "the shared repair must run as a temporary task under the page 7 step"
     );
+    let requests: i64 = conn.query_row("SELECT COUNT(*) FROM agent_request_contexts WHERE task_id=?1 AND actor='agent'", [TASK], |r| r.get(0))?;
+    let all_steps=nodes.iter().filter(|n|n.kind=="step").count();
+    ensure!(all_steps as i64 == requests-1, "one host step per execution request after task creation ({all_steps} steps, {requests} requests)");
+    let folded:i64=conn.query_row("SELECT COALESCE(SUM(json_extract(data,'$.folded_steps')),0) FROM agent_task_events WHERE task_id=?1 AND kind='context/step_view'",[TASK],|r|r.get(0))?;
+    ensure!(folded>=40,"completed work must leave concise step records; got {folded}");
     let failures:i64 = conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.meta.result.process_exit_code')=1",[TASK],|r|r.get(0))?;
     ensure!(
         failures == 1,

@@ -9,6 +9,10 @@ export function layoutAgentFlow(nodes: readonly FlowNodeData[], edges: readonly 
     const positions = new Map<string, { x: number; y: number }>()
     const children = new Map<string, FlowNodeData[]>()
     for (const node of nodes) if (node.parentId) children.set(node.parentId, [...children.get(node.parentId) ?? [], node])
+    // Finish is created before the first AI request, but belongs after its steps.
+    for (const siblings of children.values()) siblings.sort((a, b) =>
+      Number(a.kind === 'task_finish') - Number(b.kind === 'task_finish') ||
+      (a.ordinal ?? 0) - (b.ordinal ?? 0))
     let column = 0
     const visiting = new Set<string>()
     const place = (node: FlowNodeData, depth: number): number => {
