@@ -1,15 +1,15 @@
 # Agent 流程伪代码与 Rust 执行器
 
-当前语言版本 **8**。使用常见 JS 基础语法表达流程，由 SWC 解析、Rust 执行持久化指令；没有 JS 虚拟机。**普通表达式由宿主确定性求值，智能判断必须写成显式任务函数。** 相同程序、相同输入和相同工具／任务返回值产生相同控制流；AI 任务及外部操作本身不因此变成确定性的。
+当前语言版本 **9**。使用常见 JS 基础语法表达流程，由 SWC 解析、Rust 执行持久化指令；没有 JS 虚拟机。**普通表达式由宿主确定性求值，智能判断必须写成显式任务函数。** 相同程序、相同输入和相同工具／任务返回值产生相同控制流；AI 任务及外部操作本身不因此变成确定性的。
 
-## 固定语言范围（版本 8）
+## 固定语言范围（版本 9）
 
 | 部分 | 允许范围与含义 |
 | --- | --- |
 | 文件 | 顶层普通 function；唯一 main 接受零或一个输入。辅助函数显式传参。补写源码只有当前函数及所需 helper，没有第二个 main |
 | 数据 | JSON 字符串、有限数字、布尔、null、数组、静态键对象；成员／下标读取、对象简写、简单数组解构 |
 | 局部值 | const/let/var、局部赋值、赋值表达式、局部 ++/-- 与 += -= *= /= %=。const 不重绑定。变量不共享可变别名 |
-| 调用 | helper(args)、已发布的 library.method(args)（如 io.read）、或精确工具名 tools.EXACT_NAME(args)／tools["exact/name"](args)；编译时核对 helper 实参数量，不允许调用或 fork main |
+| 调用 | helper(args)、已发布的 library.method(args)（如 io.read）；编译时核对 helper 实参数量，不允许调用或 fork main |
 | 控制流 | if/else、for(init;test;update)、while、do/while、数组 for...of、无标签 break/continue、三元表达式、return、assert、try/catch/throw |
 | 表达式 | + - * / %、一元 + - !、== != === !== < <= > >=、&& || ??、模板字符串；宿主直接计算，不创建模型任务 |
 | 收集及数据方法 | 本地数组 push；确定性的 includes/indexOf/slice、字符串 startsWith/endsWith/trim/toLowerCase/toUpperCase/split、数组 join，以及 JSON.stringify/JSON.parse |
@@ -31,15 +31,17 @@
 
 数据方法只有文首列出的白名单：includes/indexOf 接受一个查找值（字符串接收者要求字符串实参；数组使用 JSON 值相等），slice 接受一个或两个整数下标；startsWith/endsWith/split 接受一个字符串；trim/toLowerCase/toUpperCase 无实参；join 接受零或一个字符串分隔符（默认逗号）；JSON.stringify/parse 恰好一个实参。类型或实参数量不匹配明确报错，不猜测方法含义。
 
-## 工具库与绑定
+## 工具声明与固定名字
 
-模型请求固定发布 program_tool_libraries，列出 namespace -> method -> 真实工具名。源码优先使用库方法；方法参数仍是原工具的 JSON 对象，参数 schema、原始返回、权限、插件归属和确认规则不变，不新增一层业务工具执行器。
+模型请求发布 program_tool_headers：每个库一份自动生成的 TS 风格声明，包含固定方法名、JSON 参数类型、可选字段、返回类型及注释。程序仍使用不带类型的 JS 子集，声明不是可执行源码。只接收 namespace.method(args)，拒绝 tools.*、动态方法下标与 execute_program/define_task_body 的 libraries 别名参数。
 
-内置 io 的 read/read_lines/write/list/search/edit/replace 分别映射 read_file/read_file_lines/write_file/list_dir/search_text/edit_file/replace_range。只发布当前权限可用的方法；文件工具组尚未加载时，执行器按真实工具名自动加载原工具组，不额外询问模型。
+内置文件库为 io.read/read_lines/write/list/search/edit/replace。其他宿主操作在 host 库中按原方法名声明。插件在 plugin.json 或远程握手的 plugin 中声明 library，例如 {"id":"ppt-master","library":"ppt"}；已登记的 ppt_master__get_design 对外只发布 ppt.get_design。未声明 library 的旧插件按 ID 将连字符替换为下划线，作为固定兼容名字。库名必须是有效、非保留的标识符，不能占用 io/host；不同插件不能占用同一个库名。方法来自实际注册工具，不按业务含义猜测。
 
-启用并在当前工具目录可见的插件按真实包 ID 生成库名（连字符等替换为下划线），方法从已登记 host 工具名去掉该包的真实前缀。例如目录若确实声明 ppt-master 和 ppt_master__get_design，发布 ppt_master.get_design；不在通用宿主写 PPT 方法或猜测工具名。重名库不自动选一个，仍可用精确工具名或显式别名。
+头文件生成器和编译器使用同一份当前作用域目录：所有已启用且当前权限、插件归属、执行限制允许的操作均发布，不要求预先加载工具组。未启用／未授权的工具不发布也不能编译。主程序和当前函数补写都只使用宿主目录，模型不提供或继承别名表。宿主编译结果保留固定绑定；helper 和 fork 使用原编译结果，恢复不重新猜测工具目标。实际执行继续经过原工具分发、权限、插件归属和回执检查。
 
-execute_program/define_task_body 的可选 libraries 参数可增加别名，例如在上述真实工具已公布时传 {"ppt":{"get_design":"ppt_master__get_design"}}，源码即可写 ppt.get_design(args)。不存在、当前不可用或涉及任务调度控制的目标在安装前拒绝；不能覆盖既有库方法。用户无需为普通内置 io 传映射，额外别名由编排 AI 根据真实目录填写。
+参数从真实 JSON schema 自动生成：整数、范围、格式、额外字段限制等通过注释保留，枚举和联合类型转成声明。返回类型来自 outputSchema（命令工具可用 output_schema）；没有返回 schema 时是 unknown，不虚构返回字段。递归／外部引用无法内联时保留引用注释并标 unknown，声明不代替原工具运行时契约。
+
+规划请求只发送库声明，不重复发送这些操作的原始 JSON schema。注释任务需要直接执行工具时，发送原生 invoke_library 工具，其 method 是同一固定名字（例如 io.read），args 是原参数对象，分支 schema 来自原工具。宿主内部原工具名不作为第二个公开名字；历史结构化调用在模型请求中投影为固定方法名，原始审计记录保留。invoke_library 仅是兼容原生函数名字符限制的传输包装，不可写入流程源码，不授予新权限，也不供规划请求直接执行业务操作。
 
 ```js
 function main(request) {
@@ -51,7 +53,7 @@ function main(request) {
 }
 ```
 
-库不是可变 JS 对象：只允许静态 library.method 调用，不支持动态下标或把库方法当作函数值传递。所有库调用在整份源码编译时绑定到精确 Tool effect；未知方法在任何效果执行前拒绝。映射随程序持久化，并原样传入代码 helper、注释任务、当前函数补写和 fork 分支。恢复已有回执不重新猜测或切换目标；执行时仍复核当前工具权限。
+库不是可变 JS 对象：不允许把方法当函数值传递。整份源码先编译再执行，未知方法在任何效果发生前拒绝。源码参数仍是原 JSON 对象，不把位置参数自动转换成字段。
 
 ## 任务函数与工具步骤
 
@@ -122,4 +124,4 @@ main 返回结束整项任务，helper 返回恢复原调用方；finish 只交�
 
 agent_runtime_windows.state.program 保存源码、指令、函数帧、PC、变量、catch 栈、指令预算和挂起 effect ID。每次效果先持久化位置，已有回执恢复时直接消费，不重复计算已完成的更新或重放操作。缺少外部回执时结果未知，不能承诺跨进程恰好一次。
 
-版本 7 及更早的现场、源码和回执保留，但拒绝按版本 8 续跑；不把旧 AI 表达式回执解释成新规则。旧 Semantic/Ai 枚举仅用于读取旧快照和明确拒绝，不生成或执行隐式 AI 表达式。源码上限 100,000 字节，最多 64 个函数、调用深度 64，每运行帧 100,000 条指令；预算耗尽强制失败，不能被 catch 隐藏为成功。
+版本 8 及更早的现场、源码和回执保留，但拒绝按版本 9 续跑；不把旧 AI 表达式回执解释成新规则。旧 Semantic/Ai 枚举仅用于读取旧快照和明确拒绝，不生成或执行隐式 AI 表达式。源码上限 100,000 字节，最多 64 个函数、调用深度 64，每运行帧 100,000 条指令；预算耗尽强制失败，不能被 catch 隐藏为成功。

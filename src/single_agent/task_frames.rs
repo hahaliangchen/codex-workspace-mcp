@@ -1667,7 +1667,7 @@ mod tests {
     async fn tools_require_a_task_and_host_records_each_ai_request() {
         let (address,seen,server)=model(|n,body| {
             let names=tool_names(body);
-            for name in ["create_task","read_task_board"] {assert!(names.iter().any(|t|t==name),"{name} must be advertised");}
+            for name in ["create_task"] {assert!(names.iter().any(|t|t==name),"{name} must be advertised");}
             for name in ["create_step","update_task_definition","branch_task","return_task","plan_tasks","start_task"] {assert!(!names.iter().any(|t|t==name),"{name} must not be advertised");}
             match n {
                 0=>{
@@ -2192,7 +2192,7 @@ mod tests {
                         .filter(|m| m["name"] == "scope_value").collect::<Vec<_>>();
                     assert!(values.iter().any(|m| m.to_string().contains("workspace_root")));
                     assert!(values.iter().any(|m| m.to_string().contains("list_skills")));
-                    assert!(tool_names(body).iter().any(|name| name == "write_file"));
+                    assert!(super::super::tests::declares(body,"io","write"));
                     call("local", "read_file", json!({"path":"local.txt"}))
                 }
                 7 => call("nested", "create_task", json!({"goal":"Inspect the local prerequisite"})),
@@ -2209,7 +2209,7 @@ mod tests {
                     assert!(text.contains("MAIN_SHARED_VALUE"));
                     assert!(!text.contains("ONLY_CHILD_A_LOCAL_VALUE"), "sibling receives A's return, not A's working body");
                     assert!(text.contains("A output saved in a.txt"));
-                    assert!(tool_names(body).iter().any(|name| name == "write_file"));
+                    assert!(super::super::tests::declares(body,"io","write"));
                     call("b", "write_file", json!({"path":"b.txt","content":"B output"}))
                 }
                 12 => answer("B output saved in b.txt"),
@@ -2413,7 +2413,7 @@ mod tests {
                     assert_eq!(earlier["kind"], "task");
                     assert_eq!(earlier["task"]["goal"], "Write the note");
                     assert!(earlier["answer"].as_str().unwrap().contains("NOTE_WRITTEN"));
-                    assert!(tool_names(body).iter().any(|t|t=="write_file"),"loaded tool groups carry over");
+                    assert!(super::super::tests::declares(body,"io","write"),"permitted file declarations carry over");
                     call("t2","create_task",json!({"goal":"Report what the note says","first_step":"Read the earlier task"}))
                 },
                 5=>{

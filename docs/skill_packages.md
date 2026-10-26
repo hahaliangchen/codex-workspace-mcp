@@ -36,6 +36,7 @@ frontend/src/builtin_plugins/
 {
   "version": 1,
   "id": "example",
+  "library": "example",
   "title": "示例插件",
   "skill": "SKILL.md",
   "inject": [],
@@ -53,6 +54,10 @@ frontend/src/builtin_plugins/
 ```
 
 `skill` 为可选字段；未声明、文件不存在或为空时，插件仍可正常挂载、打开页面和调用声明工具，不生成替代业务提示词。提供非空 SKILL.md 时，其 YAML frontmatter 必须有相同的 `name: example` 和适用描述 `description`。工具名必须唯一，不得覆盖其他已安装插件或宿主工具。清单 `inject` 是后端服务依赖；每个插件发布 `plugin:{id}` 服务，可声明 `inject: ["plugin:other"]`。缺少依赖不能激活，被依赖的插件不能在使用者仍运行时停用。
+
+`library` 声明该插件的固定程序库名（例如 ppt-master 声明 `"library":"ppt"`）。未填写的旧包按 ID 将连字符替换为下划线。库名必须是非保留标识符，不能使用 io/host，不能与其他已安装插件重名。该字段也支持远程 plugin/handshake 的 plugin 对象。工具方法从已登记名称移除该插件的双下划线前缀；模型不再自行传 libraries 别名。
+
+宿主从 inputSchema 自动生成 program_tool_headers 声明，供模型阅读参数和约束，程序源码仍是无类型 JS 子集。原生／远程工具可提供 outputSchema，命令工具可提供 output_schema；没有返回契约时声明 unknown。规划请求只发声明，注释任务用 invoke_library 传输同一个固定方法名及原参数，执行仍进入原 handler 和权限检查。详见[执行语言](agent-program.md#工具声明与固定名字)。
 
 `tools` 是完整声明。实现可由项目的原生贡献适配器提供，或通过 `command_tools` 的独立程序适配器提供。两者都经过相同清单校验、注册和清理；通用加载器没有 code-flow 特例。原生适配器提供工具 schema、handler 和权限等级，外置包不能借用项目的原生实现。
 

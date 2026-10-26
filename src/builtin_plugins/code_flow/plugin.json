@@ -1,6 +1,7 @@
 {
   "version": 1,
   "id": "code-flow",
+  "library": "flow",
   "title": "代码 Flow",
   "skill": "SKILL.md",
   "tools": ["read_code_flow"],

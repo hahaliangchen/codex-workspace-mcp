@@ -83,6 +83,7 @@ fn optional_instructions(root: &Path, entry: &str) -> Result<Option<(PathBuf, St
 fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Result<Package> {
     let root = root.canonicalize()?;
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(root.join("plugin.json"))?)?;
+    ensure!(manifest.library.as_deref().is_none_or(crate::agent_program::libraries::valid_namespace), "invalid or reserved plugin library namespace");
     ensure!(
         manifest.version == 1 && identifier(&manifest.id),
         "invalid skill package version or ID"
@@ -160,6 +161,11 @@ fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Resu
             "command tool shadows a host tool"
         );
     }
+    let prefix=format!("{}__",manifest.id.replace('-',"_"));
+    let methods=manifest.tools.iter().map(|name|name.strip_prefix(&prefix).unwrap_or(name)).collect::<std::collections::BTreeSet<_>>();
+    ensure!(methods.len()==manifest.tools.len(), "plugin tools collide after source method normalization");
+    ensure!(methods.iter().all(|method|crate::agent_program::libraries::identifier(method)), "invalid source library method");
+    ensure!(!manifest.tools.iter().any(|name|name==crate::agent_program::declarations::CALL), "tool name reserved for library transport");
     for name in &manifest.tools {
         if commands.contains(name.as_str()) {
             continue;
@@ -286,7 +292,7 @@ impl Registry {
     }
     pub fn catalog(&self) -> Value {
         json!(self.entries.read().unwrap().values().map(|package|json!({
-            "id":package.manifest.id,"name":package.manifest.id,"title":package.manifest.title,
+            "id":package.manifest.id,"name":package.manifest.id,"title":package.manifest.title,"library":package.manifest.library,
             "description":package.description,"enabled":package.scope.is_some(),"scope":package.scope,
             "tools":package.manifest.tools,"pages":package.manifest.pages,"package_root":package.root,"origin":package.origin,"inject":package.manifest.inject,"remote":package.remote.is_some(),
         })).collect::<Vec<_>>())
@@ -330,7 +336,7 @@ impl Registry {
         let installed = self.entries.read().unwrap();
         active.iter().filter_map(|id|installed.get(id)).filter(|package|package.scope.is_some())
             .flat_map(Self::definitions)
-            .map(|tool|json!({"type":"function","function":{"name":tool["name"],"description":tool["description"],"parameters":tool["inputSchema"]}})).collect()
+            .map(|tool|json!({"type":"function","function":{"name":tool["name"],"description":tool["description"],"parameters":tool["inputSchema"],"outputSchema":tool["outputSchema"]}})).collect()
     }
     fn definitions(package: &Package) -> Vec<Value> {
         package
@@ -563,6 +569,9 @@ impl Plugin for PackagePlugin {
                         .contains(name))),
             "tool name belongs to another installed plugin"
         );
+        let library = self.0.manifest.library.clone().unwrap_or_else(|| crate::agent_program::libraries::namespace(&self.0.manifest.id));
+        ensure!(crate::agent_program::libraries::valid_namespace(&library), "invalid or reserved plugin library namespace");
+        ensure!(!tools.packages.entries.read().unwrap().values().any(|p| p.manifest.id != self.0.manifest.id && p.manifest.library.clone().unwrap_or_else(|| crate::agent_program::libraries::namespace(&p.manifest.id)) == library), "plugin library namespace already belongs to another installed plugin");
         let names = self
             .0
             .manifest
@@ -856,6 +865,29 @@ pub(crate) fn test_runtime() -> (Arc<PluginRuntime>, Arc<ToolCatalog>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_library_names_are_manifest_owned_validated_and_unique() {
+        let root=std::env::temp_dir().join(format!("library-manifest-{}",crate::agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut manifest=json!({"version":1,"id":"library-test","title":"Library test","library":"ppt"});
+        for library in ["io","host","tools","default","bad-name",""] {
+            manifest["library"]=json!(library);
+            std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
+            assert!(load(&root).is_err(),"{library}");
+        }
+        manifest["library"]=json!("ppt");
+        std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
+        assert_eq!(load(&root).unwrap().manifest.library.as_deref(),Some("ppt"));
+        manifest["library"]=json!("flow");
+        std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
+        let (runtime,catalog)=test_runtime();
+        let parent=runtime.snapshot().into_iter().find(|p|p.id=="skill-packages").unwrap().scope;
+        let error=runtime.mount(parent,PackagePlugin(load(&root).unwrap())).unwrap_err();
+        assert!(format!("{error:#}").contains("namespace already belongs"),"{error:#}");
+        assert_eq!(catalog.packages.catalog()[0]["library"],"flow");
+        runtime.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn plugins_without_instruction_files_still_mount_and_expose_their_pages() {
         let root=std::env::temp_dir().join(format!("optional-skill-{}",crate::agent_service::uuid_like()));

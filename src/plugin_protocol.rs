@@ -17,6 +17,9 @@ pub struct Manifest {
     pub version: u32,
     pub id: String,
     pub title: String,
+    /// Stable source namespace; absent on legacy manifests: derive from the ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
     /// Optional instructions for this plugin's own conversation.
     #[serde(default)]
     pub skill: String,
@@ -52,7 +55,9 @@ impl ToolPermission {
         match self {
             Self::ReadOnly => true,
             Self::WorkspaceWrite => !matches!(mode, PermissionMode::ReadOnly),
-            Self::Execution => !ban_execution && matches!(mode, PermissionMode::FullAccess | PermissionMode::Ask),
+            Self::Execution => {
+                !ban_execution && matches!(mode, PermissionMode::FullAccess | PermissionMode::Ask)
+            }
         }
     }
 }

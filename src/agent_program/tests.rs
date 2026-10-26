@@ -1,6 +1,12 @@
 use super::*;
 use runtime::ActionKind;
 
+// Test-only effect targets, declared just like plugin methods.
+fn compile(source: &str) -> anyhow::Result<Program> {
+    let mut bindings=libraries::builtin();
+    bindings.insert("test".into(),["record","never","selected"].into_iter().map(|n|(n.into(),n.into())).collect());
+    compile_with_libraries(source,bindings)
+}
 fn runtime(source: &str) -> Runtime {
     Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap()
 }
@@ -17,7 +23,7 @@ fn data_loops_local_calls_and_destructuring_need_no_operators() {
 function echo(input) {return input;}
 function main() {
   const result = echo({ready:true, rows:[{n:2},{n:3}]});
-  for (const item of result.rows) {tools.record({item});}
+  for (const item of result.rows) {test.record({item});}
   const [a,b] = result.rows;
   if(result.ready){return {a,b};} else {throw 'not ready';}
 }"#,
@@ -36,7 +42,7 @@ function main() {
 #[test]
 fn suspended_effect_serializes_and_resumes_once() {
     let mut r = runtime(
-        "function main(){ const receipt = tools.write_file({path:'a.txt',content:'x'}); return receipt.version; }",
+        "function main(){ const receipt = io.write({path:'a.txt',content:'x'}); return receipt.version; }",
     );
     let State::Action(first) = r.next() else {
         panic!()
@@ -54,13 +60,13 @@ fn suspended_effect_serializes_and_resumes_once() {
 #[test]
 fn child_failure_unwinds_to_callers_catch_and_skips_following_effect() {
     let mut r = runtime(
-        "function child(){ tools.read_file({path:'missing'}); tools.write_file({path:'bad'}); } function main(){ try { child(); } catch(error) { return error.message; } }",
+        "function child(){ io.read({path:'missing'}); io.write({path:'bad'}); } function main(){ try { child(); } catch(error) { return error.message; } }",
     );
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!({"message":"not found"}), true).unwrap();
     assert_eq!(returned(r), json!("not found"));
     let mut r = runtime(
-        "function main(){ tools.read_file({path:'missing'}); tools.write_file({path:'bad'}); }",
+        "function main(){ io.read({path:'missing'}); io.write({path:'bad'}); }",
     );
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!({"message":"not found"}), true).unwrap();
@@ -93,7 +99,7 @@ fn fork_and_join_preserve_handles_and_typed_results_in_order() {
 #[test]
 fn unsupported_code_is_rejected_with_location_before_effects() {
     for source in [
-        "function main(){tools.write_file({path:'bad'});\n fetch('https://example.com');}",
+        "function main(){io.write({path:'bad'});\n fetch('https://example.com');}",
         "function main(){const x=1; x=2;}",
         "import fs from 'fs'; function main(){}",
         "function main(){tools.create_task({});}",
@@ -173,7 +179,7 @@ fn executable_extensions_and_unknown_data_methods_are_rejected_before_effects() 
         "x.unknown()",
     ] {
         let error = compile(&format!(
-            "function main(){{let x=1;tools.write_file({{path:'never'}});\nreturn {expression};}}"
+            "function main(){{let x=1;io.write({{path:'never'}});\nreturn {expression};}}"
         ))
         .unwrap_err()
         .to_string();
@@ -245,7 +251,7 @@ fn type_errors_and_assertions_use_the_existing_exception_path() {
         assert_eq!(returned(r)["caught"], true, "{expression}");
     }
     assert!(
-        matches!(runtime("function main(){assert(false,'failed');tools.write_file({path:'never'});}").next(),State::Failed(e) if e["message"]=="failed")
+        matches!(runtime("function main(){assert(false,'failed');io.write({path:'never'});}").next(),State::Failed(e) if e["message"]=="failed")
     );
     assert_eq!(
         returned(runtime("function main(){assert(1+1===2);return 'passed';}")),
@@ -321,7 +327,7 @@ fn c_style_truth_values_are_deterministic_for_all_json_types() {
 
 #[test]
 fn old_operator_enabled_runtime_cannot_resume_pending_effects() {
-    let mut r = runtime("function main(){tools.write_file({path:'not-replayed',content:'x'});}");
+    let mut r = runtime("function main(){io.write({path:'not-replayed',content:'x'});}");
     assert!(matches!(r.next(), State::Action(_)));
     r.program.version = 1;
     let mut restored: Runtime = serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
@@ -330,7 +336,7 @@ fn old_operator_enabled_runtime_cannot_resume_pending_effects() {
 
 #[test]
 fn integer_literals_and_task_parameters_remain_json_integers() {
-    let source = "function main(input){tools.list_dir({path:'.',max_depth:2,limit:input.limit});}";
+    let source = "function main(input){io.list({path:'.',max_depth:2,limit:input.limit});}";
     let mut r = Runtime::new(compile(source).unwrap(), "main", vec![json!({"limit":3})]).unwrap();
     let State::Action(action) = r.next() else {
         panic!()
@@ -347,7 +353,7 @@ fn programs_have_one_main_and_helpers_use_normal_returns() {
     assert!(compile("function prepare(){return 'ready';}").is_err());
     assert!(compile("function main(){} function main(){}").is_err());
     let mut r = runtime(
-        "function prepare(){return {ready:true};} function execute(input){tools.write_file({path:'done.txt',content:'done'});return input;} function main(){const prepared=prepare();const result=execute(prepared);return result;}",
+        "function prepare(){return {ready:true};} function execute(input){io.write({path:'done.txt',content:'done'});return input;} function main(){const prepared=prepare();const result=execute(prepared);return result;}",
     );
     assert!(
         matches!(r.next(), State::Action(_)),
@@ -361,13 +367,13 @@ fn programs_have_one_main_and_helpers_use_normal_returns() {
 fn comment_helpers_bind_arguments_and_resume_mixed_tool_library_calls() {
     let source = r#"
 function main(request) {
-  const original = tools["files/read"]({path: request.source});
+  const original = io.read({path: request.source});
   const saved = process(original.content, request);
   return {saved, original: original.content};
 }
 function process(content, request) {
   // Explicit tool calls and task calls share one sequence.
-  return tools.write_file({path: request.output, content: transform(content, request).content});
+  return io.write({path: request.output, content: transform(content, request).content});
 }
 function transform(content, request) {
   // Transform content according to request; preserve the requested scope.
@@ -381,7 +387,7 @@ function transform(content, request) {
     )
     .unwrap();
     assert!(
-        matches!(r.next(),State::Action(Action{kind:ActionKind::Tool{name,args},..}) if name=="files/read" && args["path"]=="source.txt")
+        matches!(r.next(),State::Action(Action{kind:ActionKind::Tool{name,args},..}) if name=="read_file" && args["path"]=="source.txt")
     );
     r.resume(json!({"content":"SOURCE"}), false).unwrap();
     let State::Action(task) = r.next() else {
@@ -497,10 +503,10 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "function hidden(){return 1;}", // nested functions
         "const fn = function(){return 1;};",
         "const fn = () => 1;",
-        "yield tools.read_file({});",
+        "yield io.read({});",
         "yield* rows;",
-        "await tools.read_file({});",
-        "call(tools.read_file,{});",
+        "await io.read({});",
+        "call(io.read,{});",
         "call('read_file',{});",
         "ai({instruction:'work'});",
         "const typed: string = 'x';",
@@ -540,7 +546,7 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "return import('module');",
     ] {
         let body = format!(
-            "const data={{value:1}}; const rows=[]; let value=1; tools.write_file({{path:'never-written'}});\n{fragment}"
+            "const data={{value:1}}; const rows=[]; let value=1; io.write({{path:'never-written'}});\n{fragment}"
         );
         for (source, mode) in [
             (
@@ -591,12 +597,12 @@ fn static_call_contracts_are_checked_before_execution() {
         "function main(){return JSON.includes('x');}",
         "function main(){return JSON.stringify(1,2);}",
         "function main(){return 0xffffffffffffffff;}",
-        "function main(){tools.write_file({path:'never'}); return helper();} function helper(input){return input;}",
-        "function main(){tools.write_file({path:'never'}); return fork(helper,1,2);} function helper(input){return input;}",
+        "function main(){io.write({path:'never'}); return helper();} function helper(input){return input;}",
+        "function main(){io.write({path:'never'}); return fork(helper,1,2);} function helper(input){return input;}",
         "function main(){return main();}",
         "function main(a,b){return a;}",
         "function main(){return fork(main);}",
-        "function main(){return tools.read_file({},{});}",
+        "function main(){return io.read({},{});}",
         "function main(){return tools[name]({});}",
     ] {
         let error = compile(source).unwrap_err().to_string();
@@ -631,7 +637,7 @@ fn json_fields_and_elements_capture_values_before_later_array_mutation() {
 #[test]
 fn all_older_program_versions_reject_pending_effects_without_replaying() {
     for version in 1..VERSION {
-        let mut r = runtime("function main(){tools.write_file({path:'never-replayed'});}");
+        let mut r = runtime("function main(){io.write({path:'never-replayed'});}");
         assert!(matches!(r.next(), State::Action(_)));
         r.program.version = version;
         let mut restored: Runtime =
@@ -666,6 +672,7 @@ fn embedded_skill_and_tool_contracts_advertise_the_same_source_whitelist() {
 fn published_flow_examples_compile_with_the_fixed_whitelist() {
     for text in [SKILL, include_str!("../../docs/agent-program.md")] {
         let mut examples = 0;
+        let text=text.replace("\r\n","\n");
         for block in text.split("```js\n").skip(1) {
             let source = block.split("```").next().unwrap();
             let result = if source.contains("function main(") {
@@ -733,11 +740,11 @@ fn common_loops_updates_templates_and_assignment_order_are_deterministic() {
 #[test]
 fn lazy_expressions_execute_only_selected_effects_once() {
     for source in [
-        "function main(){return false && tools.never({});}",
-        "function main(){return true || tools.never({});}",
-        "function main(){return true ? 'selected' : tools.never({});}",
-        "function main(){return false ? tools.never({}) : 'selected';}",
-        "function main(){return 'selected' ?? tools.never({});}",
+        "function main(){return false && test.never({});}",
+        "function main(){return true || test.never({});}",
+        "function main(){return true ? 'selected' : test.never({});}",
+        "function main(){return false ? test.never({}) : 'selected';}",
+        "function main(){return 'selected' ?? test.never({});}",
     ] {
         assert!(
             matches!(runtime(source).next(), State::Returned(_)),
@@ -745,10 +752,10 @@ fn lazy_expressions_execute_only_selected_effects_once() {
         );
     }
     for expression in [
-        "true && tools.selected({})",
-        "false || tools.selected({})",
-        "null ?? tools.selected({})",
-        "true ? tools.selected({}) : tools.never({})",
+        "true && test.selected({})",
+        "false || test.selected({})",
+        "null ?? test.selected({})",
+        "true ? test.selected({}) : test.never({})",
     ] {
         let mut r = runtime(&format!("function main(){{return {expression};}}"));
         let State::Action(action) = r.next() else {
@@ -762,7 +769,7 @@ fn lazy_expressions_execute_only_selected_effects_once() {
     }
     // Earlier arithmetic failures must precede later effects.
     assert!(matches!(
-        runtime("function main(){return (1/0)+tools.never({});}").next(),
+        runtime("function main(){return (1/0)+test.never({});}").next(),
         State::Failed(_)
     ));
 }
@@ -788,7 +795,7 @@ fn loop_jumps_unwind_only_the_handlers_they_leave() {
 #[test]
 fn suspended_loops_do_not_repeat_updates_or_effects_after_restore() {
     let mut r = runtime(
-        "function main(){var rows=[];for(var i=0;i<3;i++){var next=i+1;const receipt=tools.record({i,next});rows.push(receipt);}return {rows,i};}",
+        "function main(){var rows=[];for(var i=0;i<3;i++){var next=i+1;const receipt=test.record({i,next});rows.push(receipt);}return {rows,i};}",
     );
     for i in 0..3 {
         let State::Action(action) = r.next() else {
@@ -820,12 +827,8 @@ fn no_implicit_semantic_effects_are_emitted_or_executed() {
 
 #[test]
 fn library_calls_compile_to_exact_tools_and_keep_json_arguments() {
-    let bindings = libraries::merge(
-        libraries::builtin(),
-        &json!({"ppt":{"get_design":"presentation__get_design"}}),
-        None,
-    )
-    .unwrap();
+    let mut bindings=libraries::builtin();
+    bindings.insert("ppt".into(),BTreeMap::from([("get_design".into(),"presentation__get_design".into())]));
     for (source, name, args) in [
         (
             "function main(){return io.read({path:'source.txt'});}",
@@ -870,47 +873,18 @@ fn library_catalog_uses_real_ownership_and_omits_unavailable_or_ambiguous_names(
     let definitions = ["read_file", "ppt_master__get_design", "other__inspect"]
         .map(|name| json!({"function":{"name":name}}));
     let packages = json!([
-        {"id":"ppt-master","enabled":true,"tools":["ppt_master__get_design","ppt_master__missing"]},
+        {"id":"ppt-master","library":"ppt","enabled":true,"tools":["ppt_master__get_design","ppt_master__missing"]},
         {"id":"other","enabled":false,"tools":["other__inspect"]},
     ]);
     let catalog = libraries::catalog(&definitions, &packages);
     assert_eq!(catalog["io"]["read"], "read_file");
     assert!(!catalog["io"].contains_key("write"));
     assert_eq!(
-        catalog["ppt_master"]["get_design"],
+        catalog["ppt"]["get_design"],
         "ppt_master__get_design"
     );
-    assert!(!catalog["ppt_master"].contains_key("missing"));
+    assert!(!catalog["ppt"].contains_key("missing"));
     assert!(!catalog.contains_key("other"));
-    let allowed = definitions
-        .iter()
-        .map(|d| d["function"]["name"].as_str().unwrap().to_owned())
-        .collect();
-    assert!(
-        libraries::merge(
-            catalog.clone(),
-            &json!({"ppt":{"get_design":"ppt_master__get_design"}}),
-            Some(&allowed)
-        )
-        .is_ok()
-    );
-    assert!(
-        libraries::merge(
-            catalog.clone(),
-            &json!({"ppt":{"get_design":"invented"}}),
-            Some(&allowed)
-        )
-        .is_err()
-    );
-    assert!(
-        libraries::merge(
-            catalog.clone(),
-            &json!({"io":{"read":"other__inspect"}}),
-            Some(&allowed)
-        )
-        .is_err()
-    );
-    assert!(libraries::merge(catalog, &json!({"control":{"start":"create_task"}}), None).is_err());
     let collision = json!([
         {"id":"a-b","enabled":true,"tools":["read_file"]},
         {"id":"a_b","enabled":true,"tools":["other__inspect"]},
@@ -921,11 +895,11 @@ fn library_catalog_uses_real_ownership_and_omits_unavailable_or_ambiguous_names(
 #[test]
 fn numeric_and_null_short_circuits_preserve_c_boolean_results_and_skip_effects() {
     for (expression, expected) in [
-        ("0 && tools.never({})", json!(false)),
-        ("null && tools.never({})", json!(false)),
-        ("{} || tools.never({})", json!(true)),
-        ("1 || tools.never({})", json!(true)),
-        ("0 ?? tools.never({})", json!(0)),
+        ("0 && test.never({})", json!(false)),
+        ("null && test.never({})", json!(false)),
+        ("{} || test.never({})", json!(true)),
+        ("1 || test.never({})", json!(true)),
+        ("0 ?? test.never({})", json!(0)),
         ("!({}).error", json!(true)),
         ("0 || 7", json!(true)),
         ("1 && {}", json!(true)),
@@ -942,4 +916,13 @@ fn numeric_and_null_short_circuits_preserve_c_boolean_results_and_skip_effects()
     );
     r.resume(json!({}), false).unwrap();
     assert_eq!(returned(r), json!(true));
+}
+
+#[test]
+fn raw_tool_spellings_are_rejected_before_any_effect() {
+    for body in ["return tools.read_file({path:'x'});", "return tools['read_file']({});", "return invoke_library({method:'io.read',args:{}});"] {
+        for source in [format!("function main(){{io.write({{path:'never'}});{body}}}"),format!("function main(){{return null;}} function unused(){{{body}}}")] {assert!(super::compile(&source).is_err(),"{source}");}
+    }
+    assert!(super::tool()["function"]["parameters"]["properties"].get("libraries").is_none());
+    assert!(super::body_tool()["function"]["parameters"]["properties"].get("libraries").is_none());
 }

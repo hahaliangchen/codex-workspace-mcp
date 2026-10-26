@@ -1,6 +1,5 @@
 //! Static source libraries bind to real tools, never to guessed operations.
 use super::*;
-use anyhow::{Context, Result, ensure};
 use std::collections::BTreeSet;
 
 pub type Libraries = BTreeMap<String, BTreeMap<String, String>>;
@@ -12,10 +11,31 @@ pub fn identifier(name: &str) -> bool {
         .is_some_and(|c| c.is_alphabetic() || matches!(c, '_' | '$'))
         && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
 }
-fn reserved(name: &str) -> bool {
+pub fn reserved(name: &str) -> bool {
     matches!(
         name,
-        "tools"
+        "await"
+            | "yield"
+            | "delete"
+            | "void"
+            | "typeof"
+            | "instanceof"
+            | "in"
+            | "super"
+            | "with"
+            | "debugger"
+            | "extends"
+            | "enum"
+            | "implements"
+            | "interface"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "default"
+            | "case"
+            | "tools"
             | "JSON"
             | "call"
             | "fork"
@@ -50,7 +70,7 @@ fn reserved(name: &str) -> bool {
             | "export"
     ) || name.starts_with("$temp")
 }
-fn namespace(id: &str) -> String {
+pub fn namespace(id: &str) -> String {
     let mut name = id
         .chars()
         .map(|c| {
@@ -91,9 +111,16 @@ pub fn catalog(definitions: &[Value], packages: &Value) -> Libraries {
         .iter()
         .filter_map(|d| d["function"]["name"].as_str())
         .collect::<BTreeSet<_>>();
+    let owned = packages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|p| p["tools"].as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
     let mut result = builtin();
     for methods in result.values_mut() {
-        methods.retain(|_, tool| allowed.contains(tool.as_str()));
+        methods.retain(|_, tool| allowed.contains(tool.as_str()) && !owned.contains(tool.as_str()));
     }
     result.retain(|_, methods| !methods.is_empty());
     let mut candidates: BTreeMap<String, Vec<BTreeMap<String, String>>> = BTreeMap::new();
@@ -104,8 +131,11 @@ pub fn catalog(definitions: &[Value], packages: &Value) -> Libraries {
         let Some(id) = package["id"].as_str() else {
             continue;
         };
-        let library = namespace(id);
-        if !identifier(&library) || reserved(&library) || library == "io" {
+        let library = package["library"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| namespace(id));
+        if !valid_namespace(&library) {
             continue;
         }
         let prefix = format!("{}__", id.replace('-', "_"));
@@ -129,58 +159,52 @@ pub fn catalog(definitions: &[Value], packages: &Value) -> Libraries {
             result.insert(name, methods.remove(0));
         }
     }
+    let bound = result
+        .values()
+        .flat_map(|methods| methods.values().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let rest = allowed
+        .iter()
+        .filter(|name| !bound.contains(**name) && !owned.contains(**name) && !control(name))
+        .map(|name| ((*name).to_owned(), (*name).to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    if !rest.is_empty() {
+        result.insert("host".into(), rest);
+    }
     result
 }
-pub fn merge(
-    mut base: Libraries,
-    additions: &Value,
-    allowed: Option<&BTreeSet<String>>,
-) -> Result<Libraries> {
-    if additions.is_null() {
-        return Ok(base);
-    }
-    let additions = additions
-        .as_object()
-        .context("libraries must map namespace names to method/tool mappings")?;
-    ensure!(additions.len() <= 64, "at most 64 library aliases");
-    for (name, methods) in additions {
-        ensure!(
-            identifier(name) && !reserved(name),
-            "invalid or reserved library namespace {name}"
-        );
-        let methods = methods
-            .as_object()
-            .context("library methods must map names to exact tool names")?;
-        ensure!(methods.len() <= 256, "too many library methods");
-        for (method, tool) in methods {
-            ensure!(identifier(method), "invalid library method {method}");
-            let tool = tool
-                .as_str()
-                .filter(|n| !n.is_empty() && n.len() <= 256)
-                .context("library target must be an exact tool name")?;
-            ensure!(
-                !matches!(
-                    tool,
-                    "execute_program"
-                        | "define_task_body"
-                        | "create_task"
-                        | "spawn_agent"
-                        | "join_agents"
-                        | "return_task"
-                ),
-                "library methods cannot control the task scheduler"
-            );
-            ensure!(
-                allowed.is_none_or(|names| names.contains(tool)),
-                "LIBRARY_TOOL_UNAVAILABLE: {tool}"
-            );
-            let entry = base.entry(name.clone()).or_default();
-            ensure!(
-                entry.get(method).is_none_or(|old| old == tool),
-                "cannot rebind published library method {name}.{method}"
-            );
-            entry.insert(method.clone(), tool.to_owned());
-        }
-    }
-    Ok(base)
+
+/// Host-owned namespaces cannot be claimed by plugins.
+pub fn valid_namespace(name: &str) -> bool {
+    identifier(name) && !reserved(name) && !matches!(name, "io" | "host")
+}
+pub fn control(name: &str) -> bool {
+    matches!(
+        name,
+        "execute_program"
+            | "define_task_body"
+            | "create_task"
+            | "spawn_agent"
+            | "join_agents"
+            | "return_task"
+            | "create_step"
+            | "list_skills"
+            | "read_skill"
+            | "unload_skill"
+            | "list_tool_groups"
+            | "load_tool_group"
+            | "unload_tool_group"
+            | "release_assets"
+    )
+}
+pub fn public_name(libraries: &Libraries, target: &str) -> Option<String> {
+    libraries.iter().find_map(|(library, methods)| {
+        methods
+            .iter()
+            .find_map(|(method, tool)| (tool == target).then(|| format!("{library}.{method}")))
+    })
+}
+pub fn target<'a>(libraries: &'a Libraries, name: &str) -> Option<&'a str> {
+    let (library, method) = name.split_once('.')?;
+    libraries.get(library)?.get(method).map(String::as_str)
 }

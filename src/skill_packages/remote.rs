@@ -272,7 +272,7 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         // must not inject business parameters into the model's contract.
         if !remote.skill.trim().is_empty() {
             remote.skill.push_str(&format!(
-                "\nHost tool mapping: `{raw}` → `{name}`. Use the host name when calling.\n"
+                "\nSource method: `{}.{raw}(args)`. Follow program_tool_headers for its JSON contract.\n", plugin["library"].as_str().map(str::to_owned).unwrap_or_else(||crate::agent_program::libraries::namespace(&id))
             ));
         }
         names.push(name.clone());
@@ -316,6 +316,11 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         manifest: Manifest {
             version: 1,
             id,
+            library: plugin.get("library").filter(|v| !v.is_null()).map(|v| {
+                let name = v.as_str().context("plugin library must be a string")?;
+                ensure!(crate::agent_program::libraries::valid_namespace(name), "invalid plugin library namespace");
+                Ok::<_, anyhow::Error>(name.to_owned())
+            }).transpose()?,
             title: plugin["title"].as_str().unwrap_or("Remote plugin").into(),
             skill: skill_entry.into(),
             inject: vec![],
@@ -524,7 +529,7 @@ mod tests {
                 assert!(!headers.contains_key("x-ppt-connection"));
                 assert_eq!(body["method"],format!("plugin/{method}"));
                 let value=match method.as_str() {
-                    "handshake"=>json!({"version":1,"subject":"user-a","state":"awaiting_confirmation","connection_id":"test-connection","plugin":{"id":"note-book","title":"Notes","skill":"skill:SKILL.md","pages":[],"tools":[{"name":"read_file","description":"Read a note","inputSchema":{"type":"object","properties":{"document":{"type":"string"}},"required":["document"],"additionalProperties":false}}]}}),
+                    "handshake"=>json!({"version":1,"subject":"user-a","state":"awaiting_confirmation","connection_id":"test-connection","plugin":{"id":"note-book","library":"notes","title":"Notes","skill":"skill:SKILL.md","pages":[],"tools":[{"name":"read_file","description":"Read a note","inputSchema":{"type":"object","properties":{"document":{"type":"string"}},"required":["document"],"additionalProperties":false},"outputSchema":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}}]}}),
                     "confirm"=>json!({"state":"ready"}),
                     "call"=>{assert_eq!(headers["x-plugin-connection"],"test-connection");received.lock().unwrap().push(body["payload"]["args"].clone());json!({"value":{"content":"note text"}})},
                     _=>panic!("unexpected method {method}")
@@ -542,6 +547,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(package.manifest.tools, vec!["note_book__read_file"]);
+        assert_eq!(package.manifest.library.as_deref(),Some("notes"));
         assert!(package.root.as_os_str().is_empty());
         let (runtime, catalog) = test_runtime();
         let parent = runtime
@@ -556,13 +562,18 @@ mod tests {
             read["content"]
                 .as_str()
                 .unwrap()
-                .contains("`read_file` → `note_book__read_file`")
+                .contains("`notes.read_file(args)`")
         );
         assert!(!read.to_string().contains("test-secret"));
         let tools = catalog
             .packages
             .tools(&std::collections::BTreeSet::from(["note-book".into()]));
         assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["outputSchema"]["properties"]["content"]["type"],"string");
+        let bindings=crate::agent_program::libraries::catalog(&tools,&catalog.packages.catalog());
+        let headers=crate::agent_program::declarations::headers(&bindings,&tools);
+        assert!(headers.contains("declare namespace notes") && headers.contains("content:"));
+        assert!(!headers.contains("note_book__read_file"));
         assert_eq!(
             tools[0]["function"]["parameters"]["additionalProperties"],
             false

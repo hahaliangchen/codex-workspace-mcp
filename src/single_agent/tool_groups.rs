@@ -297,71 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn fresh_frames_only_advertise_core_and_every_local_tool_is_classified() {
-        let h = Harness::new();
-        let s = h.session();
-        let mut w = Window::default();
-        let full = available_tools(&s, &w);
-        let core = super::super::tools(&s, &w);
-        for name in [
-            "read_asset",
-            "read_session_history",
-            "read_skill",
-            "load_tool_group",
-            "list_tool_groups",
-        ] {
-            assert!(has(&core, name), "missing core tool {name}");
-        }
-        for name in [
-            "plan_tasks",
-            "branch_task",
-            "next_step",
-            "read_file",
-            "write_file",
-            "run_program",
-            "browser_open",
-            "read_rust_symbol",
-            "analyze_images",
-            "spawn_agent",
-        ] {
-            assert!(!has(&core, name), "unloaded definition leaked: {name}");
-        }
-        for tool in agent_service::local_tools(&h.state.workspace, None, false) {
-            let name = tool["function"]["name"].as_str().unwrap();
-            assert!(
-                name == "workspace_info" || group(name).is_some(),
-                "unclassified local tool: {name}"
-            );
-        }
-        assert!(estimate(&json!(core)) * 3 < estimate(&json!(full)));
-        w.loaded_tool_groups = requested(&json!(["files", "execution"])).unwrap();
-        let selected = super::super::tools(&s, &w);
-        assert!(has(&selected, "write_file") && has(&selected, "run_program"));
-        assert!(!has(&selected, "browser_open") && !has(&selected, "read_go_symbol"));
-        assert_eq!(
-            selected,
-            super::super::tools(&s, &w),
-            "unchanged frames keep a stable tool list"
-        );
-        eprintln!(
-            "tool schema estimates: all={} tools/{} tokens; core={} tools/{} tokens; files+execution={} tools/{} tokens",
-            full.len(),
-            estimate(&json!(full)),
-            core.len(),
-            estimate(&json!(core)),
-            selected.len(),
-            estimate(&json!(selected))
-        );
-        let mut legacy = serde_json::to_value(&w).unwrap();
-        legacy.as_object_mut().unwrap().remove("loaded_tool_groups");
-        assert!(
-            serde_json::from_value::<Window>(legacy)
-                .unwrap()
-                .loaded_tool_groups
-                .is_empty()
-        );
+    fn unloaded_groups_publish_the_same_available_catalog_as_loaded_groups() {
+        let h=Harness::new();let s=h.session();let mut w=Window::default();
+        let before=super::super::tools(&s,&w);
+        for name in ["read_file","write_file","run_program","browser_open","read_go_symbol"] {assert!(has(&before,name));}
+        let bindings=ts_program::library_catalog(&s,&before);
+        let body=request(&s,&w.messages,&before);
+        assert!(super::super::tests::declares(&body,"io","read"));
+        assert!(!has(body["tools"].as_array().unwrap(),"read_file"));
+        w.loaded_tool_groups=requested(&json!(["files","execution"])).unwrap();
+        assert_eq!(before,super::super::tools(&s,&w));
+        assert_eq!(bindings,ts_program::library_catalog(&s,&super::super::tools(&s,&w)));
         assert!(requested(&json!(["nonexistent"])).is_err());
-        assert!(crate::task_tree::validate_inputs(&json!({"tool_groups":"files"})).is_err());
     }
 
     #[tokio::test]
@@ -430,74 +377,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_loop_requires_loading_and_unloading_hides_definitions_and_blocks_calls() {
-        let mut h = Harness::new();
-        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let seen = captured.clone();
-        let app=Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>| {
+    async fn loading_and_unloading_metadata_does_not_hide_permitted_source_methods() {
+        let mut h=Harness::new();
+        let requests=Arc::new(Mutex::new(Vec::<Value>::new()));let seen=requests.clone();
+        let app=Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>|{
             let seen=seen.clone();async move {
                 let mut requests=seen.lock().unwrap();let n=requests.len();
-                let definitions=body["tools"].as_array().unwrap();
-                let call=|name:&str,args:Value|json!({"role":"assistant","tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
-                let message=match n {
-                    0=>call("create_task",json!({"goal":"Verify lazy tools","first_step":"Try a file tool"})),
-                    1=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked.txt","content":"must not run"}))},
-                    2=>{assert!(body.to_string().contains("TOOL_GROUP_NOT_LOADED"));call("load_tool_group",json!({"group":"files"}))},
-                    3=>{assert!(has(definitions,"write_file") && !has(definitions,"run_program"));
-                        let mut response=call("load_tool_group",json!({"group":"execution"}));
-                        response["tool_calls"].as_array_mut().unwrap().push(json!({"id":"parallel-program","type":"function","function":{"name":"run_program","arguments":json!({"program":"does-not-exist"}).to_string()}}));response},
-                    4=>{assert!(!has(definitions,"run_program"));call("write_file",json!({"path":"saved.txt","content":"loaded tool worked"}))},
-                    5=>call("unload_tool_group",json!({"group":"files"})),
-                    6=>{assert!(!has(definitions,"write_file"));call("write_file",json!({"path":"blocked-again.txt","content":"must not run"}))},
-                    _=>json!({"role":"assistant","content":"Verified tool loading and unloading."}),
+                assert!(super::super::tests::declares(&body,"io","write"));
+                assert!(!has(body["tools"].as_array().unwrap(),"write_file"));
+                let (name,args)=match n {
+                    0=>("create_task",json!({"goal":"Use fixed methods independently of group metadata"})),
+                    1=>("load_tool_group",json!({"group":"files"})),
+                    2=>("unload_tool_group",json!({"group":"files"})),
+                    3=>("execute_program",json!({"source":"function main(){return io.write({path:'saved.txt',content:'unloaded methods remain available'});}"})),
+                    _=>panic!("the compiled write requires no further model call"),
                 };
                 requests.push(body);
-                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+                Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))
             }
         }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        h.state.provider_url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        run_task(
-            h.state.clone(),
-            "t".into(),
-            "fake".into(),
-            "Verify lazy tools".into(),
-            9,
-            h.cancel.clone(),
-            1,
-            false,
-        )
-        .await
-        .unwrap();
-        server.abort();
-        assert_eq!(captured.lock().unwrap().len(), 8);
-        assert_eq!(
-            std::fs::read_to_string(h.root.join("saved.txt")).unwrap(),
-            "loaded tool worked"
-        );
-        assert!(!h.root.join("blocked.txt").exists() && !h.root.join("blocked-again.txt").exists());
-        let raw: String = agent_service::open_db(&h.root)
-            .unwrap()
-            .query_row(
-                "SELECT state FROM agent_runtime_windows WHERE task_id='t' AND scope='main'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let saved: Window = serde_json::from_str(&raw).unwrap();
-        assert!(saved.loaded_tool_groups.is_empty());
-        for (i, m) in saved
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m["role"] == "tool")
-        {
-            assert!(saved.messages[..i].iter().any(|a| {
-                a["tool_calls"]
-                    .as_array()
-                    .is_some_and(|calls| calls.iter().any(|c| c["id"] == m["tool_call_id"]))
-            }));
-        }
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        h.state.provider_url=format!("http://{}/v1",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        run_task(h.state.clone(),"t".into(),"fake".into(),"Write through fixed library".into(),8,h.cancel.clone(),1,false).await.unwrap();
+        server.abort();assert_eq!(requests.lock().unwrap().len(),4);
+        assert_eq!(std::fs::read_to_string(h.root.join("saved.txt")).unwrap(),"unloaded methods remain available");
     }
 }

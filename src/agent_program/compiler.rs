@@ -282,7 +282,7 @@ impl Compiler {
             return self.error(call.span, "argument spreads are unsupported");
         }
         let ast::Callee::Expr(target) = &call.callee else {
-            return self.error(call.span, "use a declared helper or tools.EXACT_NAME");
+            return self.error(call.span, "use a declared helper or library.method");
         };
         if matches!(&**target, ast::Expr::Ident(i) if i.sym == *"join") {
             if call.args.is_empty() {
@@ -352,20 +352,10 @@ impl Compiler {
                     }
                 }
             }
-            ast::Expr::Member(m) if matches!(&*m.obj,ast::Expr::Ident(i) if i.sym==*"tools") => {
-                match &m.prop {
-                    ast::MemberProp::Ident(i) => i.sym.to_string(),
-                    ast::MemberProp::Computed(c) => match &*c.expr {
-                        ast::Expr::Lit(ast::Lit::Str(s)) => s.value.to_string_lossy().into_owned(),
-                        _ => return self.error(call.span, "tool names must be static"),
-                    },
-                    _ => return self.error(call.span, "invalid tool name"),
-                }
-            }
             _ => {
                 return self.error(
                     call.span,
-                    "use helper(args), tools.EXACT_NAME(args), fork(helper,args) or join(handles); call/ai wrappers are unsupported",
+                    "use helper(args), library.method(args), fork(helper,args) or join(handles); call/ai wrappers are unsupported",
                 );
             }
         };
@@ -517,6 +507,9 @@ impl Compiler {
                 Ok(if u.prefix { Expr::Variable(name) } else { old })
             }
             ast::Expr::Call(call) => {
+                if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if matches!(&*m.obj,ast::Expr::Ident(i) if i.sym==*"tools"))) {
+                    return self.error(call.span,"tools.* is unsupported; use the fixed library.method(args) names in program_tool_headers");
+                }
                 if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Ident(i) if i.sym==*"assert"))
                 {
                     if !(1..=2).contains(&call.args.len())
@@ -573,7 +566,7 @@ impl Compiler {
                     );
                     return Ok(Expr::Variable(destination));
                 }
-                if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if !matches!(&*m.obj,ast::Expr::Ident(i) if i.sym==*"tools" || self.libraries.contains_key(i.sym.as_ref()))))
+                if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if !matches!(&*m.obj,ast::Expr::Ident(i) if self.libraries.contains_key(i.sym.as_ref()))))
                 {
                     let ast::Callee::Expr(target) = &call.callee else {
                         unreachable!()
@@ -633,7 +626,7 @@ impl Compiler {
                     ast::Callee::Expr(e) => &**e,
                     _ => {
                         return self
-                            .error(call.span, "use a declared function or tools.EXACT_NAME");
+                            .error(call.span, "use a declared function or library.method");
                     }
                 };
                 for (index, arg) in call.args.iter().enumerate() {
@@ -1190,6 +1183,5 @@ fn compile_inner(
         version: VERSION,
         source: source.into(),
         functions,
-        libraries,
     })
 }

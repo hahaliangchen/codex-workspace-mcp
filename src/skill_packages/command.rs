@@ -15,6 +15,8 @@ pub struct CommandTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -60,7 +62,7 @@ impl CommandTool {
         Ok(())
     }
     pub fn definition(&self) -> Value {
-        json!({"name":self.name,"description":self.description,"inputSchema":self.input_schema})
+        json!({"name":self.name,"description":self.description,"inputSchema":self.input_schema,"outputSchema":self.output_schema})
     }
 }
 async fn bounded(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>> {

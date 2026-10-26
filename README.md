@@ -1,13 +1,13 @@
 # codex-workspace-mcp
 
 > 当前通用 Agent 的执行、作用域和宿主／插件边界，以[通用 Agent 设计](docs/generic-agent-design.md)为准。下文部分早期调度、上下文压缩说明属于历史实现，尚未逐项同步；维护执行层前请先阅读该设计文档。
-> 流程执行器仍处验证阶段：历史版本的双 Agent 制作、逐件验收并交付 5 个 HTML 已通过；当前版本 8 完成了确定性表达式与显式 AI 任务的自动回归，20 页及 PPT 尚未重新实测。见[当前验证记录](docs/generic-agent-design.md#15-c-风格真值与工具库2026-10-26版本-8)和[历史真实测试报告](docs/agent-program-real-test-2026-10-26.md)。
+> 流程执行器仍处验证阶段：历史版本的双 Agent 制作、逐件验收并交付 5 个 HTML 已通过；当前版本 9 完成了固定库名、自动声明和显式 AI 任务的自动回归，真实模型的 20 页及 PPT 尚未重新实测。见[当前验证记录](docs/generic-agent-design.md#16-固定工具名与自动声明2026-10-26版本-9)和[历史真实测试报告](docs/agent-program-real-test-2026-10-26.md)。
 
 由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。当前执行采用固定 JS 基础语法子集的流程调用与返回、父作用域继承、按容量折叠上下文；支持按需串行子任务和受约束的并发委派。模型直接连接提供商的 Chat Completions 接口。
 
 ## 核心能力
 
-- 版本 8 流程伪代码：普通函数、常见基础循环／表达式与 C 风格真值由 Rust 确定性执行，工具可按 io.read 等库方法表达；智能生成和业务判断通过显式注释任务调用，支持授权 fork/join、异常与回执恢复。拒绝生成器、异步、TS 扩展和完整 JS 环境，详见[执行语言](docs/agent-program.md)。
+- 版本 9 流程伪代码：普通函数、常见基础循环／表达式与 C 风格真值由 Rust 确定性执行，工具使用固定库名和自动生成的声明表达；智能生成和业务判断通过显式注释任务调用，支持授权 fork/join、异常与回执恢复。拒绝生成器、异步、TS 扩展和完整 JS 环境，详见[执行语言](docs/agent-program.md)。
 - 文件读取、文本搜索、版本校验写入与编辑。
 - Go、Rust、Python、TypeScript/JavaScript 符号索引和职责记忆。
 - 受限原生程序执行、项目依赖与脚本、进程日志、HTTP 探测及浏览器操作。

@@ -207,7 +207,7 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
             // A plugin page is already mounted before its first model request.
             if s.plugin.is_some() && matches!(name,"list_skills"|"read_skill") {return false;
             }
-            tool_groups::group(name).is_none_or(|group| w.loaded_tool_groups.contains(group))
+            true // All available methods are published and compiled from one catalog.
         });
     }
     definitions
@@ -512,7 +512,9 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     if s.mode==Mode::Main {
         wire.insert(1.min(wire.len()),json!({"role":"system","name":"task_program_skill","content":crate::agent_program::SKILL}));
         let libraries=ts_program::library_catalog(s,definitions);
-        wire.insert(2.min(wire.len()),json!({"role":"system","name":"program_tool_libraries","content":json!({"libraries":libraries,"instruction":"These source library methods map to the exact advertised tool names. Prefer library.method(args) in flow source, using the same JSON parameters and returns. Optional libraries in execute_program/define_task_body may bind a new namespace to exact available tool names; never guess a mapping. Permissions and plugin ownership are unchanged."}).to_string()}));
+        let headers=crate::agent_program::declarations::headers(&libraries,definitions);
+        wire.insert(2.min(wire.len()),json!({"role":"system","name":"program_tool_headers","content":headers}));
+
     }
     // Plugin instructions are a session-owned system layer, rebuilt outside
     // compressible chat history. No plugin page means no automatic injection.
@@ -651,7 +653,32 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             }
         }
     }
-    let mut body = json!({"model":s.model,"stream":true,"messages":wire,"tools":definitions,"parallel_tool_calls":false});
+    let mut published=definitions.to_vec();
+    if s.mode==Mode::Main {
+        let libraries=ts_program::library_catalog(s,definitions);
+        // The planning request gets declarations, not duplicate business schemas.
+        published.retain(|d| d["function"]["name"].as_str().is_none_or(|name| !matches!(name,"list_tool_groups"|"load_tool_group"|"unload_tool_group") && crate::agent_program::libraries::public_name(&libraries,name).is_none()));
+        if comment_task.is_some() {
+            if let Some(native)=crate::agent_program::declarations::native_tool(&libraries,definitions) { published.push(native); }
+            wire.push(json!({"role":"system","name":"library_transport","content":"For direct native steps use invoke_library({method: 'namespace.method', args: {...}}), with the same method names and JSON contract as program_tool_headers. In define_task_body source call namespace.method({...}) directly. invoke_library is a transport only, not a source function."}));
+        }
+        // Historical exchanges and compiled effects use private dispatcher names
+        // in storage. Project them to the fixed public spelling for the model.
+        for message in &mut wire {
+            if let Some(calls)=message["tool_calls"].as_array_mut() {
+                for call in calls {
+                    let Some(raw)=call["function"]["name"].as_str() else {continue};
+                    let Some(method)=crate::agent_program::libraries::public_name(&libraries,raw) else {continue};
+                    if let Some(arguments)=call["function"]["arguments"].as_str().and_then(|a|serde_json::from_str::<Value>(a).ok()) {
+                        call["function"]["name"]=json!(crate::agent_program::declarations::CALL);
+                        call["function"]["arguments"]=json!(json!({"method":method,"args":arguments}).to_string());
+                    }
+                }
+            }
+            if message["role"]=="tool" { if let Some(method)=message["name"].as_str().and_then(|n|crate::agent_program::libraries::public_name(&libraries,n)) {message["name"]=json!(method);} }
+        }
+    }
+    let mut body = json!({"model":s.model,"stream":true,"messages":wire,"tools":published,"parallel_tool_calls":false});
     if let Some(error) = anchor_error { body["_host_task_anchor_error"] = json!(error); }
     if let Some(error) = plugin_error { body["_host_plugin_instruction_error"] = json!(error); }
     body["max_tokens"] = json!(output_tokens(s, &body));
@@ -1504,7 +1531,20 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         }
         let mut image_messages = Vec::new();
         let mut released_assets = None;
-        for call in calls {
+        for mut call in calls {
+            let mut transport_error=None;
+            if call.name==crate::agent_program::declarations::CALL {
+                let resolve=(|| -> Result<(String,String)> {
+                    ensure!(s.mode==Mode::Main && w.program_task.is_some() && w.program.is_none(), "invoke_library is available only in an executing comment task");
+                    let payload:Value=serde_json::from_str(&call.arguments)?;
+                    ensure!(payload["args"].is_object(), "library arguments must be an object");
+                    let method=payload["method"].as_str().context("library method required")?;
+                    let catalog=ts_program::library_catalog(s,&definitions);
+                    let target=crate::agent_program::libraries::target(&catalog,method).context("unknown or unavailable library method")?;
+                    Ok((target.to_owned(),payload["args"].to_string()))
+                })();
+                match resolve {Ok((name,args))=>{call.name=name;call.arguments=args;},Err(error)=>transport_error=Some(error)}
+            }
             let mut skill_change = None;
             let kind = if s.mode == Mode::Main {
                 "tool/call"
@@ -1516,6 +1556,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             let mut material_source: Option<(String, Value)> = None;
             let mut refreshed_from: Option<Value> = None;
             let output=async {
+                if let Some(error)=transport_error { return Err(error); }
                 let args:Value=serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
                 ensure!(!no_task || crate::task_tree::is_tool(&call.name),
                     "NO_TASK: {} was not executed. Call create_task alone with goal and necessary background before using tools. To answer without tools, reply directly.",call.name);
@@ -1525,8 +1566,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
-                    "execute_program" => ts_program::install(w,&ts_program::scoped_arguments(s,w,&args)?),
-                    "define_task_body" => ts_program::install_body(w,&ts_program::scoped_arguments(s,w,&args)?),
+                    "execute_program" => ts_program::install_scoped(s,w,&args,false),
+                    "define_task_body" => ts_program::install_scoped(s,w,&args,true),
                     "list_tool_groups" => Ok(tool_groups::list(s, w)),
                     "load_tool_group" | "unload_tool_group" => anyhow::bail!("tool group changes must be called alone"),
                     "read_task_board" => {
@@ -1537,6 +1578,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     },
                     "spawn_agent" => {
                         ensure!(s.is_root(),"DELEGATE_RECURSION_DENIED");
+                        ensure!(args["program"].is_null() || w.program.as_ref().and_then(|p|p.pending.as_ref()).is_some_and(|a|a.id==call.call_id && matches!(a.kind,crate::agent_program::runtime::ActionKind::Fork{..})), "compiled child programs must come from the host's pending fork instruction");
                         let runtime=ts_program::fork_runtime(&args)?;
                         let (assignment,mut shared)=task_frames::delegate_context(s,w,&args).await?;
                         if let Some(runtime)=runtime { shared["program"]=serde_json::to_value(runtime)?; }
@@ -2284,6 +2326,10 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::post};
     use std::sync::{Arc, Mutex};
 
+    pub(super) fn declares(body: &Value, library: &str, method: &str) -> bool {
+        body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_tool_headers").and_then(|m|m["content"].as_str()).is_some_and(|text| text.contains(&format!("declare namespace {library}")) && text.contains(&format!("function {method}(")))
+    }
+
     fn completion_request(body:&Value)->bool {
         body["messages"].as_array().unwrap().iter().rev().find(|m| {
                 m["role"]=="assistant" || m["role"]=="tool" || m["name"]=="task_completion_check" || (m["role"]=="user" && m.get("name").is_none())
@@ -2606,7 +2652,7 @@ mod tests {
                 let message = if let Some(assignment) = messages.iter().find(|m|m["name"]=="parent_assignment") {
                     let spec:Value=serde_json::from_str(assignment["content"].as_str().unwrap()).unwrap();
                     let name=spec["name"].as_str().unwrap();
-                    assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="write_file"),"fork must inherit prepared file tools");
+                    assert!(declares(&body,"io","write"),"fork must inherit prepared file tools");
                     assert!(!body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="join_agents"),"a child cannot control sibling Agents");
                     assert!(messages.iter().any(|m|m["name"]=="scope_value" && m["content"].as_str().unwrap().contains("SHARED_SPEC_READY")),"shared source must arrive without a read");
                     assert!(messages.iter().any(|m|m["name"]=="scope_value" && m["content"].as_str().unwrap().contains("root")),"workspace preparation must be inherited too");
@@ -2746,7 +2792,7 @@ mod tests {
                     assert!(messages.iter().any(|m|m["role"]=="user" && m["content"].as_str().is_some_and(|text|text.contains("Delegate independent files, then inspect and accept the results"))),"the user's words reach the delegate");
                     assert!(!body["tools"].as_array().unwrap().iter().any(|t|crate::collaboration_jobs::is_tool(t["function"]["name"].as_str().unwrap())));
                     let name=spec["name"].as_str().unwrap();
-                    if !body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="write_file") {
+                    if !declares(&body,"io","write") {
                         return Json(json!({"choices":[{"finish_reason":"tool_calls","message":tool("child-load-files","load_tool_group",json!({"group":"files"}))}]}));
                     }
                     if !saw_call("child-write") {
@@ -3308,7 +3354,7 @@ mod tests {
                 let messages=body["messages"].as_array().unwrap();
                 let skill=messages.iter().filter(|m|m["name"]=="plugin_instructions").collect::<Vec<_>>();
                 assert_eq!(skill.len(),1);assert_eq!(skill[0]["role"],"system");assert_eq!(skill[0]["content"],instructions);
-                assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_code_flow"),"plugin tools must be available in the first request");
+                assert!(declares(&body,"flow","read_code_flow"),"plugin tools must be available in the first request");
                 assert!(!body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="unload_skill"),"the page's own workflow stays attached");
                 assert!(!body["tools"].as_array().unwrap().iter().any(|t|matches!(t["function"]["name"].as_str(),Some("read_skill"|"list_skills"|"plan_tasks"|"next_step"))),"plugin startup and loop iteration are host work, not model prerequisites");
                 let message=match n {
@@ -3363,7 +3409,7 @@ mod tests {
                     return Json(json!({"choices":[{"message":{"role":"assistant","content":"验证完成"},"finish_reason":"stop"}]}));
                 }
                 let n=calls.iter().filter(|b|!completion_request(b)).count()+1;
-                let has_flow=body["tools"].as_array().unwrap().iter().any(|tool|tool["function"]["name"]=="read_code_flow");
+                let has_flow=declares(&body,"flow","read_code_flow");
                 match n {
                     1|2|8=>assert!(!has_flow,"skill tools must be absent before loading and after explicit unload"),
                     3|4|5|6|7=>assert!(has_flow,"loaded skills persist through a follow-up user turn"),
@@ -3819,7 +3865,7 @@ mod tests {
                 } else if body["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="analyze-call") {
                     let messages=body["messages"].as_array().unwrap();
                     assert_eq!(messages.iter().filter(|m|m["role"]=="user" && m["name"].is_null()).count(),1);
-                    assert!(messages[1]["content"].to_string().contains("UNRELATED_MAIN_CONTEXT"));
+                    assert!(messages.iter().any(|m|m["content"].to_string().contains("UNRELATED_MAIN_CONTEXT")));
                     let reply=messages.iter().find(|m|m["tool_call_id"]=="analyze-call").unwrap();
                     assert_eq!(reply["tool_call_id"],"analyze-call");
                     let result:Value=serde_json::from_str(reply["content"].as_str().unwrap()).unwrap();
@@ -3829,7 +3875,7 @@ mod tests {
                     assert_eq!(messages[result_index-1]["tool_calls"][0]["id"],"analyze-call");
                     json!({"role":"assistant","content":"根据图像分析工具，第二页末行越界，原因待核对。"})
                 } else if body["messages"].as_array().unwrap().iter().any(|m|m["tool_call_id"]=="start") {
-                    assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="analyze_images"));
+                    assert!(declares(&body,"host","analyze_images"));
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":"analyze-call","type":"function","function":{"name":"analyze_images","arguments":json!({"artifact_ids":[id],"question":"检查这张图"}).to_string()}}]})
                 } else {
                     json!({"role":"assistant","content":null,"tool_calls":[{"id":"start","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Inspect the uploaded picture","first_step":"Analyze the picture"}).to_string()}}]})

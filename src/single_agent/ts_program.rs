@@ -10,25 +10,19 @@ pub(super) fn library_catalog(s: &Session<'_>, definitions: &[Value]) -> agent_p
     let packages=s.state.tool_catalog.as_ref().map(|c|c.packages.catalog()).unwrap_or_else(||json!([]));
     agent_program::libraries::catalog(definitions,&packages)
 }
-pub(super) fn scoped_arguments(s: &Session<'_>, w: &Window, args: &Value) -> Result<Value> {
-    ensure!(args.is_object(),"program arguments must be a JSON object");
-    let definitions=available_tools(s,w);
-    let allowed=definitions.iter().filter_map(|t|t["function"]["name"].as_str().map(str::to_owned)).collect();
-    let mut libraries=library_catalog(s,&definitions);
-    if let Some(task)=&w.program_task {
-        libraries=agent_program::libraries::merge(libraries,&task["libraries"],Some(&allowed))?;
-    }
-    libraries=agent_program::libraries::merge(libraries,&args["libraries"],Some(&allowed))?;
-    let mut args=args.clone();
-    args["libraries"]=serde_json::to_value(libraries)?;
-    Ok(args)
+pub(super) fn install_scoped(s: &Session<'_>, w: &mut Window, args: &Value, body: bool) -> Result<Value> {
+    ensure!(args.is_object(), "program arguments must be a JSON object");
+    ensure!(args.get("libraries").is_none(), "library names are fixed by the host/plugin declarations; libraries aliases are unsupported");
+    let libraries = library_catalog(s, &tools(s,w));
+    if body { install_body_with(w,args,libraries) } else { install_with(w,args,libraries) }
 }
-fn bindings(args: &Value, base: agent_program::libraries::Libraries) -> Result<agent_program::libraries::Libraries> {
-    agent_program::libraries::merge(base,&args["libraries"],None)
-}
+#[cfg(test)]
 pub(super) fn install(w: &mut Window, args: &Value) -> Result<Value> {
+    install_with(w,args,agent_program::libraries::builtin())
+}
+fn install_with(w: &mut Window, args: &Value, libraries: agent_program::libraries::Libraries) -> Result<Value> {
+    ensure!(args.get("libraries").is_none(), "model-defined libraries are unsupported");
     let source = args["source"].as_str().context("source is required")?;
-    let libraries=if args["libraries"].is_object() {bindings(args,Default::default())?} else {agent_program::libraries::builtin()};
     let program = agent_program::compile_with_libraries(source,libraries)?;
     let entry = args["entry"].as_str().unwrap_or("main");
     ensure!(
@@ -57,7 +51,12 @@ pub(super) fn install(w: &mut Window, args: &Value) -> Result<Value> {
         json!({"status":"started","entry":entry,"version":agent_program::VERSION,"source_hash":crate::visual_artifacts::hash(source.as_bytes())}),
     )
 }
+#[cfg(test)]
 pub(super) fn install_body(w: &mut Window, args: &Value) -> Result<Value> {
+    install_body_with(w,args,agent_program::libraries::builtin())
+}
+fn install_body_with(w: &mut Window, args: &Value, libraries: agent_program::libraries::Libraries) -> Result<Value> {
+    ensure!(args.get("libraries").is_none(), "model-defined libraries are unsupported");
     ensure!(
         w.program.is_none(),
         "the current task body is already executing"
@@ -70,7 +69,6 @@ pub(super) fn install_body(w: &mut Window, args: &Value) -> Result<Value> {
         .as_str()
         .context("current function name missing")?;
     let source = args["source"].as_str().context("source is required")?;
-    let libraries=if args["libraries"].is_object() {bindings(args,Default::default())?} else if task["libraries"].is_object() {bindings(task,Default::default())?} else {agent_program::libraries::builtin()};
     let program = agent_program::compile_body_with_libraries(source, name, libraries)?;
     let params = &program.functions[name].params;
     let input = task["input"]
@@ -97,14 +95,14 @@ pub(super) fn fork_runtime(args: &Value) -> Result<Option<Runtime>> {
     let Some(p) = args.get("program") else {
         return Ok(None);
     };
-    let source = p["source"].as_str().context("program.source is required")?;
+    let program: agent_program::Program = serde_json::from_value(p["compiled"].clone()).context("compiled host program required")?;
     let entry = p["entry"].as_str().context("program.entry is required")?;
     let arguments = p["args"]
         .as_array()
         .context("program.args must be an array")?
         .clone();
     Ok(Some(Runtime::task_program(
-        agent_program::compile_entry_with_libraries(source, entry, bindings(p,if p["libraries"].is_object(){Default::default()}else{agent_program::libraries::builtin()})?)?,
+        program,
         entry,
         arguments,
     )?))
@@ -319,9 +317,9 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     } else {
                         function.description.clone()
                     };
-                    let mut task = json!({"name":name,"description":description,"input":input,"libraries":program.libraries});
+                    let mut task = json!({"name":name,"description":description,"input":input});
                     if !function.comment_only {
-                        task["body"] = json!({"source":program.source,"entry":name,"args":args,"libraries":program.libraries});
+                        task["body"] = json!({"compiled":program,"entry":name,"args":args});
                     }
                     (
                         "create_task".into(),
@@ -334,12 +332,12 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     input,
                 } => (
                     "create_task".into(),
-                    json!({"goal":name,"briefing":description,"program_task":{"name":name,"description":description,"input":input,"libraries":w.program.as_ref().unwrap().program.libraries}}),
+                    json!({"goal":name,"briefing":description,"program_task":{"name":name,"description":description,"input":input}}),
                 ),
                 ActionKind::Tool { name, args } => (name.clone(), args.clone()),
                 ActionKind::Fork { entry, args } => (
                     "spawn_agent".into(),
-                    json!({"name":format!("function {entry}"),"task":format!("Execute the compiled {entry} function with its provided arguments and return its value"),"program":{"source":w.program.as_ref().unwrap().program.source,"entry":entry,"args":args,"libraries":w.program.as_ref().unwrap().program.libraries}}),
+                    json!({"name":format!("function {entry}"),"task":format!("Execute the compiled {entry} function with its provided arguments and return its value"),"program":{"compiled":w.program.as_ref().unwrap().program,"entry":entry,"args":args}}),
                 ),
                 ActionKind::Join { ids } => ("join_agents".into(), json!({"agent_ids":ids})),
             };
@@ -404,19 +402,19 @@ mod tests {
         let source = r#"
 function worker(input) {
   const value = make_text(input.text);
-  storage.write({path:input.path,content:value});
+  io.write({path:input.path,content:value});
   return {path:input.path, text:value};
 }
 function make_text(text) {
   // Return the supplied text as a JSON string.
 }
 function main() {
-  const spec=storage.read({path:"spec.txt"});
+  const spec=io.read({path:"spec.txt"});
   const a=fork(worker,{path:"a.txt",text:"OUTPUT_A"});
   const b=fork(worker,{path:"b.txt",text:"OUTPUT_B"});
   const [x,y]=join(a,b);
-  const checkA=storage.read({path:x.path});
-  const checkB=storage.read({path:y.path});
+  const checkA=io.read({path:x.path});
+  const checkB=io.read({path:y.path});
   return {outputs:[x.path,y.path],source:spec,checkA,checkB};
 }"#;
         let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
@@ -428,7 +426,7 @@ function main() {
                     assert_eq!(task["name"], "make_text");
                     json!({"role":"assistant","content":task["input"]["text"].to_string()})
                 } else {
-                    let (name,args)=match n {0=>("create_task",json!({"goal":"Use two Agents with typed function returns"})),1=>("execute_program",json!({"source":source,"libraries":{"storage":{"read":"read_file","write":"write_file"}}})),_=>panic!("unexpected scheduler model request {n}")};
+                    let (name,args)=match n {0=>("create_task",json!({"goal":"Use two Agents with typed function returns"})),1=>("execute_program",json!({"source":source})),_=>panic!("unexpected scheduler model request {n}")};
                     json!({"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
                 };
                 Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
@@ -507,7 +505,7 @@ function main() {
         let requests = count.clone();
         let source = r#"
 function main() {
-  const spec=tools.read_file({path:"spec.txt"});
+  const spec=io.read({path:"spec.txt"});
   const a=fork(worker,{path:"a.txt",text:"A",source:spec.content});
   const b=fork(worker,{path:"b.txt",text:"B",source:spec.content});
   const [x,y]=join(a,b);
@@ -515,7 +513,7 @@ function main() {
 }
 function worker(part) {
   const saved=produce(part);
-  const checked=tools.read_file({path:saved.path});
+  const checked=io.read({path:saved.path});
   return {path:saved.path,content:checked.content};
 }
 function produce(part) {
@@ -531,17 +529,18 @@ function produce(part) {
                     assert!(messages.iter().any(|m|m["name"]=="task_program_skill"),"the executing AI needs the generic representation skill to refine this function");
                     assert!(messages.iter().any(|m|m["name"]=="program_task_execution"));
                     let names=body["tools"].as_array().unwrap().iter().map(|t|t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
-                    assert!(names.contains(&"write_file"));
+                    assert!(names.contains(&"invoke_library"));
+                    assert!(!names.contains(&"write_file"));
                     for name in ["create_task","execute_program","spawn_agent","join_agents"] {assert!(!names.contains(&name),"{name} must not be advertised to a task body");}
                     let task:Value=serde_json::from_str(task["content"].as_str().unwrap()).unwrap();
                     assert_eq!(task["name"],"produce");
                     assert!(names.contains(&"define_task_body"));
                     let part=&task["input"]["part"];
                     assert_eq!(part["source"],"SHARED_SOURCE");
-                    if messages.iter().any(|m|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|a|a.iter().any(|c|c["function"]["name"]=="write_file"))) {
+                    if messages.iter().any(|m|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|a|a.iter().any(|c|c["function"]["name"]=="invoke_library"))) {
                         json!({"role":"assistant","content":json!({"path":part["path"]}).to_string()})
                     } else {
-                        json!({"role":"assistant","tool_calls":[{"id":format!("write{n}"),"type":"function","function":{"name":"write_file","arguments":json!({"path":part["path"],"content":part["text"]}).to_string()}}]})
+                        json!({"role":"assistant","tool_calls":[{"id":format!("write{n}"),"type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.write","args":{"path":part["path"],"content":part["text"]}}).to_string()}}]})
                     }
                 } else {
                     assert!(messages.iter().any(|m|m["name"]=="task_program_skill"));
@@ -644,18 +643,21 @@ function produce(part) {
     }
 
     #[tokio::test]
-    async fn ts_program_cannot_bypass_permissions_and_stops_after_denied_write() {
+    async fn unavailable_write_fails_compilation_before_any_tool_effect() {
         let root = TestRoot::new();
         let count = Arc::new(AtomicUsize::new(0));
         let requests = count.clone();
         let app=Router::new().route("/v1/chat/completions",post(move |Json(_):Json<Value>|{
             let n=requests.fetch_add(1,Ordering::SeqCst);
+            async move {
+            if n==2 {return Json(json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"The write is unavailable in read-only mode; no file operation ran."}}]}));}
             let (name,args)=match n {
                 0=>("create_task",json!({"goal":"Attempt denied write"})),
-                1=>("execute_program",json!({"source":"function main(){tools.write_file({path:'denied.txt',content:'x'});tools.read_file({path:'next.txt'});}"})),
+                1=>("execute_program",json!({"source":"function main(){io.write({path:'denied.txt',content:'x'});io.read({path:'next.txt'});}"})),
                 _=>panic!("runtime error must stop, not ask model to reschedule"),
             };
-            async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
+            Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))
+            }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut state =
@@ -681,10 +683,10 @@ function produce(part) {
             conn.query_row("SELECT status FROM agent_tasks", [], |r| r
                 .get::<_, String>(0))
                 .unwrap(),
-            "failed"
+            "completed"
         );
         assert!(!root.path().join("denied.txt").exists());
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 3);
         let calls:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='read_file'",[],|r|r.get(0)).unwrap();
         assert_eq!(calls, 0, "operation after denied write must not execute");
     }
@@ -709,12 +711,12 @@ function produce(part) {
 function phase(request) {
   // Refine this same task, not another main.
   const result=stage(request);
-  tools.write_file({path:request.output,content:result});
+  io.write({path:request.output,content:result});
   return {path:request.output,status:result};
 }
 function stage(request) {
   // Coded helpers are tasks too; tools remain steps.
-  const file=tools.read_file({path:request.source});
+  const file=io.read({path:request.source});
   return analyze(request,file.content);
 }
 function analyze(request,content) { return evaluate(request,content); }
@@ -733,7 +735,7 @@ function evaluate(request,content) {
                     match n {
                         0=>("create_task",json!({"goal":"Nested task functions preserve the caller and its inputs"})),
                         1=>("load_tool_group",json!({"group":"files"})),
-                        2=>("execute_program",json!({"source":"function main(request){const result=phase(request);const file=tools.read_file({path:result.path});return {result,actual:file.content};} function phase(request){// Read and process the source, save output, and return its path and status.\n}","input":{"source":"source.txt","output":"output.txt"}})),
+                        2=>("execute_program",json!({"source":"function main(request){const result=phase(request);const file=io.read({path:result.path});return {result,actual:file.content};} function phase(request){// Read and process the source, save output, and return its path and status.\n}","input":{"source":"source.txt","output":"output.txt"}})),
                         _=>panic!("unexpected planner request {n}"),
                     }
                 };
@@ -827,7 +829,7 @@ function evaluate(request,content) {
             async move {
                 let (name,args)=match n {
                     0=>("create_task",json!({"goal":"Catch a child function error"})),
-                    1=>("execute_program",json!({"source":"function main(){try{const value=child();tools.write_file({path:'never.txt',content:value});return 'unexpected';}catch(error){return {caught:true,message:error.message};}} function child(){return tools.read_file({path:'missing.txt'});}"})),
+                    1=>("execute_program",json!({"source":"function main(){try{const value=child();io.write({path:'never.txt',content:value});return 'unexpected';}catch(error){return {caught:true,message:error.message};}} function child(){return io.read({path:'missing.txt'});}"})),
                     _=>panic!("function returns and catch must not ask the model to reschedule"),
                 };
                 Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))
@@ -883,7 +885,7 @@ function evaluate(request,content) {
             "async function work(){return 1;}",
             "function work(input: string){return input;}",
             "function work(){return ai({instruction:'value'});}",
-            "function work(){return tools.read_file({});} export function unused(){return 1;}",
+            "function work(){return io.read({});} export function unused(){return 1;}",
         ] {
             let mut main = Window::default();
             assert!(install(&mut main, &json!({"source":source.replace("work", "main")})).is_err());
@@ -900,7 +902,7 @@ function evaluate(request,content) {
         let root=TestRoot::new();
         let count=Arc::new(AtomicUsize::new(0));
         let requests=count.clone();
-        let source=r#"function main(){var rows=[];var sum=0;for(var i=0;i<4;i++){if(i===1)continue;const path=`part-${i}.txt`;tools.write_file({path,content:`${i+1}`});const actual=tools.read_file({path});rows.push(actual.content);sum+=i;}assert(rows.length===3);if(false&&tools.read_file({path:'never'})){throw 'bad';}return {rows,sum,selection:sum>0?'passed':'failed'};}"#;
+        let source=r#"function main(){var rows=[];var sum=0;for(var i=0;i<4;i++){if(i===1)continue;const path=`part-${i}.txt`;io.write({path,content:`${i+1}`});const actual=io.read({path});rows.push(actual.content);sum+=i;}assert(rows.length===3);if(false&&io.read({path:'never'})){throw 'bad';}return {rows,sum,selection:sum>0?'passed':'failed'};}"#;
         let app=Router::new().route("/v1/chat/completions",post(move |Json(_):Json<Value>|{
             let n=requests.fetch_add(1,Ordering::SeqCst);
             let (name,args)=match n {0=>("create_task",json!({"goal":"Execute deterministic common flow"})),1=>("execute_program",json!({"source":source})),_=>panic!("ordinary computation must never request a model: {n}")};
@@ -943,15 +945,10 @@ function evaluate(request,content) {
     }
 
     #[test]
-    fn refined_and_forked_functions_keep_the_frozen_library_mapping() {
-        let libs=json!({"storage":{"read":"read_file"}});
-        let mut child=Window{program_task:Some(json!({"name":"work","input":{"path":"source.txt"},"libraries":libs})),..Default::default()};
-        install_body(&mut child,&json!({"source":"function work(input){return storage.read({path:input.path});}"})).unwrap();
-        assert!(!child.program.as_ref().unwrap().program.libraries.contains_key("io"));
-        assert!(matches!(child.program.as_mut().unwrap().next(),State::Action(Action{kind:ActionKind::Tool{name,args},..}) if name=="read_file" && args["path"]=="source.txt"));
-        let mut fork=fork_runtime(&json!({"program":{"source":"function work(input){return storage.read({path:input.path});}","entry":"work","args":[{"path":"source.txt"}],"libraries":libs}})).unwrap().unwrap();
-        assert!(!fork.program.libraries.contains_key("io"));
-        assert!(matches!(fork.next(),State::Action(Action{kind:ActionKind::Tool{name,..},..}) if name=="read_file"));
+    fn forked_functions_use_the_host_compiled_program() {
+        let program=agent_program::compile("function work(input){return io.read({path:input.path});} function main(){return null;}").unwrap();
+        let mut fork=fork_runtime(&json!({"program":{"compiled":program,"entry":"work","args":[{"path":"source.txt"}]}})).unwrap().unwrap();
+        assert!(matches!(fork.next(),State::Action(Action{kind:ActionKind::Tool{name,args},..}) if name=="read_file" && args["path"]=="source.txt"));
     }
 
     #[tokio::test]
@@ -964,9 +961,12 @@ function evaluate(request,content) {
             let n=requests.fetch_add(1,Ordering::SeqCst);
             let messages=body["messages"].as_array().unwrap();
             if n==1 {
-                // The file group can still be hidden; the source adapter loads
-                // it using the exact resolved host name without another model.
-                assert!(messages.iter().any(|m|m["name"]=="program_tool_libraries"));
+                // The unloaded file group is published in the same declarations
+                // that the source compiler consumes.
+                assert!(messages.iter().any(|m|m["name"]=="program_tool_headers"));
+                let headers=messages.iter().find(|m|m["name"]=="program_tool_headers").unwrap()["content"].as_str().unwrap();
+                assert!(headers.contains("function read("));assert!(headers.contains("function write("));
+                assert!(!body["tools"].as_array().unwrap().iter().any(|t|matches!(t["function"]["name"].as_str(),Some("read_file"|"write_file"|"invoke_library"))));
             }
             let (name,args)=match n {0=>("create_task",json!({"goal":"Use file library and C truth values"})),1=>("execute_program",json!({"source":source})),_=>panic!("no condition should request a model: {n}")};
             async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
@@ -990,7 +990,7 @@ function evaluate(request,content) {
     }
 
     #[test]
-    fn library_aliases_are_checked_against_frame_permissions_before_installation() {
+    fn fixed_libraries_respect_frame_permissions_and_reject_model_aliases() {
         let root=TestRoot::new();
         let mut state=agent_service::tests::test_state(root.path(),"127.0.0.1:9".parse().unwrap());
         state.permission_mode=agent_service::PermissionMode::ReadOnly;
@@ -998,16 +998,14 @@ function evaluate(request,content) {
         let s=Session{agent_id:None,task_node_id:None,step_node_id:None,plugin:None,state:&state,task:"task",model:"fake",turn:1,cancel:&cancel,ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,input_budget:INPUT_BUDGET};
         let mut w=Window::default();
         let source="function main(){io.read({path:'source'});io.write({path:'must-not-write'});}";
-        assert!(scoped_arguments(&s,&w,&json!([])).is_err());
-        let args=scoped_arguments(&s,&w,&json!({"source":source})).unwrap();
-        assert!(!args["libraries"]["io"].as_object().unwrap().contains_key("write"));
-        assert!(install(&mut w,&args).is_err());
+        assert!(install_scoped(&s,&mut w,&json!([]),false).is_err());
+        assert!(install_scoped(&s,&mut w,&json!({"source":source}),false).is_err());
         assert!(w.program.is_none());
-        assert!(scoped_arguments(&s,&w,&json!({"source":"function main(){return null;}","libraries":{"io2":{"write":"write_file"}}})).is_err());
+        assert!(install_scoped(&s,&mut w,&json!({"source":"function main(){return null;}","libraries":{"io2":{"write":"write_file"}}}),false).is_err());
     }
 
     #[tokio::test]
-    async fn plugin_library_alias_uses_the_registered_owner_tool() {
+    async fn plugin_declared_library_uses_the_registered_owner_tool() {
         let root=TestRoot::new();
         std::fs::write(root.path().join("code-flow.json"),r#"{"version":1,"features":[]}"#).unwrap();
         let (_runtime,catalog)=crate::skill_packages::test_runtime();
@@ -1015,13 +1013,14 @@ function evaluate(request,content) {
         let project_root=root.path().to_string_lossy().into_owned();
         let app=Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>|{
             let n=requests.fetch_add(1,Ordering::SeqCst);
-            let message=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_tool_libraries").unwrap();
-            let published:Value=serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
-            assert_eq!(published["libraries"]["code_flow"]["read_code_flow"],"read_code_flow");
-            assert!(published["libraries"]["io"].is_null(),"file tools are outside this plugin's ownership");
+            let message=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_tool_headers").unwrap();
+            let headers=message["content"].as_str().unwrap();
+            assert!(headers.contains("declare namespace flow"));
+            assert!(headers.contains("function read_code_flow("));
+            assert!(!headers.contains("declare namespace io"),"file tools are outside this plugin's ownership");
             let (name,args)=match n {
                 0=>("create_task",json!({"goal":"Read this plugin through its library"})),
-                1=>("execute_program",json!({"source":"function main(request){return flow.read({workspace_root:request.root});}","input":{"root":project_root},"libraries":{"flow":{"read":"read_code_flow"}}})),
+                1=>("execute_program",json!({"source":"function main(request){return flow.read_code_flow({workspace_root:request.root});}","input":{"root":project_root}})),
                 _=>panic!("no extra model is needed for library dispatch"),
             };
             async move{Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
@@ -1124,12 +1123,12 @@ function main(request) {
   产物 = 制作(request);
   const check = 检查(产物, request);
   if (!check.passed) { 产物 = 修正(产物, request); }
-  const actual = tools.read_file({path:产物.path});
+  const actual = io.read({path:产物.path});
   assert(actual.content === request.expected, 'artifact still fails inspection');
   return {path:产物.path, content:actual.content};
 }
 function 制作(request) {
-  tools.write_file({path:request.path, content:'DRAFT'});
+  io.write({path:request.path, content:'DRAFT'});
   return {path:request.path};
 }
 function 检查(产物, request) {
@@ -1137,8 +1136,8 @@ function 检查(产物, request) {
   // Return {passed:boolean,evidence:[actual tool observations]}.
 }
 function 修正(产物, request) {
-  const original = tools.read_file({path:产物.path});
-  tools.write_file({path:产物.path, content:request.expected, expected_code_hash:original.code_hash});
+  const original = io.read({path:产物.path});
+  io.write({path:产物.path, content:request.expected, expected_code_hash:original.code_hash});
   return 产物;
 }
 "#;
@@ -1150,10 +1149,10 @@ function 修正(产物, request) {
                     let task: Value = serde_json::from_str(task["content"].as_str().unwrap()).unwrap();
                     assert_eq!(task["name"], "检查");
                     let input = &task["input"];
-                    assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "read_file"));
-                    let read = messages.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "read_file")));
+                    assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "invoke_library"));
+                    let read = messages.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "invoke_library")));
                     if !read {
-                        json!({"role":"assistant","tool_calls":[{"id":"inspect-actual","type":"function","function":{"name":"read_file","arguments":json!({"path":input["产物"]["path"]}).to_string()}}]})
+                        json!({"role":"assistant","tool_calls":[{"id":"inspect-actual","type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.read","args":{"path":input["产物"]["path"]}}).to_string()}}]})
                     } else {
                         assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("DRAFT")));
                         json!({"role":"assistant","content":json!({"passed":false,"evidence":[{"path":"artifact.txt","observed":"DRAFT","source":"read_file"}]}).to_string()})
@@ -1274,7 +1273,7 @@ function 修正(产物, request) {
             input_budget: INPUT_BUDGET,
         };
         let mut w = Window::default();
-        install(&mut w,&json!({"source":"function main(){const result=tools.write_file({path:'never-repeat.txt',content:'x'});return result.receipt;}"})).unwrap();
+        install(&mut w,&json!({"source":"function main(){const result=io.write({path:'never-repeat.txt',content:'x'});return result.receipt;}"})).unwrap();
         let State::Action(action) = w.program.as_mut().unwrap().next() else {
             panic!()
         };

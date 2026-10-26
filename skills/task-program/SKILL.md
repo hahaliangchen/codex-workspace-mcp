@@ -5,7 +5,7 @@ description: 将用户目标与业务 skill 表达为可执行的流程伪代码
 
 # 用程序表达任务
 
-语言版本 8。用普通 JS 基础语法表达完整流程；Rust 宿主执行普通计算，AI 只处理显式任务函数。业务要求、确认点、验收标准来自用户和业务 skill，不写进通用宿主。
+语言版本 9。用普通 JS 基础语法表达完整流程；Rust 宿主执行普通计算，AI 只处理显式任务函数。业务要求、确认点、验收标准来自用户和业务 skill，不写进通用宿主。
 
 ## 固定写法
 
@@ -14,7 +14,7 @@ description: 将用户目标与业务 skill 表达为可执行的流程伪代码
 - 控制流支持 if/else、传统 for、while、do/while、数组 for...of、无标签 break/continue、三元、assert、return、try/catch/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
 - + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件采用 C 风格真值：false、null 和数值 0 为假，其余 JSON 值为真（空字符串、数组、对象也为真）。if(items.length)、if(!result.error)、if(obj) 都合法。算术和比较仍不做字符串／数字强制转换。短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。
 - 数字运算类型明确：整数加减乘余数精确保留 JSON 64 位整数，溢出报错；除法为有限小数除法，除零报错。超过 2^53-1 的整数不能隐式转换成小数。+ 只连接两个字符串或相加两个数字。==/=== 都比较 JSON 值内容，不表示业务质量。
-- 优先使用 program_tool_libraries 发布的 library.method(args)，如 io.read({path})、io.write({path,content})。工具原 JSON 参数和返回不变；tools.EXACT_NAME(args)／静态 tools["exact/name"](args) 保留作精确名称入口。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
+- 只使用 program_tool_headers 声明的固定 library.method(args)，如 io.read({path})、io.write({path,content})。参数、可选字段和返回信息直接看声明；不写 tools.*，不提供 libraries 别名。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
 - 本地数组 push 收集结果；只支持确定性方法 includes/indexOf/slice、字符串 startsWith/endsWith/trim/toLowerCase/toUpperCase/split、数组 join、JSON.stringify/parse。未知方法编译失败，不能假定会让 AI 解释。
 - 禁止 function*/yield、async/await/Promise、call()/ai() 包装、模块导入导出、TS 类型、闭包、箭头／匿名／嵌套函数、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入和 JS 全局环境。
 
@@ -22,9 +22,11 @@ let/const 在函数内不做块级遮蔽，使用不同名字；var 可以重复
 
 ## 工具库
 
-io.read/read_lines/write/list/search/edit/replace 对应真实文件工具。插件库和方法从当前启用、可用的工具目录发布，不按业务含义猜测。必要时 execute_program/define_task_body 的 libraries 参数可建立新别名：{"ppt":{"get_design":"目录公布的精确工具名"}}，然后写 ppt.get_design(args)；这里只说明映射形状，实际值必须从目录取得。不能覆盖已发布方法或指向不存在／无权限的工具，不能通过库调用任务调度器。
+program_tool_headers 是根据真实工具契约生成的 TS 声明，供阅读，不复制类型到源码。每个方法只有一个固定名字。io 是本地文件库，host 是其他宿主操作，插件在清单里声明自己的 library 名。声明中包含 JSON 对象参数、可选字段、整数／范围等约束及一行说明；返回类型无 schema 时为 unknown，不猜测其字段。
 
-库方法使用原工具的 JSON 对象参数，不自动把字符串或位置参数转换成字段。只支持静态 namespace.method，不把库当作 JS 对象或函数值。公共库映射随 main 保存、向 helper/补写/fork 继承；不需要在各分支重新发现或重填。方法最终走原来的工具分发、工具组加载、权限与插件归属检查。
+可用的方法全部发布，编译器使用同一份权限与插件归属过滤目录，不需要为写程序加载工具组。只允许静态 namespace.method(args)，不支持动态方法名或模型起别名。方法最终经过原有工具分发和权限检查。
+
+规划请求只发这些声明和编排工具，不重复发业务工具的 JSON schema。在注释任务中直接执行操作时，用原生 invoke_library({method:"io.read",args:{path:"..."}})，它的分支参数 schema 来自真实工具；同一个方法在源码中仍写 io.read({path:"..."})。invoke_library 只是传输工具，不是源码函数。需要补写当前任务时使用 define_task_body，不创建新 main。
 
 ## AI 工作必须显式调用
 
