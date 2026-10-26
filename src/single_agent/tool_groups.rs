@@ -26,7 +26,7 @@ const GROUPS: &[(&str, &str)] = &[
     ),
     (
         "collaboration",
-        "Delegate independent tasks, inspect results, merge, review or cancel delegates",
+        "Fork child functions onto Agents; join their returns, inspect, merge, review or cancel",
     ),
 ];
 
@@ -77,6 +77,7 @@ pub(super) fn group(name: &str) -> Option<&'static str> {
         "read_attachment" => "attachments",
         "view_image" | "analyze_images" | "image_analysis_results" => "vision",
         "spawn_agent"
+        | "join_agents"
         | "wait_agents"
         | "review_agent_result"
         | "inspect_agent_changes"
@@ -470,7 +471,7 @@ mod tests {
         .await
         .unwrap();
         server.abort();
-        assert_eq!(captured.lock().unwrap().len(), 9);
+        assert_eq!(captured.lock().unwrap().len(), 8);
         assert_eq!(
             std::fs::read_to_string(h.root.join("saved.txt")).unwrap(),
             "loaded tool worked"

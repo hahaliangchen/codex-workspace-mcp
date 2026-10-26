@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+mod agent_program;
 mod agent_service;
 mod agent_web;
 mod ai_proxy;

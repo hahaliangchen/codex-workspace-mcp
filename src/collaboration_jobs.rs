@@ -106,9 +106,15 @@ pub fn tools() -> Vec<Value> {
     vec![
         function(
             "spawn_agent",
-            "Delegate one independent task. At most five task agents run per conversation; context compression does not consume these slots. Returns immediately. The host inherits the current execution context, including confirmed requirements, loaded materials, execution receipts, active skills and asset references. Large parents are projected to narrative and references, so include the asset_ids the delegate should read first and do not repeat shared requirements, design specs or outlines. Supply the specific task, owned files/pages and acceptance criteria; the optional context field is for assignment-specific exceptions or references only. Delegates inherit this conversation's model, permissions and plugin/project binding; they cannot create further delegates. You remain responsible for verifying their actual results.",
-            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"inputs":{"type":"object","description":"Declared assets, pinned materials, node returns, history events, and tool_groups for the delegate. Omitted tool_groups starts with core tools only."},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Asset handles the delegate should read first. Bodies remain references in projected contexts."}}),
+            "Inside execute_program use yield fork(helper,args), not call(tools.spawn_agent,args). This native tool runs one child function on another Agent and immediately returns its agent_id handle. The child inherits the caller's prepared tool groups, skills and saved parent-scope values, within context capacity, plus this assignment's inputs. Supply only its goal, parameters, owned resources and expected return; do not repeat shared setup or the whole plan. Local working context stays in the child. At most five children run per conversation; child Agents cannot fork again. Use join_agents when the caller needs these returns. Existing permissions, plugin boundaries and Git isolation still apply. A returned function is not proof that its artifacts pass acceptance.",
+            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"inputs":{"type":"object","description":"Additional assets, pinned materials, node returns, history events and tool_groups. Parent tool groups and saved scope values are inherited even when omitted."},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Explicit argument handles; complete bodies are supplied when they fit, otherwise references allow paging."}}),
             json!(["name", "task"]),
+        ),
+        function(
+            "join_agents",
+            "Inside execute_program use yield join(handles), not call(tools.join_agents,args). This native API suspends this caller until ALL specified fork handles have returned, including failed or cancelled children. Call alone. The host waits without repeated model calls; child completions are delivered with concise return values and saved detail handles. This does not accept results or replay child actions. Inspect the returned artifacts and integrate once before final delivery. Use wait_agents only if an intermediate status is specifically needed.",
+            json!({"agent_ids":{"type":"array","minItems":1,"maxItems":LIMIT,"uniqueItems":true,"items":{"type":"string","minLength":1}}}),
+            json!(["agent_ids"]),
         ),
         function(
             "wait_agents",
@@ -137,7 +143,9 @@ pub fn tools() -> Vec<Value> {
 pub fn is_tool(name: &str) -> bool {
     matches!(
         name,
-        "spawn_agent" | "wait_agents" | "review_agent_result" | "cancel_agent" | "inspect_agent_changes" | "merge_agent_result"
+        "spawn_agent"
+            | "join_agents"
+            | "wait_agents" | "review_agent_result" | "cancel_agent" | "inspect_agent_changes" | "merge_agent_result"
     )
 }
 pub fn ensure_active(root: &Path, task: &str, id: &str) -> Result<()> {
@@ -175,7 +183,10 @@ pub fn claim_resource(root: &Path, task: &str, agent: Option<&str>, call_id: &st
     let mut conn=db(root)?;
     let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let previous=tx.query_row("SELECT owner,owner_agent,expires_at FROM agent_resource_claims WHERE resource=?1",[&resource],
-        |r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,i64>(2)?))).optional()?;
+        |r| {
+                Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,i64>(2)?))
+            },
+        ).optional()?;
     if let Some((other,other_agent,expiry))=previous {
         if other!=owner {
             let active=if let Some(id)=other_agent {
@@ -283,6 +294,7 @@ pub fn submit(
     let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
     let mut spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
     spec["caller_task_node_id"]=shared_context["caller_task_node_id"].clone();
+    spec["program_function"] = json!(shared_context["program"].is_object());
     if let Some(node)=shared_context.get("task_node") {
         let mut node:crate::task_tree::Node=serde_json::from_value(node.clone())?;
         let saved=crate::task_tree::get(&tx,task,&node.node_id)?;
@@ -364,7 +376,7 @@ pub fn submit(
         if let Ok(spec) = specification(state.workspace.root(), &task, &job) {
             match crate::delegate_git::finish(&spec) {
                 Ok(Some(git)) => result["git"] = git,
-                Ok(None) => {},
+                Ok(None) => {}
                 Err(error) => {
                     result["status"] = json!("failed");
                     result["error"] = json!(format!("could not snapshot delegate Git changes: {error:#}"));
@@ -453,8 +465,8 @@ fn reap(root: &Path, task: &str) -> Result<()> {
 pub fn statuses(root: &Path, task: &str) -> Result<Value> {
     reap(root, task)?;
     let conn = db(root)?;
-    let mut stmt=conn.prepare("SELECT id,name,status,delivered,review FROM agent_delegates WHERE task_id=?1 ORDER BY created_at,rowid")?;
-    Ok(json!(stmt.query_map([task],|r|Ok(json!({"agent_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"delivered":r.get::<_,bool>(3)?,"review":r.get::<_,Option<String>>(4)?.map(|s|serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))})))?.collect::<rusqlite::Result<Vec<_>>>()?))
+    let mut stmt=conn.prepare("SELECT id,name,status,delivered,review,COALESCE(json_extract(specification,'$.program_function'),0) FROM agent_delegates WHERE task_id=?1 ORDER BY created_at,rowid")?;
+    Ok(json!(stmt.query_map([task],|r|Ok(json!({"agent_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"delivered":r.get::<_,bool>(3)?,"program_function":r.get::<_,bool>(5)?,"review":r.get::<_,Option<String>>(4)?.map(|s|serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))})))?.collect::<rusqlite::Result<Vec<_>>>()?))
 }
 pub fn ready(root: &Path, task: &str) -> Result<Vec<Value>> {
     reap(root, task)?;
@@ -464,7 +476,7 @@ pub fn ready(root: &Path, task: &str) -> Result<Vec<Value>> {
 }
 pub fn outstanding(root: &Path, task: &str) -> Result<bool> {
     reap(root, task)?;
-    Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0 OR review IS NULL))",[task],|r|r.get(0))?)
+    Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0 OR (review IS NULL AND COALESCE(json_extract(specification,'$.program_function'),0)=0)))",[task],|r|r.get(0))?)
 }
 /// Only work submitted by this task may delay or receive its completion.
 pub fn outstanding_for(root: &Path, task: &str, owner: &str) -> Result<bool> {
@@ -486,6 +498,70 @@ pub async fn wait(root: &Path, task: &str, cancel: &CancellationToken, millis: u
             return Ok(());
         }
         tokio::select! {_=cancel.cancelled()=>anyhow::bail!("cancelled"),_=notified=>{},_=tokio::time::sleep_until(deadline)=>return Ok(())}
+    }
+}
+
+/// A join is an idempotent wait over durable fork handles, not a new model
+/// turn or an acceptance decision. No connection/transaction lives across await.
+pub async fn join(
+    root: &Path,
+    task: &str,
+    owner: &str,
+    args: &Value,
+    cancel: &CancellationToken,
+) -> Result<Value> {
+    let ids = args["agent_ids"]
+        .as_array()
+        .context("agent_ids must be an array")?;
+    ensure!(
+        !ids.is_empty() && ids.len() <= LIMIT,
+        "join requires 1..={LIMIT} agent handles"
+    );
+    let ids = ids
+        .iter()
+        .map(|id| {
+            id.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .context("agent_ids must contain nonempty strings")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len() == ids.len(),
+        "duplicate join handle"
+    );
+    for id in &ids {
+        let spec = specification(root, task, id)?;
+        ensure!(
+            spec["caller_task_node_id"]
+                .as_str()
+                .is_none_or(|caller| caller == owner),
+            "JOIN_CALLER_MISMATCH"
+        );
+    }
+    loop {
+        ensure!(!cancel.is_cancelled(), "cancelled");
+        // Register before examining statuses so notify_waiters cannot be lost.
+        let changed = CHANGED.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        reap(root, task)?;
+        let joined = {
+            let conn = db(root)?;
+            ids.iter().map(|id| conn.query_row(
+                "SELECT name,status FROM agent_delegates WHERE task_id=?1 AND id=?2", params![task,id],
+                |r| Ok(json!({"agent_id":id,"name":r.get::<_,String>(0)?,"status":r.get::<_,String>(1)?})))
+            ).collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if joined.iter().all(|child| child["status"] != "running") {
+            return Ok(json!({"joined":true,"delegates":joined,"acceptance":"unreviewed"}));
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => anyhow::bail!("cancelled"),
+            _ = &mut changed => {},
+            // Recheck leases after a missed notification or another host's exit.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+        }
     }
 }
 fn terminal_git(root: &Path, task: &str, id: &str) -> Result<Value> {
@@ -579,16 +655,24 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
             }
         } else {
             let output_paths=child_result["artifact_index"]["assets"].as_array().into_iter().flatten()
-                .filter(|asset| asset["source_tool"].as_str().is_some_and(|tool|matches!(tool,"write_file"|"edit_file"|"replace_range")))
+                .filter(|asset| {
+                    asset["source_tool"].as_str().is_some_and(|tool| {
+                        matches!(tool,"write_file"|"edit_file"|"replace_range")
+                    })
+                })
                 .filter_map(|asset|asset["source_path"].as_str()).collect::<Vec<_>>();
             let mut inspected = false;
             for (name,value) in &receipts {
                 if name=="read_file" || name=="read_file_lines" {
-                    inspected |= value["path"].as_str().is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
+                    inspected |= value["path"].as_str().is_some_and(|path| {
+                        output_paths.is_empty() || output_paths.contains(&path)
+                    })
                         && fresh_local_read(&files,value)?;
                 } else if name.ends_with("__read_file") {
                     let path=value["data"]["path"].as_str().or_else(||value["path"].as_str());
-                    inspected |= path.is_some_and(|path|output_paths.is_empty() || output_paths.contains(&path))
+                    inspected |= path.is_some_and(|path| {
+                        output_paths.is_empty() || output_paths.contains(&path)
+                    })
                         && (value["data"]["revision"].is_number() || value["revision"].is_number());
                 } else if name=="analyze_images" {
                     inspected |= value["status"]=="succeeded" || value["status"]=="completed";
@@ -642,6 +726,120 @@ pub fn cancel_all(root: &Path, task: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn join_waits_for_all_selected_handles_and_preserves_failed_returns() {
+        let root = std::env::temp_dir().join(format!("join-{}", agent_service::uuid_like()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conn = db(&root).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','','fake','running',0,0)",[]).unwrap();
+        for id in ["fast", "slow", "unrelated"] {
+            conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,'t',1,?1,?1,?2,'running',0)",
+                params![id,json!({"caller_task_node_id":"parent"}).to_string()]).unwrap();
+            conn.execute(
+                "INSERT INTO agent_delegate_executors VALUES (?1,'other-live-host',?2,0)",
+                params![id, now_ms() + 60_000],
+            )
+            .unwrap();
+        }
+        let cancel = CancellationToken::new();
+        let args = json!({"agent_ids":["slow","fast"]});
+        let waiting = join(&root, "t", "parent", &args, &cancel);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        conn.execute(
+            "UPDATE agent_delegates SET status='completed' WHERE id='fast'",
+            [],
+        )
+        .unwrap();
+        CHANGED.notify_waiters();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "a fast return must not resume the caller before the other selected child"
+        );
+        conn.execute(
+            "UPDATE agent_delegates SET status='failed' WHERE id='slow'",
+            [],
+        )
+        .unwrap();
+        CHANGED.notify_waiters();
+        let value = tokio::time::timeout(std::time::Duration::from_secs(2), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["delegates"][0]["agent_id"], "slow");
+        assert_eq!(value["delegates"][0]["status"], "failed");
+        assert_eq!(value["delegates"][1]["status"], "completed");
+        assert_eq!(value["acceptance"], "unreviewed");
+        assert_eq!(
+            join(&root, "t", "parent", &args, &cancel).await.unwrap(),
+            value,
+            "resuming a durable join must not replay the children"
+        );
+        assert!(
+            join(&root, "t", "other-parent", &args, &cancel)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("JOIN_CALLER_MISMATCH")
+        );
+        assert!(
+            join(
+                &root,
+                "t",
+                "parent",
+                &json!({"agent_ids":["fast","fast"]}),
+                &cancel
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            join(&root, "t", "parent", &json!({"agent_ids":[]}), &cancel)
+                .await
+                .is_err()
+        );
+        assert!(
+            join(
+                &root,
+                "t",
+                "parent",
+                &json!({"agent_ids":["missing"]}),
+                &cancel
+            )
+            .await
+            .is_err()
+        );
+        cancel.cancel();
+        assert!(
+            join(
+                &root,
+                "t",
+                "parent",
+                &json!({"agent_ids":["unrelated"]}),
+                &cancel
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status FROM agent_delegates WHERE id='unrelated'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "running"
+        );
+    }
+
     #[test]
     fn polling_live_delegates_does_not_wait_for_a_database_writer() {
         let root = std::env::temp_dir().join(format!("delegate-poll-{}", agent_service::uuid_like()));

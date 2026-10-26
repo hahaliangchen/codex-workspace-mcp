@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 
 pub const ROOT: &str = "n0";
 /// Guard against corrupt parent links. Real nesting is bounded by MAX_TEMP_TASKS.
-pub const MAX_DEPTH: usize = 16;
+pub const MAX_DEPTH: usize = MAX_TEMP_TASKS * 2 + 8;
 /// Temporary tasks may nest this deep below a main task.
-pub const MAX_TEMP_TASKS: usize = 3;
+pub const MAX_TEMP_TASKS: usize = 64;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
@@ -295,7 +295,7 @@ fn clip(text: &str, limit: usize) -> String {
 pub fn path_status(conn: &Connection, task: &str, id: &str) -> Result<Value> {
     let node = get(conn, task, id)?;
     if !is_task(&node) {
-        return Ok(json!({"task":null,"instruction":"No task is running. To answer without tools, reply directly. Before using tools, call create_task alone with goal and necessary background; no planned steps are required."}));
+        return Ok(json!({"task":null,"instruction":"No task is running. To answer without tools, reply directly. Before using tools for any business execution, write a short execution program sketch in create_task briefing and call create_task alone with goal. A materialized step list is not required."}));
     }
     let mut tasks = Vec::new();
     for ancestor in path(conn, task, id)?.into_iter().filter(is_task) {
@@ -321,8 +321,12 @@ pub fn path_status(conn: &Connection, task: &str, id: &str) -> Result<Value> {
         .iter()
         .find(|n| n.status == "current")
         .map(|step| json!({"node_id":step.node_id,"title":step.title}));
-    Ok(json!({"task_path":tasks,"steps":listed,"earlier_steps_omitted":omitted,"current_step":current,
-        "instruction":"Execute the current task. The host records each AI call, response, tool calls and results as one step. Units of work that need their own materials and return results can run as child tasks: call create_task alone with tasks, each with its goal, briefing and asset_ids; they run in order in their own scopes and return their summaries here so you can resume. No tool calls triggers a host completion check in this same task context. On that check, continue using tools if work remains, otherwise summarize; finish itself never calls AI."}))
+    let instruction=if node.inputs["program_task"].is_object() {
+        "Execute this helper body using its description, named arguments and supplied materials. Use tools as steps or define_task_body to implement this same function with child task calls; return its contracted JSON value to the waiting caller. Do not create another main. The host records actual calls and results."
+    } else {
+        "Execute the current user goal using the supplied materials. After required skill/tool preparation, submit its complete program through execute_program: one main for the full task, helper call for serial work, fork/join for authorized parallel work. Main returns when its requested work, checks and delivery are complete; helper returns resume their caller. The host records actual calls and results; do not recreate step nodes."
+    };
+    Ok(json!({"task_path":tasks,"steps":listed,"earlier_steps_omitted":omitted,"current_step":current,"instruction":instruction}))
 }
 
 pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Result<Node> {
@@ -636,11 +640,11 @@ pub fn is_tool(name: &str) -> bool {
 
 pub fn tools() -> Vec<Value> {
     vec![json!({"type":"function","function":{"name":"create_task",
-        "description":"Create tasks and execute them now. A task is a scope: materials loaded while it runs stay in its context until it ends, subject to context capacity. Without a running task, goal creates the main task, and tasks may also list its first child tasks. Inside a task, tasks creates serial child tasks under it; goal alone is shorthand for one. Units of work you can already see fit one call with several tasks. Work you meet unexpectedly inside a task can become that task's own child task. Children run in order, each in its own scope with its goal, briefing, the user's words, loaded skills, the materials in its asset_ids and the returns of the earlier children; your other working records stay with you while they run. After the last one, their working contexts are released and this call returns their summaries with handles to what they saved. The host creates one step per AI request. A no-tool reply triggers completion confirmation in the current task before host finish. Call alone.",
+        "description":"Create the task scope with its goal and necessary background before tool-based work. Call alone. After missing skill/tool contracts are prepared, submit one complete execute_program whose main covers the user goal and calls helpers for steps. Do not recreate the task per operation. Materials remain in scope subject to capacity, with references to originals. The optional tasks array retains serial scope calls for legacy/manual workflows; inside a TS program express serial helpers with call and authorized parallel helpers with fork/join. The host records execution steps and normal returns without an extra completion confirmation.",
         "parameters":{"type":"object","properties":{
             "goal":{"type":"string","description":"Without a running task: the main task's objective. Inside a task: one child's objective, shorthand for tasks with one entry."},
             "reason":{"type":"string","description":"Optional: why this work runs in its own scope."},
-            "briefing":{"type":"string","description":"Optional background for the main task or the single child. The host supplies chronological caller tool activity and saved-result references automatically; full caller working records are not inherited."},
+            "briefing":{"type":"string","description":"For a new main task, write its short execution program sketch and necessary background here, for every business execution with tools. For a child, supply its function body only when not already inherited. The host stores the briefing in the existing task record and supplies parent-scope values automatically; no separate planning artifact is needed."},
             "asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Saved materials the child tasks need. The host loads complete bodies when the whole child request fits; otherwise supplies references and total_chars for explicit read_asset pages (max_chars up to 24000). A child can process oversized material and return only the needed result. With tasks, shared by every child."},
             "tasks":{"type":"array","minItems":1,"maxItems":64,"description":"Serial child tasks, run in this order, each in its own scope.","items":{"type":"object","properties":{
                 "goal":{"type":"string"},"briefing":{"type":"string"},

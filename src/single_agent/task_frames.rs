@@ -77,11 +77,15 @@ fn new_task(parent: &Node, args: &Value, ordinal: usize, role: &str, turn: usize
     let goal = required_text(args, "goal")?;
     // A child's declared materials are its parameters; a main task has no caller.
     let inputs = if role == "temp" && !args["asset_ids"].is_null() { json!({"assets":args["asset_ids"]}) } else { json!({}) };
+    let mut inputs = inputs;
+    if role == "temp" && args["program_task"].is_object() {
+        inputs["program_task"] = args["program_task"].clone();
+    }
     let mut task = tree::planned(parent, &json!({"title":task_title(&goal),"goal":goal,"reason":args["reason"],"inputs":inputs}), ordinal, "task")?;
     task.agent_id = parent.agent_id.clone();
     task.briefing = args["briefing"].as_str().map(str::trim).unwrap_or("").to_owned();
     task.metadata = json!({"role":role,"turn":turn});
-    let finish = tree::planned(&task, &json!({"title":"Finish","goal":"End this task and deliver its summary after host completion confirmation; never call AI here"}), tree::FINISH_ORDINAL, "finish")?;
+    let finish = tree::planned(&task, &json!({"title":"Finish","goal":"Return this task result to the waiting caller or serial iterator; never call AI here"}), tree::FINISH_ORDINAL, "finish")?;
     Ok((task, finish))
 }
 
@@ -95,10 +99,10 @@ pub(super) async fn begin_round(s: &Session<'_>, w: &mut Window, request: &str) 
         let parent=tree::get(&tx,&task,&owner)?;
         ensure!(tree::is_task(&parent) && parent.status=="running" && parent.agent_id==agent,"TASK_EXECUTION_FRAME_MISMATCH");
         let ordinal=tree::children(&tx,&task,&owner)?.iter().filter(|n|n.kind=="step").count();
-        let title=if frame.confirming_finish {format!("Round {}: completion confirmation",ordinal+1)} else {format!("Round {}",ordinal+1)};
+        let title= format!("Round {}",ordinal+1);
         let mut node=tree::planned(&parent,&json!({"title":title,"goal":"One AI request, its response, tool calls and results"}),ordinal,"step")?;
         node.agent_id=agent;node.status="current".into();
-        node.metadata=json!({"request_id":request,"scope":scope,"phase":if frame.confirming_finish {"confirming_finish"} else {"executing"}});
+        node.metadata=json!({"request_id":request,"scope":scope,"phase":"executing"});
         tree::emit(&tx,&task,"task/node_started",&mut node,turn)?;
         frame.current_step_node_id=Some(node.node_id);
         write_window(&tx,&task,&scope,&frame)?;
@@ -109,7 +113,8 @@ pub(super) async fn begin_round(s: &Session<'_>, w: &mut Window, request: &str) 
 
 /// Store references to the native exchange; do not invent a lossy step summary.
 pub(super) async fn complete_round(s: &Session<'_>, w: &mut Window) -> Result<()> {
-    let Some(id)=w.current_step_node_id.clone() else {return Ok(())};
+    let Some(id)=w.current_step_node_id.clone() else {return Ok(());
+    };
     let agent=s.delegate_id().map(str::to_owned);
     let (task,turn,scope,mut frame)=(s.task.to_owned(),s.turn,s.scope.clone(),w.clone());
     *w=db(s.state.workspace.root(),move|conn| {
@@ -138,14 +143,6 @@ pub(super) async fn complete_round(s: &Session<'_>, w: &mut Window) -> Result<()
     Ok(())
 }
 
-pub(super) async fn confirm_finish(s: &Session<'_>, w: &mut Window) -> Result<()> {
-    w.confirming_finish=true;
-    let message=json!({"role":"user","name":"task_completion_check","content":"你上一条回复没有调用工具。若任务已完成，或因外部原因无法继续（说明原因以及需要用户做什么），直接回复总结即结束；若还有能推进的工作，继续调用工具。"});
-    let seq=append(s,"task/completion_check",json!({"turn":s.turn,"task_node_id":frame_task(s,w),"message":message}),false).await?;
-    w.messages.push(sourced(message,s.task,seq));
-    save(s,w).await
-}
-
 fn record_call(tx: &rusqlite::Transaction<'_>, task: &str, turn: usize, step: usize, request: &str, call: &crate::model_stream::ToolCall, node: &str) -> Result<i64> {
     record_event(tx,task,"tool/call",json!({"actor":"agent","turn":turn,"step":step,"task_node_id":node,"flowNodeId":request,
         "callId":call.call_id,"name":call.name,"arguments":call.arguments,
@@ -155,8 +152,10 @@ fn record_call(tx: &rusqlite::Transaction<'_>, task: &str, turn: usize, step: us
 pub(super) fn tool_description(definitions: &[Value], name: &str, arguments: &str) -> String {
     let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
     args["label"].as_str().filter(|label| !label.trim().is_empty())
-        .or_else(|| definitions.iter().find(|tool| tool["function"]["name"] == name)
-            .and_then(|tool| tool["function"]["description"].as_str()))
+        .or_else(|| {
+            definitions.iter().find(|tool| tool["function"]["name"] == name)
+            .and_then(|tool| tool["function"]["description"].as_str())
+        })
         .unwrap_or(name).to_owned()
 }
 
@@ -183,7 +182,9 @@ pub(super) fn round_activity(s: &Session<'_>, owner: &str, definitions: &[Value]
         entry.as_object_mut().unwrap().remove("arguments_preview");
         if let Some(assets)=entry["assets"].as_array_mut() {
             for asset in assets {
-                *asset=["asset_id","revision","read_reference"].iter().filter_map(|key|asset.get(*key).map(|value|((*key).to_owned(),value.clone()))).collect();
+                *asset=["asset_id","revision","read_reference"].iter().filter_map(|key| {
+                        asset.get(*key).map(|value|((*key).to_owned(),value.clone()))
+                    }).collect();
             }
         }
     }
@@ -197,10 +198,14 @@ pub(super) fn brief_arguments(value: &Value) -> Value {
             return json!({"characters":value.as_str().map(|text| text.chars().count()).unwrap_or_else(||value.to_string().chars().count())});
         }
         match value {
-            Value::String(text) if text.chars().count() > 160 => json!({"characters":text.chars().count()}),
+            Value::String(text) if text.chars().count() > 160 => {
+                json!({"characters":text.chars().count()})
+            }
             Value::Object(fields) if depth < 2 => fields.iter().map(|(key,value)|(key.clone(),brief(value,key,depth+1))).collect(),
             Value::Array(items) if depth < 2 => json!(items.iter().take(8).map(|item|brief(item,key,depth+1)).collect::<Vec<_>>()),
-            Value::Object(_) | Value::Array(_) => json!({"characters":value.to_string().chars().count()}),
+            Value::Object(_) | Value::Array(_) => {
+                json!({"characters":value.to_string().chars().count()})
+            }
             _ => value.clone(),
         }
     }
@@ -214,16 +219,18 @@ fn result_facts(result: &Value) -> Value {
             Value::String(text) => json!(text.chars().take(512).collect::<String>()),
             Value::Object(fields) if depth < 2 => fields.iter().map(|(key,value)|(key.clone(),fact(value,depth+1))).collect(),
             Value::Array(items) if depth < 2 => json!(items.iter().take(8).map(|value|fact(value,depth+1)).collect::<Vec<_>>()),
-            Value::Object(_) | Value::Array(_) => json!({"characters":value.to_string().chars().count()}),
+            Value::Object(_) | Value::Array(_) => {
+                json!({"characters":value.to_string().chars().count()})
+            }
             _ => value.clone(),
         }
     }
     let keys = ["status", "revision", "version", "sourceHash", "source_hash", "source_revision", "source_stable",
         "saved", "applied", "needsSave", "error", "message", "document", "summary", "artifact_id", "job_id", "task_id", "project_id", "path", "page", "pageId", "retryable"];
     let select = |value: &Value| -> Value {
-        keys.iter().filter_map(|key| value.get(*key).map(|value| {
-            ((*key).to_owned(),fact(value,0))
-        })).collect()
+        keys.iter().filter_map(|key| {
+                value.get(*key).map(|value| ((*key).to_owned(),fact(value,0)))
+            }).collect()
     };
     let mut facts = select(result);
     if let Some(data) = result.get("data") {
@@ -276,7 +283,9 @@ fn activity_for(s: &Session<'_>, tasks: &[Node], definitions: &[Value], limit: O
                 if let Some(index) = calls.get(&key) {
                     let entry = &mut activity[*index];
                     entry["status"] = data["meta"]["result"]["status"].as_str().map(|status| json!(status))
-                        .unwrap_or_else(|| json!(if data["message"]["isError"] == true {"error"} else {"returned"}));
+                        .unwrap_or_else(|| {
+                            json!(if data["message"]["isError"] == true {"error"} else {"returned"})
+                        });
                     entry["result_reference"] = json!({"tool":"read_session_history","arguments":{"task_id":s.task,"event_seq":seq}});
                     entry["result_facts"] = result_facts(&data["meta"]["result"]);
                     let mut assets = references.get(&seq).cloned().unwrap_or_default();
@@ -360,7 +369,7 @@ async fn create_main_task(s: &Session<'_>, w: &mut Window, call: &crate::model_s
             node.status = "running".into();
             tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
             Ok((json!({"task":{"node_id":node.node_id,"goal":node.goal},
-                "instruction":"Execute this task now. The host records one step per AI call. Materials you load stay in this task's context while it runs. Units of work you can see can run as serial child tasks created together in one create_task call with tasks, each with the asset_ids it needs. When ready to end, reply with a summary; the host will ask for completion confirmation before finish."}),
+                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete program with one main covering the user goal and helpers for its steps. Use call for serial helpers and fork/join for authorized parallel helpers. Normal returns resume the caller or finish main; the host records execution without another model completion verdict."}),
                 node.node_id))
         })();
         if created.is_err() {
@@ -379,7 +388,6 @@ async fn create_main_task(s: &Session<'_>, w: &mut Window, call: &crate::model_s
         if marker {
             frame.task_node_id = Some(owner);
             frame.current_step_node_id = None;
-            frame.confirming_finish = false;
         }
         write_window(&tx, &task, &scope, &frame)?;
         tx.commit()?;
@@ -424,7 +432,8 @@ async fn create_temporary_task(s: &Session<'_>, w: &mut Window, parent_id: &str,
             Ok::<_, anyhow::Error>(nodes)
         })()?;
         let first = &nodes[0].0;
-        let inputs = declared_inputs(s, w, first).await?;
+        let mut inputs = declared_inputs(s, w, first).await?;
+        inherit_scope_values(s, w, &mut inputs).await?;
         let frame = temporary_frame(s, w, first, inputs, chain_facts(&nodes.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), 0, Vec::new()))?;
         Ok::<_, anyhow::Error>((nodes, frame))
     }
@@ -473,7 +482,7 @@ async fn create_temporary_task(s: &Session<'_>, w: &mut Window, parent_id: &str,
 /// A temporary task's own context, like a function's scope: its goal and
 /// briefing, the materials declared for it (its parameters, kept until it
 /// returns), the skills and pinned materials it inherits and the user's words
-/// in this main task. The caller's working records stay behind. Its
+/// in this main task. Parent values are readable; conversational working records stay behind. Its
 /// chronological tool activity and saved-result references are assembled by
 /// the host; ancestor goals also arrive with every request as the task path.
 fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node, inputs: Vec<Value>, chain: Value) -> Result<Window> {
@@ -485,6 +494,7 @@ fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node, inputs: Vec<Va
         }
     }
     messages.extend(inputs);
+    messages.push(scope_environment(parent, &frame_task(s, parent)));
     if chain["earlier"].as_array().is_some_and(|items| !items.is_empty()) {
         messages.push(json!({"role":"user","name":"chain_returns","content":json!({"host_status":true,"not_a_user_request":true,
             "returns":chain["earlier"],"instruction":"Returns of the earlier tasks in this chain, in order. Read a handle only when you need its content."}).to_string(),
@@ -493,13 +503,27 @@ fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node, inputs: Vec<Va
     messages.push(json!({"role":"user","name":"caller_activity","content":caller_activity(s,parent)?.to_string(),"_frame_input":true}));
     let mut started = json!({"host_status":true,"not_a_user_request":true,
         "task":{"node_id":node.node_id,"goal":node.goal,"reason":node.spawned_from,"briefing":node.briefing,"asset_ids":node.inputs["assets"]},
-        "instruction":"Execute this child task in its own scope. Declared asset_ids are supplied as complete bodies when they fit, otherwise as references with lengths. Read referenced material in explicit read_asset pages as needed; unread text has not been delivered. Only the declared body or reference stays until return; pages are ordinary working steps subject to folding. Return only the result needed by the caller, with saved asset handles; this working context is then released."});
+        "instruction":"Execute this child task using the inherited parent environment and the declared inputs. Shared and declared values arrive as complete bodies when they fit, otherwise as references with lengths. Read absent bodies in explicit read_asset pages as needed; unread text has not been delivered. Reuse prepared capabilities and values instead of initializing them again. Return only the result needed by the caller, with saved asset handles; this child's local working context is then released."});
     if !chain.is_null() {
         started["chain"] = json!({"position":chain["position"],"total":chain["total"],"tasks":chain["tasks"],
             "note":"Tasks of one create_task call run in this order, each in its own scope. Do only this task's part; the next one starts when this one returns."});
     }
     messages.push(json!({"role":"user","name":"task_started","content":started.to_string(),"_frame_input":true}));
+    let program_task = node
+        .inputs
+        .get("program_task")
+        .filter(|v| v.is_object())
+        .cloned();
+    if let Some(task) = &program_task {
+        let mut input=task.clone();
+        input.as_object_mut().unwrap().remove("body");
+        messages.push(json!({"role":"user","name":"program_task_input","content":input.to_string(),"_frame_input":true}));
+    }
+    let program=program_task.as_ref().filter(|t|t["body"].is_object())
+        .map(|t|super::ts_program::fork_runtime(&json!({"program":t["body"]}))).transpose()?.flatten();
     let mut child = Window {
+        program,
+        program_task,
         messages,
         task_node_id: Some(node.node_id.clone()),
         loaded_tool_groups: parent.loaded_tool_groups.clone(),
@@ -576,7 +600,8 @@ pub(super) async fn create_step(s: &Session<'_>, w: &mut Window, call: &crate::m
 async fn next_in_chain(s: &Session<'_>, w: &Window, id: &str, text: &str, saved: &Value) -> Result<Option<(Node, Window, Window)>> {
     let (chain, index, mut caller) = {
         let conn = agent_service::open_db(s.state.workspace.root())?;
-        let Some(finish) = tree::finish_node(&conn, s.task, id)? else { return Ok(None) };
+        let Some(finish) = tree::finish_node(&conn, s.task, id)? else { return Ok(None);
+        };
         let iterator = &finish.metadata["iterator"];
         let ids = iterator["chain"].as_array().cloned().unwrap_or_default();
         let index = iterator["index"].as_u64().unwrap_or(0) as usize;
@@ -592,14 +617,17 @@ async fn next_in_chain(s: &Session<'_>, w: &Window, id: &str, text: &str, saved:
     };
     // What the user said meanwhile belongs to the whole main task.
     for original in w.messages.iter().filter(|m| is_user_original(m)) {
-        if !caller.messages.iter().any(|m| m["source"]["seq"] == original["source"]["seq"] && m["content"] == original["content"]) {
+        if !caller.messages.iter().any(|m| {
+            m["source"]["seq"] == original["source"]["seq"] && m["content"] == original["content"]
+        }) {
             caller.messages.push(original.clone());
         }
     }
     let mut earlier = chain[..index].iter().map(child_return).collect::<Vec<_>>();
     earlier.push(json!({"task":chain[index].title,"node_id":chain[index].node_id,"result":text,"assets":saved}));
     let next = chain[index + 1].clone();
-    let inputs = declared_inputs(s, &caller, &next).await?;
+    let mut inputs = declared_inputs(s, &caller, &next).await?;
+    inherit_scope_values(s, &caller, &mut inputs).await?;
     let frame = temporary_frame(s, &caller, &next, inputs, chain_facts(&chain, index + 1, earlier))?;
     Ok(Some((next, caller, frame)))
 }
@@ -620,7 +648,7 @@ fn returned_assets(s: &Session<'_>, w: &Window, node: &str) -> Value {
         .collect::<Vec<_>>())
 }
 
-/// The host has confirmed a no-tool response: reach the finish node of
+/// A no-tool response reaches the finish node of
 /// the task in view, and that reply is the task's summary. A temporary task's
 /// finish runs the iterator it holds: the interrupted create_task call returns
 /// the summary and the waiting task continues. A main task's summary is the
@@ -683,7 +711,6 @@ pub(super) async fn finish(s: &Session<'_>, w: &Window, message: &Value) -> Resu
             let mut frame = frame;
             frame.task_node_id = Some(tree::ROOT.into());
             frame.current_step_node_id = None;
-            frame.confirming_finish = false;
             write_window(&tx, &task, &old_scope, &frame)?;
             tx.commit()?;
             return Ok(None);
@@ -751,7 +778,6 @@ pub(super) async fn finish(s: &Session<'_>, w: &Window, message: &Value) -> Resu
                 resumed.messages.push(original.clone());
             }
         }
-        resumed.confirming_finish = false;
         parent.status = "running".into();
         tree::emit(&tx, &task, "task/node_resumed", &mut parent, turn)?;
         write_window(&tx, &task, &scope, &resumed)?;
@@ -785,8 +811,10 @@ fn plain_text(raw: &str) -> String {
 pub(super) fn memory_index(conn: &rusqlite::Connection, task: &str, turn: usize) -> Result<Option<Value>> {
     let tasks = tree::children(conn, task, tree::ROOT)?
         .into_iter()
-        .filter(|node| node.kind == "task" && !tree::is_temp(node)
-            && node.metadata["turn"].as_u64().is_some_and(|started| started < turn as u64))
+        .filter(|node| {
+            node.kind == "task" && !tree::is_temp(node)
+            && node.metadata["turn"].as_u64().is_some_and(|started| started < turn as u64)
+        })
         .collect::<Vec<_>>();
     let task_turns = tasks.iter().filter_map(|node| node.metadata["turn"].as_i64()).collect::<BTreeSet<_>>();
     let task_ranges = tasks.iter().filter_map(|node| {
@@ -799,7 +827,8 @@ pub(super) fn memory_index(conn: &rusqlite::Connection, task: &str, turn: usize)
     let mut turns = BTreeMap::<i64, (i64, Value)>::new();
     let mut task_owned_turns = task_turns;
     for (seq, kind, number, content, calls) in rows {
-        let (Some(number), Some(content)) = (number, content) else { continue };
+        let (Some(number), Some(content)) = (number, content) else { continue;
+        };
         if task_ranges.range(..=seq).next_back().is_some_and(|(_, end)| seq <= *end) {
             task_owned_turns.insert(number);
         }
@@ -822,7 +851,8 @@ pub(super) fn memory_index(conn: &rusqlite::Connection, task: &str, turn: usize)
         let (Some(number), Some(seq), Some(summary)) = (
             node.metadata["turn"].as_i64(), node.returned_seq,
             node.result.as_ref().and_then(|result| result["result"].as_str()),
-        ) else { continue };
+        ) else { continue;
+        };
         let mut entry = json!({"kind":"task","turn":number,
             "task":{"node_id":node.node_id,"goal":clip(&node.goal,160),"status":node.status},
             "answer":summary.trim().chars().take(200).collect::<String>()});
@@ -831,8 +861,10 @@ pub(super) fn memory_index(conn: &rusqlite::Connection, task: &str, turn: usize)
         }
         entries.push((seq, entry));
     }
-    entries.extend(turns.into_iter().filter(|(number, (_, entry))| !task_owned_turns.contains(number)
-        && entry.get("request").is_some() && entry.get("answer").is_some()).map(|(_, entry)| entry));
+    entries.extend(turns.into_iter().filter(|(number, (_, entry))| {
+                !task_owned_turns.contains(number)
+        && entry.get("request").is_some() && entry.get("answer").is_some()
+            }).map(|(_, entry)| entry));
     entries.sort_by_key(|(seq, _)| *seq);
     if entries.is_empty() {
         return Ok(None);
@@ -852,7 +884,8 @@ pub(super) async fn fresh_main_window(s: &Session<'_>, previous: Option<&Window>
     if let Some(index) = memory {
         window.messages.push(json!({"role":"user","name":"conversation_memory","content":index.to_string(),"_frame_input":true}));
     }
-    let Some(previous) = previous else { return Ok(window) };
+    let Some(previous) = previous else { return Ok(window);
+    };
     window.loaded_tool_groups = previous.loaded_tool_groups.clone();
     window.active_skills = previous.active_skills.clone();
     window.active_skill_scopes = previous.active_skill_scopes.clone();
@@ -915,7 +948,7 @@ pub(super) async fn delegate_context(
         recorded.briefing=args["context"].as_str().unwrap_or("").to_owned();
         recorded.metadata=json!({"role":"delegate","turn":s.turn});
         tree::emit(&tx, s.task, "task/node_planned", &mut recorded, s.turn)?;
-        let mut finish=tree::planned(&recorded,&json!({"title":"Finish","goal":"End the delegated task and return its confirmed summary"}),tree::FINISH_ORDINAL,"finish")?;
+        let mut finish=tree::planned(&recorded,&json!({"title":"Finish","goal":"End the delegated task and return its summary"}),tree::FINISH_ORDINAL,"finish")?;
         tree::emit(&tx,s.task,"task/node_planned",&mut finish,s.turn)?;
         tx.commit()?;
         recorded
@@ -993,6 +1026,114 @@ async fn declared_inputs(s: &Session<'_>, parent: &Window, node: &Node) -> Resul
     Ok(inputs)
 }
 
+/// Parent return values behave like lexical variables. Resolve only this
+/// frame's saved values (including values it inherited), never sibling working
+/// histories. Snapshots survive folding and restart; fit_input_bodies keeps
+/// oversized values as references. Explicit arguments take precedence.
+async fn inherit_scope_values(
+    s: &Session<'_>,
+    parent: &Window,
+    inputs: &mut Vec<Value>,
+) -> Result<()> {
+    let owner = frame_task(s, parent);
+    // Most material reads already have snapshots. At the call boundary save
+    // other successful returns (workspace info, discovery, capability loads)
+    // as variables too. Do not add snapshot events to ordinary tool execution.
+    let conn = agent_service::open_db(s.state.workspace.root())?;
+    let node = tree::get(&conn, s.task, &owner)?;
+    let activity = activity_for(s, &[node], &tools(s, parent), None)?;
+    for entry in activity["activity"].as_array().into_iter().flatten() {
+        if entry["tool"] == "create_task"
+            || entry["status"] == "error"
+            || entry["status"] == "pending"
+            || entry["assets"]
+                .as_array()
+                .is_some_and(|assets| !assets.is_empty())
+        {
+            continue;
+        }
+        let event = |seq: Option<i64>| -> Result<Value> {
+            let seq = seq.context("scope value has no source event")?;
+            crate::session_history::load_events(
+                &conn,
+                s.task,
+                &crate::session_history::EventQuery {
+                    exact: Some(seq),
+                    ..Default::default()
+                },
+            )?
+            .pop()
+            .context("scope value event missing")?
+            .data()
+        };
+        let mut call = event(entry["event_seq"].as_i64())?;
+        let seq = entry["result_reference"]["arguments"]["event_seq"].as_i64();
+        let mut returned = event(seq)?;
+        if call["event"].is_object() {
+            call = call["event"].clone();
+        }
+        if returned["event"].is_object() {
+            returned = returned["event"].clone();
+        }
+        if returned["message"]["isError"] == true {
+            continue;
+        }
+        let args = match &call["arguments"] {
+            Value::String(text) => serde_json::from_str(text)?,
+            value => value.clone(),
+        };
+        crate::context_assets::register(
+            s.state.workspace.root(),
+            s.task,
+            seq.unwrap(),
+            entry["tool"].as_str().context("scope value tool missing")?,
+            &args,
+            &returned["meta"]["result"],
+        )?;
+    }
+    let index = crate::context_assets::frame_index(
+        s.state.workspace.root(),
+        s.task,
+        &owner,
+        &parent.messages,
+    )?;
+    let mut seen = inputs
+        .iter()
+        .chain(parent.messages.iter().filter(|m| m["_pinned"] == true))
+        .filter_map(|m| {
+            m[crate::context_assets::REFERENCE]["asset_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    for value in index["assets"].as_array().into_iter().flatten() {
+        let Some(id) = value["asset_id"].as_str() else {
+            continue;
+        };
+        if !seen.insert(id.to_owned()) || value["source_tool"] == "read_skill" {
+            continue;
+        }
+        let mut message = input_message(s, parent, id).await?;
+        let delivery: Value = serde_json::from_str(message["content"].as_str().unwrap_or("{}"))?;
+        let result = delivery.get("original_result").unwrap_or(&delivery);
+        if !result["error"].is_null() || result["isError"] == true {
+            continue;
+        }
+        message["name"] = json!("scope_value");
+        message["_scope_owner"] = parent
+            .messages
+            .iter()
+            .find(|m| {
+                m[crate::context_assets::REFERENCE]["asset_id"] == id
+                    && m["_scope_owner"].is_string()
+            })
+            .map(|m| m["_scope_owner"].clone())
+            .unwrap_or_else(|| json!(owner));
+        inputs.push(message);
+    }
+    Ok(())
+}
+
 /// A child's place in its chain: position, the planned goals in order and the
 /// returns of the earlier children. Null for a single child.
 fn chain_facts(chain: &[Node], index: usize, earlier: Vec<Value>) -> Value {
@@ -1059,7 +1200,9 @@ fn fit_input_bodies(s: &Session<'_>, child: &mut Window) -> Result<()> {
         message["content"] = json!(receipt.to_string());
         bodies.push((index, body));
     }
-    let fits = |child: &Window| child.input_tokens(s, &request(s, &child.messages, &definitions)).saturating_add(4096) < s.input_budget;
+    let fits = |child: &Window| {
+        child.input_tokens(s, &request(s, &child.messages, &definitions)).saturating_add(4096) < s.input_budget
+    };
     ensure!(fits(child), "TASK_INPUTS_OVER_CAPACITY: fixed instructions, briefing and input references exceed capacity; shorten the briefing or declare fewer inputs; parent frame preserved");
     for (index, body) in bodies {
         let reference = std::mem::replace(&mut child.messages[index], body);
@@ -1128,7 +1271,12 @@ async fn child_material(s: &Session<'_>, parent: &Window, node: &Node) -> Result
             messages.push(message.clone());
         }
     }
-    let groups=tool_groups::from_inputs(s, &node.inputs)?;
+    // fork shares the caller's prepared environment, just like a serial call.
+    // It does not copy the caller's working transcript or sibling local values.
+    inherit_scope_values(s, parent, &mut messages).await?;
+    let mut groups= parent.loaded_tool_groups.clone();
+    groups.extend(tool_groups::from_inputs(s, &node.inputs)?);
+    messages.push(scope_environment(parent, &frame_task(s, parent)));
     let mut child = Window {
         messages,
         task_node_id: Some(node.node_id.clone()),
@@ -1146,9 +1294,19 @@ async fn child_material(s: &Session<'_>, parent: &Window, node: &Node) -> Result
     Ok(child)
 }
 
+fn scope_environment(parent: &Window, owner: &str) -> Value {
+    json!({"role":"user","name":"scope_environment","_frame_input":true,
+        "content":json!({"host_status":true,"not_a_user_request":true,
+            "parent_task":owner,"loaded_tool_groups":parent.loaded_tool_groups,
+            "active_skills":parent.active_skills,
+            "instruction":"Inherited parent-scope variables and capabilities. Reuse complete scope_value bodies and already loaded tools directly. Read a handle only for missing content or an explicitly needed fresh version. This is a saved environment, not shared mutable memory; local work stays here and only explicit results return."}).to_string()})
+}
+
 /// Point a frame at the node it now executes: refresh its path and node card.
 fn focus_frame(frame:&mut Window,node:&Node,ancestors:&[Node])->Result<()> {
-    frame.messages.retain(|m| !matches!(m["name"].as_str(),Some("task_path"|"task_node"|"task_instruction")));
+    frame.messages.retain(|m| {
+        !matches!(m["name"].as_str(),Some("task_path"|"task_node"|"task_instruction"))
+    });
     frame.messages.insert(1.min(frame.messages.len()),json!({"role":"system","name":"task_path","content":json!(ancestors.iter().map(|n|json!({"node_id":n.node_id,"title":n.title,"goal":n.goal,"reason":n.spawned_from})).collect::<Vec<_>>()).to_string()}));
     frame.messages.insert(2.min(frame.messages.len()),json!({"role":"system","name":"task_node","content":serde_json::to_string(node)?}));
     frame.task_node_id=Some(node.node_id.clone());
@@ -1171,9 +1329,7 @@ fn inherit_material(parent:&Window,messages:&mut Vec<Value>) {
             // read of it. A reference must never replace an available body.
             if message[crate::context_assets::REFERENCE]["source_tool"] == "read_skill"
                 && let Some(id) = message[crate::context_assets::REFERENCE]["asset_id"].as_str()
-                && let Some(existing) = messages.iter_mut().find(|m| {
-                    m[crate::context_assets::REFERENCE]["asset_id"] == id
-                })
+                && let Some(existing) = messages.iter_mut().find(|m| m[crate::context_assets::REFERENCE]["asset_id"] == id)
             {
                 let loaded = !matches!(message["_asset_state"].as_str(), Some("reference_only" | "not_delivered"));
                 let existing_loaded = !matches!(existing["_asset_state"].as_str(), Some("reference_only" | "not_delivered"));
@@ -1305,7 +1461,9 @@ mod tests {
 
     /// A scripted model: `reply(n, body)` answers the n-th request.
     fn completion_request(body:&Value)->bool {
-        body["messages"].as_array().unwrap().iter().rev().find(|m| m["role"]=="assistant" || m["role"]=="tool" || m["name"]=="task_completion_check" || m["name"]=="user_interjection" || (m["role"]=="user" && m.get("name").is_none())).is_some_and(|m|m["name"]=="task_completion_check")
+        body["messages"].as_array().unwrap().iter().rev().find(|m| {
+                m["role"]=="assistant" || m["role"]=="tool" || m["name"]=="task_completion_check" || m["name"]=="user_interjection" || (m["role"]=="user" && m.get("name").is_none())
+            }).is_some_and(|m|m["name"]=="task_completion_check")
     }
 
     async fn model(reply: impl Fn(usize, &Value) -> Value + Send + Sync + 'static) -> (std::net::SocketAddr, Requests, tokio::task::JoinHandle<()>) {
@@ -1363,9 +1521,11 @@ mod tests {
 
     #[test]
     fn inherited_skill_material_is_deduplicated_by_asset_not_delivery_event() {
-        let skill=|seq:i64,state:&str| json!({"role":"tool","tool_call_id":format!("call-{seq}"),
+        let skill=|seq:i64,state:&str| {
+            json!({"role":"tool","tool_call_id":format!("call-{seq}"),
             "content":format!("skill delivery {seq}"),"source":{"seq":seq},"_asset_state":state,
-            (crate::context_assets::REFERENCE):{"asset_id":"asset-skill","source_tool":"read_skill"}});
+            (crate::context_assets::REFERENCE):{"asset_id":"asset-skill","source_tool":"read_skill"}})
+        };
         let parent=Window{messages:vec![skill(1,"loaded"),skill(2,"loaded"),skill(3,"reference_only")],..Default::default()};
         let mut messages=vec![];
         inherit_material(&parent,&mut messages);
@@ -1544,22 +1704,22 @@ mod tests {
         let mut window=h.w.clone();
         assert!(matches!(run_loop(&h.session(),&mut window,12).await.unwrap(),LoopResult::Answer));
         server.abort();
-        assert_eq!(seen.lock().unwrap().len(),9);
+        assert_eq!(seen.lock().unwrap().len(), 8);
         assert_eq!(std::fs::read_to_string(h.root.join("result.txt")).unwrap(),"verified output");
         let conn=agent_service::open_db(&h.root).unwrap();
         let nodes=tree::nodes(&conn,"t").unwrap();
         let main=nodes.iter().find(|n|n.kind=="task").unwrap();
         let steps=nodes.iter().filter(|n|n.kind=="step" && n.parent_id.as_deref()==Some(main.node_id.as_str())).collect::<Vec<_>>();
-        assert_eq!(steps.len(),7);
+        assert_eq!(steps.len(), 6);
         assert!(steps.iter().all(|s|s.status=="done"));
         assert!(steps.iter().all(|s|s.metadata["request_id"].is_string()));
-        assert_eq!(steps.last().unwrap().metadata["phase"],"confirming_finish");
+        assert_eq!(steps.last().unwrap().metadata["phase"], "executing");
         assert_eq!(main.status,"done");
         assert_eq!(main.result.as_ref().unwrap()["result"],"Written result.txt from the source.");
         assert!(nodes.iter().any(|n|n.kind=="finish" && n.parent_id.as_deref()==Some(main.node_id.as_str()) && n.status=="done"));
         assert_eq!(tree::get(&conn,"t",tree::ROOT).unwrap().status,"running","the conversation is back at its top level");
         let flow:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='flow/node_add'",[],|r|r.get(0)).unwrap();
-        assert_eq!(flow,9,"one Flow request node per model request");
+        assert_eq!(flow, 8,"one Flow request node per model request");
         // Work belongs to the step it was done in.
         let owner:String=conn.query_row("SELECT node_id FROM agent_task_events WHERE task_id='t' AND kind='tool/call' AND json_extract(data,'$.callId')='write'",[],|r|r.get(0)).unwrap();
         assert_eq!(owner,steps[4].node_id);
@@ -1619,15 +1779,17 @@ mod tests {
         let result=run_loop(&h.session(),&mut window,12).await;
         server.abort();
         assert!(matches!(result.unwrap(),LoopResult::Answer));
-        assert_eq!(seen.lock().unwrap().len(),9);
+        assert_eq!(seen.lock().unwrap().len(), 7);
         let conn=agent_service::open_db(&h.root).unwrap();
         let nodes=tree::nodes(&conn,"t").unwrap();
         let main=nodes.iter().find(|n|n.kind=="task" && n.metadata["role"]=="main").unwrap();
         let repair=nodes.iter().find(|n|n.kind=="task" && n.metadata["role"]=="temp").unwrap();
-        let steps=|owner:&str| nodes.iter().filter(|n|n.kind=="step" && n.parent_id.as_deref()==Some(owner)).map(|n|(n.title.as_str(),n.status.as_str())).collect::<Vec<_>>();
-        assert_eq!(steps(&main.node_id).len(),4);
+        let steps=|owner:&str| {
+            nodes.iter().filter(|n|n.kind=="step" && n.parent_id.as_deref()==Some(owner)).map(|n|(n.title.as_str(),n.status.as_str())).collect::<Vec<_>>()
+        };
+        assert_eq!(steps(&main.node_id).len(), 3);
         assert!(steps(&main.node_id).iter().all(|(_,status)|*status=="done"));
-        assert_eq!(steps(&repair.node_id).len(),4);
+        assert_eq!(steps(&repair.node_id).len(), 3);
         let switch=nodes.iter().find(|n|Some(n.node_id.as_str())==repair.parent_id.as_deref()).unwrap();
         assert_eq!(repair.parent_id.as_deref(),Some(switch.node_id.as_str()),"the temporary task hangs under the step that met the problem");
         let finish=nodes.iter().find(|n|n.kind=="finish" && n.parent_id.as_deref()==Some(repair.node_id.as_str())).unwrap();
@@ -1688,7 +1850,7 @@ mod tests {
                 4=>{ids.0=asset(body,"spec");
                     call("section","create_task",json!({"goal":"Write section one","reason":"Section one is a unit with its own materials","briefing":"Follow the spec","asset_ids":[ids.0]}))},
                 5=>{assert!(text.contains("SPEC_BODY"),"the declared material arrives as the child's parameter");
-                    assert!(!text.contains("OTHER_BODY"),"the caller's other materials stay with the caller");
+                    assert!(text.contains("OTHER_BODY"),"parent-scope values are readable without being explicit arguments");
                     call("scratch","read_file",json!({"path":"scratch.txt"}))},
                 6=>{ids.1=asset(body,"scratch");
                     assert!(text.contains("SPEC_BODY"),"parameters stay for the whole child task");
@@ -1741,8 +1903,10 @@ mod tests {
         let mut h = Harness::new().await;
         h.user("ORIGINAL_USER_WORDS").await;
         h.start("Process materials", "Inspect inputs").await;
-        let make = |text: String| crate::context_assets::register(&h.root, "t", 0, "example__read",
-            &json!({"input":text.chars().next()}), &json!({"body":text})).unwrap();
+        let make = |text: String| {
+            crate::context_assets::register(&h.root, "t", 0, "example__read",
+            &json!({"input":text.chars().next()}), &json!({"body":text})).unwrap()
+        };
         let first = make("A".repeat(36000));
         let second = make("B".repeat(36000));
         let huge = make("HUGE_MATERIAL_".repeat(30000));
@@ -1831,7 +1995,15 @@ mod tests {
         }).await;
         h.state = agent_service::tests::test_state(&h.root, address);
         h.user("Extract only the fact needed for this task").await;
-        let s = Session { input_budget: 30000, ..h.session() };
+        // Reserve space relative to fixed instructions: two 24k-character
+        // pages plus the delivery reserve must fit before old pages fold.
+        // Prompt wording changes must not accidentally test withheld delivery.
+        let fixed = estimate(&request(
+            &h.session(),
+            &h.w.messages,
+            &tools(&h.session(), &h.w),
+        ));
+        let s = Session { input_budget: fixed + 26000, ..h.session() };
         let mut w = h.w.clone();
         assert!(matches!(run_loop(&s, &mut w, 15).await.unwrap(), LoopResult::Answer));
         server.abort();
@@ -1993,12 +2165,93 @@ mod tests {
         server.abort();
         assert!(matches!(outcome.unwrap(),LoopResult::Answer),"the run continues after the chain stops");
         let nodes=tree::nodes(&agent_service::open_db(&h.root).unwrap(),"t").unwrap();
-        let status=|goal:&str| nodes.iter().find(|n|n.goal==goal).unwrap().status.clone();
+        let status=|goal:&str| {
+            nodes.iter().find(|n|n.goal==goal).unwrap().status.clone()
+        };
         assert_eq!((status("Write part one"),status("Write part two"),status("Write part three")),("done".into(),"cancelled".into(),"cancelled".into()));
     }
 
     #[tokio::test]
-    async fn child_tasks_receive_ordered_caller_activity_and_reopen_saved_assets() {
+    async fn parent_environment_survives_serial_children_and_child_locals_do_not_leak() {
+        let mut h = Harness::new().await;
+        std::fs::write(h.root.join("common.txt"), "MAIN_SHARED_VALUE").unwrap();
+        std::fs::write(h.root.join("local.txt"), "ONLY_CHILD_A_LOCAL_VALUE").unwrap();
+        let root = h.root.clone();
+        let (address, seen, server) = model(move |n, body| {
+            let text = body["messages"].to_string();
+            match n {
+                0 => call("main", "create_task", json!({"goal":"Process two outputs using shared preparation"})),
+                1 => call("skills", "list_skills", json!({})),
+                2 => call("workspace", "workspace_info", json!({})),
+                3 => call("files", "load_tool_group", json!({"group":"files"})),
+                4 => call("common", "read_file", json!({"path":"common.txt"})),
+                5 => call("children", "create_task", json!({"tasks":[{"goal":"Write A"},{"goal":"Write B"}]})),
+                6 => {
+                    assert!(text.contains("MAIN_SHARED_VALUE"));
+                    let values = body["messages"].as_array().unwrap().iter()
+                        .filter(|m| m["name"] == "scope_value").collect::<Vec<_>>();
+                    assert!(values.iter().any(|m| m.to_string().contains("workspace_root")));
+                    assert!(values.iter().any(|m| m.to_string().contains("list_skills")));
+                    assert!(tool_names(body).iter().any(|name| name == "write_file"));
+                    call("local", "read_file", json!({"path":"local.txt"}))
+                }
+                7 => call("nested", "create_task", json!({"goal":"Inspect the local prerequisite"})),
+                8 => {
+                    assert!(text.contains("MAIN_SHARED_VALUE") && text.contains("ONLY_CHILD_A_LOCAL_VALUE"));
+                    answer("Nested prerequisite checked")
+                }
+                9 => {
+                    assert!(tool_result(body, "nested").contains("Nested prerequisite checked"));
+                    call("a", "write_file", json!({"path":"a.txt","content":"A output"}))
+                }
+                10 => answer("A output saved in a.txt"),
+                11 => {
+                    assert!(text.contains("MAIN_SHARED_VALUE"));
+                    assert!(!text.contains("ONLY_CHILD_A_LOCAL_VALUE"), "sibling receives A's return, not A's working body");
+                    assert!(text.contains("A output saved in a.txt"));
+                    assert!(tool_names(body).iter().any(|name| name == "write_file"));
+                    call("b", "write_file", json!({"path":"b.txt","content":"B output"}))
+                }
+                12 => answer("B output saved in b.txt"),
+                13 => {
+                    assert!(tool_result(body, "children").contains("A output saved in a.txt"));
+                    assert!(tool_result(body, "children").contains("B output saved in b.txt"));
+                    assert!(text.contains("MAIN_SHARED_VALUE"));
+                    assert!(!text.contains("ONLY_CHILD_A_LOCAL_VALUE"));
+                    let conn = agent_service::open_db(&root).unwrap();
+                    let windows: i64 = conn.query_row("SELECT count(*) FROM agent_runtime_windows WHERE task_id='t' AND scope LIKE 'node:%'", [], |r| r.get(0)).unwrap();
+                    assert_eq!(windows, 0, "returned child windows are released");
+                    answer("Both outputs delivered")
+                }
+                _ => panic!("unexpected request {n}"),
+            }
+        }).await;
+        h.state = agent_service::tests::test_state(&h.root, address);
+        h.user("Create two outputs; prepare common inputs in the main task")
+            .await;
+        let mut window = h.w.clone();
+        let outcome = run_loop(&h.session(), &mut window, 24).await;
+        server.abort();
+        assert!(matches!(outcome.unwrap(), LoopResult::Answer));
+        assert_eq!(
+            std::fs::read_to_string(h.root.join("a.txt")).unwrap(),
+            "A output"
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.root.join("b.txt")).unwrap(),
+            "B output"
+        );
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            14,
+            "one model request per action/return, without completion checks"
+        );
+        assert!(!requests.iter().any(completion_request));
+    }
+
+    #[tokio::test]
+    async fn child_tasks_inherit_parent_values_and_ordered_caller_activity() {
         let mut h = Harness::new().await;
         std::fs::write(h.root.join("source.txt"), "ORIGINAL_PAGE_BODY").unwrap();
         // A different task in the same conversation must not leak into this index.
@@ -2028,12 +2281,12 @@ mod tests {
                 assert!(read["arguments_preview"].as_str().unwrap().contains("source.txt"));
                 assert_eq!(read["status"], "returned");
                 assert!(read["result_reference"]["arguments"]["event_seq"].is_i64());
-                assert!(!body["messages"].to_string().contains("ORIGINAL_PAGE_BODY"), "the child receives handles, not its caller's file body");
+                assert!(body["messages"].to_string().contains("ORIGINAL_PAGE_BODY"), "the child reuses its parent value without another read");
                 assert!(!index.to_string().contains("UNRELATED_ACTIVITY"));
                 call("reopen", "read_asset", read["assets"][0]["read_reference"]["arguments"].clone())
             }
             5 => {
-                assert!(tool_result(body, "reopen").contains("ORIGINAL_PAGE_BODY"));
+                assert!(body["messages"].to_string().contains("ORIGINAL_PAGE_BODY"), "a duplicate read may be a receipt while the inherited body stays available");
                 call("nested", "create_task", json!({"goal":"Check the repaired prerequisite","reason":"Independent final prerequisite check"}))
             }
             6 => {
@@ -2044,7 +2297,7 @@ mod tests {
                 let reopened = activity.iter().position(|entry| entry["tool"] == "read_asset").unwrap();
                 assert!(read < reopened, "nested tasks see ancestor activity before caller activity");
                 assert!(activity[reopened]["assets"][0]["asset_id"].is_string());
-                assert!(!body["messages"].to_string().contains("ORIGINAL_PAGE_BODY"));
+                assert!(body["messages"].to_string().contains("ORIGINAL_PAGE_BODY"), "nested children inherit ancestor values too");
                 answer("Prerequisite checked")
             }
             7 => { assert!(tool_result(body, "nested").contains("Prerequisite checked")); answer("Prerequisite repaired") }
@@ -2073,7 +2326,7 @@ mod tests {
                 assert!(!messages.iter().any(|m|m["name"]=="task_activity"),"the old duplicate ledger is no longer attached to every round");
                 assert!(tool_result(body,"read").contains("PRIVATE_SOURCE_BODY"),"the overview does not replace native tool delivery");
                 call("write","write_file",json!({"path":"processed.txt","content":"Processed source"}))
-            },
+            }
             4=>{
                 let messages=body["messages"].as_array().unwrap();
                 assert!(!messages.iter().any(|m|m["name"]=="step_result"),"below capacity completed rounds keep their native exchange");
@@ -2085,7 +2338,7 @@ mod tests {
                 assert!(original.to_string().contains("PRIVATE_SOURCE_BODY"),"the complete original remains available");
                 assert!(tool_result(body,"write").contains("processed.txt"),"the newest exchange stays in native form");
                 answer("Source processed")
-            },
+            }
             _=>panic!("unexpected model request {n}"),
         }).await;
         h.state=agent_service::tests::test_state(&h.root,address);
@@ -2096,7 +2349,8 @@ mod tests {
         let conn=agent_service::open_db(&h.root).unwrap();
         let reads:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='tool/call' AND json_extract(data,'$.name')='read_file'",[],|row|row.get(0)).unwrap();
         assert_eq!(reads,1);
-        assert!(seen.lock().unwrap().iter().any(|body|completion_request(body)));
+        assert!(
+            !seen.lock().unwrap().iter().any(|body|completion_request(body)));
         assert!(!window.messages.iter().any(|m|m["name"]=="task_activity"),"overviews stay outside persisted conversational history");
     }
 
@@ -2180,7 +2434,7 @@ mod tests {
         run_task(h.state.clone(),"t".into(),"fake".into(),"Write a note".into(),10,CancellationToken::new(),1,false).await.unwrap();
         run_task(h.state.clone(),"t".into(),"fake".into(),"What did the note say?".into(),10,CancellationToken::new(),2,false).await.unwrap();
         server.abort();
-        assert_eq!(seen.lock().unwrap().len(),9);
+        assert_eq!(seen.lock().unwrap().len(), 7);
         let conn=agent_service::open_db(&h.root).unwrap();
         let resets:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='context/main_reset'",[],|r|r.get(0)).unwrap();
         assert_eq!(resets,2);
@@ -2201,7 +2455,7 @@ mod tests {
                     assert!(text.contains("Draft the plan") && text.contains("Draft a plan"),"the same task context continues");
                     assert!(!body["messages"].as_array().unwrap().iter().any(|m|m["name"]=="conversation_memory"),"not a fresh context");
                     answer(&"计划已完成".repeat(50))
-                },
+                }
                 3=>{
                     let memory=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="conversation_memory").unwrap();
                     let index:Value=serde_json::from_str(memory["content"].as_str().unwrap()).unwrap();
@@ -2213,7 +2467,7 @@ mod tests {
                     assert_eq!(entries[0]["answer"],"计划已完成".repeat(40),"the final summary is truncated to 200 characters");
                     assert!(!entries.iter().any(|entry|entry["request"]=="continue"));
                     answer(&"问答摘要".repeat(60))
-                },
+                }
                 4=>{
                     let memory=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="conversation_memory").unwrap();
                     let index:Value=serde_json::from_str(memory["content"].as_str().unwrap()).unwrap();
@@ -2225,7 +2479,7 @@ mod tests {
                     assert_eq!(entries[1]["request"],"A separate question");
                     assert_eq!(entries[1]["answer"],"问答摘要".repeat(50));
                     answer("Done")
-                },
+                }
                 _=>panic!("unexpected request {n}"),
             }
         }).await;
@@ -2235,16 +2489,41 @@ mod tests {
         let conn=agent_service::open_db(&h.root).unwrap();
         assert_eq!(tree::active(&conn,"t").unwrap().unwrap().kind,"task","the task stays open");
         run_task(h.state.clone(),"t".into(),"fake".into(),"continue".into(),4,CancellationToken::new(),2,false).await.unwrap();
-        assert_eq!(seen.lock().unwrap().len(),4);
-        let main=tree::nodes(&conn,"t").unwrap().into_iter().find(|n|n.kind=="task").unwrap();
-        assert_eq!(main.status,"done");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let main = tree::nodes(&conn, "t")
+            .unwrap()
+            .into_iter()
+            .find(|n| n.kind == "task")
+            .unwrap();
+        assert_eq!(main.status, "done");
         let resets:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='context/main_reset'",[],|r|r.get(0)).unwrap();
-        assert_eq!(resets,1);
+        assert_eq!(resets, 1);
         drop(conn);
-        run_task(h.state.clone(),"t".into(),"fake".into(),"A separate question".into(),4,CancellationToken::new(),3,false).await.unwrap();
-        run_task(h.state.clone(),"t".into(),"fake".into(),"Another question".into(),4,CancellationToken::new(),4,false).await.unwrap();
+        run_task(
+            h.state.clone(),
+            "t".into(),
+            "fake".into(),
+            "A separate question".into(),
+            4,
+            CancellationToken::new(),
+            3,
+            false,
+        )
+        .await
+        .unwrap();
+        run_task(
+            h.state.clone(),"t".into(),
+            "fake".into(),
+            "Another question".into(),
+            4,
+            CancellationToken::new(),
+            4,
+            false,
+        )
+        .await
+        .unwrap();
         server.abort();
-        assert_eq!(seen.lock().unwrap().len(),6);
+        assert_eq!(seen.lock().unwrap().len(), 5);
     }
 
     #[tokio::test]
@@ -2272,68 +2551,165 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completion_confirmation_can_resume_tools_and_only_its_final_summary_reaches_finish() {
-        use std::sync::atomic::{AtomicUsize,Ordering};
-        let count=Arc::new(AtomicUsize::new(0));let index=count.clone();
-        let (address,seen,server)=raw_model(move|_,body| {
-            let n=index.fetch_add(1,Ordering::SeqCst);
-            match n {
-                0=>{
-                    let tool=body["tools"].as_array().unwrap().iter().find(|t|t["function"]["name"]=="create_task").unwrap();
-                    assert_eq!(tool["function"]["parameters"]["required"],json!([]),"goal or tasks; the host validates which");
-                    assert!(tool["function"]["parameters"]["properties"]["tasks"].is_object());
-                    call("start","create_task",json!({"goal":"Inspect the task and report"}))
-                },
-                1=>answer("Initial response before confirmation"),
-                2=>{assert!(completion_request(body));call("inspect","read_task_board",json!({}))},
-                3=>{assert!(!completion_request(body));assert!(tool_result(body,"inspect").contains("task_tree"));answer("Ready for another confirmation")},
-                4=>{assert!(completion_request(body));answer("Confirmed final summary")},
-                _=>panic!("finish must not request another AI call"),
+    async fn finish_returns_to_the_serial_iterator_without_another_model_call() {
+        let (address,seen,server)=raw_model(|n,body| match n {
+                0=> call(
+                "chain",
+                "create_task",
+                json!({"goal":"Main function", "tasks":[
+                {"goal":"First function"}, {"goal":"Second function"}]}),
+            ),
+            1 => answer("FIRST_RETURN"),
+            2 => {
+                assert!(!completion_request(body));
+                assert!(body["messages"].to_string().contains("FIRST_RETURN"));
+                let current: Value = serde_json::from_str(
+                    body["messages"].as_array().unwrap().iter().find(|m| m["name"]== "task_started")
+                        .unwrap()["content"]
+                        .as_str()
+                        .unwrap(),
+                ).unwrap();
+                    assert_eq!(current["task"]["goal"], "Second function");
+                answer("SECOND_RETURN")
             }
+            3 => {
+                let result = tool_result(body, "chain");
+                    assert!(result.contains("FIRST_RETURN") && result.contains("SECOND_RETURN"));
+                answer("MAIN_RETURN")
+            }
+            _=>panic!("finish must not request an extra model decision"),
         }).await;
         let mut h=Harness::new().await;h.state=agent_service::tests::test_state(&h.root,address);
-        h.user("Inspect and report").await;let mut window=h.w.clone();
-        let result=run_loop(&h.session(),&mut window,8).await;
-        server.abort();assert!(matches!(result.unwrap(),LoopResult::Answer));
-        assert_eq!(seen.lock().unwrap().len(),5);
-        let conn=agent_service::open_db(&h.root).unwrap();let nodes=tree::nodes(&conn,"t").unwrap();
-        let task=nodes.iter().find(|n|n.kind=="task").unwrap();
-        assert_eq!(task.result.as_ref().unwrap()["result"],"Confirmed final summary");
-        let steps=nodes.iter().filter(|n|n.kind=="step").collect::<Vec<_>>();
-        assert_eq!(steps.len(),4);assert!(steps.iter().all(|n|n.status=="done"));
-        assert_eq!(steps.iter().filter(|n|n.metadata["phase"]=="confirming_finish").count(),2);
-        assert!(steps.iter().all(|n|n.result.as_ref().unwrap()["response"].is_object()));
-        let finish=nodes.iter().find(|n|n.kind=="finish").unwrap();
-        assert!(finish.returned_seq>steps.last().unwrap().returned_seq);
-        let owner:String=conn.query_row("SELECT node_id FROM agent_task_events WHERE task_id='t' AND kind='tool/result' AND json_extract(data,'$.message.toolCallId')='inspect'",[],|r|r.get(0)).unwrap();
-        assert_eq!(owner,steps[1].node_id);
+        h.user("Run the functions in order").await;let mut window=h.w.clone();
+        let outcome =run_loop(&h.session(),&mut window, 6).await;
+        server.abort();assert!(matches!(outcome.unwrap(), LoopResult::Answer));
+        assert_eq!(seen.lock().unwrap().len(), 4);
+        let conn = agent_service::open_db(&h.root).unwrap();
+        let nodes = tree::nodes(&conn, "t").unwrap();
+        assert!(
+            nodes
+                .iter()
+                .filter(|n| n.kind == "finish")
+                .all(|n| n.status == "done")
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|n| n.metadata["role"] == "main")
+                .unwrap()
+                .result.as_ref()
+                .unwrap()["result"],
+            "MAIN_RETURN"
+        );
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='task/completion_check'", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
     }
 
     #[tokio::test]
-    async fn completion_confirmation_can_end_with_an_external_blocker() {
-        use std::sync::atomic::{AtomicUsize,Ordering};
-        let count=Arc::new(AtomicUsize::new(0));let index=count.clone();
-        let summary="未完成：外部编辑冲突阻止继续保存。请用户在编辑器中选择保留的稿件后再继续。";
-        let (address,seen,server)=raw_model(move|_,body| {
-            match index.fetch_add(1,Ordering::SeqCst) {
-                0=>call("start","create_task",json!({"goal":"Complete the document"})),
-                1=>answer("External edit conflict prevents saving the remaining pages."),
-                2=>{assert!(completion_request(body));answer(summary)},
-                _=>panic!("a blocked summary must reach finish without more model requests"),
-            }
+    async fn a_blocked_function_returns_its_result_without_a_completion_check() {
+        let summary = "未完成：外部编辑冲突。请用户选择保留的稿件后再继续。";
+        let (address, seen, server) = raw_model(move |n, _| match n {
+            0 => call(
+                "start",
+                "create_task",
+                json!({"goal":"Complete the document"}),
+            ),
+            1 => answer(summary),
+            _ =>panic!("a blocked function returns without another AI call"),
         }).await;
         let mut h=Harness::new().await;h.state=agent_service::tests::test_state(&h.root,address);
         h.user("Complete the document").await;let mut window=h.w.clone();
-        let result=run_loop(&h.session(),&mut window,8).await;
-        server.abort();assert!(matches!(result.unwrap(),LoopResult::Answer));
-        assert_eq!(seen.lock().unwrap().len(),3);
-        let conn=agent_service::open_db(&h.root).unwrap();let nodes=tree::nodes(&conn,"t").unwrap();
-        let task=nodes.iter().find(|n|n.kind=="task").unwrap();
-        assert_eq!(task.result.as_ref().unwrap()["result"],summary);
-        assert!(nodes.iter().any(|n|n.kind=="finish" && n.status=="done"));
-        let saved:String=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='t' AND scope='main'",[],|row|row.get(0)).unwrap();
-        let saved:Value=serde_json::from_str(&saved).unwrap();
-        assert_eq!(saved["task_node_id"],tree::ROOT,"a blocked task releases its active frame through finish");
+        let outcome =run_loop(&h.session(),&mut window, 4).await;
+        server.abort();assert!(matches!(outcome.unwrap(), LoopResult::Answer));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        let conn = agent_service::open_db(&h.root).unwrap();
+        let nodes = tree::nodes(&conn, "t").unwrap();
+        let task = nodes.iter().find(|n| n.kind == "task").unwrap();
+        assert_eq!(task.result.as_ref().unwrap()["result"], summary);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.kind == "finish" && n.status == "done")
+        );
+        let saved: String = conn
+            .query_row(
+                "SELECT state FROM agent_runtime_windows WHERE task_id='t' AND scope='main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&saved).unwrap()["task_node_id"],
+            tree::ROOT
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_native_join_recovers_before_the_next_model_request() {
+        let (address, seen, server) = model(|_, body| {
+            let messages = body["messages"].as_array().unwrap();
+            let result = messages
+                .iter()
+                .find(|m| {
+                    m["role"] == "tool"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("\"joined\":true"))
+                })
+                .expect("saved join must finish before asking the model what to do");
+            let value: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+            assert_eq!(value["delegates"][0]["status"], "completed");
+            answer("Joined the saved handle; no child action was replayed")
+        })
+        .await;
+        let mut h = Harness::new().await;
+        h.state = agent_service::tests::test_state(&h.root, address);
+        h.start("Resume the interrupted parent function", "Join its fork")
+            .await;
+        h.w.loaded_tool_groups.insert("collaboration".into());
+        let owner = h.w.task_node_id.clone().unwrap();
+        let conn = crate::collaboration_jobs::db(&h.root).unwrap();
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,delivered,review,created_at) VALUES ('saved-child','t',1,'fork','child',?1,'completed',1,'{}',0)",[json!({"caller_task_node_id":owner}).to_string()]).unwrap();
+        // Crash point: the native join call is saved, but has no result yet.
+        h.tool_call("join_agents", json!({"agent_ids":["saved-child"]}));
+        h.persist().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            crate::single_agent::run_task(
+                h.state.clone(),
+                "t".into(),
+                "fake".into(),
+                "Resume".into(),
+                4,
+                CancellationToken::new(),
+                2,
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the host recovers the saved join without a model planning/polling turn"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM agent_delegates WHERE task_id='t'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT status FROM agent_tasks WHERE id='t'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "completed"
+        );
     }
 
     #[tokio::test]

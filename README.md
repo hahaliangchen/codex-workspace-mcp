@@ -1,9 +1,13 @@
 # codex-workspace-mcp
 
-由 Rust 执行任务的本地 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。主 Agent 可派发最多 5 个并发任务子 Agent，并使用独立的上下文压缩子 Agent；模型直接连接提供商的 Chat Completions 接口。
+> 当前通用 Agent 的执行、作用域和宿主／插件边界，以[通用 Agent 设计](docs/generic-agent-design.md)为准。下文部分早期调度、上下文压缩说明属于历史实现，尚未逐项同步；维护执行层前请先阅读该设计文档。
+> TS 执行器目前是原型：支持函数任务、工具步骤与当前函数补写；本地双 Agent 制作 5 个 HTML 并逐文件验收、汇总返回已通过，20 页尚未重新验证。见[测试报告](docs/agent-program-real-test-2026-10-26.md)。
+
+由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。当前执行采用生成器式调用与返回、父作用域继承、按容量折叠上下文；支持按需串行子任务和受约束的并发委派。模型直接连接提供商的 Chat Completions 接口。
 
 ## 核心能力
 
+- 函数形状的流程伪代码（普通函数、注释任务与工具库）：SWC AST → Rust 执行器，支持 call/fork/join、局部赋值、断言与错误传播；描述性条件及数据表达式由 AI 依据输入和证据解释，宿主推进流程，详见 [执行语言](docs/agent-program.md)。
 - 文件读取、文本搜索、版本校验写入与编辑。
 - Go、Rust、Python、TypeScript/JavaScript 符号索引和职责记忆。
 - 受限原生程序执行、项目依赖与脚本、进程日志、HTTP 探测及浏览器操作。
