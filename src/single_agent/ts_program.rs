@@ -5,15 +5,35 @@ use crate::agent_program::{self, Action, Runtime, State, runtime::ActionKind};
 
 pub(super) enum Round {
     Exchange(String, Value),
-    AiCompleted,
+}
+pub(super) fn library_catalog(s: &Session<'_>, definitions: &[Value]) -> agent_program::libraries::Libraries {
+    let packages=s.state.tool_catalog.as_ref().map(|c|c.packages.catalog()).unwrap_or_else(||json!([]));
+    agent_program::libraries::catalog(definitions,&packages)
+}
+pub(super) fn scoped_arguments(s: &Session<'_>, w: &Window, args: &Value) -> Result<Value> {
+    ensure!(args.is_object(),"program arguments must be a JSON object");
+    let definitions=available_tools(s,w);
+    let allowed=definitions.iter().filter_map(|t|t["function"]["name"].as_str().map(str::to_owned)).collect();
+    let mut libraries=library_catalog(s,&definitions);
+    if let Some(task)=&w.program_task {
+        libraries=agent_program::libraries::merge(libraries,&task["libraries"],Some(&allowed))?;
+    }
+    libraries=agent_program::libraries::merge(libraries,&args["libraries"],Some(&allowed))?;
+    let mut args=args.clone();
+    args["libraries"]=serde_json::to_value(libraries)?;
+    Ok(args)
+}
+fn bindings(args: &Value, base: agent_program::libraries::Libraries) -> Result<agent_program::libraries::Libraries> {
+    agent_program::libraries::merge(base,&args["libraries"],None)
 }
 pub(super) fn install(w: &mut Window, args: &Value) -> Result<Value> {
     let source = args["source"].as_str().context("source is required")?;
-    let program = agent_program::compile(source)?;
+    let libraries=if args["libraries"].is_object() {bindings(args,Default::default())?} else {agent_program::libraries::builtin()};
+    let program = agent_program::compile_with_libraries(source,libraries)?;
     let entry = args["entry"].as_str().unwrap_or("main");
     ensure!(
         entry == "main",
-        "execute_program enters the task through its single main; helpers run through call/fork"
+        "execute_program enters the task through its single main; helpers run through ordinary calls/fork"
     );
     let count = program
         .functions
@@ -50,7 +70,8 @@ pub(super) fn install_body(w: &mut Window, args: &Value) -> Result<Value> {
         .as_str()
         .context("current function name missing")?;
     let source = args["source"].as_str().context("source is required")?;
-    let program = agent_program::compile_body(source, name)?;
+    let libraries=if args["libraries"].is_object() {bindings(args,Default::default())?} else if task["libraries"].is_object() {bindings(task,Default::default())?} else {agent_program::libraries::builtin()};
+    let program = agent_program::compile_body_with_libraries(source, name, libraries)?;
     let params = &program.functions[name].params;
     let input = task["input"]
         .as_object()
@@ -83,7 +104,7 @@ pub(super) fn fork_runtime(args: &Value) -> Result<Option<Runtime>> {
         .context("program.args must be an array")?
         .clone();
     Ok(Some(Runtime::task_program(
-        agent_program::compile_entry(source, entry)?,
+        agent_program::compile_entry_with_libraries(source, entry, bindings(p,if p["libraries"].is_object(){Default::default()}else{agent_program::libraries::builtin()})?)?,
         entry,
         arguments,
     )?))
@@ -187,6 +208,8 @@ fn resolve(
     w.program.as_mut().unwrap().resume(value, failed)
 }
 async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
+    // Version rejection must precede receipt consumption or dispatch.
+    if w.program.as_ref().is_some_and(|p|p.program.version!=agent_program::VERSION) {return Ok(());}
     let Some(action) = w.program.as_ref().and_then(|p| p.pending.clone()) else {
         return Ok(());
     };
@@ -283,59 +306,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
         State::Action(action) => {
             let at = json!(action.at);
             let (name, args) = match &action.kind {
-                ActionKind::Ai { config } => {
-                    let runtime = w.program.clone();
-                    // This is an explicit value-producing AI call, not another
-                    // scheduler. It receives the active skill and selected input.
-                    let mut expression = w.clone();
-                    expression.messages.push(json!({"role":"system","name":"program_ai_expression","content":"You are evaluating one ai() expression inside an already running TypeScript program. Return only its requested value; do not plan, create tasks, call tools, schedule Agents or perform other operations. For format=json return valid JSON only; for text return exactly the requested text. The host continues the program after this value returns."}));
-                    expression.messages.push(json!({"role":"user","name":"program_ai_input","content":config.to_string()}));
-                    let response = model_round(s, &mut expression, step, &[]).await;
-                    expression.program = runtime;
-                    let outcome = response.and_then(|(_, m)| {
-                        ensure!(
-                            crate::model_stream::tool_calls(&m).is_empty(),
-                            "ai expression returned tools instead of a value"
-                        );
-                        let text = m["content"]
-                            .as_str()
-                            .context("ai expression returned no text")?;
-                        if config["format"] == "json" {
-                            serde_json::from_str::<Value>(text)
-                                .context("ai expression returned invalid JSON")
-                        } else {
-                            Ok(json!(text))
-                        }
-                    });
-                    // Drop the expression-only instructions from future rounds.
-                    expression.messages.retain(|m| {
-                        !matches!(
-                            m["name"].as_str(),
-                            Some("program_ai_expression" | "program_ai_input")
-                        )
-                    });
-                    *w = expression;
-                    match outcome {
-                        Ok(value) => {
-                            let seq = append(
-                                s,
-                                "program/ai_result",
-                                json!({"action_id":action.id,"value":value,"location":at}),
-                                false,
-                            )
-                            .await?;
-                            resolve(s, w, &action, value, false, seq)?;
-                        }
-                        Err(error) => {
-                            ensure!(!s.cancel.is_cancelled(), "cancelled");
-                            let value = json!({"message":format!("{error:#}"),"effect":"ai"});
-                            append(s,"program/ai_result",json!({"action_id":action.id,"value":value,"failed":true,"location":at}),false).await?;
-                            w.program.as_mut().unwrap().resume(value, true)?;
-                        }
-                    }
-                    save(s, w).await?;
-                    return Ok(Round::AiCompleted);
-                }
+                ActionKind::Ai { .. } => anyhow::bail!("legacy AI expression actions are unsupported; use an explicit task"),
                 ActionKind::Call { name, args } => {
                     let program = &w.program.as_ref().unwrap().program;
                     let function = &program.functions[name];
@@ -348,9 +319,9 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     } else {
                         function.description.clone()
                     };
-                    let mut task = json!({"name":name,"description":description,"input":input});
+                    let mut task = json!({"name":name,"description":description,"input":input,"libraries":program.libraries});
                     if !function.comment_only {
-                        task["body"] = json!({"source":program.source,"entry":name,"args":args});
+                        task["body"] = json!({"source":program.source,"entry":name,"args":args,"libraries":program.libraries});
                     }
                     (
                         "create_task".into(),
@@ -363,12 +334,12 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     input,
                 } => (
                     "create_task".into(),
-                    json!({"goal":name,"briefing":description,"program_task":{"name":name,"description":description,"input":input}}),
+                    json!({"goal":name,"briefing":description,"program_task":{"name":name,"description":description,"input":input,"libraries":w.program.as_ref().unwrap().program.libraries}}),
                 ),
                 ActionKind::Tool { name, args } => (name.clone(), args.clone()),
                 ActionKind::Fork { entry, args } => (
                     "spawn_agent".into(),
-                    json!({"name":format!("function {entry}"),"task":format!("Execute the compiled {entry} function with its provided arguments and return its value"),"program":{"source":w.program.as_ref().unwrap().program.source,"entry":entry,"args":args}}),
+                    json!({"name":format!("function {entry}"),"task":format!("Execute the compiled {entry} function with its provided arguments and return its value"),"program":{"source":w.program.as_ref().unwrap().program.source,"entry":entry,"args":args,"libraries":w.program.as_ref().unwrap().program.libraries}}),
                 ),
                 ActionKind::Join { ids } => ("join_agents".into(), json!({"agent_ids":ids})),
             };
@@ -425,36 +396,39 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn ts_program_drives_two_agents_tools_ai_and_join_without_model_scheduler_rounds() {
+    async fn ts_program_drives_two_agents_tools_tasks_and_join_without_model_scheduler_rounds() {
         let root = TestRoot::new();
         std::fs::write(root.path().join("spec.txt"), "SHARED_SOURCE").unwrap();
         let count = Arc::new(AtomicUsize::new(0));
         let requests = count.clone();
         let source = r#"
-function* worker(input) {
-  const value = yield ai({instruction:"Return exact requested text",input:input.text,format:"text"});
-  yield call(tools.write_file,{path:input.path,content:value});
+function worker(input) {
+  const value = make_text(input.text);
+  storage.write({path:input.path,content:value});
   return {path:input.path, text:value};
 }
-function* main() {
-  const spec=yield call(tools.read_file,{path:"spec.txt"});
-  const a=yield fork(worker,{path:"a.txt",text:"OUTPUT_A"});
-  const b=yield fork(worker,{path:"b.txt",text:"OUTPUT_B"});
-  const [x,y]=yield join(a,b);
-  const checkA=yield call(tools.read_file,{path:x.path});
-  const checkB=yield call(tools.read_file,{path:y.path});
+function make_text(text) {
+  // Return the supplied text as a JSON string.
+}
+function main() {
+  const spec=storage.read({path:"spec.txt"});
+  const a=fork(worker,{path:"a.txt",text:"OUTPUT_A"});
+  const b=fork(worker,{path:"b.txt",text:"OUTPUT_B"});
+  const [x,y]=join(a,b);
+  const checkA=storage.read({path:x.path});
+  const checkB=storage.read({path:y.path});
   return {outputs:[x.path,y.path],source:spec,checkA,checkB};
 }"#;
         let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
             let requests=requests.clone();async move {
                 let n=requests.fetch_add(1,Ordering::SeqCst);
                 let messages=body["messages"].as_array().unwrap();
-                let message=if let Some(input)=messages.iter().find(|m|m["name"]=="program_ai_input") {
-                    assert_eq!(body["tools"].as_array().unwrap().len(),0);
-                    let config:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
-                    json!({"role":"assistant","content":config["input"]})
+                let message=if let Some(input)=messages.iter().find(|m|m["name"]=="program_task_input") {
+                    let task:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    assert_eq!(task["name"], "make_text");
+                    json!({"role":"assistant","content":task["input"]["text"].to_string()})
                 } else {
-                    let (name,args)=match n {0=>("create_task",json!({"goal":"Use two Agents with typed function returns"})),1=>("execute_program",json!({"source":source})),_=>panic!("unexpected scheduler model request {n}")};
+                    let (name,args)=match n {0=>("create_task",json!({"goal":"Use two Agents with typed function returns"})),1=>("execute_program",json!({"source":source,"libraries":{"storage":{"read":"read_file","write":"write_file"}}})),_=>panic!("unexpected scheduler model request {n}")};
                     json!({"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
                 };
                 Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
@@ -503,7 +477,7 @@ function* main() {
         assert_eq!(
             count.load(Ordering::SeqCst),
             4,
-            "only setup and two explicit ai() expressions call a model"
+            "only setup and two comment tasks call a model"
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
@@ -678,7 +652,7 @@ function produce(part) {
             let n=requests.fetch_add(1,Ordering::SeqCst);
             let (name,args)=match n {
                 0=>("create_task",json!({"goal":"Attempt denied write"})),
-                1=>("execute_program",json!({"source":"function* main(){yield call(tools.write_file,{path:'denied.txt',content:'x'});yield call(tools.read_file,{path:'next.txt'});}"})),
+                1=>("execute_program",json!({"source":"function main(){tools.write_file({path:'denied.txt',content:'x'});tools.read_file({path:'next.txt'});}"})),
                 _=>panic!("runtime error must stop, not ask model to reschedule"),
             };
             async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
@@ -903,6 +877,54 @@ function evaluate(request,content) {
     }
 
     #[test]
+    fn source_adapters_reject_extensions_without_installing_a_program() {
+        for source in [
+            "function* work(){return 1;}",
+            "async function work(){return 1;}",
+            "function work(input: string){return input;}",
+            "function work(){return ai({instruction:'value'});}",
+            "function work(){return tools.read_file({});} export function unused(){return 1;}",
+        ] {
+            let mut main = Window::default();
+            assert!(install(&mut main, &json!({"source":source.replace("work", "main")})).is_err());
+            assert!(main.program.is_none());
+            let mut child = Window { program_task: Some(json!({"name":"work","input":{}})), ..Default::default() };
+            assert!(install_body(&mut child, &json!({"source":source})).is_err());
+            assert!(child.program.is_none());
+            assert!(fork_runtime(&json!({"program":{"source":source,"entry":"work","args":[]}})).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn common_flow_runs_with_no_model_requests_after_program_submission() {
+        let root=TestRoot::new();
+        let count=Arc::new(AtomicUsize::new(0));
+        let requests=count.clone();
+        let source=r#"function main(){var rows=[];var sum=0;for(var i=0;i<4;i++){if(i===1)continue;const path=`part-${i}.txt`;tools.write_file({path,content:`${i+1}`});const actual=tools.read_file({path});rows.push(actual.content);sum+=i;}assert(rows.length===3);if(false&&tools.read_file({path:'never'})){throw 'bad';}return {rows,sum,selection:sum>0?'passed':'failed'};}"#;
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(_):Json<Value>|{
+            let n=requests.fetch_add(1,Ordering::SeqCst);
+            let (name,args)=match n {0=>("create_task",json!({"goal":"Execute deterministic common flow"})),1=>("execute_program",json!({"source":source})),_=>panic!("ordinary computation must never request a model: {n}")};
+            async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Execute common flow".into(),8,CancellationToken::new(),1,false).await.unwrap();
+        server.abort();
+        assert_eq!(count.load(Ordering::SeqCst),2);
+        let status:String=conn.query_row("SELECT status FROM agent_tasks",[],|r|r.get(0)).unwrap();
+        assert_eq!(status,"completed");
+        for (i,text) in [(0,"1"),(2,"3"),(3,"4")] {assert_eq!(std::fs::read_to_string(root.path().join(format!("part-{i}.txt"))).unwrap(),text);}
+        let calls:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='read_file'",[],|r|r.get(0)).unwrap();
+        assert_eq!(calls,3,"the short-circuited read must not run");
+        let raw:String=conn.query_row("SELECT state FROM agent_runtime_windows WHERE scope='main'",[],|r|r.get(0)).unwrap();
+        let window:Window=serde_json::from_str(&raw).unwrap();
+        assert_eq!(window.program_value,Some(json!({"rows":["1","3","4"],"sum":5,"selection":"passed"})));
+    }
+
+    #[test]
     fn task_body_accepts_named_or_aggregate_inputs_without_changing_the_caller() {
         for source in [
             "function work(shared,item){return {shared,item};}",
@@ -918,6 +940,104 @@ function evaluate(request,content) {
                 matches!(w.program.as_mut().unwrap().next(),State::Returned(value) if value==input)
             );
         }
+    }
+
+    #[test]
+    fn refined_and_forked_functions_keep_the_frozen_library_mapping() {
+        let libs=json!({"storage":{"read":"read_file"}});
+        let mut child=Window{program_task:Some(json!({"name":"work","input":{"path":"source.txt"},"libraries":libs})),..Default::default()};
+        install_body(&mut child,&json!({"source":"function work(input){return storage.read({path:input.path});}"})).unwrap();
+        assert!(!child.program.as_ref().unwrap().program.libraries.contains_key("io"));
+        assert!(matches!(child.program.as_mut().unwrap().next(),State::Action(Action{kind:ActionKind::Tool{name,args},..}) if name=="read_file" && args["path"]=="source.txt"));
+        let mut fork=fork_runtime(&json!({"program":{"source":"function work(input){return storage.read({path:input.path});}","entry":"work","args":[{"path":"source.txt"}],"libraries":libs}})).unwrap().unwrap();
+        assert!(!fork.program.libraries.contains_key("io"));
+        assert!(matches!(fork.next(),State::Action(Action{kind:ActionKind::Tool{name,..},..}) if name=="read_file"));
+    }
+
+    #[tokio::test]
+    async fn io_library_and_c_conditions_work_after_real_writes_without_extra_models() {
+        let root=TestRoot::new();
+        let count=Arc::new(AtomicUsize::new(0));
+        let requests=count.clone();
+        let source=r#"function main(){io.write({path:'one.txt',content:'one'});io.write({path:'two.txt',content:'two'});const actual=io.read({path:'two.txt'});const items=[actual];const result={};const obj={};if(items.length && !result.error && obj){return {content:actual.content,checked:true};}throw 'incorrect truth conversion';}"#;
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
+            let n=requests.fetch_add(1,Ordering::SeqCst);
+            let messages=body["messages"].as_array().unwrap();
+            if n==1 {
+                // The file group can still be hidden; the source adapter loads
+                // it using the exact resolved host name without another model.
+                assert!(messages.iter().any(|m|m["name"]=="program_tool_libraries"));
+            }
+            let (name,args)=match n {0=>("create_task",json!({"goal":"Use file library and C truth values"})),1=>("execute_program",json!({"source":source})),_=>panic!("no condition should request a model: {n}")};
+            async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Use the library".into(),8,CancellationToken::new(),1,false).await.unwrap();
+        server.abort();
+        let status:String=conn.query_row("SELECT status FROM agent_tasks",[],|r|r.get(0)).unwrap();
+        assert_eq!(status,"completed");
+        assert_eq!(count.load(Ordering::SeqCst),2);
+        assert_eq!(std::fs::read_to_string(root.path().join("one.txt")).unwrap(),"one");
+        assert_eq!(std::fs::read_to_string(root.path().join("two.txt")).unwrap(),"two");
+        let names:Vec<String>=conn.prepare("SELECT json_extract(data,'$.name') FROM agent_task_events WHERE kind='tool/call'").unwrap().query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(names.iter().filter(|n|n.as_str()=="write_file").count(),2);
+        assert_eq!(names.iter().filter(|n|n.as_str()=="read_file").count(),1);
+        assert!(!names.iter().any(|n|n.starts_with("io.")));
+    }
+
+    #[test]
+    fn library_aliases_are_checked_against_frame_permissions_before_installation() {
+        let root=TestRoot::new();
+        let mut state=agent_service::tests::test_state(root.path(),"127.0.0.1:9".parse().unwrap());
+        state.permission_mode=agent_service::PermissionMode::ReadOnly;
+        let cancel=CancellationToken::new();
+        let s=Session{agent_id:None,task_node_id:None,step_node_id:None,plugin:None,state:&state,task:"task",model:"fake",turn:1,cancel:&cancel,ban_execution:false,mode:Mode::Main,scope:"main".into(),parent:None,input_budget:INPUT_BUDGET};
+        let mut w=Window::default();
+        let source="function main(){io.read({path:'source'});io.write({path:'must-not-write'});}";
+        assert!(scoped_arguments(&s,&w,&json!([])).is_err());
+        let args=scoped_arguments(&s,&w,&json!({"source":source})).unwrap();
+        assert!(!args["libraries"]["io"].as_object().unwrap().contains_key("write"));
+        assert!(install(&mut w,&args).is_err());
+        assert!(w.program.is_none());
+        assert!(scoped_arguments(&s,&w,&json!({"source":"function main(){return null;}","libraries":{"io2":{"write":"write_file"}}})).is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_library_alias_uses_the_registered_owner_tool() {
+        let root=TestRoot::new();
+        std::fs::write(root.path().join("code-flow.json"),r#"{"version":1,"features":[]}"#).unwrap();
+        let (_runtime,catalog)=crate::skill_packages::test_runtime();
+        let count=Arc::new(AtomicUsize::new(0));let requests=count.clone();
+        let project_root=root.path().to_string_lossy().into_owned();
+        let app=Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>|{
+            let n=requests.fetch_add(1,Ordering::SeqCst);
+            let message=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_tool_libraries").unwrap();
+            let published:Value=serde_json::from_str(message["content"].as_str().unwrap()).unwrap();
+            assert_eq!(published["libraries"]["code_flow"]["read_code_flow"],"read_code_flow");
+            assert!(published["libraries"]["io"].is_null(),"file tools are outside this plugin's ownership");
+            let (name,args)=match n {
+                0=>("create_task",json!({"goal":"Read this plugin through its library"})),
+                1=>("execute_program",json!({"source":"function main(request){return flow.read({workspace_root:request.root});}","input":{"root":project_root},"libraries":{"flow":{"read":"read_code_flow"}}})),
+                _=>panic!("no extra model is needed for library dispatch"),
+            };
+            async move{Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());state.tool_catalog=Some(catalog);
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        conn.execute("INSERT INTO plugin_sessions VALUES ('task','code-flow')",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Read the plugin library".into(),6,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        assert_eq!(count.load(Ordering::SeqCst),2);
+        let diagnostics=conn.prepare("SELECT data FROM agent_task_events WHERE kind IN ('turn/end','program/error','tool/result')").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(conn.query_row("SELECT status FROM agent_tasks",[],|r|r.get::<_,String>(0)).unwrap(),"completed","{}",diagnostics.join("\n"));
+        let calls:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='read_code_flow'",[],|r|r.get(0)).unwrap();
+        assert_eq!(calls,1);
     }
 
     #[tokio::test]
@@ -995,15 +1115,15 @@ function evaluate(request,content) {
     }
 
     #[tokio::test]
-    async fn semantic_inspection_reads_real_artifacts_repairs_and_asserts_without_replanning() {
+    async fn explicit_inspection_reads_artifacts_and_host_asserts_without_implicit_ai() {
         let root = TestRoot::new();
         let requests = Arc::new(AtomicUsize::new(0));
         let seen = requests.clone();
         let source = r#"
 function main(request) {
   产物 = 制作(request);
-  // !== means the saved artifact fails the requested quality criteria.
-  if (产物 !== request.expected) { 产物 = 修正(产物, request); }
+  const check = 检查(产物, request);
+  if (!check.passed) { 产物 = 修正(产物, request); }
   const actual = tools.read_file({path:产物.path});
   assert(actual.content === request.expected, 'artifact still fails inspection');
   return {path:产物.path, content:actual.content};
@@ -1011,6 +1131,10 @@ function main(request) {
 function 制作(request) {
   tools.write_file({path:request.path, content:'DRAFT'});
   return {path:request.path};
+}
+function 检查(产物, request) {
+  // Read the actual artifact and compare its quality with request.
+  // Return {passed:boolean,evidence:[actual tool observations]}.
 }
 function 修正(产物, request) {
   const original = tools.read_file({path:产物.path});
@@ -1024,23 +1148,15 @@ function 修正(产物, request) {
                 let messages = body["messages"].as_array().unwrap();
                 let message = if let Some(task) = messages.iter().find(|m| m["name"] == "program_task_input") {
                     let task: Value = serde_json::from_str(task["content"].as_str().unwrap()).unwrap();
-                    assert_eq!(task["name"], "semantic_expression");
+                    assert_eq!(task["name"], "检查");
                     let input = &task["input"];
-                    assert_eq!(input["return_type"], "boolean");
                     assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "read_file"));
-                    if input["expression"] == "产物 !== request.expected" {
-                        assert!(task["description"].as_str().unwrap().contains("quality criteria"));
-                        let read = messages.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "read_file")));
-                        if !read {
-                            json!({"role":"assistant","tool_calls":[{"id":"inspect-actual","type":"function","function":{"name":"read_file","arguments":json!({"path":input["bindings"]["产物"]["path"]}).to_string()}}]})
-                        } else {
-                            assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("DRAFT")));
-                            json!({"role":"assistant","content":json!({"value":true,"evidence":[{"path":"artifact.txt","observed":"DRAFT","source":"read_file"}]}).to_string()})
-                        }
+                    let read = messages.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "read_file")));
+                    if !read {
+                        json!({"role":"assistant","tool_calls":[{"id":"inspect-actual","type":"function","function":{"name":"read_file","arguments":json!({"path":input["产物"]["path"]}).to_string()}}]})
                     } else {
-                        assert_eq!(input["expression"], "actual.content === request.expected");
-                        assert_eq!(input["bindings"]["actual"]["content"], "APPROVED");
-                        json!({"role":"assistant","content":json!({"value":true,"evidence":[{"source":"bindings.actual","observed":"APPROVED"}]}).to_string()})
+                        assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("DRAFT")));
+                        json!({"role":"assistant","content":json!({"passed":false,"evidence":[{"path":"artifact.txt","observed":"DRAFT","source":"read_file"}]}).to_string()})
                     }
                 } else {
                     let (name,args) = match n {
@@ -1091,7 +1207,7 @@ function 修正(产物, request) {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(status, "completed", "{terminal:?}");
-        assert_eq!(requests.load(Ordering::SeqCst), 6);
+        assert_eq!(requests.load(Ordering::SeqCst), 5);
         assert_eq!(
             std::fs::read_to_string(root.path().join("artifact.txt")).unwrap(),
             "APPROVED"
@@ -1109,12 +1225,12 @@ function 修正(产物, request) {
             Some(json!({"path":"artifact.txt","content":"APPROVED"}))
         );
         let nodes = crate::task_tree::nodes(&conn, "task").unwrap();
-        let semantic = nodes
+        let inspections = nodes
             .iter()
-            .filter(|n| n.inputs["program_task"]["name"] == "semantic_expression")
+            .filter(|n| n.inputs["program_task"]["name"] == "检查")
             .collect::<Vec<_>>();
-        assert_eq!(semantic.len(), 2);
-        for node in semantic {
+        assert_eq!(inspections.len(), 1);
+        for node in inspections {
             assert_eq!(node.status, "done");
             let remaining: i64 = conn
                 .query_row(
@@ -1125,13 +1241,13 @@ function 修正(产物, request) {
                 .unwrap();
             assert_eq!(
                 remaining, 0,
-                "semantic inspection releases its local context"
+                "explicit inspection releases its local context"
             );
         }
         let evidence: i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/result' AND json_extract(data,'$.meta.result.result') LIKE '%evidence%'",[],|r|r.get(0)).unwrap();
         assert_eq!(
-            evidence, 2,
-            "original semantic envelopes remain in durable receipts"
+            evidence, 1,
+            "explicit inspection evidence remains in durable receipts"
         );
     }
 
@@ -1158,7 +1274,7 @@ function 修正(产物, request) {
             input_budget: INPUT_BUDGET,
         };
         let mut w = Window::default();
-        install(&mut w,&json!({"source":"function* main(){const result=yield call(tools.write_file,{path:'never-repeat.txt',content:'x'});return result.receipt;}"})).unwrap();
+        install(&mut w,&json!({"source":"function main(){const result=tools.write_file({path:'never-repeat.txt',content:'x'});return result.receipt;}"})).unwrap();
         let State::Action(action) = w.program.as_mut().unwrap().next() else {
             panic!()
         };
@@ -1179,16 +1295,16 @@ function 修正(产物, request) {
         );
         assert!(!root.path().join("never-repeat.txt").exists());
 
-        // A persisted semantic return is consumed with its original contract,
-        // without repeating inspection or asking the model for another verdict.
+        // A persisted explicit inspection return is consumed once; ordinary
+        // boolean branching does not ask a model for another verdict.
         let mut w = Window::default();
-        install(&mut w, &json!({"source":"function main(){if('actual' !== 'expected'){return 'repair';}return 'deliver';}"})).unwrap();
+        install(&mut w, &json!({"source":"function main(){const check=inspect();if(!check.passed){return 'repair';}return 'deliver';} function inspect(){// Return {passed:boolean,evidence:[...]}.\n}"})).unwrap();
         let State::Action(action) = w.program.as_mut().unwrap().next() else {
             panic!()
         };
-        assert_eq!(action.semantic_boolean, Some(true));
+        assert_eq!(action.semantic_boolean, None);
         save(&session, &w).await.unwrap();
-        append(&session,"tool/result",json!({"message":{"toolCallId":action.id,"isError":false},"meta":{"result":{"result":json!({"value":true,"evidence":[{"source":"saved inspection"}]}).to_string()}}}),false).await.unwrap();
+        append(&session,"tool/result",json!({"message":{"toolCallId":action.id,"isError":false},"meta":{"result":{"result":json!({"passed":false,"evidence":[{"source":"saved inspection"}]}).to_string()}}}),false).await.unwrap();
         let raw: String = agent_service::open_db(root.path())
             .unwrap()
             .query_row(

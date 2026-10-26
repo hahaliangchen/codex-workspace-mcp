@@ -511,6 +511,8 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     let comment_task = messages.iter().find(|m| m["name"] == "program_task_input");
     if s.mode==Mode::Main {
         wire.insert(1.min(wire.len()),json!({"role":"system","name":"task_program_skill","content":crate::agent_program::SKILL}));
+        let libraries=ts_program::library_catalog(s,definitions);
+        wire.insert(2.min(wire.len()),json!({"role":"system","name":"program_tool_libraries","content":json!({"libraries":libraries,"instruction":"These source library methods map to the exact advertised tool names. Prefer library.method(args) in flow source, using the same JSON parameters and returns. Optional libraries in execute_program/define_task_body may bind a new namespace to exact available tool names; never guess a mapping. Permissions and plugin ownership are unchanged."}).to_string()}));
     }
     // Plugin instructions are a session-owned system layer, rebuilt outside
     // compressible chat history. No plugin page means no automatic injection.
@@ -1399,10 +1401,6 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         let (node, message) = if w.program.is_some() {
             match ts_program::next(s, w, step).await? {
                 ts_program::Round::Exchange(node, message) => (node, message),
-                ts_program::Round::AiCompleted => {
-                    model_rounds += 1;
-                    continue;
-                }
             }
         } else {
             model_rounds += 1;
@@ -1527,8 +1525,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
-                    "execute_program" => ts_program::install(w,&args),
-                    "define_task_body" => ts_program::install_body(w,&args),
+                    "execute_program" => ts_program::install(w,&ts_program::scoped_arguments(s,w,&args)?),
+                    "define_task_body" => ts_program::install_body(w,&ts_program::scoped_arguments(s,w,&args)?),
                     "list_tool_groups" => Ok(tool_groups::list(s, w)),
                     "load_tool_group" | "unload_tool_group" => anyhow::bail!("tool group changes must be called alone"),
                     "read_task_board" => {

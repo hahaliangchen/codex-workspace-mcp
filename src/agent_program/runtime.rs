@@ -27,7 +27,7 @@ pub struct Action {
     pub at: Location,
     pub destination: Option<String>,
     pub kind: ActionKind,
-    /// Some(true) requires a boolean; Some(false) accepts any semantic JSON value.
+    /// Decode-only legacy field. Version 8 actions always use None.
     #[serde(default)]
     pub semantic_boolean: Option<bool>,
 }
@@ -83,7 +83,7 @@ fn eval(e: &Expr, locals: &BTreeMap<String, Value>) -> Result<Value> {
             match (&obj, &key) {
                 (Value::Array(a), Value::String(k)) if k == "length" => json!(a.len()),
                 (Value::String(s), Value::String(k)) if k == "length" => {
-                    json!(s.encode_utf16().count())
+                    json!(s.chars().count())
                 }
                 (Value::Array(a), Value::Number(n)) => a
                     .get({
@@ -101,16 +101,73 @@ fn eval(e: &Expr, locals: &BTreeMap<String, Value>) -> Result<Value> {
                     .cloned()
                     .unwrap_or(Value::Null),
                 (Value::Object(o), Value::String(k)) => o.get(k).cloned().unwrap_or(Value::Null),
+                (Value::String(s), Value::Number(n)) => {
+                    let index = n
+                        .as_u64()
+                        .context("string index must be a nonnegative integer")?;
+                    s.chars()
+                        .nth(usize::try_from(index).context("string index is too large")?)
+                        .map(|c| json!(c.to_string()))
+                        .unwrap_or(Value::Null)
+                }
                 _ => bail!("cannot access member {} on {}", key, obj),
             }
         }
-        Expr::Binary(..)
-        | Expr::Unary(..)
-        | Expr::Conditional(..)
-        | Expr::Stringify(..)
-        | Expr::StringMethod(..) => {
-            bail!("operators and ordinary methods are forbidden in orchestration programs")
+        Expr::Binary(op, left, right) => {
+            let left = eval(left, locals)?;
+            match op.as_str() {
+                "&&" => {
+                    if !super::values::boolean(&left)? {
+                        json!(false)
+                    } else {
+                        json!(super::values::boolean(&eval(right, locals)?)?)
+                    }
+                }
+                "||" => {
+                    if super::values::boolean(&left)? {
+                        json!(true)
+                    } else {
+                        json!(super::values::boolean(&eval(right, locals)?)?)
+                    }
+                }
+                "??" => {
+                    if left.is_null() {
+                        eval(right, locals)?
+                    } else {
+                        left
+                    }
+                }
+                _ => super::values::binary(op, left, eval(right, locals)?)?,
+            }
         }
+        Expr::Unary(op, value) => super::values::unary(op, eval(value, locals)?)?,
+        Expr::Conditional(test, left, right) => {
+            if super::values::boolean(&eval(test, locals)?)? {
+                eval(left, locals)?
+            } else {
+                eval(right, locals)?
+            }
+        }
+        Expr::Stringify(value) => json!(serde_json::to_string(&eval(value, locals)?)?),
+        Expr::ParseJson(value) => {
+            let value = eval(value, locals)?;
+            serde_json::from_str(value.as_str().context("JSON.parse needs a string")?)
+                .context("invalid JSON")?
+        }
+        Expr::Template(parts) => json!(
+            parts
+                .iter()
+                .map(|p| super::values::text(&eval(p, locals)?))
+                .collect::<Result<Vec<_>>>()?
+                .concat()
+        ),
+        Expr::StringMethod(receiver, name, args) => super::values::method(
+            eval(receiver, locals)?,
+            name,
+            args.iter()
+                .map(|arg| eval(arg, locals))
+                .collect::<Result<_>>()?,
+        )?,
     })
 }
 
@@ -145,7 +202,7 @@ impl Runtime {
         let f = program
             .functions
             .get(name)
-            .with_context(|| format!("unknown generator {name}"))?;
+            .with_context(|| format!("unknown function {name}"))?;
         ensure!(
             args.len() == f.params.len(),
             "{name}: expected {} arguments, got {}",
@@ -194,22 +251,17 @@ impl Runtime {
         self.finished = true;
         self.error = Some(value);
     }
-    pub fn resume(&mut self, mut value: Value, mut failed: bool) -> Result<()> {
-        let action = self.pending.take().context("no suspended effect")?;
-        if !failed && let Some(boolean) = action.semantic_boolean {
-            // Preserve the original envelope in the normal task/tool receipt.
-            // Validate the handoff contract, never infer whether its evidence
-            // establishes a domain-specific acceptance criterion.
-            if value.get("value").is_none()
-                || (boolean && !value["value"].is_boolean())
-                || !value["evidence"].as_array().is_some_and(|a| !a.is_empty())
-            {
-                failed = true;
-                value = json!({"message":"semantic task must return {value, evidence:[...]} with nonempty evidence and a boolean value for conditions","receipt":value});
-            } else {
-                value = value["value"].clone();
-            }
-        }
+    pub fn resume(&mut self, value: Value, failed: bool) -> Result<()> {
+        ensure!(
+            self.program.version == VERSION,
+            "program language version changed; original source and results remain saved"
+        );
+        let action = self.pending.as_ref().context("no suspended effect")?;
+        ensure!(
+            action.semantic_boolean.is_none(),
+            "legacy implicit semantic tasks cannot resume"
+        );
+        let action = self.pending.take().unwrap();
         if failed {
             self.raise(value, &action.at);
         } else if let Some(name) = action.destination {
@@ -241,11 +293,9 @@ impl Runtime {
         }
         while !self.finished {
             if self.fuel == 0 {
-                self.raise(
-                    json!({"message":"program instruction budget exhausted"}),
-                    &Location { line: 1, column: 1 },
-                );
-                break;
+                self.finished = true;
+                self.error = Some(json!({"message":"program instruction budget exhausted"}));
+                return State::Failed(self.error.clone().unwrap());
             }
             self.fuel -= 1;
             let instruction = {
@@ -264,7 +314,7 @@ impl Runtime {
                     }
                     Op::Branch(test, target) => {
                         let frame = self.frames.last_mut().unwrap();
-                        if !eval(&test, &frame.locals)?.as_bool().context("if condition must be a boolean task result; truthiness coercion is forbidden")? {
+                        if !super::values::boolean(&eval(&test, &frame.locals)?)? {
                             frame.pc = target;
                         }
                     }
@@ -346,44 +396,10 @@ impl Runtime {
                                 .map(|e| eval(e, locals))
                                 .collect::<Result<Vec<_>>>()
                         };
-                        let semantic_boolean = match &effect {
-                            Effect::Semantic { boolean, .. } => Some(*boolean),
-                            _ => None,
-                        };
                         let kind = match effect {
-                            Effect::Semantic {
-                                expression,
-                                description,
-                                bindings,
-                                boolean,
-                                direct,
-                            } => {
-                                if let Some(value) = direct {
-                                    let value = eval(&value, locals)?;
-                                    if value.is_boolean() {
-                                        if let Some(destination) = destination {
-                                            self.frames
-                                                .last_mut()
-                                                .unwrap()
-                                                .locals
-                                                .insert(destination, value);
-                                        }
-                                        return Ok(None);
-                                    }
-                                }
-                                ActionKind::Task {
-                                    name: "semantic_expression".into(),
-                                    description: format!(
-                                        "Interpret this flow pseudocode expression according to the current task, its requirements, comments and supplied bindings: {expression}\nFunction comments: {description}\nOperators and method names describe intent; do not execute JavaScript or assume object identity comparison. Use the inherited materials and actual tool evidence; read or inspect real artifacts when the condition requires it. Bindings may include $condition_value, the already obtained value: never repeat its original tool/helper call. Do only this expression, then return JSON {{\"value\":{},\"evidence\":[...]}}. Evidence must be nonempty and cite supplied inputs, saved results or actual tool observations; do not invent observations. If evidence is missing, obtain it with the advertised tools or return $task_error. The host alone resumes the caller and chooses the branch.",
-                                        if boolean {
-                                            "true_or_false"
-                                        } else {
-                                            "the_requested_JSON_value"
-                                        }
-                                    ),
-                                    input: json!({"expression":expression,"bindings":eval(&bindings, locals)?,"return_type":if boolean {"boolean"} else {"json"}}),
-                                }
-                            }
+                            Effect::Semantic { .. } | Effect::Ai(_) => bail!(
+                                "legacy implicit AI expression effects are unsupported; use an explicit comment task"
+                            ),
                             Effect::Call(name, args) => {
                                 let args = values(&args)?;
                                 Self::frame(
@@ -452,29 +468,13 @@ impl Runtime {
                                 description,
                                 input: eval(&input, locals)?,
                             },
-                            Effect::Ai(config) => {
-                                let config = eval(&config, locals)?;
-                                ensure!(
-                                    config.is_object() && config["instruction"].is_string(),
-                                    "ai needs {{instruction,input,format}}"
-                                );
-                                ensure!(
-                                    config["format"].is_null()
-                                        || matches!(
-                                            config["format"].as_str(),
-                                            Some("text" | "json")
-                                        ),
-                                    "ai format must be text or json"
-                                );
-                                ActionKind::Ai { config }
-                            }
                         };
                         return Ok(Some(Action {
                             id: format!("program-{}", crate::agent_service::uuid_like()),
                             at: at.clone(),
                             destination,
                             kind,
-                            semantic_boolean,
+                            semantic_boolean: None,
                         }));
                     }
                 }

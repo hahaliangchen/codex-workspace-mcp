@@ -1,112 +1,80 @@
 ---
 name: task-program
-description: 将用户目标与业务 skill 表达为可执行的流程伪代码：唯一 main、注释任务函数、工具库调用、串行和经授权的并发。用于本 Agent 的工具业务编排。
+description: 将用户目标与业务 skill 表达为可执行的流程伪代码：唯一 main、显式 AI 任务、工具调用、确定性表达式和基础控制流。
 ---
 
 # 用程序表达任务
 
-业务 skill 说明要完成什么及其流程、确认点和验收条件；本 skill 只教如何表达调用关系。宿主负责执行、保存和调用返回，不替业务决定步骤。纯对话回答不写程序。
+语言版本 8。用普通 JS 基础语法表达完整流程；Rust 宿主执行普通计算，AI 只处理显式任务函数。业务要求、确认点、验收标准来自用户和业务 skill，不写进通用宿主。
 
-## 写法
+## 固定写法
 
-用简单 C 风格的函数语法表示流程，写一个完整的 `main(request)`。语法借用 TS 结构解析，不要求编写真实业务 JavaScript；业务语义交给 AI，宿主负责调用、返回、分支和迭代。它覆盖用户要求的工作、验证和交付，调用辅助函数；不能只准备资料就从 main 返回。源码交给 `execute_program({source,input})`，无需执行 JavaScript。
+- 一个 main 覆盖用户要求的工作、验证和交付；顶层普通 function 定义辅助任务，helper(args) 调用。main 不能被调用或 fork。
+- 数据为 JSON；支持 const/let/var、局部赋值及赋值表达式、++/--、+= -= *= /= %=、对象简写、简单数组解构、成员／下标读取、模板字符串。
+- 控制流支持 if/else、传统 for、while、do/while、数组 for...of、无标签 break/continue、三元、assert、return、try/catch/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
+- + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件采用 C 风格真值：false、null 和数值 0 为假，其余 JSON 值为真（空字符串、数组、对象也为真）。if(items.length)、if(!result.error)、if(obj) 都合法。算术和比较仍不做字符串／数字强制转换。短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。
+- 数字运算类型明确：整数加减乘余数精确保留 JSON 64 位整数，溢出报错；除法为有限小数除法，除零报错。超过 2^53-1 的整数不能隐式转换成小数。+ 只连接两个字符串或相加两个数字。==/=== 都比较 JSON 值内容，不表示业务质量。
+- 优先使用 program_tool_libraries 发布的 library.method(args)，如 io.read({path})、io.write({path,content})。工具原 JSON 参数和返回不变；tools.EXACT_NAME(args)／静态 tools["exact/name"](args) 保留作精确名称入口。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
+- 本地数组 push 收集结果；只支持确定性方法 includes/indexOf/slice、字符串 startsWith/endsWith/trim/toLowerCase/toUpperCase/split、数组 join、JSON.stringify/parse。未知方法编译失败，不能假定会让 AI 解释。
+- 禁止 function*/yield、async/await/Promise、call()/ai() 包装、模块导入导出、TS 类型、闭包、箭头／匿名／嵌套函数、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入和 JS 全局环境。
 
-流程源码只表达调用、参数、依赖和返回。长正文或大型生成数据由任务函数产出为返回值或保存资产，再交给工具使用；不要把这些正文展开成流程源码里的巨型字符串，避免多层转义与代码／数据混杂。简短配置和普通参数仍可使用 JSON 字面量。
+let/const 在函数内不做块级遮蔽，使用不同名字；var 可以重复声明，不做提升，首次无初值为 null。数据按 JSON 快照交接，不共享可变别名。字符串 length、索引、slice 和 indexOf 使用 Unicode 标量。模板只插入原始值，对象和数组使用 JSON.stringify。完整规范在 docs/agent-program.md。
 
-调用对象决定执行单元：AI 定义的函数调用是任务，宿主提供的工具库调用是步骤。任务函数可以组合子任务与工具步骤，不以有无注释判断是否为叶子。函数体有两种写法，可以组合：
+## 工具库
 
-- 已明确的操作：在函数内编排工具库或其他函数调用，注释说明其用途。
-- 需要 AI 完成的工作：函数体只写注释。宿主把注释当任务说明，把实参按参数名绑定为输入，让当前 Agent 在局部任务作用域执行。执行 AI 可以直接调用工具，也可以补写当前函数体并调用更细的任务，返回后继续调用方。
+io.read/read_lines/write/list/search/edit/replace 对应真实文件工具。插件库和方法从当前启用、可用的工具目录发布，不按业务含义猜测。必要时 execute_program/define_task_body 的 libraries 参数可建立新别名：{"ppt":{"get_design":"目录公布的精确工具名"}}，然后写 ppt.get_design(args)；这里只说明映射形状，实际值必须从目录取得。不能覆盖已发布方法或指向不存在／无权限的工具，不能通过库调用任务调度器。
 
-注释说明本函数做什么、输入如何使用、要交回什么字段。输出应能直接作为下一调用的参数；实际产物宜返回路径／稳定引用和检查结果。工作步骤和规模来自用户与业务 skill，不从示例推定固定步骤、数量或分工比例。
+库方法使用原工具的 JSON 对象参数，不自动把字符串或位置参数转换成字段。只支持静态 namespace.method，不把库当作 JS 对象或函数值。公共库映射随 main 保存、向 helper/补写/fork 继承；不需要在各分支重新发现或重填。方法最终走原来的工具分发、工具组加载、权限与插件归属检查。
 
-空函数执行时，使用 `define_task_body({source})` 补写**当前函数**，保留 program_task_input 中的函数名和调用方所需返回契约。形参可直接使用命名输入的字段名，也可用一个形参接收完整命名输入对象；例如原输入为 {shared, item}，单个 input 形参通过 input.shared 和 input.item 访问。源码声明当前函数及需要的辅助函数，不声明另一个 main；宿主直接在当前任务作用域执行，不新增重复任务。已完成的操作用保存结果承接，只编排余下工作。辅助函数可以继续包含代码、说明注释、空任务以及工具步骤。
+## AI 工作必须显式调用
 
-例如，当前调用是 process(shared, part)，可补写：
+需要理解、生成、转换或验收时声明注释函数，说明职责、输入和返回字段；调用它就是任务。不要用 artifact !== expected 代替质量验收，也不要把未绑定名字当作描述性业务条件。使用实际证据让函数返回 passed，再在 if/assert 中消费它。
 
-```ts
+```js
+function main(request) {
+  let output = produce(request);
+  const check = inspect(output, request);
+  if (!check.passed) {
+    output = repair(output, check, request);
+  }
+  return deliver(output, request);
+}
+function produce(request) {
+  // 按 request 制作实际产物，返回路径、版本和实际结果。
+}
+function inspect(output, request) {
+  // 读取真实产物，对照 request 判断，返回 {passed:boolean,evidence:[...],issues:[...]}。
+}
+function repair(output, check, request) {
+  // 依据 check 修正授权范围内的问题，返回实际产物。
+}
+function deliver(output, request) {
+  // 完成所需检查和交付，如实返回结果和限制。
+}
+```
+
+注释任务在当前 Agent 的局部作用域执行，可直接使用已公布工具；也可 define_task_body 补写当前函数及新 helper，继续分解工作，不新建第二个 main、不重复创建当前任务。形参按原命名输入绑定，或用单个形参接收完整输入对象。有代码的 helper 同样是任务，其工具调用是步骤。main 返回结束，helper 返回恢复调用方。
+
+当前调用为 process(shared, part) 时，可补写：
+
+```js
 function process(shared, part) {
-  // 当前任务继续执行，内部自定义方法调用形成子任务。
-  const source = tools.read_file({path: part.source});
-  const result = transform(shared, part, source.content);
-  tools.write_file({path: part.output, content: result.content});
-  return {path: part.output};
+  const source = io.read({path: part.source});
+  const changed = transform(shared, part, source.content);
+  const saved = io.write({path: part.output, content: changed.content});
+  return {path: part.output, receipt: saved};
 }
 function transform(shared, part, content) {
-  // 按 shared 与 part 处理 content，返回 {content:string}。
-  // 需要时可继续补写本函数并调用其子任务。
+  // 根据 shared、part 处理 content，返回 {content:string}。
 }
 ```
 
-## 参数和结果
+## 数据流与交付
 
-把共同依赖与各自职责分开。准备函数返回共享材料及各份工作；后续需要这些材料的函数显式接收共享参数，嵌套调用也继续传递。可以传同一个 shared 对象或明确的所需子集，不能用“沿用公共规范”“参考前文”替代规范与资料本身。父环境继承提供已有能力，不替代函数的数据契约。
+共同依赖与各自职责分开传参。共享规则传完整对象，资产用真实稳定引用、路径、版本及必要正文；不以“沿用公共规范”代替数据。嵌套 helper 继续传递所需依赖，分支收到各自独占清单，不能只换标签却传相同完整工作。
 
-共享参数按需要携带已确认的要求、公共规则和资产。资产使用工具返回的真实稳定引用、路径、版本及必要正文，供被调用函数定位材料；不虚构引用，不为共享强行复制全部大正文。已有材料足够时直接使用；只有缺失具体内容或确需新版时才读取对应引用。各分支另外接收自己的工作清单和资源范围，不能只更换标签却传入相同的完整工作。
+正文、HTML 等长数据由任务函数返回或保存为资产，编排源码不展开巨型字符串。只读取缺失材料或确需新版的内容；已有输入、技能、工具和回执直接复用。
 
-返回数据要能被下一调用使用：产物及其稳定引用、处理结果、尚未解决的问题和必要证据。汇总沿实际返回值和记录推进，不重新发现工作范围。明确变量从哪里产生、传给谁，不假定另一个局部函数的变量会自动生效。
+返回 JSON 要能被下一调用使用；检查任务保留真实工具证据。工具成功、accepted、函数返回或编译通过均不等于业务验收。按业务技能完成修复、异步结果收集和确认点，再交付。工具参数遵守真实契约，返回是原始 JSON，例如 read_file 的 result.content，不带 original_result 包装。
 
-## 编排已知的步骤
-
-已知的先后依赖、逐项迭代和分支写在代码里；注释任务函数承接其中具体的判断或处理。不要把已经明确的多个阶段和整个循环塞进一个笼统的注释任务，留给内部工具循环反复决定下一步。相同处理作用于一个清单时，用 for...of 调用当前条目的函数，让调用方持有清单与迭代位置；条目返回后自然进入下一项。
-
-工具库使用当前公布的真实方法与契约。已明确的读写可以直接写在辅助函数里，注释解释用途。可以用描述性条件和 assert 表达检查要求，或让检查函数返回布尔结论及证据；调用方据此继续或抛出具体问题。检查通过后使用其结果，不重新把整个检查阶段再做一遍。需要收集循环结果时，声明本地结果数组（const results = []），逐项 results.push(result)，再把 results 传给汇总函数。数组追加是宿主支持的结果收集语法，不执行任意 JS 方法；数组按 JSON 值传递，不共享别名。也可使用已有记录能力和稳定引用。可用 let 或简单局部赋值保存后续返回值；不要编造不存在的宿主工具。
-
-下面只展示调用和数据流；函数名、输出字段和并发数量不是所有业务的固定流程：
-
-```ts
-function main(request) {
-  const plan = prepare(request);
-  const a = fork(process, plan.shared, plan.left);
-  const b = fork(process, plan.shared, plan.right);
-  const outputs = join(a, b);
-  return verify(plan.shared, outputs);
-}
-function prepare(request) {
-  // 按实际需求准备 shared 公共规则与真实资产引用。
-  // 此例已获并发授权：返回职责不同的 left/right，含 source 和 output。
-}
-function process(shared, part) {
-  // 使用公布的工具库方法读取、处理和保存。
-  const source = tools.read_file({path: part.source});
-  const changed = transform(shared, source.content, part);
-  const saved = tools.write_file({path: part.output, content: changed.content});
-  return {items: [{path: part.output, receipt: saved}]};
-}
-function transform(shared, content, part) {
-  // 根据 shared 和 part 处理 content，只处理该分支职责。
-  // 返回 {content: string}。
-}
-function verify(shared, outputs) {
-  for (const output of outputs) {
-    for (const item of output.items) {
-      const check = inspect(shared, item);
-      if (check.failed) { throw check; }
-    }
-  }
-  return {outputs, verified: true};
-}
-function inspect(shared, item) {
-  // 按 shared 规定的实际验收条件，检查当前 item 的真实产物。
-  // 使用所需工具获得证据；返回 {failed: boolean, evidence, issues}。
-  // 只处理当前条目，不重新枚举全部工作或代替调用方调度。
-}
-```
-
-示例并发只适用于用户或业务 skill 已授权多个 Agent 的情况。串行直接调用函数。`fork(fn,shared,part)` 启动该函数对应的子 Agent，`join(a,b)` 等待返回；子 Agent 不再派生 Agent。任务函数默认由当前 Agent 执行，不是每个函数都新开 Agent。返回 main 之前完成业务要求的交付；示例的返回对象仅演示类型化交接，不代表任何业务验收标准。
-
-## 数据和控制流
-
-允许 JSON 字面量、参数／成员引用、`const/let` 接收返回值、简单局部赋值、函数调用、`if/else`、数组 `for...of`、`assert(condition, message)`、`return` 和 `try/catch/throw`。首次 `产物 = 制作(要求)` 可以建立局部值，后续 `产物 = 修正(产物, 要求)` 替换它；const 不可重新绑定，不支持成员写入、复合赋值或递增递减。
-
-比较、逻辑、取反、描述性方法、三元表达式和模板插值交给语义任务解释，不按 JavaScript 运算。比如 `if (产物 !== 要求.期待产物)` 可以表示“实际产物不满足预期”，不是对象身份比较。函数里的注释说明判断意图，参与表达式的局部值按名字绑定，原任务要求与父环境继续可用。已返回的真布尔值直接推进，不再询问 AI；其他条件不会做 JS 真值转换。`assert` 失败沿已有异常通道传播，没有 catch 就停止。
-
-语义任务可用正常工具读取、渲染或检查真实产物，返回 `{"value": true, "evidence": [...]}`（普通数据表达式的 value 可以是任何 JSON 值）。evidence 必须非空，指向已有输入、保存结果或本次真实工具观察；缺少证据先获取，无法判断就返回 `$task_error`，不能猜测通过。宿主检查返回格式、布尔类型及非空证据，保存原始回执后只将 value 交给后续流程；这不等于宿主认证业务验收。语义任务只解释当前表达式，不重新规划 main。若用 define_task_body 细化它，仍须保持 value/evidence 返回契约。
-
-先绑定需要实际执行的工具／任务调用，再在语义表达式中引用其结果，避免在 `&&`、三元等描述里隐藏实际操作：`const actual = tools.read_file({path}); if (actual.content !== expected) { ... }`。`if (inspect(item).passed)` 这类直接调用仍按普通调用执行一次，再消费结果。数组和 for...of 由宿主推进，清单必须来自真实数组返回值；本地 `results.push(value)` 是确定性的结果收集。其他方法只描述返回值，不会运行 JS 或修改调用方变量。
-
-工具通过 `tools.EXACT_NAME(args)` 调用；带特殊字符的名称可写 `tools["exact/name"](args)`。准确使用已公布的工具契约。程序里工具返回原始 JSON，例如 read_file 的正文为 result.content，不含聊天交付用的 original_result 包装。工具库不是 JavaScript／浏览器／Node 环境。
-
-提交前像检查普通程序一样，沿 main 看一遍：用户目标是否完整覆盖，每个调用是否收到所需参数，每个返回字段是否有来源，串行依赖与并行所有权是否正确，验收是否读取实际产物。源码编译通过只说明表示合法，不保证业务逻辑正确。
-
-注释任务完成时返回一个 JSON 值，与注释约定的输出匹配；不要 Markdown 围栏。普通说明可以作为 JSON 字符串返回。无法完成则返回 {"$task_error":{"message":"具体原因"}}，宿主会沿调用链传播；没有 catch 时终止，不自动重放外部操作。工具受理不代表异步工作完成，继续遵循业务工具契约与确认点。
+执行前检查完整 main、参数来源、分支所有权和返回契约。编译错误按行列修正，运行时类型错误明确失败，不能转交 AI 猜测。任务返回一个 JSON 值，无 Markdown 围栏；文本用 JSON 字符串。无法完成返回 {"$task_error":{"message":"具体原因"}}，未捕获错误停止，不重放外部操作。原权限和插件边界始终有效。

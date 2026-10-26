@@ -1,17 +1,22 @@
-//! TypeScript-shaped pseudocode is the reviewable flow language, not a JS VM.
+//! A fixed JavaScript-shaped subset is the flow language, not a JS/TS runtime.
 //! SWC compiles it to serializable control flow; effects use the normal host tools.
 mod compiler;
+pub(crate) mod libraries;
 pub(crate) mod runtime;
 #[cfg(test)]
 mod tests;
+mod values;
 
 pub use compiler::{compile, compile_body, compile_entry};
+pub use compiler::{
+    compile_body_with_libraries, compile_entry_with_libraries, compile_with_libraries,
+};
 pub use runtime::{Action, Runtime, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 8;
 // JavaScript has one number type; JSON tool schemas often require integer
 // representations. Preserve integral values at the deterministic boundary.
 fn number_value(value: f64) -> Value {
@@ -34,6 +39,8 @@ pub struct Program {
     pub version: u32,
     pub source: String,
     pub functions: BTreeMap<String, Function>,
+    #[serde(default)]
+    pub libraries: libraries::Libraries,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Function {
@@ -81,13 +88,14 @@ pub enum Expr {
     Array(Vec<Expr>),
     Object(Vec<(String, Expr)>),
     Member(Box<Expr>, Box<Expr>),
-    // Legacy variants remain decodable so old snapshots fail explicitly by version,
-    // rather than being silently treated as a fresh task. They are never emitted.
+    // Pure expressions are deterministic. Calls are lowered to durable effects.
     Binary(String, Box<Expr>, Box<Expr>),
     Unary(String, Box<Expr>),
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>),
     Stringify(Box<Expr>),
     StringMethod(Box<Expr>, String, Vec<Expr>),
+    Template(Vec<Expr>),
+    ParseJson(Box<Expr>),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Effect {
@@ -95,7 +103,9 @@ pub enum Effect {
     Call(String, Vec<Expr>),
     Fork(String, Vec<Expr>),
     Join(Vec<Expr>),
+    // Decode old snapshots for explicit version rejection; never newly compiled.
     Ai(Expr),
+    // Decode-only legacy AI interpretation; version 8 rejects this effect.
     Semantic {
         expression: String,
         description: String,
@@ -114,12 +124,12 @@ pub const SKILL: &str = include_str!("../skills/task-program/SKILL.md");
 
 pub fn tool() -> Value {
     json!({"type":"function","function":{"name":"execute_program",
-        "description":"Execute the complete task pseudocode described by the supplied task-program skill. Use one ordinary function main with helper calls. Every AI-defined helper call is a task with its own scope and typed return, whether its body contains code or comments. An empty body requires comments for the executing AI, which may implement the same function with define_task_body and nested helper calls. Calls to host tools are execution steps. Keep source for orchestration: obtain long generated payloads from helper return values or saved assets instead of embedding them as giant source literals. A helper can also orchestrate tools.EXACT_NAME(args) and other helpers, with comments explaining those calls. fork(helper,args) starts an authorized child Agent; join(handles) waits and returns ordered values. Main return ends the task; helper return resumes its caller. Functions, JSON data, local assignment, if/else, assert and array for...of express flow. Descriptive comparisons, operators and data methods are interpreted by an AI task with named bindings and function comments, using actual tools when evidence is needed; the host consumes its explicit value and evidence, never executes JS operators or methods. Bind real tool/helper calls before placing their results inside semantic expressions. Boolean results advance directly; local array.push(value) deterministically collects task returns. The host compiles the whole source before effects, preserves source/frames/locals/position, and executes tools through existing permissions and plugin boundaries. Call alone after creating the task and preparing missing contracts. Checks and delivery belong in main's complete flow; syntax success does not prove business acceptance. No JS VM or arbitrary imports. Legacy generator/effect syntax remains readable for compatibility, but write ordinary function-call pseudocode for new tasks.",
-        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000},"input":{}},"required":["source"],"additionalProperties":false}}})
+        "description":"Execute the complete version 8 flow program described by task_program_skill. One ordinary main covers the authorized work, verification and delivery, using helper(args) and the published library.method(args), such as io.read({path}), with the same exact tool schema. tools.EXACT_NAME(args) remains an escape hatch. Optional libraries bind new namespaces and methods to exact available tool names; mappings are frozen across helpers, refinements and forks and cannot expand permissions. Every helper is a task with local scope and a JSON return; tools are actual steps. A comment-only helper explicitly requests AI work and can implement its current body with define_task_body. Ordinary arithmetic, comparisons, logic, templates and whitelisted data methods are deterministic host computations, never implicit AI tasks. Use const/let/var, local assignments/updates, common for/while/do-while/for-of loops, break/continue, if/else, ternaries, assert, return and try/catch/throw. Logical and conditional expressions short-circuit; types are explicit and false, null and numeric zero are false; all other JSON values are true, including empty strings and containers. Logical operators return booleans and short-circuit; ?? selects the right side only for null. Business judgment belongs in an explicit inspection helper returning a boolean field and real evidence, not in operator interpretation. Pass shared inputs and distinct branch assignments explicitly. Authorized fork(helper,args) starts a child Agent and join waits for ordered results; child Agents cannot fork. Main return ends the task; helper return resumes its caller. Reject function*, yield, async/await, call()/ai(), modules, TS types, closures/classes and unlisted JS runtime features. Long generated payloads belong in task returns or saved assets. Compile all source before effects, preserve frames/locals/position and use existing permission/plugin boundaries. Call alone after task creation and missing-contract preparation. Type/compile errors are explicit; no AI fallback. Existing receipts are consumed without replay; older language snapshots cannot execute. Compilation and function return do not prove business acceptance.",
+        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000},"input":{},"libraries":{"type":"object","maxProperties":64,"additionalProperties":{"type":"object","maxProperties":256,"additionalProperties":{"type":"string","maxLength":256}},"description":"Optional namespace -> method -> exact available tool name aliases, e.g. a ppt namespace bound to published plugin tool names. Do not invent tool targets."}},"required":["source"],"additionalProperties":false}}})
 }
 
 pub fn body_tool() -> Value {
     json!({"type":"function","function":{"name":"define_task_body",
-        "description":"Implement the current task function using its program_task_input description and named actual arguments. Submit source declaring that same function name; use current argument names or one parameter receiving the complete named-input object, with its calls to tools and/or additional helper functions. AI-defined helper calls create child tasks; tool-library calls are steps. Empty helpers require explanatory comments; they can themselves refine their implementation. No new main: this implements the current function and returns its value to the existing caller. Keep orchestration source separate from long generated payloads: obtain those as helper return values or asset references, not giant source literals. Pass shared materials explicitly. Use the same restricted syntax as task-program skill. Call alone; after compilation the host executes the body in this existing task scope. Do not recreate completed operations: implement only the remaining work with their saved results.",
-        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000}},"required":["source"],"additionalProperties":false}}})
+        "description":"Implement the current task function using its program_task_input description and named actual arguments. Submit source declaring that same function name; use current argument names or one parameter receiving the complete named-input object, with its calls to tools and/or additional helper functions. AI-defined helper calls create child tasks; tool-library calls are steps. Empty helpers require explanatory comments; they can themselves refine their implementation. No new main: this implements the current function and returns its value to the existing caller. Keep orchestration source separate from long generated payloads: obtain those as helper return values or asset references, not giant source literals. Pass shared materials explicitly. Use the same restricted syntax as task-program skill. Published tool libraries and the caller's frozen aliases are inherited; optional libraries may add aliases to exact currently available tool names. Call alone; after compilation the host executes the body in this existing task scope. Do not recreate completed operations: implement only the remaining work with their saved results.",
+        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000},"libraries":{"type":"object","maxProperties":64,"additionalProperties":{"type":"object","maxProperties":256,"additionalProperties":{"type":"string","maxLength":256}}}},"required":["source"],"additionalProperties":false}}})
 }
