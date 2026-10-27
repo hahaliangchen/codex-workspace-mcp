@@ -2173,7 +2173,8 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             save(s, w).await?;
             if result["error_code"] == "ASSET_CONFLICT" {
                 let message = if let Some(copy) = result["candidate_path"].as_str() {
-                    format!("文件 {} 在任务期间被外部修改，当前文件未覆盖。待写副本保存在 {}。请决定如何处理；系统不会自动合并或重试。", result["path"].as_str().unwrap_or(""), copy)
+                    let saved = if result["candidate"] == "request" { "这次的修改请求" } else { "待写副本" };
+                    format!("文件 {} 在任务期间被外部修改，当前文件未覆盖。{}保存在 {}。请决定如何处理；系统不会自动合并或重试。", result["path"].as_str().unwrap_or(""), saved, copy)
                 } else {
                     format!("文件 {} 在读取期间发生变化，未进行编辑。请决定如何处理；系统不会自动重试。", result["path"].as_str().unwrap_or(""))
                 };

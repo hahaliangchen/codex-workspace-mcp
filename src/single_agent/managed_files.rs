@@ -61,10 +61,13 @@ pub(super) struct Prepared {
     target: PathBuf,
     base: Option<Vec<u8>>,
     proposed: Vec<u8>,
+    request_only: bool,
     pub args: Value,
 }
 
 /// Compute the intended content from the saved baseline, never from a conflicting file.
+/// After an external change the edit may no longer fit the baseline; the request
+/// itself is then the candidate, and the caller stops on the conflict.
 pub(super) fn prepare(root: &Path, task: &str, workspace: &Path, name: &str, mut args: Value) -> Result<Prepared> {
     let raw = args["path"].as_str().context("file path required")?;
     let (work, rel, path) = key(workspace, raw)?;
@@ -76,28 +79,37 @@ pub(super) fn prepare(root: &Path, task: &str, workspace: &Path, name: &str, mut
             baseline(root, task, &work, &rel)?.context("file baseline missing")?
         }
     };
-    let proposed = match name {
-        "write_file" => args["content"].as_str().context("content required")?.as_bytes().to_vec(),
-        "edit_file" => {
-            let source = std::str::from_utf8(base.as_deref().context("cannot edit a missing baseline")?)?;
-            let edits: Vec<crate::tools::TextEdit> = serde_json::from_value(args["edits"].clone())?;
-            crate::file_edit::text_edits(source, &edits)?.into_bytes()
-        }
-        "replace_range" => {
-            let source = std::str::from_utf8(base.as_deref().context("cannot edit a missing baseline")?)?;
-            let start = args["start_line"].as_u64().context("start_line required")? as usize;
-            let end = args["end_line"].as_u64().context("end_line required")? as usize;
-            let replacement = args["replacement"].as_str().context("replacement required")?;
-            crate::file_edit::line_replacement(source, start, end, replacement, args["expected_old_text"].as_str())?.into_bytes()
-        }
-        _ => anyhow::bail!("unsupported managed file operation"),
+    let changed = crate::file_edit::snapshot(&path)?.as_deref() != base.as_deref();
+    let (proposed, request_only) = match proposed_content(name, &args, base.as_deref()) {
+        Ok(bytes) => (bytes, false),
+        Err(_) if changed => (serde_json::to_vec_pretty(&args)?, true),
+        Err(error) => return Err(error),
     };
     let object = args.as_object_mut().context("file arguments must be an object")?;
     object.remove("expected_code_hash");
     if let Some(bytes) = &base {
         object.insert("expected_code_hash".into(), json!(crate::symbol_description::content_hash(bytes)));
     }
-    Ok(Prepared { workspace: work, relative: rel, target: path, base, proposed, args })
+    Ok(Prepared { workspace: work, relative: rel, target: path, base, proposed, request_only, args })
+}
+
+fn proposed_content(name: &str, args: &Value, base: Option<&[u8]>) -> Result<Vec<u8>> {
+    Ok(match name {
+        "write_file" => args["content"].as_str().context("content required")?.as_bytes().to_vec(),
+        "edit_file" => {
+            let source = std::str::from_utf8(base.context("cannot edit a missing baseline")?)?;
+            let edits: Vec<crate::tools::TextEdit> = serde_json::from_value(args["edits"].clone())?;
+            crate::file_edit::text_edits(source, &edits)?.into_bytes()
+        }
+        "replace_range" => {
+            let source = std::str::from_utf8(base.context("cannot edit a missing baseline")?)?;
+            let start = args["start_line"].as_u64().context("start_line required")? as usize;
+            let end = args["end_line"].as_u64().context("end_line required")? as usize;
+            let replacement = args["replacement"].as_str().context("replacement required")?;
+            crate::file_edit::line_replacement(source, start, end, replacement, args["expected_old_text"].as_str())?.into_bytes()
+        }
+        _ => anyhow::bail!("unsupported managed file operation"),
+    })
 }
 
 impl Prepared {
@@ -108,13 +120,14 @@ impl Prepared {
         let dir = root.join(".codex-workspace-mcp").join("conflicts");
         fs::create_dir_all(&dir)?;
         let suffix = self.target.file_name().context("file name required")?.to_string_lossy();
-        let path = dir.join(format!("{}-{}", crate::agent_service::uuid_like(), suffix));
+        let (kind, extension) = if self.request_only { ("request", ".request.json") } else { ("file", "") };
+        let path = dir.join(format!("{}-{}{}", crate::agent_service::uuid_like(), suffix, extension));
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
         std::io::Write::write_all(&mut file, &self.proposed)?;
         file.sync_all()?;
         Ok(json!({"error_code":"ASSET_CONFLICT", "path":self.relative,
-            "workspace":self.workspace,"candidate_path":path.to_string_lossy(),
-            "message":"The file changed outside this task. The current file and proposed copy are preserved; ask the user how to proceed. Do not merge or retry automatically."}))
+            "workspace":self.workspace,"candidate":kind,"candidate_path":path.to_string_lossy(),
+            "message":"The file changed outside this task. The current file and the proposed change are preserved; ask the user how to proceed. Do not merge or retry automatically."}))
     }
     pub(super) fn committed(&self, root: &Path, task: &str) -> Result<bool> {
         let current = crate::file_edit::snapshot(&self.target)?;
@@ -150,6 +163,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&path)?, "external\n");
         assert_eq!(fs::read_to_string(saved["candidate_path"].as_str().unwrap())?, "agent\n");
         assert_eq!(saved["error_code"], "ASSET_CONFLICT");
+        assert_eq!(saved["candidate"], "file");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -183,6 +197,27 @@ mod tests {
         observe(&root, "task", &root, &json!({"path":"document.txt"}), &json!({"code_hash":crate::symbol_description::content_hash(b"external")}))?;
         let prepared = prepare(&root, "task", &root, "write_file", json!({"path":"document.txt","content":"agent"}))?;
         assert!(prepared.conflict()?);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn an_edit_written_against_an_external_change_stops_as_a_conflict() -> Result<()> {
+        let root = root();
+        let path = root.join("document.txt");
+        fs::write(&path, "original\n")?;
+        observe(&root, "task", &root, &json!({"path":"document.txt"}), &json!({"code_hash":crate::symbol_description::content_hash(b"original\n")}))?;
+        fs::write(&path, "external\n")?;
+        observe(&root, "task", &root, &json!({"path":"document.txt"}), &json!({"code_hash":crate::symbol_description::content_hash(b"external\n")}))?;
+        // The edit fits only the external version, never the task's baseline.
+        let prepared = prepare(&root, "task", &root, "edit_file", json!({"path":"document.txt","edits":[{"old_text":"external","new_text":"agent"}]}))?;
+        assert!(prepared.conflict()?);
+        let saved = prepared.preserve(&root)?;
+        assert_eq!(saved["error_code"], "ASSET_CONFLICT");
+        assert_eq!(saved["candidate"], "request");
+        assert_eq!(fs::read_to_string(&path)?, "external\n");
+        let request: Value = serde_json::from_str(&fs::read_to_string(saved["candidate_path"].as_str().unwrap())?)?;
+        assert_eq!(request["edits"][0]["old_text"], "external");
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -223,7 +258,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let requests = count.clone();
         let external = root.join("document.txt");
-        let app = Router::new().route("/chat/completions", post(move |Json(_body): Json<Value>| {
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(_body): Json<Value>| {
             let n = requests.fetch_add(1, Ordering::SeqCst);
             let (name, args) = match n {
                 0 => ("create_task", json!({"goal":"Update the file"})),
