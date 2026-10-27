@@ -22,7 +22,11 @@ const HEADER: &str = "# 项目备注\n\n写给 AI 的长期说明，每次对话
 pub fn task_project(root: &Path, task: &str) -> Result<Option<PathBuf>> {
     let conn = agent_service::open_db(root)?;
     let plugin: Option<String> = conn
-        .query_row("SELECT plugin_id FROM plugin_sessions WHERE task_id=?1", [task], |r| r.get(0))
+        .query_row(
+            "SELECT plugin_id FROM plugin_sessions WHERE task_id=?1",
+            [task],
+            |r| r.get(0),
+        )
         .optional()
         .unwrap_or(None);
     let meta: Option<(Option<String>, String)> = conn
@@ -35,7 +39,10 @@ pub fn task_project(root: &Path, task: &str) -> Result<Option<PathBuf>> {
     if plugin.is_some() || meta.as_ref().is_some_and(|(_, kind)| kind == "chat") {
         return Ok(None);
     }
-    Ok(Some(meta.and_then(|(path, _)| path).map_or_else(|| root.to_path_buf(), PathBuf::from)))
+    Ok(Some(
+        meta.and_then(|(path, _)| path)
+            .map_or_else(|| root.to_path_buf(), PathBuf::from),
+    ))
 }
 
 pub fn read(project: &Path) -> Option<String> {
@@ -50,9 +57,11 @@ pub fn system_message(project: &Path) -> Option<Value> {
     if body.len() < text.len() {
         body.push_str("\n…(truncated; read AGENTS.md for the rest)");
     }
-    Some(json!({"role":"system","name":"project_notes","content":format!(
-        "Project notes from {FILE}, written or approved by the user. Treat them as standing instructions for all work in this project unless the user overrides them in this conversation.\n\n{body}"
-    )}))
+    Some(
+        json!({"role":"system","name":"project_notes","content":format!(
+            "Project notes from {FILE}, written or approved by the user. Treat them as standing instructions for all work in this project unless the user overrides them in this conversation.\n\n{body}"
+        )}),
+    )
 }
 
 /// Append one note as a list item, creating the file with a short header.
@@ -83,14 +92,21 @@ pub(crate) fn registered(state: &AgentServiceState, workspace: &str) -> Result<P
         [workspace],
         |r| r.get(0),
     )?;
-    ensure!(known || Path::new(workspace) == state.workspace.root(), "项目不存在");
+    ensure!(
+        known || Path::new(workspace) == state.workspace.root(),
+        "项目不存在"
+    );
     Ok(PathBuf::from(workspace))
 }
 
 fn response(result: Result<Value>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -102,7 +118,10 @@ fn notes(project: &Path) -> Value {
 pub struct NotesQuery {
     workspace: String,
 }
-pub async fn get(State(state): State<AgentServiceState>, Query(query): Query<NotesQuery>) -> Response {
+pub async fn get(
+    State(state): State<AgentServiceState>,
+    Query(query): Query<NotesQuery>,
+) -> Response {
     response(registered(&state, &query.workspace).map(|project| notes(&project)))
 }
 
@@ -112,11 +131,15 @@ pub struct NotesInput {
     content: String,
 }
 /// Replace the whole file with what the user edited.
-pub async fn put(State(state): State<AgentServiceState>, Json(input): Json<NotesInput>) -> Response {
+pub async fn put(
+    State(state): State<AgentServiceState>,
+    Json(input): Json<NotesInput>,
+) -> Response {
     response((|| {
         let project = registered(&state, &input.workspace)?;
         let path = project.join(FILE);
-        std::fs::write(&path, &input.content).with_context(|| format!("无法写入 {}", path.display()))?;
+        std::fs::write(&path, &input.content)
+            .with_context(|| format!("无法写入 {}", path.display()))?;
         Ok(notes(&project))
     })())
 }
@@ -127,7 +150,10 @@ pub struct AppendInput {
     note: String,
 }
 /// Accept a note the agent proposed (possibly edited by the user).
-pub async fn post(State(state): State<AgentServiceState>, Json(input): Json<AppendInput>) -> Response {
+pub async fn post(
+    State(state): State<AgentServiceState>,
+    Json(input): Json<AppendInput>,
+) -> Response {
     response((|| {
         let project = registered(&state, &input.workspace)?;
         append(&project, &input.note)?;
@@ -150,7 +176,12 @@ mod tests {
         assert!(text.contains("- 打包要打完整独立包\n  依赖全部打进去\n- 部署前先跑测试\n"));
         let message = system_message(&dir).unwrap();
         assert_eq!(message["name"], "project_notes");
-        assert!(message["content"].as_str().unwrap().contains("部署前先跑测试"));
+        assert!(
+            message["content"]
+                .as_str()
+                .unwrap()
+                .contains("部署前先跑测试")
+        );
         assert!(append(&dir, "  ").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

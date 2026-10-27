@@ -1,11 +1,10 @@
-//! Isolated acceptance runs shared by the linear baseline and task-tree rollout.
+//! Isolated acceptance runs for the compiled flow runtime.
 use crate::agent_service::{self, AgentServiceState};
 use anyhow::{Context, Result, ensure};
 use axum::{Json, Router, routing::post};
 use rusqlite::params;
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -73,7 +72,6 @@ fn initialize(state: &mut AgentServiceState) -> Result<()> {
                 .collect(),
             max_output_tokens: Default::default(),
             context_windows: Default::default(),
-            context_request_options: Default::default(),
         });
     route
         .context_windows
@@ -106,7 +104,12 @@ fn initialize(state: &mut AgentServiceState) -> Result<()> {
 
 /// Windows installs `python`; most Linux distributions only `python3`.
 fn python() -> &'static str {
-    let found = |name: &str| std::process::Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success());
+    let found = |name: &str| {
+        std::process::Command::new(name)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
     if found("python") { "python" } else { "python3" }
 }
 
@@ -154,36 +157,14 @@ fn tool(id: usize, name: &str, args: Value) -> Value {
     json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("acceptance-{id}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
 }
 
-fn check_call(number: Option<u64>, footer: bool) -> (String, Value) {
-    let mut args = vec![json!("check_pages.py")];
-    if let Some(number) = number {
-        args.extend([json!("--page"), json!(number.to_string())]);
-    }
-    if footer {
-        args.extend([json!("--footer-from"), json!("11")]);
-    }
-    (
-        "run_program".into(),
-        json!({"program":"python","args":args,"timeout_seconds":30}),
-    )
-}
-
 /// Twenty pages as steps of one main task. The broken shared stylesheet found
 /// at page 7 is repaired by a temporary task under that step; the user's update
 /// at page 10 reaches every later page; finished page steps leave brief records.
 #[tokio::test]
-async fn scripted_twenty_page_task_graph_repairs_and_applies_the_interjection() -> Result<()>
-{
-    let root = workspace("scripted-tree")?;
+async fn scripted_twenty_page_task_graph_repairs_and_applies_the_interjection() -> Result<()> {
+    let root = workspace("scripted-program")?;
     let outline: Value = serde_json::from_slice(&std::fs::read(root.join("outline.json"))?)?;
-    let mut queue = VecDeque::new();
-    queue.push_back(("create_task".into(), json!({"goal":"Generate and verify all twenty HTML pages","first_step":"Load the tools and read the shared materials"})));
-    for group in ["files", "execution"] {
-        queue.push_back(("load_tool_group".into(), json!({"group":group})));
-    }
-    for name in ["outline.json", "design_spec.md"] {
-        queue.push_back(("read_file".into(), json!({"path":name})));
-    }
+    let mut html = std::collections::BTreeMap::new();
     for page in outline["pages"].as_array().unwrap() {
         let n = page["id"].as_u64().unwrap();
         let title = page["title"].as_str().unwrap();
@@ -198,75 +179,92 @@ async fn scripted_twenty_page_task_graph_repairs_and_applies_the_interjection() 
         } else {
             String::new()
         };
-        let html = format!(
-            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title><link rel=\"stylesheet\" href=\"shared.css\"></head><body><main class=\"page\"><h1>{title}</h1><section class=\"{}\">{points}</section>{footer}</main><!-- {} --></body></html>",
-            page["layout"].as_str().unwrap(),
-            "context pressure fixture ".repeat(1200)
-        );
-        queue.push_back((
-            "write_file".into(),
-            json!({"path":format!("page{n:02}.html"),"content":html}),
-        ));
-        queue.push_back(check_call(Some(n), n >= 11));
-        if n == 7 {
-            // The shared stylesheet is broken: not this page's work, so a
-            // temporary task repairs it and the page step resumes.
-            let mut css = std::fs::read_to_string(root.join("shared.css"))?;
-            let expected = crate::symbol_description::content_hash(css.as_bytes());
-            css.push_str(
-                "\n.repair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }\n",
-            );
-            queue.push_back(("create_task".into(), json!({"goal":"Repair shared.css so the repair-grid layout exists","first_step":"Add the missing .repair-grid class",
-                "reason":"The page07 check fails because shared.css has no .repair-grid class","briefing":"page07.html uses the repair-grid layout; shared.css lacks that class"})));
-            queue.push_back(("read_file".into(), json!({"path":"shared.css"})));
-            queue.push_back((
-                "write_file".into(),
-                json!({"path":"shared.css","content":css,"expected_code_hash":expected}),
-            ));
-            queue.push_back(("answer".into(), json!("shared.css now defines .repair-grid")));
-            queue.push_back(check_call(Some(n), false));
-        }
-        if n == 10 {
-            queue.push_back(("inject_user_update".into(), json!({})));
-        }
+        html.insert(n, format!("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{title}</title><link rel=\"stylesheet\" href=\"shared.css\"></head><body><main class=\"page\"><h1>{title}</h1><section class=\"{}\">{points}</section>{footer}</main><!-- {} --></body></html>",page["layout"].as_str().unwrap(),"context pressure fixture ".repeat(1200)));
     }
-    queue.push_back(check_call(None, true));
-    let progress = Arc::new(Mutex::new((queue, 0usize, 0usize, false)));
+    let source = r#"
+function main() {
+  const outline = JSON.parse(io.read({path:"outline.json"}).content);
+  const spec = io.read({path:"design_spec.md"});
+  const shared = {spec:spec.content};
+  const files = [];
+  for (const page of outline.pages) {
+    const draft = designPage(shared,page);
+    const path = "page" + (page.id < 10 ? "0" : "") + page.id + ".html";
+    io.write({path,content:draft.content});
+    let check = host.run_program({program:"python",args:["check_pages.py","--page",""+page.id,"--footer-from","11"],timeout_seconds:30});
+    if (check.process_exit_code !== 0) {
+      repair(shared,page,check);
+      check = host.run_program({program:"python",args:["check_pages.py","--page",""+page.id,"--footer-from","11"],timeout_seconds:30});
+    }
+    assert(check.process_exit_code === 0,"page failed");
+    files.push(path);
+  }
+  const final = host.run_program({program:"python",args:["check_pages.py","--footer-from","11"],timeout_seconds:30});
+  assert(final.process_exit_code === 0,"final checker failed");
+  return {files};
+}
+/** @virtual */ function designPage(shared,page) {
+  // Use shared design rules and this page's outline. Return {content:string}.
+}
+/** @virtual */ function repair(shared,page,check) {
+  // Inspect the failed checker result; repair the shared prerequisite, return null.
+}
+"#;
+    let progress = Arc::new(Mutex::new((0usize, 0usize, false, 0usize)));
     let captured = progress.clone();
     let working = root.clone();
-    let app = Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
-        let captured = captured.clone();
-        let working = working.clone();
+    let mut repaired_css = std::fs::read_to_string(root.join("shared.css"))?;
+    let expected_hash = crate::symbol_description::content_hash(repaired_css.as_bytes());
+    repaired_css
+        .push_str("\n.repair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }\n");
+    let app=Router::new().route("/v1/chat/completions",post(move|Json(body):Json<Value>| {
+        let captured=captured.clone();let working=working.clone();let html=html.clone();
+        let repaired_css=repaired_css.clone();let expected_hash=expected_hash.clone();
         async move {
-            let mut progress = captured.lock().unwrap();
-            progress.1 += 1;
-            let round = progress.1;
-            let messages = body["messages"].as_array().unwrap();
-            let message = if messages.iter().rev().find(|m|m["role"]=="assistant" || m["role"]=="tool" || m["name"]=="task_completion_check").is_some_and(|m|m["name"]=="task_completion_check") {
-                json!({"role":"assistant","content":messages.iter().rev().find(|m|m["role"]=="assistant").unwrap()["content"]})
-            } else if let Some((name,args)) = progress.0.pop_front() {
-                if name=="inject_user_update" {
-                    crate::interjections::submit(&working,TASK,UPDATE).unwrap();
-                    progress.3 = true;
-                    tool(round,"read_task_board",json!({}))
-                } else if name=="answer" {
-                    json!({"role":"assistant","content":args})
-                } else {
-                    if name=="write_file" && args["path"]=="page11.html" {
-                        assert!(body.to_string().contains("内部资料"),"the mid-turn update must reach the next execution request");
+            let mut progress=captured.lock().unwrap();let round=progress.0;progress.0+=1;
+            let messages=body["messages"].as_array().unwrap();
+            let task=messages.iter().find(|m|m["name"]=="program_task_input")
+                .map(|m|serde_json::from_str::<Value>(m["content"].as_str().unwrap()).unwrap());
+            let message=if let Some(task)=task {
+                match task["name"].as_str().unwrap() {
+                    "designPage"=>{
+                        let n=task["bindings"]["page"]["id"].as_u64().unwrap();
+                        if n==10 && !progress.2 {crate::interjections::submit(&working,TASK,UPDATE).unwrap();progress.2=true;}
+                        if n==11 {assert!(body.to_string().contains("内部资料"),"user update must reach the next function");}
+                        progress.1=progress.1.max(n as usize);
+                        json!({"role":"assistant","content":json!({"content":html[&n]}).to_string()})
                     }
-                    tool(round,&name,args)
+                    "repair"=>{
+                        let stage=progress.3;progress.3+=1;
+                        match stage {
+                            0=>tool(round,"invoke_library",json!({"method":"io.read","args":{"path":"shared.css"}})),
+                            1=>tool(round,"invoke_library",json!({"method":"io.write","args":{"path":"shared.css","content":repaired_css,"expected_code_hash":expected_hash}})),
+                            2=>json!({"role":"assistant","content":"null"}),
+                            _=>panic!("repair must execute once"),
+                        }
+                    }
+                    other=>panic!("unexpected function {other}"),
                 }
-            } else {json!({"role":"assistant","content":"All twenty fixture pages were checked."})};
+            } else {
+                match round {
+                    0=>tool(round,"create_task",json!({"goal":"Generate and verify all twenty HTML pages"})),
+                    1=>tool(round,"execute_program",json!({"source":source})),
+                    _=>panic!("the compiled main must continue without model rescheduling"),
+                }
+            };
             Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let mut state = agent_service::tests::test_state(&root, listener.local_addr()?);
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     initialize(&mut state)?;
+    state
+        .provider_routes
+        .get_mut(&state.provider_name)
+        .unwrap()
+        .context_windows
+        .insert(state.default_model.clone(), 131_072);
     let outcome = crate::single_agent::run_task(
         state.clone(),
         TASK.into(),
@@ -284,38 +282,46 @@ async fn scripted_twenty_page_task_graph_repairs_and_applies_the_interjection() 
     ensure!(check["passed"] == true, "final checker failed: {check}");
     let progress = progress.lock().unwrap();
     ensure!(
-        progress.0.is_empty() && progress.3,
-        "the script must finish and propagate the user update"
+        progress.1 == 20 && progress.2 && progress.3 == 3,
+        "all functions and user update must complete once"
     );
     let conn = agent_service::open_db(&root)?;
     let nodes = crate::task_tree::nodes(&conn, TASK)?;
-    // The loop ends when the model answers without tool calls: the main task reaches its finish node.
-    let main = nodes.iter().find(|n| n.kind == "task" && n.metadata["role"] == "main").context("main task missing")?;
-    ensure!(main.status == "done", "the plain final answer must finish the main task");
-    let steps = nodes.iter().filter(|n| n.kind == "step" && n.parent_id.as_deref() == Some(main.node_id.as_str())).count();
-    ensure!(steps >= 46, "every execution request has a host step; got {steps}");
-    let repair = nodes.iter().find(|n| n.kind == "task" && n.metadata["role"] == "temp").context("repair task missing")?;
-    let page7 = nodes.iter().find(|n| Some(n.node_id.as_str())==repair.parent_id.as_deref() && n.kind=="step").context("repair caller step missing")?;
+    let main = nodes
+        .iter()
+        .find(|n| n.metadata["role"] == "main")
+        .context("main task missing")?;
+    ensure!(main.status == "done", "main must return");
+    let repair = nodes
+        .iter()
+        .find(|n| n.goal == "repair")
+        .context("repair function missing")?;
+    let owner = nodes
+        .iter()
+        .find(|n| Some(n.node_id.as_str()) == repair.parent_id.as_deref())
+        .context("repair caller step missing")?;
     ensure!(
-        repair.parent_id.as_deref() == Some(page7.node_id.as_str()) && repair.status == "done",
-        "the shared repair must run as a temporary task under the page 7 step"
+        repair.status == "done" && owner.kind == "step",
+        "repair must return to its suspended program"
     );
-    let requests: i64 = conn.query_row("SELECT COUNT(*) FROM agent_request_contexts WHERE task_id=?1 AND actor='agent'", [TASK], |r| r.get(0))?;
-    let all_steps=nodes.iter().filter(|n|n.kind=="step").count();
-    ensure!(all_steps as i64 == requests-1, "one host step per execution request after task creation ({all_steps} steps, {requests} requests)");
-    let folded:i64=conn.query_row("SELECT COALESCE(SUM(json_extract(data,'$.folded_steps')),0) FROM agent_task_events WHERE task_id=?1 AND kind='context/step_view'",[TASK],|r|r.get(0))?;
-    ensure!(folded>=40,"completed work must leave concise step records; got {folded}");
-    let failures:i64 = conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.meta.result.process_exit_code')=1",[TASK],|r|r.get(0))?;
+    ensure!(
+        nodes.iter().filter(|n| n.goal == "designPage").count() == 20,
+        "each page has one function scope"
+    );
+    let failures:i64=conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.meta.result.process_exit_code')=1",[TASK],|r|r.get(0))?;
     ensure!(
         failures == 1,
         "only the intentional page 7 check may fail, got {failures}"
     );
-    for name in ["outline.json", "design_spec.md", "check_pages.py"] {
-        ensure!(
-            std::fs::read(root.join(name))? == std::fs::read(fixture_root().join(name))?,
-            "fixture input modified: {name}"
-        );
-    }
+    let over_budget:i64=conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='context/usage' AND json_extract(data,'$.estimated_input_tokens')>json_extract(data,'$.input_budget')",[TASK],|r|r.get(0))?;
+    ensure!(over_budget == 0, "requests must fit the budget");
+    // Per-function scopes may avoid folding entirely; pressure folding is
+    // exercised by step_context's growing-window tests, not forced here.
+    let obsolete:i64=conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind='tool/call' AND json_extract(data,'$.name') IN ('load_tool_group','create_step','return_task')",[TASK],|r|r.get(0))?;
+    ensure!(
+        obsolete == 0,
+        "the acceptance run must use the current flow path"
+    );
     Ok(())
 }
 
@@ -408,25 +414,61 @@ async fn real_model_blog_build_meets_a_runtime_only_defect() -> Result<()> {
 }
 
 async fn real_model_blog(fixture_name: &str) -> Result<()> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(fixture_name);
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture_name);
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("target/context-acceptance")
-        .join(format!("{fixture_name}-real-{}", agent_service::uuid_like()));
+        .join(format!(
+            "{fixture_name}-real-{}",
+            agent_service::uuid_like()
+        ));
     copy_tree(&fixture, &root)?;
     let mut state = agent_service::tests::test_state(&root, "127.0.0.1:1".parse()?);
     let config = crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
     crate::ai_proxy::apply_agent_config(&mut state, &config);
-    state.default_model = state.model_map.get(&state.default_model).cloned().unwrap_or(state.default_model);
+    state.default_model = state
+        .model_map
+        .get(&state.default_model)
+        .cloned()
+        .unwrap_or(state.default_model);
     let mut conn = agent_service::open_db(&root)?;
     conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES (?1,?2,?3,'running',0,0)", params![BLOG_TASK,BLOG_PROMPT,state.default_model])?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let seq = agent_service::append_event_tx(&tx, BLOG_TASK, "user/message", &json!({"turn":0,"message":{"role":"user","content":BLOG_PROMPT}}), None)?;
+    let seq = agent_service::append_event_tx(
+        &tx,
+        BLOG_TASK,
+        "user/message",
+        &json!({"turn":0,"message":{"role":"user","content":BLOG_PROMPT}}),
+        None,
+    )?;
     tx.commit()?;
-    let proposal = crate::main_task_anchor::update(&root, BLOG_TASK, &json!({"objective":"Build the static blog in SPEC.md with build.py","constraints":["Do not modify posts/, templates/, SPEC.md or check_site.py","Standard library only"],
-        "completion_conditions":["python check_site.py reports passed"],"source_event_seqs":[seq]}))?;
-    crate::main_task_anchor::decide_definition(&root, BLOG_TASK, proposal["version"].as_i64().unwrap(), true, "acceptance-harness")?;
-    let outcome = crate::single_agent::run_task(state.clone(), BLOG_TASK.into(), state.default_model.clone(), BLOG_PROMPT.into(), 120, CancellationToken::new(), 1, false).await;
-    let check = program(&root, &["check_site.py"]).unwrap_or_else(|error| json!({"passed":false,"error":format!("{error:#}")}));
+    let proposal = crate::main_task_anchor::update(
+        &root,
+        BLOG_TASK,
+        &json!({"objective":"Build the static blog in SPEC.md with build.py","constraints":["Do not modify posts/, templates/, SPEC.md or check_site.py","Standard library only"],
+        "completion_conditions":["python check_site.py reports passed"],"source_event_seqs":[seq]}),
+    )?;
+    crate::main_task_anchor::decide_definition(
+        &root,
+        BLOG_TASK,
+        proposal["version"].as_i64().unwrap(),
+        true,
+        "acceptance-harness",
+    )?;
+    let outcome = crate::single_agent::run_task(
+        state.clone(),
+        BLOG_TASK.into(),
+        state.default_model.clone(),
+        BLOG_PROMPT.into(),
+        120,
+        CancellationToken::new(),
+        1,
+        false,
+    )
+    .await;
+    let check = program(&root, &["check_site.py"])
+        .unwrap_or_else(|error| json!({"passed":false,"error":format!("{error:#}")}));
     let nodes = crate::task_tree::nodes(&conn, BLOG_TASK)?;
     let usage = |node: &str| -> Result<(i64, i64, i64)> {
         Ok(conn.query_row("SELECT COUNT(*), COALESCE(SUM(json_extract(data,'$.estimated_input_tokens')),0), COALESCE(MAX(json_extract(data,'$.estimated_input_tokens')),0) FROM agent_task_events WHERE task_id=?1 AND node_id=?2 AND kind='context/usage'",
@@ -437,7 +479,13 @@ async fn real_model_blog(fixture_name: &str) -> Result<()> {
         Ok(json!({"node_id":n.node_id,"parent_id":n.parent_id,"kind":n.kind,"title":n.title,"status":n.status,"reason":n.spawned_from,
             "result":n.result.as_ref().map(|r|r["result"].clone()),"requests":requests,"estimated_input_total":total,"estimated_input_peak":peak}))
     }).collect::<Result<Vec<_>>>()?;
-    let count = |kind: &str| -> Result<i64> {Ok(conn.query_row("SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind=?2",params![BLOG_TASK,kind],|r|r.get(0))?)};
+    let count = |kind: &str| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM agent_task_events WHERE task_id=?1 AND kind=?2",
+            params![BLOG_TASK, kind],
+            |r| r.get(0),
+        )?)
+    };
     let tool_errors: Vec<String> = conn.prepare("SELECT data FROM agent_task_events WHERE task_id=?1 AND kind='tool/result' AND json_extract(data,'$.message.isError')=1")?
         .query_map([BLOG_TASK], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter().map(|raw| serde_json::from_str::<Value>(&raw).map(|v| v["meta"]["result"]["error"].to_string().chars().take(200).collect()).unwrap_or(raw)).collect();
@@ -447,9 +495,18 @@ async fn real_model_blog(fixture_name: &str) -> Result<()> {
         "changed_shared":std::fs::read_dir(fixture.join("lib"))?.filter_map(|e|e.ok()).filter_map(|e| {
             let name=e.file_name();(std::fs::read(e.path()).ok()!=std::fs::read(root.join("lib").join(&name)).ok()).then(||name.to_string_lossy().into_owned())
         }).collect::<Vec<_>>()});
-    std::fs::write(root.join("report.json"), serde_json::to_vec_pretty(&report)?)?;
-    eprintln!("Blog acceptance report: {}", root.join("report.json").display());
+    std::fs::write(
+        root.join("report.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    eprintln!(
+        "Blog acceptance report: {}",
+        root.join("report.json").display()
+    );
     outcome?;
-    ensure!(check["passed"] == true, "blog build incomplete; inspect report.json and the event database");
+    ensure!(
+        check["passed"] == true,
+        "blog build incomplete; inspect report.json and the event database"
+    );
     Ok(())
 }

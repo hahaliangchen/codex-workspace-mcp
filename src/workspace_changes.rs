@@ -334,8 +334,7 @@ pub async fn execute_tracked(
         tokio::task::spawn_blocking(move || capture(&capture_root, &capture_name, &capture_args))
             .await?;
     let result = if crate::project_process::is_tool(&name) {
-        crate::project_process::execute_cancellable(&workspace, &name, args.clone(), &cancel)
-            .await
+        crate::project_process::execute_cancellable(&workspace, &name, args.clone(), &cancel).await
     } else if crate::program_execution::is_tool(&name) {
         crate::program_execution::execute_cancellable(&workspace, &args, &cancel).await
     } else {
@@ -628,7 +627,8 @@ mod tests {
 
     #[test]
     fn undo_restores_files_in_the_tasks_own_project() {
-        let base = std::env::temp_dir().join(format!("changes-{}", crate::agent_service::uuid_like()));
+        let base =
+            std::env::temp_dir().join(format!("changes-{}", crate::agent_service::uuid_like()));
         let (root, project) = (base.join("server"), base.join("project"));
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&project).unwrap();
@@ -636,15 +636,37 @@ mod tests {
         fs::write(root.join("a.txt"), "server copy\n").unwrap();
         let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','','fake','completed',0,0)", []).unwrap();
-        conn.execute("INSERT INTO agent_session_meta(task_id,workspace) VALUES ('t',?1)", [project.to_string_lossy()]).unwrap();
+        conn.execute(
+            "INSERT INTO agent_session_meta(task_id,workspace) VALUES ('t',?1)",
+            [project.to_string_lossy()],
+        )
+        .unwrap();
         let mut before = Snapshot::new();
-        before.insert("a.txt".into(), Image { exists: true, bytes: Some(b"old\n".to_vec()), stamp: String::new() });
+        before.insert(
+            "a.txt".into(),
+            Image {
+                exists: true,
+                bytes: Some(b"old\n".to_vec()),
+                stamp: String::new(),
+            },
+        );
         let mut after = Snapshot::new();
-        after.insert("a.txt".into(), Image { exists: true, bytes: Some(b"new\n".to_vec()), stamp: String::new() });
+        after.insert(
+            "a.txt".into(),
+            Image {
+                exists: true,
+                bytes: Some(b"new\n".to_vec()),
+                stamp: String::new(),
+            },
+        );
         record(&root, "t", 1, before, after).unwrap();
         undo(&root, "t", 1).unwrap();
         assert_eq!(fs::read_to_string(project.join("a.txt")).unwrap(), "old\n");
-        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "server copy\n", "the server checkout is untouched");
+        assert_eq!(
+            fs::read_to_string(root.join("a.txt")).unwrap(),
+            "server copy\n",
+            "the server checkout is untouched"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

@@ -131,32 +131,6 @@ export function useSession(taskId: string | undefined, onSettled: () => void): S
     }
   }, [taskId, load])
 
-  // The Observer has its own completion path after the Worker finishes. Keep
-  // reading its durable events briefly after the Worker stream closes.
-  useEffect(() => {
-    if (!taskId || !task || live(task)) return
-    if (!['completed', 'failed', 'max_steps'].includes(task.status)) return
-    const currentTurnEvents = events.slice(Math.max(0, events.findLastIndex(event => event.type === 'turn/start')))
-    if (!currentTurnEvents.some(event => event.type === 'observer/config' && event.data.enabled === true)) return
-    if (currentTurnEvents.some(event => event.type === 'observer/retrospective')) return
-    const run = generation.current
-    const deadline = Date.now() + 65_000
-    const timer = window.setInterval(() => {
-      if (run !== generation.current || Date.now() >= deadline) {
-        window.clearInterval(timer)
-        return
-      }
-      void api.events(taskId).then(history => {
-        if (run !== generation.current) return
-        if ((history.at(-1)?.seq ?? -1) > lastSeq.current) {
-          lastSeq.current = history.at(-1)?.seq ?? -1
-          setEvents(history)
-        }
-      }, () => {})
-    }, 1500)
-    return () => window.clearInterval(timer)
-  }, [api, taskId, task, events])
-
   const reload = useCallback(() => {
     if (taskId === undefined) return
     generation.current += 1

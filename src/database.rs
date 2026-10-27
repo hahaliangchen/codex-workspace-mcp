@@ -312,7 +312,8 @@ mod tests {
     /// waits its turn instead of failing with "database is locked", and no sequence number repeats.
     #[test]
     fn concurrent_writers_wait_for_the_lock_instead_of_failing() {
-        let root = std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         {
             let conn = crate::agent_service::open_db(&root).unwrap();
@@ -327,14 +328,21 @@ mod tests {
             .map(|writer| {
                 let root = root.clone();
                 std::thread::spawn(move || -> Result<(), String> {
-                    let mut conn = crate::agent_service::open_db(&root).map_err(|e| e.to_string())?;
+                    let mut conn =
+                        crate::agent_service::open_db(&root).map_err(|e| e.to_string())?;
                     for step in 0..each {
                         // Read the next sequence number, then write: the pattern that fails in a deferred transaction.
                         let tx = conn
                             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                             .map_err(|e| e.to_string())?;
-                        crate::agent_service::append_event_tx(&tx, "task", "test/event", &json!({"writer":writer,"step":step}), None)
-                            .map_err(|e| e.to_string())?;
+                        crate::agent_service::append_event_tx(
+                            &tx,
+                            "task",
+                            "test/event",
+                            &json!({"writer":writer,"step":step}),
+                            None,
+                        )
+                        .map_err(|e| e.to_string())?;
                         tx.commit().map_err(|e| e.to_string())?;
                     }
                     Ok(())
@@ -352,14 +360,18 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((count, distinct), ((writers * each) as i64, (writers * each) as i64));
+        assert_eq!(
+            (count, distinct),
+            ((writers * each) as i64, (writers * each) as i64)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
     /// The same work in deferred transactions shows why they are not used for read-then-write.
     #[test]
     fn a_deferred_read_then_write_fails_while_another_connection_writes() {
-        let root = std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("db_lock_{}", crate::agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         let mut reader = crate::agent_service::open_db(&root).unwrap();
         let writer = crate::agent_service::open_db(&root).unwrap();
@@ -367,7 +379,9 @@ mod tests {
             .execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('a','p','m','running',0,0)", [])
             .unwrap();
         let tx = reader.transaction().unwrap();
-        let _: i64 = tx.query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0)).unwrap();
+        let _: i64 = tx
+            .query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0))
+            .unwrap();
         writer
             .execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('b','p','m','running',0,0)", [])
             .unwrap();

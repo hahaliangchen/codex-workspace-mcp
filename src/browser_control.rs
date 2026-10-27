@@ -249,6 +249,7 @@ fn reconnection_failure(record: &Value, error: &anyhow::Error) -> Value {
         "reason":format!("{error:#}"),"browser_connection":record,
         "needed":"The recorded connection could not be restored. No browser was created and the page was not navigated or uploaded again."})
 }
+#[cfg(test)]
 pub async fn cleanup(root: &Path, task: &str) {
     let _ = close_session(root, task).await;
 }
@@ -278,89 +279,6 @@ pub async fn cleanup_after_finish(root: &Path, task: &str, status: &str) {
 /// page and the exact upload attempt kept in that page's JavaScript state.
 /// A completed work frame remains historical evidence even when this returns
 /// unavailable; callers only revoke reuse of the receipt.
-pub async fn validate_upload_receipt(root: &Path, task: &str, receipt: &Value) -> Value {
-    let receipt_page = &receipt["page"];
-    let session_id = receipt_page["browser_session_id"].as_str().unwrap_or("");
-    let page_id = receipt_page["page_id"].as_str().unwrap_or("");
-    let attempt_id = receipt["upload_attempt_id"].as_str().unwrap_or("");
-    let invalid = |reason: &str| {
-        json!({"available":false,"reason":reason,"browser_session_id":session_id,
-        "page_id":page_id,"upload_attempt_id":attempt_id})
-    };
-    if session_id.is_empty() || page_id.is_empty() || attempt_id.is_empty() {
-        return invalid("receipt_identity_incomplete");
-    }
-    let page = sessions()
-        .lock()
-        .await
-        .entry(session_key(root, task))
-        .or_default()
-        .clone();
-    let mut guard = page.lock().await;
-    if guard.is_none() {
-        match saved_connection(root, task) {
-            Ok(Some(record)) => match reconnect(&record).await {
-                Ok(session) => *guard = Some(session),
-                Err(error) => {
-                    return json!({"available":false,"reason":"browser_reconnect_failed","details":format!("{error:#}"),"browser_connection":record});
-                }
-            },
-            Ok(None) => return invalid("browser_session_missing"),
-            Err(error) => {
-                return json!({"available":false,"reason":"browser_connection_history_unavailable","details":format!("{error:#}")});
-            }
-        }
-    }
-    let Some(session) = guard.as_mut() else {
-        return invalid("browser_session_closed");
-    };
-    if session.session_id != session_id {
-        return invalid("browser_session_changed");
-    }
-    if session.page_id != page_id {
-        return invalid("browser_page_changed");
-    }
-    if receipt_page["page_epoch"]
-        .as_u64()
-        .is_some_and(|epoch| session.epoch < epoch)
-    {
-        return invalid("browser_page_epoch_changed");
-    }
-    if let Some(child) = session.child.as_mut() {
-        match child.try_wait() {
-            Ok(Some(_)) => return invalid("browser_process_exited"),
-            Err(_) => return invalid("browser_process_status_unavailable"),
-            Ok(None) => {}
-        }
-    }
-    let token = serde_json::to_string(attempt_id).unwrap_or_else(|_| "\"\"".to_owned());
-    let expression = format!(
-        r#"(()=>{{
-      const attempt=window.__codexUploadAttempts?.[{token}];
-      return {{url:location.href,attempt_id:attempt?.id||null,change_event_received:attempt?.change_event_received===true,
-        latest_attempt_id:window.__codexLatestUploadAttempt||null,file_name:attempt?.file_name||null,status:attempt?.status||null}};
-    }})()"#
-    );
-    let current = match eval(&session.ws, &expression).await {
-        Ok(value) => value,
-        Err(_) => return invalid("browser_page_unreachable"),
-    };
-    if current["url"] != receipt_page["url"] {
-        return invalid("browser_page_url_changed");
-    }
-    if current["attempt_id"] != attempt_id || current["change_event_received"] != true {
-        return invalid("upload_attempt_missing_or_changed");
-    }
-    if current["latest_attempt_id"] != attempt_id {
-        return invalid("upload_attempt_superseded");
-    }
-    if !receipt["file"]["name"].is_null() && current["file_name"] != receipt["file"]["name"] {
-        return invalid("upload_file_identity_changed");
-    }
-    json!({"available":true,"reason":"active_session_page_and_upload_attempt_match","browser_session_id":session_id,
-        "page_id":page_id,"page_epoch":session.epoch,"upload_attempt_id":attempt_id,
-        "file_name":current["file_name"],"load_status":current["status"]})
-}
 
 async fn close_session(root: &Path, task: &str) -> Value {
     let page = sessions()
@@ -634,31 +552,6 @@ pub async fn execute_scoped(
 
 /// Observer has no navigation/mutation API. The captured instance and page must
 /// still be the ones authorized by the Worker before and throughout capture.
-pub async fn observe_page_snapshot(
-    root: &Path,
-    context: &crate::visual_artifacts::VisualContext,
-    expected_page: &Value,
-) -> Result<Value> {
-    let page = sessions()
-        .lock()
-        .await
-        .get(&session_key(root, context.task_id()))
-        .cloned()
-        .context("no authorized task page is available")?;
-    let mut guard = page.lock().await;
-    let session = guard.as_mut().context("task browser is closed")?;
-    ensure!(
-        session.owner == context.identity,
-        "Observer page belongs to another work instance"
-    );
-    if !expected_page["page_id"].is_null() {
-        ensure!(
-            expected_page["page_id"] == session.page_id,
-            "Observer page identity changed"
-        );
-    }
-    screenshot(root, context, session, false).await
-}
 
 async fn page_state(ws: &str) -> Result<Value> {
     eval(ws,r#"({url:location.href,viewport:{width:innerWidth,height:innerHeight,device_scale_factor:devicePixelRatio},document_epoch:performance.timeOrigin,dom:document.documentElement.outerHTML.slice(0,200000),ready:document.readyState})"#).await
@@ -724,28 +617,54 @@ async fn read(ws: &str, expect: &str) -> Result<Value> {
       return{url:location.href,title:document.title,text:(document.body&&document.body.innerText||'').slice(0,4000),controls,file_inputs,alerts,ready_state:document.readyState,font_state:document.fonts?document.fonts.status:'unsupported'}
     })()"#).await?;
     let matched = expect.is_empty() || value["text"].as_str().unwrap_or("").contains(expect);
-    value["ok"]=json!(true);value["status"]=json!("read");value["matched"]=json!(matched);
-    value["expect_text"]=json!(expect);
+    value["ok"] = json!(true);
+    value["status"] = json!("read");
+    value["matched"] = json!(matched);
+    value["expect_text"] = json!(expect);
     Ok(value)
 }
 
 async fn wait_for(ws: &str, args: &Value) -> Result<Value> {
-    let selector=args["selector"].as_str().unwrap_or("");
-    let text=args["text"].as_str().unwrap_or("");
-    let font_status=args["font_status"].as_str().unwrap_or("");
+    let selector = args["selector"].as_str().unwrap_or("");
+    let text = args["text"].as_str().unwrap_or("");
+    let font_status = args["font_status"].as_str().unwrap_or("");
     if selector.trim().is_empty() && text.is_empty() && font_status.is_empty() {
-        return Ok(json!({"ok":false,"status":"invalid_condition","error_code":"wait_condition_required","needed":"Set selector, text or font_status."}));
+        return Ok(
+            json!({"ok":false,"status":"invalid_condition","error_code":"wait_condition_required","needed":"Set selector, text or font_status."}),
+        );
     }
-    let state=match args["state"].as_str().unwrap_or("visible") {"hidden"=>"hidden","exists"=>"exists",_=>"visible"};
-    let timeout_ms=args["timeout_ms"].as_u64().unwrap_or(10000).clamp(100,30000);
-    let started=tokio::time::Instant::now();
+    let state = match args["state"].as_str().unwrap_or("visible") {
+        "hidden" => "hidden",
+        "exists" => "exists",
+        _ => "visible",
+    };
+    let timeout_ms = args["timeout_ms"]
+        .as_u64()
+        .unwrap_or(10000)
+        .clamp(100, 30000);
+    let started = tokio::time::Instant::now();
     loop {
-        let expression=format!(r#"(()=>{{const selector={};const text={};const state={};const font_status={};let el=null;let selector_error=null;if(selector){{try{{el=document.querySelector(selector)}}catch(e){{selector_error=String(e)}}}}const style=el?getComputedStyle(el):null;const visible=!!(el&&el.getClientRects().length&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||1)>0);const text_match=!text||(document.body&&document.body.innerText||'').includes(text);const selector_match=!selector||(state==='hidden'?!visible:(state==='exists'?!!el:visible));const actual_font_status=document.fonts?document.fonts.status:'unsupported';return{{selector_error,selector_found:!!el,visible,text_match,font_status:actual_font_status,matched:selector_match&&text_match&&(!font_status||actual_font_status===font_status),url:location.href,title:document.title}}}})()"#,
-            serde_json::to_string(selector)?,serde_json::to_string(text)?,serde_json::to_string(state)?,serde_json::to_string(font_status)?);
-        let value=eval(ws,&expression).await?;
-        if let Some(error)=value["selector_error"].as_str() {return Ok(json!({"ok":false,"status":"invalid_selector","error":error}));}
-        if value["matched"]==true {return Ok(json!({"ok":true,"status":"matched","matched":true,"page":value,"elapsed_ms":started.elapsed().as_millis()}));}
-        if started.elapsed()>=Duration::from_millis(timeout_ms) {return Ok(json!({"ok":false,"status":"timeout","matched":false,"error_code":"wait_timeout","page_state":value,"timeout_ms":timeout_ms}));}
+        let expression = format!(
+            r#"(()=>{{const selector={};const text={};const state={};const font_status={};let el=null;let selector_error=null;if(selector){{try{{el=document.querySelector(selector)}}catch(e){{selector_error=String(e)}}}}const style=el?getComputedStyle(el):null;const visible=!!(el&&el.getClientRects().length&&style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity||1)>0);const text_match=!text||(document.body&&document.body.innerText||'').includes(text);const selector_match=!selector||(state==='hidden'?!visible:(state==='exists'?!!el:visible));const actual_font_status=document.fonts?document.fonts.status:'unsupported';return{{selector_error,selector_found:!!el,visible,text_match,font_status:actual_font_status,matched:selector_match&&text_match&&(!font_status||actual_font_status===font_status),url:location.href,title:document.title}}}})()"#,
+            serde_json::to_string(selector)?,
+            serde_json::to_string(text)?,
+            serde_json::to_string(state)?,
+            serde_json::to_string(font_status)?
+        );
+        let value = eval(ws, &expression).await?;
+        if let Some(error) = value["selector_error"].as_str() {
+            return Ok(json!({"ok":false,"status":"invalid_selector","error":error}));
+        }
+        if value["matched"] == true {
+            return Ok(
+                json!({"ok":true,"status":"matched","matched":true,"page":value,"elapsed_ms":started.elapsed().as_millis()}),
+            );
+        }
+        if started.elapsed() >= Duration::from_millis(timeout_ms) {
+            return Ok(
+                json!({"ok":false,"status":"timeout","matched":false,"error_code":"wait_timeout","page_state":value,"timeout_ms":timeout_ms}),
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -1208,7 +1127,8 @@ async fn upload(ws: &str, root: &Path, args: &Value) -> Result<Value> {
             window.__codexUploadAttempts[token].status='file_assigned';
             window.__codexUploadEvents[token]={seen:true,count:(old.count||0)+1,name:this.files?.[0]?.name||null};
           });
-        }"#;        let listen=cdp.call("Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":upload_observer,"arguments":[{"value":marker},{"value":name}],"returnByValue":true})).await;
+        }"#;
+        let listen=cdp.call("Runtime.callFunctionOn",json!({"objectId":object_id,"functionDeclaration":upload_observer,"arguments":[{"value":marker},{"value":name}],"returnByValue":true})).await;
         if let Err(error) = listen {
             if is_stale_node_error(&error) && attempt == 0 {
                 continue;
@@ -2023,11 +1943,6 @@ mod tests {
             .await
             .unwrap();
         assert!(resumed.get("error_code").is_none(), "{resumed}");
-        assert_eq!(
-            validate_upload_receipt(&root, context.task_id(), &uploaded).await["available"],
-            true,
-            "the original upload receipt remains usable after reconnecting in a new request"
-        );
         assert_eq!(
             resumed["browser_connection"]["websocket_url"],
             opened["browser_connection"]["websocket_url"]

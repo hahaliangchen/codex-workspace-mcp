@@ -47,20 +47,36 @@ fn list(conn: &Connection, project: &str) -> Result<Value> {
 fn update(conn: &Connection, project: &str, kind: &str, id: i64, summary: &str) -> Result<()> {
     let summary = summary.trim();
     ensure!(!summary.is_empty(), "内容不能为空");
-    let changed = conn.execute(&format!("UPDATE {} SET summary=?2 WHERE id=?1 AND workspace_root=?3", table(kind)?), params![id, summary, project])?;
+    let changed = conn.execute(
+        &format!(
+            "UPDATE {} SET summary=?2 WHERE id=?1 AND workspace_root=?3",
+            table(kind)?
+        ),
+        params![id, summary, project],
+    )?;
     ensure!(changed == 1, "这条记忆已不存在");
     Ok(())
 }
 
 fn forget(conn: &Connection, project: &str, kind: &str, id: i64) -> Result<()> {
-    conn.execute(&format!("DELETE FROM {} WHERE id=?1 AND workspace_root=?2", table(kind)?), params![id, project])?;
+    conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE id=?1 AND workspace_root=?2",
+            table(kind)?
+        ),
+        params![id, project],
+    )?;
     Ok(())
 }
 
 fn response(result: Result<Value>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -75,8 +91,13 @@ fn open_project(state: &AgentServiceState, workspace: &str) -> Result<(Connectio
 pub struct ProjectQuery {
     workspace: String,
 }
-pub async fn get(State(state): State<AgentServiceState>, Query(query): Query<ProjectQuery>) -> Response {
-    response(open_project(&state, &query.workspace).and_then(|(conn, project)| list(&conn, &project)))
+pub async fn get(
+    State(state): State<AgentServiceState>,
+    Query(query): Query<ProjectQuery>,
+) -> Response {
+    response(
+        open_project(&state, &query.workspace).and_then(|(conn, project)| list(&conn, &project)),
+    )
 }
 
 #[derive(Deserialize)]
@@ -113,23 +134,44 @@ mod tests {
 
     #[test]
     fn memories_can_be_listed_corrected_and_forgotten() {
-        let root = std::env::temp_dir().join(format!("memory-panel-{}", crate::agent_service::uuid_like()));
+        let root = std::env::temp_dir().join(format!(
+            "memory-panel-{}",
+            crate::agent_service::uuid_like()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let conn = crate::database::init_db(&root).unwrap();
         conn.execute("INSERT INTO memories(time_unix,workspace_root,summary,implementation,tests,risks,files_changed) VALUES (1,'r','打包用 musl','','','','[\"build.sh\"]'),(2,'other','别的项目','','','','[]')", []).unwrap();
         let listed = list(&conn, "r").unwrap();
-        assert_eq!(listed["work"].as_array().unwrap().len(), 1, "another project's memory stays out");
+        assert_eq!(
+            listed["work"].as_array().unwrap().len(),
+            1,
+            "another project's memory stays out"
+        );
         let id = listed["work"][0]["id"].as_i64().unwrap();
         assert_eq!(listed["work"][0]["files"][0], "build.sh");
         update(&conn, "r", "work", id, "打包用 musl 静态链接").unwrap();
-        assert_eq!(list(&conn, "r").unwrap()["work"][0]["summary"], "打包用 musl 静态链接");
+        assert_eq!(
+            list(&conn, "r").unwrap()["work"][0]["summary"],
+            "打包用 musl 静态链接"
+        );
         assert!(update(&conn, "r", "work", id, " ").is_err());
         assert!(update(&conn, "r", "nope", id, "x").is_err());
-        assert!(update(&conn, "other", "work", id, "x").is_err(), "ids are scoped to their project");
+        assert!(
+            update(&conn, "other", "work", id, "x").is_err(),
+            "ids are scoped to their project"
+        );
         forget(&conn, "other", "work", id).unwrap();
-        assert_eq!(list(&conn, "r").unwrap()["work"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list(&conn, "r").unwrap()["work"].as_array().unwrap().len(),
+            1
+        );
         forget(&conn, "r", "work", id).unwrap();
-        assert!(list(&conn, "r").unwrap()["work"].as_array().unwrap().is_empty());
+        assert!(
+            list(&conn, "r").unwrap()["work"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

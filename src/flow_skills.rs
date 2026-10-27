@@ -29,7 +29,9 @@ pub struct ProjectSkill {
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !name.starts_with('-')
         && !name.ends_with('-')
 }
@@ -52,7 +54,9 @@ fn front_matter(text: &str) -> (Option<String>, Option<String>) {
 }
 
 pub fn list(project: &FsPath) -> Vec<ProjectSkill> {
-    let Ok(entries) = std::fs::read_dir(project.join(DIR)) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(project.join(DIR)) else {
+        return Vec::new();
+    };
     let mut skills = entries
         .flatten()
         .filter_map(|entry| {
@@ -61,7 +65,11 @@ pub fn list(project: &FsPath) -> Vec<ProjectSkill> {
             let text = std::fs::read_to_string(&path).ok()?;
             let (name, description) = front_matter(&text);
             let name = name.filter(|name| *name == dir && valid_name(name))?;
-            Some(ProjectSkill { name, description: description.unwrap_or_default(), path })
+            Some(ProjectSkill {
+                name,
+                description: description.unwrap_or_default(),
+                path,
+            })
         })
         .collect::<Vec<_>>();
     skills.sort_by(|a, b| a.name.cmp(&b.name));
@@ -74,8 +82,10 @@ pub fn read(project: &FsPath, name: &str) -> Option<Result<Value>> {
     Some((|| {
         let content = std::fs::read_to_string(&skill.path)?;
         ensure!(content.len() <= MAX_SKILL_CHARS, "skill body too large");
-        Ok(json!({"skill":name,"content":content,"source":skill.path,"scope":"project","tools":[],
-            "note":"Project skill recorded by the user from an earlier task flow. Follow its steps for matching work, adapting parameters to the current request."}))
+        Ok(
+            json!({"skill":name,"content":content,"source":skill.path,"scope":"project","tools":[],
+            "note":"Project skill recorded by the user from an earlier task flow. Follow its steps for matching work, adapting parameters to the current request."}),
+        )
     })())
 }
 
@@ -90,25 +100,41 @@ pub fn system_message(project: &FsPath) -> Option<Value> {
         .map(|skill| format!("- {}: {}", skill.name, skill.description))
         .collect::<Vec<_>>()
         .join("\n");
-    Some(json!({"role":"system","name":"project_skills","content":format!(
-        "Project skills saved by the user from earlier work. Before starting work that matches one, call read_skill with its name and follow its procedure.\n{lines}"
-    )}))
+    Some(
+        json!({"role":"system","name":"project_skills","content":format!(
+            "Project skills saved by the user from earlier work. Before starting work that matches one, call read_skill with its name and follow its procedure.\n{lines}"
+        )}),
+    )
 }
 
 fn render(name: &str, description: &str, body: &str) -> String {
     let description = description.replace(['\n', '\r'], " ");
-    format!("---\nname: {name}\ndescription: {}\n---\n\n{}\n", description.trim(), body.trim())
+    format!(
+        "---\nname: {name}\ndescription: {}\n---\n\n{}\n",
+        description.trim(),
+        body.trim()
+    )
 }
 
-pub fn save(project: &FsPath, name: &str, description: &str, body: &str, overwrite: bool) -> Result<PathBuf> {
+pub fn save(
+    project: &FsPath,
+    name: &str,
+    description: &str,
+    body: &str,
+    overwrite: bool,
+) -> Result<PathBuf> {
     ensure!(valid_name(name), "技能名称只能用小写英文字母、数字和连字符");
     ensure!(!description.trim().is_empty(), "请填写适用场景");
     ensure!(!body.trim().is_empty(), "技能步骤不能为空");
     let dir = project.join(DIR).join(name);
     let path = dir.join("SKILL.md");
-    ensure!(overwrite || !path.exists(), "SKILL_EXISTS: 已有同名技能 {name}");
+    ensure!(
+        overwrite || !path.exists(),
+        "SKILL_EXISTS: 已有同名技能 {name}"
+    );
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&path, render(name, description, body)).with_context(|| format!("无法写入 {}", path.display()))?;
+    std::fs::write(&path, render(name, description, body))
+        .with_context(|| format!("无法写入 {}", path.display()))?;
     Ok(path)
 }
 
@@ -152,12 +178,23 @@ fn transcript(input: &DraftInput) -> Result<String> {
     ensure!(!input.steps.is_empty(), "请先选择流程步骤");
     let mut out = String::new();
     if !input.goal.trim().is_empty() {
-        out.push_str(&format!("用户当时的请求：\n{}\n\n", clip(input.goal.trim(), 4_000)));
+        out.push_str(&format!(
+            "用户当时的请求：\n{}\n\n",
+            clip(input.goal.trim(), 4_000)
+        ));
     }
     for (index, step) in input.steps.iter().enumerate() {
-        out.push_str(&format!("## 步骤 {}：{}（{}）\n", index + 1, step.title, step.status));
+        out.push_str(&format!(
+            "## 步骤 {}：{}（{}）\n",
+            index + 1,
+            step.title,
+            step.status
+        ));
         if !step.description.trim().is_empty() {
-            out.push_str(&format!("{}\n", clip(step.description.trim(), MAX_TOOL_CHARS)));
+            out.push_str(&format!(
+                "{}\n",
+                clip(step.description.trim(), MAX_TOOL_CHARS)
+            ));
         }
         for tool in &step.tools {
             out.push_str(&format!(
@@ -187,7 +224,13 @@ fn parse_draft(text: &str) -> Result<Value> {
     let start = text.find('{').context("模型没有返回技能草稿")?;
     let end = text.rfind('}').context("模型没有返回技能草稿")?;
     let value: Value = serde_json::from_str(&text[start..=end]).context("技能草稿格式不正确")?;
-    let field = |key: &str| value[key].as_str().map(str::trim).unwrap_or_default().to_owned();
+    let field = |key: &str| {
+        value[key]
+            .as_str()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned()
+    };
     let mut name = field("name").to_ascii_lowercase().replace([' ', '_'], "-");
     name.retain(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     let name = name.trim_matches('-').to_owned();
@@ -195,8 +238,10 @@ fn parse_draft(text: &str) -> Result<Value> {
     if body.is_empty() {
         bail!("模型返回的技能正文为空");
     }
-    Ok(json!({"name": if valid_name(&name) { name } else { "saved-flow".into() },
-        "description": field("description"), "body": body}))
+    Ok(
+        json!({"name": if valid_name(&name) { name } else { "saved-flow".into() },
+        "description": field("description"), "body": body}),
+    )
 }
 
 async fn distill(state: &AgentServiceState, task: &str, steps: String) -> Result<Value> {
@@ -217,7 +262,10 @@ async fn distill(state: &AgentServiceState, task: &str, steps: String) -> Result
     let pending = async {
         let response = state
             .model_client
-            .post(format!("{}/chat/completions", state.provider_url.trim_end_matches('/')))
+            .post(format!(
+                "{}/chat/completions",
+                state.provider_url.trim_end_matches('/')
+            ))
             .bearer_auth(&state.api_key)
             .header("x-client-request-id", request_id.as_str())
             .json(&body)
@@ -226,20 +274,38 @@ async fn distill(state: &AgentServiceState, task: &str, steps: String) -> Result
         log.headers(&response);
         let response = crate::visual_probe::successful_response(response).await?;
         let completed = crate::model_transport::consume_response(response, &log).await?;
-        let text = completed.message["content"].as_str().unwrap_or_default().to_owned();
+        let text = completed.message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         parse_draft(&text)
     };
     let result = log
-        .watch(pending, &CancellationToken::new(), crate::model_transport::TimeoutPolicy::default())
+        .watch(
+            pending,
+            &CancellationToken::new(),
+            crate::model_transport::TimeoutPolicy::default(),
+        )
         .await;
-    log.finish(if result.is_ok() { "completed" } else { "failed" }, result.as_ref().err());
+    log.finish(
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        result.as_ref().err(),
+    );
     result
 }
 
 fn response(result: Result<Value>) -> Response {
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":format!("{error:#}")}))).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":format!("{error:#}")})),
+        )
+            .into_response(),
     }
 }
 
@@ -275,7 +341,13 @@ pub async fn save_route(
     response((|| {
         let project = crate::project_notes::task_project(state.workspace.root(), &task)?
             .context("只有代码会话可以保存项目技能")?;
-        let path = save(&project, input.name.trim(), &input.description, &input.body, input.overwrite)?;
+        let path = save(
+            &project,
+            input.name.trim(),
+            &input.description,
+            &input.body,
+            input.overwrite,
+        )?;
         Ok(json!({"name":input.name.trim(),"path":path}))
     })())
 }
@@ -286,13 +358,33 @@ mod tests {
 
     #[test]
     fn saved_skills_are_listed_read_and_advertised() {
-        let dir = std::env::temp_dir().join(format!("flow-skills-{}", crate::agent_service::uuid_like()));
+        let dir =
+            std::env::temp_dir().join(format!("flow-skills-{}", crate::agent_service::uuid_like()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(system_message(&dir).is_none());
         assert!(save(&dir, "Deploy Server", "部署时", "步骤", false).is_err());
-        save(&dir, "deploy-server", "部署到服务器时使用\n第二行", "1. 打包\n2. 上传", false).unwrap();
-        assert!(save(&dir, "deploy-server", "x", "y", false).unwrap_err().to_string().contains("SKILL_EXISTS"));
-        save(&dir, "deploy-server", "部署到服务器时使用", "1. 打完整包\n2. 上传", true).unwrap();
+        save(
+            &dir,
+            "deploy-server",
+            "部署到服务器时使用\n第二行",
+            "1. 打包\n2. 上传",
+            false,
+        )
+        .unwrap();
+        assert!(
+            save(&dir, "deploy-server", "x", "y", false)
+                .unwrap_err()
+                .to_string()
+                .contains("SKILL_EXISTS")
+        );
+        save(
+            &dir,
+            "deploy-server",
+            "部署到服务器时使用",
+            "1. 打完整包\n2. 上传",
+            true,
+        )
+        .unwrap();
         let skills = list(&dir);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "部署到服务器时使用");
@@ -300,7 +392,12 @@ mod tests {
         assert!(content["content"].as_str().unwrap().contains("打完整包"));
         assert!(read(&dir, "missing").is_none());
         let hint = system_message(&dir).unwrap();
-        assert!(hint["content"].as_str().unwrap().contains("- deploy-server: 部署到服务器时使用"));
+        assert!(
+            hint["content"]
+                .as_str()
+                .unwrap()
+                .contains("- deploy-server: 部署到服务器时使用")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -308,11 +405,24 @@ mod tests {
     fn drafts_are_parsed_and_names_normalized() {
         let draft = parse_draft("```json\n{\"name\":\"Deploy_Server\",\"description\":\"部署时\",\"body\":\"## 步骤\"}\n```").unwrap();
         assert_eq!(draft["name"], "deploy-server");
-        let draft = parse_draft("{\"name\":\"部署\",\"description\":\"d\",\"body\":\"b\"}").unwrap();
+        let draft =
+            parse_draft("{\"name\":\"部署\",\"description\":\"d\",\"body\":\"b\"}").unwrap();
         assert_eq!(draft["name"], "saved-flow");
         assert!(parse_draft("{\"name\":\"x\",\"body\":\"\"}").is_err());
-        let input = DraftInput { goal: "部署".into(), steps: vec![DraftStep { title: "上传".into(), status: "failed".into(), description: String::new(),
-            tools: vec![DraftTool { name: "run_program".into(), input: "scp".into(), output: "x".repeat(5000), failed: true }] }] };
+        let input = DraftInput {
+            goal: "部署".into(),
+            steps: vec![DraftStep {
+                title: "上传".into(),
+                status: "failed".into(),
+                description: String::new(),
+                tools: vec![DraftTool {
+                    name: "run_program".into(),
+                    input: "scp".into(),
+                    output: "x".repeat(5000),
+                    failed: true,
+                }],
+            }],
+        };
         let text = transcript(&input).unwrap();
         assert!(text.contains("工具 run_program（失败）") && text.contains("已截断"));
     }

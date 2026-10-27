@@ -62,7 +62,6 @@ pub struct VisualContext {
     pub current_page: Value,
     /// Legacy latest-capture references, retained for saved-session compatibility.
     /// They do not determine whether a model may use a screenshot.
-    pub host_current_artifact_ids: Vec<String>,
     pub original_artifact_ids: Vec<String>,
 }
 impl VisualContext {
@@ -229,7 +228,10 @@ pub fn read(root: &Path, task: &str, id: &str) -> Result<(Value, Vec<u8>)> {
 }
 pub fn authorize(item: &Value, context: &VisualContext) -> Result<()> {
     let retained_task_image = context.identity["runtime"] == "single_agent"
-        && context.allowed_artifact_ids.iter().any(|id| item["artifact_id"] == id.as_str());
+        && context
+            .allowed_artifact_ids
+            .iter()
+            .any(|id| item["artifact_id"] == id.as_str());
     ensure!(
         item["task_id"] == context.task_id()
             && (item["request_id"] == context.identity["request_id"] || retained_task_image),
@@ -245,20 +247,6 @@ pub fn authorize(item: &Value, context: &VisualContext) -> Result<()> {
     );
     Ok(())
 }
-pub fn index(root: &Path, task: &str, node: &str, request: usize) -> Result<Vec<Value>> {
-    if !root.is_dir() || task.is_empty() {
-        return Ok(vec![]);
-    }
-    let conn = connection(root)?;
-    let mut stmt = conn.prepare(
-        "SELECT metadata FROM agent_visual_artifacts WHERE task_id=?1 ORDER BY rowid DESC",
-    )?;
-    let records = stmt
-        .query_map([task], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(records.into_iter().filter_map(|s|serde_json::from_str::<Value>(&s).ok()).filter(|item|item["request_id"]==request && item["node_id"]==node).take(8)
-        .map(|item|json!({"artifact_id":item["artifact_id"],"identity":item["identity"],"url":item["url"],"page_epoch":item["page_epoch"],"width":item["width"],"height":item["height"],"content_hash":item["content_hash"],"captured_at":item["captured_at"]})).collect())
-}
 pub fn view(root: &Path, context: &VisualContext, id: &str) -> Result<Value> {
     let (artifact, _) = read(root, context.task_id(), id)?;
     authorize(&artifact, context)?;
@@ -268,18 +256,15 @@ pub fn view(root: &Path, context: &VisualContext, id: &str) -> Result<Value> {
 }
 /// Observer can inspect images belonging to the accepted human goal, across
 /// its child work instances. Other tasks and replaced goals remain excluded.
-pub fn request_artifact_ids(root: &Path, task: &str, request: u64) -> Result<Vec<String>> {
-    let conn = connection(root)?;
-    let mut stmt=conn.prepare("SELECT artifact_id FROM agent_visual_artifacts WHERE task_id=?1 AND json_extract(metadata,'$.request_id')=?2 ORDER BY rowid")?;
-    Ok(stmt
-        .query_map(params![task, request], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
 /// One durable single-agent conversation may explicitly read its older images.
 pub fn task_artifact_ids(root: &Path, task: &str) -> Result<Vec<String>> {
     let conn = connection(root)?;
-    let mut stmt = conn.prepare("SELECT artifact_id FROM agent_visual_artifacts WHERE task_id=?1 ORDER BY rowid")?;
-    Ok(stmt.query_map([task], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut stmt = conn.prepare(
+        "SELECT artifact_id FROM agent_visual_artifacts WHERE task_id=?1 ORDER BY rowid",
+    )?;
+    Ok(stmt
+        .query_map([task], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 /// Encode at dispatch, keeping persistent state and SSE free of base64 copies.
 pub fn image_block(
@@ -426,11 +411,7 @@ pub async fn prepare_request(
     goal: &str,
     body: &mut Value,
 ) -> Result<Value> {
-    let provider = if actor == "observer" {
-        &state.observer_provider
-    } else {
-        &state.provider_name
-    };
+    let provider = &state.provider_name;
     let capability = state.visual.capability(provider, model);
     let request_id = new_id();
     let mut manifest = json!({"turn":context.turn,"request_trace_id":request_id,"identity":context.identity,"actor":actor,"model_route":{"provider":provider,"model":model},
@@ -521,136 +502,6 @@ pub async fn prepare_request(
         messages.push(wire);
     }
     Ok(manifest)
-}
-
-pub fn validate_check(
-    root: &Path,
-    context: &VisualContext,
-    check: &Value,
-    requests: &[Value],
-    actor: &str,
-) -> Result<Value> {
-    ensure!(check.is_object(), "visual_check_result must be an object");
-    ensure!(
-        check["identity"].is_null() || check["identity"] == context.identity,
-        "visual judgment identity does not match the active instance"
-    );
-    let assessment = check["assessment"]
-        .as_str()
-        .context("visual assessment is required")?;
-    ensure!(
-        matches!(assessment, "pass" | "issue" | "uncertain" | "unavailable"),
-        "invalid visual assessment"
-    );
-    let goal = check["checked_goal"]
-        .as_str()
-        .filter(|s| !s.trim().is_empty())
-        .context("visual result needs its checked_goal")?;
-    let ids = check["artifact_ids"]
-        .as_array()
-        .context("visual result requires artifact_ids")?;
-    ensure!(
-        ids.len() <= MAX_IMAGES,
-        "visual result exceeds image selection budget"
-    );
-    let request = requests.iter().rev().find(|request| {
-        request["request_trace_id"] == check["request_trace_id"]
-            && request["identity"] == context.identity
-    });
-    let mut artifacts = Vec::new();
-    for id in ids {
-        let id = id.as_str().context("visual artifact IDs must be strings")?;
-        let mut source_context = context.clone();
-        if let Some(identity) = request
-            .and_then(|request| request["images"].as_array())
-            .and_then(|images| images.iter().find(|image| image["artifact_id"] == id))
-            .map(|image| &image["identity"])
-            .filter(|identity| identity.is_object())
-        {
-            source_context.identity = identity.clone();
-        }
-        let (artifact, _) = read(root, source_context.task_id(), id)?;
-        authorize(&artifact, &source_context)?;
-        artifacts.push(artifact);
-    }
-    if let Some(request) = request {
-        ensure!(
-            request["checked_goal"] == goal,
-            "checked_goal must match the actual visual request goal"
-        );
-        // A limitation report may cite authorized historical captures across
-        // requests; a positive pixel claim must refer to an actual sent image.
-        let undelivered_allowed = !matches!(assessment, "pass" | "issue");
-        for id in ids.iter().filter(|_| !undelivered_allowed) {
-            let sent = request["images"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|image| image["artifact_id"] == *id);
-
-            ensure!(
-                sent,
-                "visual result cites an image never sent in the referenced request"
-            );
-        }
-    }
-    if matches!(assessment, "pass" | "issue") {
-        let request = request
-            .context("visual result must cite a successfully received image request_trace_id")?;
-        ensure!(
-            matches!(request["status"].as_str(), Some("direct")) && !ids.is_empty(),
-            "visual pass/issue requires actual image input, not DOM/capture status"
-        );
-        ensure!(
-            check["observed_facts"]
-                .as_array()
-                .is_some_and(|facts| !facts.is_empty()),
-            "visual pass/issue must record actual observed facts"
-        );
-        ensure!(
-            check["expected_visible_result"]
-                .as_str()
-                .is_some_and(|s| !s.trim().is_empty()),
-            "visual pass/issue requires expected_visible_result"
-        );
-        for fact in check["observed_facts"].as_array().unwrap() {
-            ensure!(
-                fact["fact"].as_str().is_some_and(|s| !s.trim().is_empty())
-                    && ids.iter().any(|id| id == &fact["artifact_id"]),
-                "each observed fact must cite a selected artifact_id and describe visible evidence"
-            );
-        }
-    }
-    let mut result = check.clone();
-    result["identity"] = context.identity.clone();
-    result["actor"] = json!(actor);
-    result["checked_at"] = json!(now());
-    result["artifacts"] = json!(artifacts);
-    result["model_route"] = request
-        .map(|r| r["model_route"].clone())
-        .unwrap_or(Value::Null);
-    result["input_mode"] = request
-        .map(|r| r["status"].clone())
-        .unwrap_or(json!("not_received"));
-    // Keep the observations supplied with the image request. Later page/source
-    // observations must not rewrite what the model actually received.
-    result["source_binding"]=request.map(|request|json!({"execution_epoch":request["execution_epoch"],
-        "related_source_versions":request["related_source_versions"],"current_page":request["current_page"]}))
-        .unwrap_or_else(||json!({"execution_epoch":context.execution_epoch,"related_source_versions":context.related_source_versions,"current_page":context.current_page}));
-    if let Some(request) = request {
-        // Preserve the same dispatch record for successes and failures. A
-        // missing model input must not erase why the host did not send it.
-        result["visual_request"] = request.clone();
-        result["capability"] = request["capability"].clone();
-        result["image_input_unavailable"] = request["image_input_unavailable"].clone();
-    }
-    let id = new_id();
-    result["check_id"] = json!(id);
-    connection(root)?.execute(
-        "INSERT INTO agent_visual_checks(id,task_id,metadata) VALUES (?1,?2,?3)",
-        params![id, context.task_id(), result.to_string()],
-    )?;
-    Ok(result)
 }
 
 pub async fn image_route(

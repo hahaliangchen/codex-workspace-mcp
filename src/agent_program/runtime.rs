@@ -15,6 +15,8 @@ pub struct Runtime {
     #[serde(default)]
     pub scoped_calls: bool,
     frames: Vec<Frame>,
+    #[serde(default)]
+    inherited_scope: BTreeMap<String, Value>,
     pub pending: Option<Action>,
     pub finished: bool,
     pub result: Value,
@@ -27,9 +29,6 @@ pub struct Action {
     pub at: Location,
     pub destination: Option<String>,
     pub kind: ActionKind,
-    /// Decode-only legacy field. Version 8 actions always use None.
-    #[serde(default)]
-    pub semantic_boolean: Option<bool>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ActionKind {
@@ -47,9 +46,6 @@ pub enum ActionKind {
     },
     Join {
         ids: Vec<String>,
-    },
-    Ai {
-        config: Value,
     },
     Task {
         name: String,
@@ -172,13 +168,151 @@ fn eval(e: &Expr, locals: &BTreeMap<String, Value>) -> Result<Value> {
 }
 
 impl Runtime {
+    /// Live public variables across caller frames; inner bindings shadow outer
+    /// ones. Compiler temporaries never become inherited model context.
+    pub fn named_bindings(&self) -> BTreeMap<String, Value> {
+        let mut bindings = BTreeMap::new();
+        for frame in &self.frames {
+            bindings.extend(
+                frame
+                    .locals
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with("$temp"))
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+        bindings
+    }
+    /// Conservative reachability over the remaining control flow. Include
+    /// back-edges and exception handlers; never infer liveness from comments.
+    fn collect_dead_bindings(&mut self) {
+        fn expression(value: &Expr, names: &mut std::collections::BTreeSet<String>) {
+            match value {
+                Expr::Variable(name) => {
+                    names.insert(name.clone());
+                }
+                Expr::Array(items) | Expr::Template(items) => {
+                    for item in items {
+                        expression(item, names);
+                    }
+                }
+                Expr::Object(fields) => {
+                    for (_, item) in fields {
+                        expression(item, names);
+                    }
+                }
+                Expr::Member(a, b) | Expr::Binary(_, a, b) => {
+                    expression(a, names);
+                    expression(b, names);
+                }
+                Expr::Unary(_, a) | Expr::Stringify(a) | Expr::ParseJson(a) => expression(a, names),
+                Expr::Conditional(a, b, c) => {
+                    expression(a, names);
+                    expression(b, names);
+                    expression(c, names);
+                }
+                Expr::StringMethod(a, _, args) => {
+                    expression(a, names);
+                    for arg in args {
+                        expression(arg, names);
+                    }
+                }
+                Expr::Value(_) => {}
+            }
+        }
+        for frame in &mut self.frames {
+            let code = &self.program.functions[&frame.function].code;
+            let mut pending = vec![frame.pc];
+            pending.extend(frame.handlers.iter().map(|(target, _)| *target));
+            let mut visited = std::collections::BTreeSet::new();
+            let mut live = std::collections::BTreeSet::new();
+            let mut dynamic_scope = false;
+            while let Some(pc) = pending.pop() {
+                if pc >= code.len() || !visited.insert(pc) {
+                    continue;
+                }
+                let mut next = true;
+                match &code[pc].op {
+                    Op::Set(_, e) => expression(e, &mut live),
+                    Op::Return(e) | Op::Throw(e) => {
+                        expression(e, &mut live);
+                        next = false;
+                    }
+                    Op::Branch(e, target) => {
+                        expression(e, &mut live);
+                        pending.push(*target);
+                    }
+                    Op::Jump(target) => {
+                        pending.push(*target);
+                        next = false;
+                    }
+                    Op::ForNext {
+                        items, index, end, ..
+                    } => {
+                        live.insert(items.clone());
+                        live.insert(index.clone());
+                        pending.push(*end);
+                    }
+                    Op::Catch { target, .. } => pending.push(*target),
+                    Op::EndCatch => {}
+                    Op::Append { target, items, .. } => {
+                        live.insert(target.clone());
+                        for item in items {
+                            expression(item, &mut live);
+                        }
+                    }
+                    Op::Effect(_, effect) => match effect {
+                        Effect::Tool(name, args) => {
+                            dynamic_scope |= name == "read_scope";
+                            for arg in args {
+                                expression(arg, &mut live);
+                            }
+                        }
+                        Effect::Call(_, args) | Effect::Fork(_, args) | Effect::Join(args) => {
+                            for arg in args {
+                                expression(arg, &mut live);
+                            }
+                        }
+                        Effect::Task { input: e, .. } => expression(e, &mut live),
+                    },
+                }
+                if next {
+                    pending.push(pc + 1);
+                }
+            }
+            if let Some(Action {
+                kind: ActionKind::Tool { name, args },
+                ..
+            }) = &self.pending
+                && name == "read_scope"
+                && let Some(name) = args["name"].as_str()
+            {
+                live.insert(name.to_owned());
+            }
+            // Source-level variables are visible to future AI scopes even
+            // when deterministic code no longer references them. Only
+            // compiler-generated temporaries may be garbage-collected here.
+            frame.locals.retain(|name, _| {
+                !name.starts_with("$temp") || live.contains(name) || dynamic_scope
+            });
+        }
+    }
     pub fn new(program: Program, entry: &str, args: Vec<Value>) -> Result<Self> {
+        Self::new_with_scope(program, entry, args, BTreeMap::new())
+    }
+    fn new_with_scope(
+        program: Program,
+        entry: &str,
+        args: Vec<Value>,
+        inherited_scope: BTreeMap<String, Value>,
+    ) -> Result<Self> {
         ensure!(program.version == VERSION, "unsupported program version");
-        let frame = Self::frame(&program, entry, args, None)?;
+        let frame = Self::frame(&program, entry, args, None, &inherited_scope)?;
         Ok(Self {
             program,
             scoped_calls: false,
             frames: vec![frame],
+            inherited_scope,
             pending: None,
             finished: false,
             result: Value::Null,
@@ -186,10 +320,19 @@ impl Runtime {
             fuel: 100_000,
         })
     }
-    /// The host represents every AI-defined call as a durable task scope.
-    /// Standalone runtimes can still execute inline frames without a host.
+    /// Virtual calls become durable AI task scopes; ordinary calls use frames.
     pub fn task_program(program: Program, entry: &str, args: Vec<Value>) -> Result<Self> {
         let mut runtime = Self::new(program, entry, args)?;
+        runtime.scoped_calls = true;
+        Ok(runtime)
+    }
+    pub fn task_program_with_scope(
+        program: Program,
+        entry: &str,
+        args: Vec<Value>,
+        inherited_scope: BTreeMap<String, Value>,
+    ) -> Result<Self> {
+        let mut runtime = Self::new_with_scope(program, entry, args, inherited_scope)?;
         runtime.scoped_calls = true;
         Ok(runtime)
     }
@@ -198,6 +341,7 @@ impl Runtime {
         name: &str,
         args: Vec<Value>,
         destination: Option<String>,
+        scope: &BTreeMap<String, Value>,
     ) -> Result<Frame> {
         let f = program
             .functions
@@ -209,10 +353,24 @@ impl Runtime {
             f.params.len(),
             args.len()
         );
+        let mut locals = f
+            .captures
+            .iter()
+            .map(|name| {
+                scope
+                    .get(name)
+                    .cloned()
+                    .map(|value| (name.clone(), value))
+                    .with_context(|| {
+                        format!("{name}: captured variable is not visible at the call site")
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        locals.extend(f.params.iter().cloned().zip(args));
         Ok(Frame {
             function: name.into(),
             pc: 0,
-            locals: f.params.iter().cloned().zip(args).collect(),
+            locals,
             destination,
             handlers: Vec::new(),
         })
@@ -240,6 +398,14 @@ impl Runtime {
         if value.get("stack").is_none() {
             value["stack"] = json!(stack);
         }
+        // Keep the failed frames intact when nobody can catch the error. A
+        // scoped AI continuation can inspect their actual locals without
+        // replaying the instructions or their external effects.
+        if !self.frames.iter().any(|frame| !frame.handlers.is_empty()) {
+            self.finished = true;
+            self.error = Some(value);
+            return;
+        }
         while let Some(frame) = self.frames.last_mut() {
             if let Some((target, name)) = frame.handlers.pop() {
                 frame.pc = target;
@@ -256,12 +422,7 @@ impl Runtime {
             self.program.version == VERSION,
             "program language version changed; original source and results remain saved"
         );
-        let action = self.pending.as_ref().context("no suspended effect")?;
-        ensure!(
-            action.semantic_boolean.is_none(),
-            "legacy implicit semantic tasks cannot resume"
-        );
-        let action = self.pending.take().unwrap();
+        let action = self.pending.take().context("no suspended effect")?;
         if failed {
             self.raise(value, &action.at);
         } else if let Some(name) = action.destination {
@@ -397,18 +558,18 @@ impl Runtime {
                                 .collect::<Result<Vec<_>>>()
                         };
                         let kind = match effect {
-                            Effect::Semantic { .. } | Effect::Ai(_) => bail!(
-                                "legacy implicit AI expression effects are unsupported; use an explicit comment task"
-                            ),
                             Effect::Call(name, args) => {
                                 let args = values(&args)?;
+                                let mut scope = self.inherited_scope.clone();
+                                scope.extend(self.named_bindings());
                                 Self::frame(
                                     &self.program,
                                     &name,
                                     args.clone(),
                                     destination.clone(),
+                                    &scope,
                                 )?;
-                                if self.scoped_calls {
+                                if self.scoped_calls && self.program.functions[&name].virtual_task {
                                     ActionKind::Call { name, args }
                                 } else {
                                     ensure!(self.frames.len() < 64, "program call depth limit");
@@ -417,6 +578,7 @@ impl Runtime {
                                         &name,
                                         args,
                                         destination,
+                                        &scope,
                                     )?);
                                     return Ok(None);
                                 }
@@ -474,7 +636,6 @@ impl Runtime {
                             at: at.clone(),
                             destination,
                             kind,
-                            semantic_boolean: None,
                         }));
                     }
                 }
@@ -483,6 +644,7 @@ impl Runtime {
             match outcome {
                 Ok(Some(action)) => {
                     self.pending = Some(action.clone());
+                    self.collect_dead_bindings();
                     return State::Action(action);
                 }
                 Ok(None) => {}

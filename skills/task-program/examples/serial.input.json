@@ -1,0 +1,5 @@
+{
+  "topic": "通用 Agent 的职责边界",
+  "output": "agent-overview.html",
+  "requirements": "制作一个独立中文 HTML，说明用户、AI、通用宿主、插件和工具的职责。内嵌 CSS，可在桌面与手机阅读；准确区分流程结束与业务验收。"
+}

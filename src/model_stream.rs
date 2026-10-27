@@ -59,6 +59,7 @@ fn fail<T>(code: &'static str, message: impl Into<String>) -> anyhow::Result<T> 
     }))
 }
 
+#[cfg(test)]
 pub fn stream_error_code(error: &anyhow::Error) -> Option<&'static str> {
     error.downcast_ref::<StreamError>().map(|error| error.code)
 }

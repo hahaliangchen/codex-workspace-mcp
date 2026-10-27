@@ -66,16 +66,24 @@ fn reload_package(package: &Package) -> Result<Package> {
 }
 fn frontmatter(raw: &str) -> Result<Value> {
     let normalized = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n");
-    let front = normalized.strip_prefix("---\n").and_then(|text| text.split_once("\n---"))
-        .context("skill requires YAML frontmatter")?.0;
+    let front = normalized
+        .strip_prefix("---\n")
+        .and_then(|text| text.split_once("\n---"))
+        .context("skill requires YAML frontmatter")?
+        .0;
     Ok(serde_yaml::from_str(front)?)
 }
 /// An absent instruction file is a normal plugin capability, not a failure.
 fn optional_instructions(root: &Path, entry: &str) -> Result<Option<(PathBuf, String)>> {
-    if entry.trim().is_empty() { return Ok(None); }
+    if entry.trim().is_empty() {
+        return Ok(None);
+    }
     let path = crate::file_edit::workspace_path(root, entry)?;
     match std::fs::read_to_string(&path) {
-        Ok(body) => {ensure!(body.len() <= 128000, "skill body too large"); Ok((!body.trim().is_empty()).then_some((path, body)))},
+        Ok(body) => {
+            ensure!(body.len() <= 128000, "skill body too large");
+            Ok((!body.trim().is_empty()).then_some((path, body)))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -83,16 +91,31 @@ fn optional_instructions(root: &Path, entry: &str) -> Result<Option<(PathBuf, St
 fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Result<Package> {
     let root = root.canonicalize()?;
     let manifest: Manifest = serde_json::from_slice(&std::fs::read(root.join("plugin.json"))?)?;
-    ensure!(manifest.library.as_deref().is_none_or(crate::agent_program::libraries::valid_namespace), "invalid or reserved plugin library namespace");
+    ensure!(
+        manifest
+            .library
+            .as_deref()
+            .is_none_or(crate::agent_program::libraries::valid_namespace),
+        "invalid or reserved plugin library namespace"
+    );
     ensure!(
         manifest.version == 1 && identifier(&manifest.id),
         "invalid skill package version or ID"
     );
     let description = if let Some((_, raw)) = optional_instructions(&root, &manifest.skill)? {
         let fields = frontmatter(&raw)?;
-        ensure!(fields["name"] == manifest.id, "skill name must equal package ID");
-        fields["description"].as_str().filter(|text| !text.trim().is_empty()).context("skill description required")?.to_owned()
-    } else { manifest.title.clone() };
+        ensure!(
+            fields["name"] == manifest.id,
+            "skill name must equal package ID"
+        );
+        fields["description"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .context("skill description required")?
+            .to_owned()
+    } else {
+        manifest.title.clone()
+    };
     let mut ids = std::collections::BTreeSet::new();
     for page in &manifest.pages {
         ensure!(
@@ -161,11 +184,29 @@ fn load_with(root: &Path, origin: Origin, native: Option<NativeBackend>) -> Resu
             "command tool shadows a host tool"
         );
     }
-    let prefix=format!("{}__",manifest.id.replace('-',"_"));
-    let methods=manifest.tools.iter().map(|name|name.strip_prefix(&prefix).unwrap_or(name)).collect::<std::collections::BTreeSet<_>>();
-    ensure!(methods.len()==manifest.tools.len(), "plugin tools collide after source method normalization");
-    ensure!(methods.iter().all(|method|crate::agent_program::libraries::identifier(method)), "invalid source library method");
-    ensure!(!manifest.tools.iter().any(|name|name==crate::agent_program::declarations::CALL), "tool name reserved for library transport");
+    let prefix = format!("{}__", manifest.id.replace('-', "_"));
+    let methods = manifest
+        .tools
+        .iter()
+        .map(|name| name.strip_prefix(&prefix).unwrap_or(name))
+        .collect::<std::collections::BTreeSet<_>>();
+    ensure!(
+        methods.len() == manifest.tools.len(),
+        "plugin tools collide after source method normalization"
+    );
+    ensure!(
+        methods
+            .iter()
+            .all(|method| crate::agent_program::libraries::identifier(method)),
+        "invalid source library method"
+    );
+    ensure!(
+        !manifest
+            .tools
+            .iter()
+            .any(|name| name == crate::agent_program::declarations::CALL),
+        "tool name reserved for library transport"
+    );
     for name in &manifest.tools {
         if commands.contains(name.as_str()) {
             continue;
@@ -282,14 +323,6 @@ impl Registry {
             })
         })
     }
-    pub fn remote_tool(&self, name: &str) -> Option<Arc<remote::Connection>> {
-        self.entries
-            .read()
-            .unwrap()
-            .values()
-            .find(|p| p.scope.is_some() && p.manifest.tools.iter().any(|t| t == name))
-            .and_then(|p| p.remote.clone())
-    }
     pub fn catalog(&self) -> Value {
         json!(self.entries.read().unwrap().values().map(|package|json!({
             "id":package.manifest.id,"name":package.manifest.id,"title":package.manifest.title,"library":package.manifest.library,
@@ -317,9 +350,13 @@ impl Registry {
             "package manifest changed; reload it before loading"
         );
         let instructions = optional_instructions(&package.root, &package.manifest.skill)?;
-        let (source, content) = instructions.map(|(path, body)|(Some(path), body)).unwrap_or_default();
-        Ok(json!({"skill":name,"content":content,"tools":package.manifest.tools,"source":source,
-            "content_hash":crate::symbol_description::content_hash(content.as_bytes()),"activation_scope":"conversation","package_scope":package.scope}))
+        let (source, content) = instructions
+            .map(|(path, body)| (Some(path), body))
+            .unwrap_or_default();
+        Ok(
+            json!({"skill":name,"content":content,"tools":package.manifest.tools,"source":source,
+            "content_hash":crate::symbol_description::content_hash(content.as_bytes()),"activation_scope":"conversation","package_scope":package.scope}),
+        )
     }
 
     pub fn attachment_extensions(&self, name: &str) -> Result<Vec<String>> {
@@ -569,9 +606,29 @@ impl Plugin for PackagePlugin {
                         .contains(name))),
             "tool name belongs to another installed plugin"
         );
-        let library = self.0.manifest.library.clone().unwrap_or_else(|| crate::agent_program::libraries::namespace(&self.0.manifest.id));
-        ensure!(crate::agent_program::libraries::valid_namespace(&library), "invalid or reserved plugin library namespace");
-        ensure!(!tools.packages.entries.read().unwrap().values().any(|p| p.manifest.id != self.0.manifest.id && p.manifest.library.clone().unwrap_or_else(|| crate::agent_program::libraries::namespace(&p.manifest.id)) == library), "plugin library namespace already belongs to another installed plugin");
+        let library = self
+            .0
+            .manifest
+            .library
+            .clone()
+            .unwrap_or_else(|| crate::agent_program::libraries::namespace(&self.0.manifest.id));
+        ensure!(
+            crate::agent_program::libraries::valid_namespace(&library),
+            "invalid or reserved plugin library namespace"
+        );
+        ensure!(
+            !tools
+                .packages
+                .entries
+                .read()
+                .unwrap()
+                .values()
+                .any(|p| p.manifest.id != self.0.manifest.id
+                    && p.manifest.library.clone().unwrap_or_else(|| {
+                        crate::agent_program::libraries::namespace(&p.manifest.id)
+                    }) == library),
+            "plugin library namespace already belongs to another installed plugin"
+        );
         let names = self
             .0
             .manifest
@@ -867,48 +924,77 @@ mod tests {
     use super::*;
     #[test]
     fn fixed_library_names_are_manifest_owned_validated_and_unique() {
-        let root=std::env::temp_dir().join(format!("library-manifest-{}",crate::agent_service::uuid_like()));
+        let root = std::env::temp_dir().join(format!(
+            "library-manifest-{}",
+            crate::agent_service::uuid_like()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut manifest=json!({"version":1,"id":"library-test","title":"Library test","library":"ppt"});
-        for library in ["io","host","tools","default","bad-name",""] {
-            manifest["library"]=json!(library);
-            std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
-            assert!(load(&root).is_err(),"{library}");
+        let mut manifest =
+            json!({"version":1,"id":"library-test","title":"Library test","library":"ppt"});
+        for library in ["io", "host", "tools", "default", "bad-name", ""] {
+            manifest["library"] = json!(library);
+            std::fs::write(root.join("plugin.json"), manifest.to_string()).unwrap();
+            assert!(load(&root).is_err(), "{library}");
         }
-        manifest["library"]=json!("ppt");
-        std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
-        assert_eq!(load(&root).unwrap().manifest.library.as_deref(),Some("ppt"));
-        manifest["library"]=json!("flow");
-        std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
-        let (runtime,catalog)=test_runtime();
-        let parent=runtime.snapshot().into_iter().find(|p|p.id=="skill-packages").unwrap().scope;
-        let error=runtime.mount(parent,PackagePlugin(load(&root).unwrap())).unwrap_err();
-        assert!(format!("{error:#}").contains("namespace already belongs"),"{error:#}");
-        assert_eq!(catalog.packages.catalog()[0]["library"],"flow");
+        manifest["library"] = json!("ppt");
+        std::fs::write(root.join("plugin.json"), manifest.to_string()).unwrap();
+        assert_eq!(
+            load(&root).unwrap().manifest.library.as_deref(),
+            Some("ppt")
+        );
+        manifest["library"] = json!("flow");
+        std::fs::write(root.join("plugin.json"), manifest.to_string()).unwrap();
+        let (runtime, catalog) = test_runtime();
+        let parent = runtime
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == "skill-packages")
+            .unwrap()
+            .scope;
+        let error = runtime
+            .mount(parent, PackagePlugin(load(&root).unwrap()))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("namespace already belongs"),
+            "{error:#}"
+        );
+        assert_eq!(catalog.packages.catalog()[0]["library"], "flow");
         runtime.shutdown().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn plugins_without_instruction_files_still_mount_and_expose_their_pages() {
-        let root=std::env::temp_dir().join(format!("optional-skill-{}",crate::agent_service::uuid_like()));
-        std::fs::create_dir_all(&root).unwrap();std::fs::write(root.join("index.html"),"<p>Plugin</p>").unwrap();
-        for entry in [None,Some("missing.md"),Some("empty.md")] {
-            std::fs::write(root.join("empty.md")," ").unwrap();
-            let mut manifest=json!({"version":1,"id":"optional","title":"Optional page","pages":[{"id":"main","title":"Main","entry":"index.html","renderer":"html"}]});
-            if let Some(entry)=entry {manifest["skill"]=json!(entry)}
-            std::fs::write(root.join("plugin.json"),manifest.to_string()).unwrap();
-            let mut package=load(&root).unwrap();package.scope=Some(42);
-            let registry=Registry::default();registry.entries.write().unwrap().insert("optional".into(),package);
-            assert_eq!(registry.read("optional").unwrap()["content"],"");
-            assert!(registry.page("optional","main",None).unwrap().is_file());
+        let root = std::env::temp_dir().join(format!(
+            "optional-skill-{}",
+            crate::agent_service::uuid_like()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<p>Plugin</p>").unwrap();
+        for entry in [None, Some("missing.md"), Some("empty.md")] {
+            std::fs::write(root.join("empty.md"), " ").unwrap();
+            let mut manifest = json!({"version":1,"id":"optional","title":"Optional page","pages":[{"id":"main","title":"Main","entry":"index.html","renderer":"html"}]});
+            if let Some(entry) = entry {
+                manifest["skill"] = json!(entry)
+            }
+            std::fs::write(root.join("plugin.json"), manifest.to_string()).unwrap();
+            let mut package = load(&root).unwrap();
+            package.scope = Some(42);
+            let registry = Registry::default();
+            registry
+                .entries
+                .write()
+                .unwrap()
+                .insert("optional".into(), package);
+            assert_eq!(registry.read("optional").unwrap()["content"], "");
+            assert!(registry.page("optional", "main", None).unwrap().is_file());
         }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn frontmatter_accepts_crlf_and_bom_without_changing_instruction_content() {
         let lf = "---\nname: example\ndescription: Test skill\n---\nFull instructions\n";
-        let windows = format!("\u{feff}{}",lf.replace('\n',"\r\n"));
-        assert_eq!(frontmatter(lf).unwrap(),frontmatter(&windows).unwrap());
+        let windows = format!("\u{feff}{}", lf.replace('\n', "\r\n"));
+        assert_eq!(frontmatter(lf).unwrap(), frontmatter(&windows).unwrap());
         assert!(windows.ends_with("Full instructions\r\n"));
         assert!(frontmatter("no frontmatter").is_err());
     }

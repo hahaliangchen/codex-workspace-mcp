@@ -170,13 +170,12 @@ export interface CatalogModel {
 export interface ModelCatalog {
   readonly version: number
   readonly models: readonly CatalogModel[]
-  readonly defaults: Readonly<Record<'agent' | 'visual_tool' | 'context_agent' | 'delegate_agent' | 'observer', ModelUseSettings>>
+  readonly defaults: Readonly<Record<'agent' | 'visual_tool' | 'delegate_agent', ModelUseSettings>>
 }
 
 export interface SettingsData {
   readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
-  readonly context_agent?: ModelUseSettings
   readonly delegate_agent?: ModelUseSettings
   readonly revision: string
   readonly providers: readonly ProviderConfig[]
@@ -184,9 +183,6 @@ export interface SettingsData {
   readonly orchestrator_model: string | null
   readonly reasoning_effort: string | null
   readonly fast_mode: boolean
-  readonly observer_enabled: boolean
-  readonly observer_provider: string | null
-  readonly observer_model: string | null
 }
 
 export interface SaveProviderInput {
@@ -204,7 +200,6 @@ export interface SaveProviderInput {
 export interface SaveSettingsInput {
   readonly plugin_models?: Readonly<Record<string,readonly ModelRef[]>>
   readonly visual_tool?: ModelUseSettings
-  readonly context_agent?: ModelUseSettings
   readonly delegate_agent?: ModelUseSettings
   readonly revision: string
   readonly providers: readonly SaveProviderInput[]
@@ -212,9 +207,6 @@ export interface SaveSettingsInput {
   readonly orchestrator_model: string | null
   readonly reasoning_effort: string
   readonly fast_mode: boolean
-  readonly observer_enabled: boolean
-  readonly observer_provider: string | null
-  readonly observer_model: string | null
 }
 
 export interface PluginNode {

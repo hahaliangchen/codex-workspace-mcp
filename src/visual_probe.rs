@@ -8,14 +8,6 @@ use std::{
 };
 
 #[derive(Debug, thiserror::Error)]
-#[error("{error:#}")]
-pub struct VisualModelFailure {
-    pub manifest: Value,
-    #[source]
-    pub error: anyhow::Error,
-}
-
-#[derive(Debug, thiserror::Error)]
 #[error("model returned HTTP {status}: {body}")]
 pub struct HttpModelFailure {
     pub status: u16,

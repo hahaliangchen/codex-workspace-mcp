@@ -13,13 +13,26 @@ pub const REFERENCE: &str = "_asset_reference";
 
 pub fn rewind(tx: &rusqlite::Transaction, task: &str, start: i64) -> Result<()> {
     for (table, predicate) in [
-        ("agent_context_assets", "json_extract(reference_json,'$.history_reference.event_seq')>=?2"),
+        (
+            "agent_context_assets",
+            "json_extract(reference_json,'$.history_reference.event_seq')>=?2",
+        ),
         ("agent_context_asset_deliveries", "event_seq>=?2"),
-        ("agent_context_materials", "json_extract(data,'$.through')>=?2"),
+        (
+            "agent_context_materials",
+            "json_extract(data,'$.through')>=?2",
+        ),
     ] {
-        let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0))?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
         if exists {
-            tx.execute(&format!("DELETE FROM {table} WHERE task_id=?1 AND {predicate}"), params![task, start])?;
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE task_id=?1 AND {predicate}"),
+                params![task, start],
+            )?;
         }
     }
     Ok(())
@@ -203,8 +216,14 @@ pub fn register(
             json!({"tool":"refresh_asset","arguments":{"asset_id":id}});
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let owner:Option<String>=tx.query_row("SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",params![task,seq],|r|r.get(0)).optional()?;
-    reference["task_node_id"]=json!(owner);
+    let owner: Option<String> = tx
+        .query_row(
+            "SELECT COALESCE(node_id,'n0') FROM agent_task_events WHERE task_id=?1 AND seq=?2",
+            params![task, seq],
+            |r| r.get(0),
+        )
+        .optional()?;
+    reference["task_node_id"] = json!(owner);
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO agent_context_assets VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![
@@ -254,20 +273,6 @@ pub fn reference(root: &Path, task: &str, id: &str, through: Option<i64>) -> Res
 }
 
 /// Load handles once for assembling a child task; asset bodies stay on disk.
-pub fn reference_index(root: &Path, task: &str) -> Result<BTreeMap<i64, Vec<Value>>> {
-    let conn = connection(root)?;
-    let rows = conn.prepare("SELECT reference_json FROM agent_context_assets WHERE task_id=?1")?
-        .query_map([task], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut index = BTreeMap::<i64, Vec<Value>>::new();
-    for raw in rows {
-        let reference: Value = serde_json::from_str(&raw)?;
-        if let Some(seq) = reference["history_reference"]["event_seq"].as_i64() {
-            index.entry(seq).or_default().push(reference);
-        }
-    }
-    Ok(index)
-}
 /// Always read the exact saved version. A live re-read requires refresh_asset.
 pub fn read(root: &Path, task: &str, args: &Value, through: Option<i64>) -> Result<Value> {
     let id = args["asset_id"].as_str().context("asset_id is required")?;
@@ -481,28 +486,46 @@ pub fn remember_deliveries(root: &Path, task: &str, deliveries: &Value) -> Resul
     let mut conn = connection(root)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for delivery in deliveries.as_array().into_iter().flatten() {
-        if let (Some(id), Some(seq)) = (delivery["reference"]["asset_id"].as_str(), delivery["event_seq"].as_i64()) {
-            tx.execute("INSERT OR IGNORE INTO agent_context_asset_deliveries(task_id,asset_id,event_seq)
-                SELECT ?1,?2,seq FROM agent_task_events WHERE task_id=?1 AND seq=?3", params![task,id,seq])?;
+        if let (Some(id), Some(seq)) = (
+            delivery["reference"]["asset_id"].as_str(),
+            delivery["event_seq"].as_i64(),
+        ) {
+            tx.execute(
+                "INSERT OR IGNORE INTO agent_context_asset_deliveries(task_id,asset_id,event_seq)
+                SELECT ?1,?2,seq FROM agent_task_events WHERE task_id=?1 AND seq=?3",
+                params![task, id, seq],
+            )?;
         }
     }
     tx.commit()?;
     Ok(())
 }
 
-pub fn frame_index(root:&Path,task:&str,node:&str,messages:&[Value])->Result<Value> {
-    let conn=connection(root)?;
-    let mut entries=BTreeMap::<String,(Value,i64)>::new();
+pub fn frame_index(root: &Path, task: &str, node: &str, messages: &[Value]) -> Result<Value> {
+    let conn = connection(root)?;
+    let mut entries = BTreeMap::<String, (Value, i64)>::new();
     for message in messages {
-        if let Some(id)=message[REFERENCE]["asset_id"].as_str() {
-            let seq=message.pointer("/source/seq").or_else(||message.pointer("/source/history_reference/event_seq")).and_then(Value::as_i64)
-                .unwrap_or_else(||message[REFERENCE]["history_reference"]["event_seq"].as_i64().unwrap_or(-1));
-            if entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {entries.insert(id.to_owned(),(message[REFERENCE].clone(),seq));}
+        if let Some(id) = message[REFERENCE]["asset_id"].as_str() {
+            let seq = message
+                .pointer("/source/seq")
+                .or_else(|| message.pointer("/source/history_reference/event_seq"))
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| {
+                    message[REFERENCE]["history_reference"]["event_seq"]
+                        .as_i64()
+                        .unwrap_or(-1)
+                });
+            if entries.get(id).is_none_or(|(_, previous)| *previous <= seq) {
+                entries.insert(id.to_owned(), (message[REFERENCE].clone(), seq));
+            }
         }
         for delivery in message["_step_assets"].as_array().into_iter().flatten() {
-            if let (Some(id),Some(seq))=(delivery["reference"]["asset_id"].as_str(),delivery["event_seq"].as_i64())
-                && entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {
-                entries.insert(id.to_owned(),(delivery["reference"].clone(),seq));
+            if let (Some(id), Some(seq)) = (
+                delivery["reference"]["asset_id"].as_str(),
+                delivery["event_seq"].as_i64(),
+            ) && entries.get(id).is_none_or(|(_, previous)| *previous <= seq)
+            {
+                entries.insert(id.to_owned(), (delivery["reference"].clone(), seq));
             }
         }
     }
@@ -517,250 +540,82 @@ pub fn frame_index(root:&Path,task:&str,node:&str,messages:&[Value])->Result<Val
         GROUP BY d.asset_id)
         SELECT a.reference_json,s.seq FROM scoped s JOIN agent_context_assets a ON a.task_id=?1 AND a.asset_id=s.asset_id
         ORDER BY s.seq DESC LIMIT 65")?.query_map(params![task,node],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let possibly_more=rows.len()==65;
-    for (raw,seq) in rows {
-        let reference:Value=serde_json::from_str(&raw)?;
-        if let Some(id)=reference["asset_id"].as_str() {
-            if entries.get(id).is_none_or(|(_,previous)|*previous<=seq) {
-                entries.insert(id.to_owned(),(reference,seq));
+    let possibly_more = rows.len() == 65;
+    for (raw, seq) in rows {
+        let reference: Value = serde_json::from_str(&raw)?;
+        if let Some(id) = reference["asset_id"].as_str() {
+            if entries.get(id).is_none_or(|(_, previous)| *previous <= seq) {
+                entries.insert(id.to_owned(), (reference, seq));
             }
         }
     }
     // A newer result of the same generic invocation replaces the old handle
     // in this index only. Immutable snapshots and per-step references remain.
-    let mut latest=BTreeMap::<String,(Value,i64)>::new();
-    for (reference,seq) in entries.into_values() {
-        let id=reference["asset_id"].as_str().unwrap_or("");
+    let mut latest = BTreeMap::<String, (Value, i64)>::new();
+    for (reference, seq) in entries.into_values() {
+        let id = reference["asset_id"].as_str().unwrap_or("");
         let origin=conn.query_row("SELECT source_tool,source_arguments FROM agent_context_assets WHERE task_id=?1 AND asset_id=?2",
             params![task,id],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))).optional()?;
-        let key=if let Some((tool,args))=origin {
-            let args:Value=serde_json::from_str(&args)?;
-            json!([tool,args,reference["operation"]]).to_string()
-        } else {id.to_owned()};
-        if latest.get(&key).is_none_or(|(_,previous)|*previous<=seq) {
-            latest.insert(key,(reference,seq));
+        let key = if let Some((tool, args)) = origin {
+            let args: Value = serde_json::from_str(&args)?;
+            json!([tool, args, reference["operation"]]).to_string()
+        } else {
+            id.to_owned()
+        };
+        if latest
+            .get(&key)
+            .is_none_or(|(_, previous)| *previous <= seq)
+        {
+            latest.insert(key, (reference, seq));
         }
     }
-    let total=latest.len();
-    let mut entries=latest.into_values().collect::<Vec<_>>();
-    entries.sort_by_key(|(_,seq)|std::cmp::Reverse(*seq));
-    let present=messages.iter().filter_map(complete_body).collect::<BTreeSet<_>>();
-    let mut selected=Vec::new();
-    let mut tokens=0;
-    for (reference,_) in entries.into_iter().take(64) {
-        let mut item=json!({});
-        for key in ["asset_id","kind","source_tool","operation","source_path","revision"] {
-            if let Some(value)=reference.get(key) {item[key]=value.clone();}
+    let total = latest.len();
+    let mut entries = latest.into_values().collect::<Vec<_>>();
+    entries.sort_by_key(|(_, seq)| std::cmp::Reverse(*seq));
+    let present = messages
+        .iter()
+        .filter_map(complete_body)
+        .collect::<BTreeSet<_>>();
+    let mut selected = Vec::new();
+    let mut tokens = 0;
+    for (reference, seq) in entries.into_iter().take(64) {
+        let mut item = json!({"delivery_reference":{"task_id":task,"event_seq":seq}});
+        for key in [
+            "asset_id",
+            "kind",
+            "source_tool",
+            "operation",
+            "source_path",
+            "revision",
+        ] {
+            if let Some(value) = reference.get(key) {
+                item[key] = value.clone();
+            }
         }
-        item["in_context"]=json!(reference["asset_id"].as_str().is_some_and(|id|present.contains(id)));
-        let size=crate::context_window::estimate(&item);
-        if tokens+size>3000 {break;}
-        tokens+=size;selected.push(item);
+        item["in_context"] = json!(
+            reference["asset_id"]
+                .as_str()
+                .is_some_and(|id| present.contains(id))
+        );
+        let size = crate::context_window::estimate(&item);
+        if tokens + size > 3000 {
+            break;
+        }
+        tokens += size;
+        selected.push(item);
     }
-    Ok(json!({"host_status":true,"not_a_user_request":true,"truncated":possibly_more||selected.len()<total,
+    Ok(
+        json!({"host_status":true,"not_a_user_request":true,"truncated":possibly_more||selected.len()<total,
         "assets":selected,"remaining_reference":{"tool":"read_session_history","arguments":{"node_id":node,"include_descendants":true}},
-        "instruction":"Latest saved snapshots per tool and arguments. in_context=true: its complete saved result is already in this request; reuse it. read_asset(asset_id) restores the complete recorded data of any other entry; old versions remain in step history."}))
+        "instruction":"Latest saved snapshots per tool and arguments. in_context=true: its complete saved result is already in this request; reuse it. read_asset(asset_id) restores the complete recorded data of any other entry; old versions remain in step history."}),
+    )
 }
 
 /// The reviewer sees the entire conversation with asset bodies replaced by
 /// handles. This is a view only; it does not release anything in execution.
-pub fn review_view(messages: &[Value]) -> Result<Value> {
-    let catalog = catalog(messages);
-    let mut view = messages.to_vec();
-    for message in &mut view {
-        if let Some(id) = message[REFERENCE]["asset_id"].as_str().map(str::to_owned) {
-            let parsed = message["content"]
-                .as_str()
-                .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                .unwrap_or(Value::Null);
-            let original = parsed.get("original_result").unwrap_or(&parsed);
-            let mut evidence = json!({"asset_id":id,"body":"hidden in review only"});
-            // Exact status/diagnostic text distinguishes accepted, running,
-            // failed and checked pages. Never write a host summary of evidence.
-            for key in [
-                "status",
-                "message",
-                "error",
-                "error_code",
-                "analysis",
-                "task_id",
-                "job_id",
-                "agent_id",
-                "name",
-                "acceptance",
-                "artifact_id",
-                "source_revision",
-                "id",
-                "tool",
-                "project_id",
-                "page_index",
-                "path",
-                "revision",
-            ] {
-                if let Some(value) = original
-                    .get(key)
-                    .filter(|v| v.is_string() || v.is_number() || v.is_boolean())
-                {
-                    if value.as_str().is_none_or(|s| s.chars().count() <= 4000) {
-                        evidence[key] = value.clone();
-                    }
-                }
-            }
-            if let Some(report) = original
-                .pointer("/report/result/report")
-                .and_then(Value::as_str)
-                .filter(|s| s.chars().count() <= 4000)
-            {
-                evidence["delegate_report"] = json!(report);
-            }
-            // Async receipts wrap their final status in result/data. Preserve
-            // exact identity/status fields so an older running receipt cannot
-            // obscure a later success for the same task/page.
-            fn status_fields(value: &Value, depth: usize) -> Value {
-                let mut fields = serde_json::Map::new();
-                for key in [
-                    "id",
-                    "task_id",
-                    "tool",
-                    "status",
-                    "project_id",
-                    "page_index",
-                    "path",
-                    "revision",
-                    "error",
-                    "message",
-                ] {
-                    if let Some(v) = value.get(key).filter(|v| {
-                        v.is_number()
-                            || v.is_boolean()
-                            || v.as_str().is_some_and(|s| s.chars().count() <= 1000)
-                    }) {
-                        fields.insert(key.into(), v.clone());
-                    }
-                }
-                if depth > 0 {
-                    for key in ["result", "data"] {
-                        if value[key].is_object() {
-                            let child = status_fields(&value[key], depth - 1);
-                            if child.as_object().is_some_and(|o| !o.is_empty()) {
-                                fields.insert(key.into(), child);
-                            }
-                        }
-                    }
-                }
-                json!(fields)
-            }
-            for key in ["result", "data"] {
-                if original[key].is_object() {
-                    let fields = status_fields(&original[key], 2);
-                    if fields.as_object().is_some_and(|o| !o.is_empty()) {
-                        evidence[key] = fields;
-                    }
-                }
-            }
-            for key in ["sources", "version_checks"] {
-                if let Some(values) = original[key]
-                    .as_array()
-                    .filter(|v| v.len() <= crate::visual_artifacts::MAX_IMAGES)
-                {
-                    evidence[key] = json!(
-                        values
-                            .iter()
-                            .map(|v| {
-                                let mut fields = serde_json::Map::new();
-                                for key in [
-                                    "artifact_id",
-                                    "page_index",
-                                    "project_id",
-                                    "source_revision",
-                                    "checked_revision",
-                                    "current_revision",
-                                    "freshness",
-                                    "path",
-                                ] {
-                                    if let Some(value) = v.get(key).filter(|v| {
-                                        v.is_number() || v.as_str().is_some_and(|s| s.len() < 1024)
-                                    }) {
-                                        fields.insert(key.into(), value.clone());
-                                    }
-                                }
-                                json!(fields)
-                            })
-                            .collect::<Vec<_>>()
-                    );
-                }
-            }
-            if message["role"] == "assistant" && message["tool_calls"].is_array() {
-                for call in message["tool_calls"].as_array_mut().unwrap() {
-                    call["function"]["arguments"] = json!(
-                        json!({"asset_id":id,"arguments":"hidden in review only"}).to_string()
-                    );
-                }
-            } else {
-                message["content"] = json!(evidence.to_string());
-            }
-            message["asset_id"] = json!(id);
-            let object = message.as_object_mut().unwrap();
-            object.remove(REFERENCE);
-            object.remove("_asset_state");
-            object.remove("viewed_by_context_agent");
-        }
-        message.as_object_mut().unwrap().remove("reasoning_content");
-    }
-    Ok(json!({"conversation":view,"asset_catalog":catalog,
-        "instruction":"Asset bodies are hidden only in this review view. They are still loaded in execution. Short status and diagnostic text is attributed tool evidence. Choose reference only when not needed for the next actions; omitted assets remain unchanged. Never claim you inspected hidden source bodies or pixels."}))
-}
 
 /// A single compression request sees narrative and exact execution receipts,
 /// never source bodies, pixels, historical reasoning or repeated catalogs.
-pub fn compaction_view(messages: &[Value]) -> Result<Value> {
-    let view = review_view(messages)?;
-    let assets = view["asset_catalog"]["assets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| {
-            let mut handle = serde_json::Map::new();
-            for key in [
-                "asset_id",
-                "kind",
-                "source_tool",
-                "source_path",
-                "source_paths",
-                "skill",
-                "operation",
-                "bytes",
-                "revision",
-                "project_id",
-                "artifact_id",
-                "content_hash",
-            ] {
-                if let Some(v) = entry["asset_reference"].get(key).filter(|v| !v.is_null()) {
-                    handle.insert(key.into(), v.clone());
-                }
-            }
-            json!(handle)
-        })
-        .collect::<Vec<_>>();
-    let conversation = view["conversation"].as_array().unwrap().iter().map(|message| {
-        let mut m = message.clone();
-        if let Some(seq) = m["source"]["seq"].as_i64() {
-            m["event_seq"] = json!(seq);
-        }
-        let object = m.as_object_mut().unwrap();
-        object.remove("source");
-        // Native IDs and transport envelopes are not needed to summarize a
-        // completed operation. Preserve the actual name and short evidence.
-        object.remove("tool_call_id");
-        if let Some(calls) = object.remove("tool_calls") {
-            m["operations"] = json!(calls.as_array().unwrap().iter()
-                .map(|c| json!({"tool":c["function"]["name"], "arguments":c["function"]["arguments"]}))
-                .collect::<Vec<_>>());
-        }
-        m
-    }).collect::<Vec<_>>();
-    Ok(json!({"conversation":conversation,"assets":assets}))
-}
 
 /// Protect active skill instructions independently of a summary's choices.
 /// Repeated reads of the same skill retain only its latest delivered version.

@@ -39,7 +39,10 @@ pub fn needs_approval(
 ) -> bool {
     matches!(mode, PermissionMode::Ask)
         && !(PermissionMode::WorkspaceWrite.allows(name)
-            && catalog.is_none_or(|c| c.packages.allows(name, PermissionMode::WorkspaceWrite, ban_execution)))
+            && catalog.is_none_or(|c| {
+                c.packages
+                    .allows(name, PermissionMode::WorkspaceWrite, ban_execution)
+            }))
 }
 
 fn grant_scopes(task: &str, project: Option<&FsPath>) -> Vec<String> {
@@ -53,7 +56,11 @@ fn grant_scopes(task: &str, project: Option<&FsPath>) -> Vec<String> {
 fn granted(conn: &Connection, scopes: &[String]) -> Result<bool> {
     for scope in scopes {
         let found: Option<i64> = conn
-            .query_row("SELECT 1 FROM tool_approval_grants WHERE scope=?1", [scope], |r| r.get(0))
+            .query_row(
+                "SELECT 1 FROM tool_approval_grants WHERE scope=?1",
+                [scope],
+                |r| r.get(0),
+            )
             .optional()?;
         if found.is_some() {
             return Ok(true);
@@ -91,17 +98,34 @@ pub async fn wait(
     if detail.len() > 2_000 {
         detail = format!("{}…", detail.chars().take(2_000).collect::<String>());
     }
-    open(&root)?.execute("INSERT OR IGNORE INTO tool_approval_pending VALUES (?1,?2)", params![task, call_id])?;
-    append(&root, task, "approval/request", &json!({"call_id":call_id,"tool":name,"arguments":detail,"agent_id":agent_id,
-        "project":project}))?;
+    open(&root)?.execute(
+        "INSERT OR IGNORE INTO tool_approval_pending VALUES (?1,?2)",
+        params![task, call_id],
+    )?;
+    append(
+        &root,
+        task,
+        "approval/request",
+        &json!({"call_id":call_id,"tool":name,"arguments":detail,"agent_id":agent_id,
+        "project":project}),
+    )?;
     let waited: Result<String> = async {
         loop {
             if cancel.is_cancelled() {
-                append(&root, task, "approval/decision", &json!({"call_id":call_id,"decision":"cancelled"}))?;
+                append(
+                    &root,
+                    task,
+                    "approval/decision",
+                    &json!({"call_id":call_id,"decision":"cancelled"}),
+                )?;
                 bail!("cancelled");
             }
             let decision: Option<String> = open(&root)?
-                .query_row("SELECT decision FROM tool_approvals WHERE task_id=?1 AND call_id=?2", params![task, call_id], |r| r.get(0))
+                .query_row(
+                    "SELECT decision FROM tool_approvals WHERE task_id=?1 AND call_id=?2",
+                    params![task, call_id],
+                    |r| r.get(0),
+                )
                 .optional()?;
             if let Some(decision) = decision {
                 return Ok(decision);
@@ -115,25 +139,49 @@ pub async fn wait(
     }
     .await;
     // Cleared on every exit, so the task list never shows a stale "awaiting approval".
-    open(&root)?.execute("DELETE FROM tool_approval_pending WHERE task_id=?1 AND call_id=?2", params![task, call_id])?;
+    open(&root)?.execute(
+        "DELETE FROM tool_approval_pending WHERE task_id=?1 AND call_id=?2",
+        params![task, call_id],
+    )?;
     let decision = waited?;
     let conn = open(&root)?;
     match decision.as_str() {
-        "session" => { conn.execute("INSERT OR IGNORE INTO tool_approval_grants(scope) VALUES (?1)", [&scopes[0]])?; }
-        "project" => { conn.execute("INSERT OR IGNORE INTO tool_approval_grants(scope) VALUES (?1)", [scopes.last().unwrap()])?; }
+        "session" => {
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_approval_grants(scope) VALUES (?1)",
+                [&scopes[0]],
+            )?;
+        }
+        "project" => {
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_approval_grants(scope) VALUES (?1)",
+                [scopes.last().unwrap()],
+            )?;
+        }
         _ => {}
     }
-    append(&root, task, "approval/decision", &json!({"call_id":call_id,"decision":decision}))?;
+    append(
+        &root,
+        task,
+        "approval/decision",
+        &json!({"call_id":call_id,"decision":decision}),
+    )?;
     if decision == "deny" {
-        bail!("USER_DENIED: the user declined running {name}. Do not retry the same operation. Continue with work that needs no command execution, or tell the user what they need to run or allow.");
+        bail!(
+            "USER_DENIED: the user declined running {name}. Do not retry the same operation. Continue with work that needs no command execution, or tell the user what they need to run or allow."
+        );
     }
     Ok(())
 }
 
 /// Whether the task is paused on an approval card (for the task list).
 pub fn awaiting(conn: &Connection, task: &str) -> bool {
-    conn.query_row("SELECT EXISTS(SELECT 1 FROM tool_approval_pending WHERE task_id=?1)", [task], |r| r.get(0))
-        .unwrap_or(false)
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tool_approval_pending WHERE task_id=?1)",
+        [task],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
 }
 
 #[derive(Deserialize)]
@@ -147,7 +195,10 @@ pub async fn decide(
     Json(input): Json<DecisionInput>,
 ) -> Response {
     let result = (|| {
-        anyhow::ensure!(DECISIONS.contains(&input.decision.as_str()), "未知的审批选项");
+        anyhow::ensure!(
+            DECISIONS.contains(&input.decision.as_str()),
+            "未知的审批选项"
+        );
         open(state.workspace.root())?.execute(
             "INSERT OR IGNORE INTO tool_approvals(task_id,call_id,decision) VALUES (?1,?2,?3)",
             params![task, input.call_id, input.decision],
@@ -156,7 +207,11 @@ pub async fn decide(
     })();
     match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -166,11 +221,36 @@ mod tests {
 
     #[test]
     fn ask_mode_gates_only_execution() {
-        assert!(needs_approval(PermissionMode::Ask, "run_program", None, false));
-        assert!(needs_approval(PermissionMode::Ask, "browser_open", None, false));
-        assert!(!needs_approval(PermissionMode::Ask, "write_file", None, false));
-        assert!(!needs_approval(PermissionMode::Ask, "read_file", None, false));
-        assert!(!needs_approval(PermissionMode::FullAccess, "run_program", None, false));
+        assert!(needs_approval(
+            PermissionMode::Ask,
+            "run_program",
+            None,
+            false
+        ));
+        assert!(needs_approval(
+            PermissionMode::Ask,
+            "browser_open",
+            None,
+            false
+        ));
+        assert!(!needs_approval(
+            PermissionMode::Ask,
+            "write_file",
+            None,
+            false
+        ));
+        assert!(!needs_approval(
+            PermissionMode::Ask,
+            "read_file",
+            None,
+            false
+        ));
+        assert!(!needs_approval(
+            PermissionMode::FullAccess,
+            "run_program",
+            None,
+            false
+        ));
         assert!(PermissionMode::Ask.allows("run_program"));
         assert!(!PermissionMode::WorkspaceWrite.allows("run_program"));
     }
@@ -186,18 +266,33 @@ mod tests {
             let root = root.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                open(&root).unwrap().execute("INSERT INTO tool_approvals VALUES ('t',?1,?2)", params![call, decision]).unwrap();
+                open(&root)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO tool_approvals VALUES ('t',?1,?2)",
+                        params![call, decision],
+                    )
+                    .unwrap();
             })
         };
         decide_later("c1", "deny");
-        let denied = wait(&state, "t", None, "c1", "run_program", &json!({}), &cancel).await.unwrap_err();
+        let denied = wait(&state, "t", None, "c1", "run_program", &json!({}), &cancel)
+            .await
+            .unwrap_err();
         assert!(denied.to_string().contains("USER_DENIED"), "{denied:#}");
         decide_later("c2", "session");
-        wait(&state, "t", None, "c2", "run_program", &json!({}), &cancel).await.unwrap();
+        wait(&state, "t", None, "c2", "run_program", &json!({}), &cancel)
+            .await
+            .unwrap();
         assert!(!awaiting(&open(&root).unwrap(), "t"));
         // Granted for the session: no question, returns at once.
-        tokio::time::timeout(Duration::from_millis(50), wait(&state, "t", None, "c3", "run_program", &json!({}), &cancel))
-            .await.unwrap().unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            wait(&state, "t", None, "c3", "run_program", &json!({}), &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

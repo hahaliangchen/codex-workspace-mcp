@@ -44,12 +44,27 @@ pub fn poll_tool(tool: &str) -> Option<String> {
 
 /// A task answer that will not change any more.
 pub fn finished(status: &str) -> bool {
-    matches!(status, "succeeded" | "failed" | "cancelled" | "error" | "interrupted")
+    matches!(
+        status,
+        "succeeded" | "failed" | "cancelled" | "error" | "interrupted"
+    )
 }
 
-pub fn record(root: &Path, task: &str, tool: &str, job: &str, call_id: &str, owner_node_id: Option<&str>) -> Result<()> {
+pub fn record(
+    root: &Path,
+    task: &str,
+    tool: &str,
+    job: &str,
+    call_id: &str,
+    owner_node_id: Option<&str>,
+) -> Result<()> {
     let owner_node_id = owner_node_id.map(str::to_owned);
-    let (task, tool, job, call_id) = (task.to_owned(), tool.to_owned(), job.to_owned(), call_id.to_owned());
+    let (task, tool, job, call_id) = (
+        task.to_owned(),
+        tool.to_owned(),
+        job.to_owned(),
+        call_id.to_owned(),
+    );
     crate::db_writer::write(root, move |conn| {
         schema(conn)?;
         conn.execute(
@@ -94,27 +109,66 @@ mod tests {
             INSERT INTO agent_plugin_jobs VALUES ('t','old-job','demo__render','call_1','pending',0);").unwrap();
         schema(&conn).unwrap();
         schema(&conn).unwrap();
-        let state: (String, Option<String>) = conn.query_row("SELECT status,owner_node_id FROM agent_plugin_jobs", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(state, ("pending".into(),None));
+        let state: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status,owner_node_id FROM agent_plugin_jobs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("pending".into(), None));
     }
 
     #[test]
     fn the_status_query_is_the_plugins_own_task_tool() {
-        assert_eq!(poll_tool("demo__init_project").as_deref(), Some("demo__task"));
+        assert_eq!(
+            poll_tool("demo__init_project").as_deref(),
+            Some("demo__task")
+        );
         assert_eq!(poll_tool("demo__render").as_deref(), Some("demo__task"));
         assert_eq!(poll_tool("demo__task"), None);
         assert_eq!(poll_tool("read_file"), None);
-        assert!(finished("succeeded") && finished("failed") && !finished("accepted") && !finished("running"));
+        assert!(
+            finished("succeeded")
+                && finished("failed")
+                && !finished("accepted")
+                && !finished("running")
+        );
     }
 
     #[test]
     fn recorded_tasks_stay_pending_until_completed() {
-        let root = std::env::temp_dir().join(format!("plugin-jobs-{}", crate::agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("plugin-jobs-{}", crate::agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         crate::agent_service::open_db(&root).unwrap();
-        record(&root, "t", "demo__render", "job-1", "call-1", Some("step-1")).unwrap();
-        record(&root, "t", "demo__render", "job-1", "call-1", Some("another-step")).unwrap();
-        assert_eq!(pending(&root, "t").unwrap(), vec![Job { id: "job-1".into(), tool: "demo__render".into(), call_id: "call-1".into(), owner_node_id: Some("step-1".into()) }]);
+        record(
+            &root,
+            "t",
+            "demo__render",
+            "job-1",
+            "call-1",
+            Some("step-1"),
+        )
+        .unwrap();
+        record(
+            &root,
+            "t",
+            "demo__render",
+            "job-1",
+            "call-1",
+            Some("another-step"),
+        )
+        .unwrap();
+        assert_eq!(
+            pending(&root, "t").unwrap(),
+            vec![Job {
+                id: "job-1".into(),
+                tool: "demo__render".into(),
+                call_id: "call-1".into(),
+                owner_node_id: Some("step-1".into())
+            }]
+        );
         complete(&root, "t", "job-1", "succeeded").unwrap();
         assert!(pending(&root, "t").unwrap().is_empty());
         let _ = std::fs::remove_dir_all(root);

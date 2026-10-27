@@ -157,6 +157,7 @@ fn project_input_version(root: &Path, scope: &ProcessObservationScope) -> Result
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+#[cfg(test)]
 pub fn observation_is_fresh(root: &Path, args: &Value, sample: &Value) -> bool {
     if !can_reuse_process_observation(args) {
         return false;
@@ -171,6 +172,7 @@ pub fn observation_is_fresh(root: &Path, args: &Value, sample: &Value) -> bool {
     scope == expected_scope && observation_sample_is_current(root, sample)
 }
 
+#[cfg(test)]
 pub fn observation_sample_is_current(root: &Path, sample: &Value) -> bool {
     let Ok(scope) = serde_json::from_value::<ProcessObservationScope>(sample["scope"].clone())
     else {
@@ -188,6 +190,7 @@ pub fn observation_sample_is_current(root: &Path, sample: &Value) -> bool {
             .is_some_and(|sampled| now.saturating_sub(sampled) <= PROCESS_OBSERVATION_TTL_MS)
 }
 
+#[cfg(test)]
 pub fn can_reuse_process_observation(args: &Value) -> bool {
     args["process_id"].as_str().is_none()
         && args["force_refresh"] != true
@@ -598,6 +601,7 @@ fn project(root: &Path, raw: &str) -> Result<(PathBuf, String)> {
     Ok((path, if rel.is_empty() { ".".into() } else { rel }))
 }
 
+#[cfg(any(windows, test))]
 fn normalize_windows_runtime_path(raw: &str) -> Result<String> {
     if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
         ensure!(

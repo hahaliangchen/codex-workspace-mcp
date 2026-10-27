@@ -108,7 +108,11 @@ fn event_text(data: &Value) -> String {
     let content = &data["message"]["content"];
     let mut text = match content {
         Value::String(text) => text.clone(),
-        Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     };
     if let Some(extra) = data["text"].as_str() {
@@ -124,8 +128,24 @@ fn snippet(text: &str, query: &str, radius: usize) -> Option<String> {
     let chars = lower[..at].chars().count();
     let start = chars.saturating_sub(radius);
     let length = query.chars().count() + radius * 2;
-    let body: String = text.chars().skip(start).take(length).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
-    Some(format!("{}{}{}", if start > 0 { "…" } else { "" }, body, if start + length < text.chars().count() { "…" } else { "" }))
+    let body: String = text
+        .chars()
+        .skip(start)
+        .take(length)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        body,
+        if start + length < text.chars().count() {
+            "…"
+        } else {
+            ""
+        }
+    ))
 }
 
 #[derive(Deserialize)]
@@ -133,17 +153,27 @@ pub struct SearchQuery {
     q: String,
 }
 /// Sessions whose messages mention the query, newest match first, with a snippet.
-pub async fn search(State(state): State<AgentServiceState>, axum::extract::Query(query): axum::extract::Query<SearchQuery>) -> Response {
+pub async fn search(
+    State(state): State<AgentServiceState>,
+    axum::extract::Query(query): axum::extract::Query<SearchQuery>,
+) -> Response {
     response((|| {
         let q = query.q.trim();
         ensure!(q.chars().count() >= 2, "至少输入两个字");
         let conn = agent_service::open_db(state.workspace.root())?;
-        let pattern = format!("%{}%", q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let pattern = format!(
+            "%{}%",
+            q.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
         let mut stmt = conn.prepare(
             "SELECT task_id,data FROM agent_task_events WHERE kind IN ('user/message','assistant/message','user/interjection') AND data LIKE ?1 ESCAPE '\\' ORDER BY timestamp DESC,seq DESC LIMIT 2000",
         )?;
         let rows = stmt
-            .query_map([pattern], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .query_map([pattern], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut seen = std::collections::HashSet::new();
         let mut matches = Vec::new();
@@ -302,7 +332,9 @@ pub fn delete(conn: &mut Connection, id: &str) -> Result<Vec<String>> {
     }
     // Several legacy runtime tables predate foreign keys. Remove their records
     // explicitly as well as the tables that already declare cascading deletes.
-    let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'")?;
+    let mut stmt = tx.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'",
+    )?;
     let tables = stmt
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -362,7 +394,10 @@ mod tests {
     #[test]
     fn content_search_snippets_center_on_the_match() {
         let text = "上次改 pptx 导图的时候，把封面换成了蓝色背景，然后又调整了目录页。";
-        assert_eq!(snippet(text, "PPTX 导图", 4).unwrap(), "上次改 pptx 导图的时候，…");
+        assert_eq!(
+            snippet(text, "PPTX 导图", 4).unwrap(),
+            "上次改 pptx 导图的时候，…"
+        );
         assert_eq!(snippet(text, "蓝色", 2).unwrap(), "…成了蓝色背景…");
         assert!(snippet(text, "不存在", 4).is_none());
         let data = json!({"message":{"content":[{"type":"text","text":"封面换成蓝色"}]}});

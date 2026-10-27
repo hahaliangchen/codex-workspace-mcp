@@ -8,7 +8,7 @@ import { useAgentApi } from './cordis/react.tsx'
 import { t } from './i18n.ts'
 import { useSession } from './useSession.ts'
 
-export type SettingsTab = 'general' | 'models' | 'observer' | 'tools' | 'plugins'
+export type SettingsTab = 'general' | 'models' | 'tools' | 'plugins'
 
 function routeTaskId(): string | undefined {
   const match = /^#\/tasks\/(.+)$/.exec(location.hash)
@@ -237,9 +237,6 @@ export function useAgentWorkspace() {
         orchestrator_model: modelId,
         reasoning_effort: defaultEffort,
         fast_mode: false,
-        observer_enabled: latest.observer_enabled,
-        observer_provider: latest.observer_provider,
-        observer_model: latest.observer_model,
       })
       setSettings(updated)
       const latestInfo = await api.info()
@@ -276,9 +273,6 @@ export function useAgentWorkspace() {
         orchestrator_model: latest.orchestrator_model,
         reasoning_effort: reasoningEffort,
         fast_mode: fastMode,
-        observer_enabled: latest.observer_enabled,
-        observer_provider: latest.observer_provider,
-        observer_model: latest.observer_model,
       })
       setSettings(updated)
       setNotice(undefined)

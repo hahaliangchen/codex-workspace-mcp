@@ -52,7 +52,6 @@ interface DraftProvider {
 interface DraftSettings {
   plugin_models: Record<string,readonly ModelRef[]>
   visual_tool: ModelUseSettings
-  context_agent: ModelUseSettings
   delegate_agent: ModelUseSettings
   revision: string
   providers: DraftProvider[]
@@ -60,9 +59,6 @@ interface DraftSettings {
   orchestrator_model: string
   reasoning_effort: string
   fast_mode: boolean
-  observer_enabled: boolean
-  observer_provider: string
-  observer_model: string
 }
 
 function parseModels(lines: string): string[] {
@@ -84,7 +80,6 @@ function toDraft(data: SettingsData): DraftSettings {
     revision: data.revision,
     plugin_models: {...data.plugin_models},
     visual_tool: data.visual_tool ?? {},
-    context_agent: data.context_agent ?? {},
     delegate_agent: data.delegate_agent ?? {},
     providers: data.providers.map((p, index) => ({
       _draftId: `saved-${index}-${p.id}`,
@@ -105,9 +100,6 @@ function toDraft(data: SettingsData): DraftSettings {
     orchestrator_model: data.orchestrator_model ?? '',
     reasoning_effort: data.reasoning_effort ?? '',
     fast_mode: data.fast_mode,
-    observer_enabled: Boolean(data.observer_enabled),
-    observer_provider: data.observer_provider ?? '',
-    observer_model: data.observer_model ?? '',
   }
 }
 
@@ -253,16 +245,12 @@ export function SettingsModal({
         revision: draft.revision,
         plugin_models: draft.plugin_models,
         visual_tool: draft.visual_tool,
-        context_agent: draft.context_agent,
         delegate_agent: draft.delegate_agent,
         providers: providersPayload,
         orchestrator_provider: draft.orchestrator_provider || null,
         orchestrator_model: draft.orchestrator_model || null,
         reasoning_effort: selectedCapability?.reasoning_efforts.includes(draft.reasoning_effort) ? draft.reasoning_effort : '',
         fast_mode: Boolean(selectedCapability?.fast_mode && draft.fast_mode),
-        observer_enabled: draft.observer_enabled,
-        observer_provider: draft.observer_provider || null,
-        observer_model: draft.observer_model || null,
       })
       const savedDraft = toDraft(saved)
       setDraft(savedDraft)
@@ -341,8 +329,6 @@ export function SettingsModal({
       providers: nextProviders,
       orchestrator_provider: draft.orchestrator_provider === provider.id ? (nextProviders[0]?.id ?? '') : draft.orchestrator_provider,
       orchestrator_model: draft.orchestrator_provider === provider.id ? '' : draft.orchestrator_model,
-      observer_provider: draft.observer_provider === provider.id ? '' : draft.observer_provider,
-      observer_model: draft.observer_provider === provider.id ? '' : draft.observer_model,
     })
     if (openProviderId === provider._draftId) setOpenProviderId(null)
   }
@@ -381,15 +367,6 @@ export function SettingsModal({
   )
   const mainCapability = mainProviderObj?.model_capabilities[draft?.orchestrator_model ?? '']
 
-  const observerProviderObj = useMemo(
-    () => draft?.providers.find(p => p.id === draft.observer_provider),
-    [draft],
-  )
-  const observerModels = useMemo(
-    () => (observerProviderObj ? parseModels(observerProviderObj.models_text) : []),
-    [observerProviderObj],
-  )
-
   if (!open) return null
 
   const dirty = draft !== null && baseline !== null && JSON.stringify(draft) !== baseline
@@ -397,7 +374,6 @@ export function SettingsModal({
   const navItems: readonly { id: SettingsTab; label: string; icon: JSX.Element }[] = [
     { id: 'general', label: '通用', icon: <IconSettingsOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'models', label: '模型与提供商', icon: <IconDatabaseOutlineRegular className={rootCss.navIcon} size={18} /> },
-    { id: 'observer', label: 'Observer', icon: <IconSearchOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'tools', label: '专用模型', icon: <IconCodeOutlineRegular className={rootCss.navIcon} size={18} /> },
     { id: 'plugins', label: '插件状态', icon: <IconCordisPluginOutlineRegular className={rootCss.navIcon} size={18} /> },
   ]
@@ -449,7 +425,7 @@ export function SettingsModal({
               </p>
             )}
 
-            {draft === null && statusMsg === null && (activeTab === 'models' || activeTab === 'tools' || activeTab === 'observer') && (
+            {draft === null && statusMsg === null && (activeTab === 'models' || activeTab === 'tools') && (
               <p className={modelsCss.intro}>正在加载设置…</p>
             )}
 
@@ -961,7 +937,7 @@ export function SettingsModal({
                       </div>
                     })}
                   </div>
-                  <p className={appearanceCss.footnote}>未限制时可使用全部模型；开启限制后仅允许勾选的模型，主对话、视觉和压缩任务共同遵守。取消全部勾选会禁止该插件调用模型。</p>
+                  <p className={appearanceCss.footnote}>未限制时可使用全部模型；开启限制后仅允许勾选的模型，主对话、视觉与协作任务共同遵守。取消全部勾选会禁止该插件调用模型。</p>
                 </div>
               </div>
             )}
@@ -970,9 +946,9 @@ export function SettingsModal({
               <section className={modelsCss.section}>
                 <div className={modelsCss.pageHead}>
                   <h2 className={modelsCss.title}>专用模型</h2>
-                  <p className={modelsCss.intro}>视觉分析、上下文压缩和协作子 Agent 可以单独选模型，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
+                  <p className={modelsCss.intro}>视觉分析和协作子 Agent 可以单独选模型，复用目录中的提供商和能力配置。留空跟随主 Agent，任务参数单独保存。</p>
                 </div>
-                {(['visual_tool', 'context_agent', 'delegate_agent'] as const).map(kind => {
+                {(['visual_tool', 'delegate_agent'] as const).map(kind => {
                   const config = draft[kind]
                   const provider = draft.providers.find(p => p.id === (config.provider || draft.orchestrator_provider))
                   const capability = provider?.model_capabilities[config.model || draft.orchestrator_model]
@@ -982,7 +958,7 @@ export function SettingsModal({
                   return (
                     <div key={kind} className={appearanceCss.block}>
                       <div className={appearanceCss.labelRow}>
-                        <div className={appearanceCss.label}>{{ visual_tool: '视觉分析工具', context_agent: '上下文压缩子 Agent', delegate_agent: '协作子 Agent' }[kind]}</div>
+                        <div className={appearanceCss.label}>{kind === 'visual_tool' ? '视觉分析工具' : '协作子 Agent'}</div>
                         <button
                           type="button"
                           className={clsx(appearanceCss.link, appearanceCss.linkMuted)}
@@ -1033,99 +1009,12 @@ export function SettingsModal({
                       </div>
                       <p className={appearanceCss.footnote}>{{
                         visual_tool: '分析已保存图片，结果通过普通工具返回。',
-                        context_agent: '只整理当前任务上下文，提交后继续由主 Agent 执行。',
                         delegate_agent: '主 Agent 派出去并行干活的子 Agent 用这个模型。可以让主 Agent 用强模型负责拆分、审查和集成，子 Agent 用更省的模型执行。留空则和主 Agent 用同一个。',
                       }[kind]}</p>
                     </div>
                   )
                 })}
               </section>
-            )}
-
-            {activeTab === 'observer' && draft !== null && (
-              <div className={modelsCss.section}>
-                <div className={modelsCss.pageHead}>
-                  <h2 className={modelsCss.title}>Observer 结束复盘</h2>
-                  <p className={modelsCss.intro}>
-                    执行结束后读取本任务的原始过程，复盘完成情况、失败恢复、重复操作和汇总是否准确，提出下次更直接的做法。复盘显示在聊天中，不参与运行中的调度，也不自动写入记忆。
-                  </p>
-                </div>
-
-                <div className={appearanceCss.block}>
-                  <div className={appearanceCss.label}>复盘</div>
-                  <div className={appearanceCss.group}>
-                    <div className={appearanceCss.row}>
-                      <div className={appearanceCss.rowText}>
-                        <span className={appearanceCss.rowTitle}>启用 Observer</span>
-                        <span className={appearanceCss.rowHint}>全局观察，每次执行结束时启动一次复盘</span>
-                      </div>
-                      <Switch
-                        checked={draft.observer_enabled}
-                        label="启用 Observer"
-                        onChange={(checked) => { updateDraft({ observer_enabled: checked }) }}
-                      />
-                    </div>
-                  </div>
-                  <p className={appearanceCss.footnote}>
-                    需要补充证据时可按需读取历史，包括 Worker、Organizer 实际收到的完整上下文。复盘失败不会改变执行结果；取消或中断不会启动新的复盘请求。
-                  </p>
-                </div>
-
-                <div className={appearanceCss.block}>
-                  <div className={appearanceCss.label}>Observer 模型</div>
-                  <div className={appearanceCss.group}>
-                    <div className={appearanceCss.row}>
-                      <div className={appearanceCss.rowText}>
-                        <span className={appearanceCss.rowTitle}>模型提供商</span>
-                        <span className={appearanceCss.rowHint}>默认使用当前任务 Worker 的模型</span>
-                      </div>
-                      <div className={appearanceCss.control}>
-                        <select
-                          className={clsx(modelsCss.input, modelsCss.selectInput)}
-                          aria-label="模型提供商"
-                          value={draft.observer_provider}
-                          onChange={(e) => {
-                            const nextProviderId = e.target.value
-                            const provider = draft.providers.find(p => p.id === nextProviderId)
-                            const firstModel = provider ? parseModels(provider.models_text)[0] ?? '' : ''
-                            updateDraft({ observer_provider: nextProviderId, observer_model: firstModel })
-                          }}
-                        >
-                          <option value="">跟随 Worker（{draft.orchestrator_provider || '主模型未设置'}）</option>
-                          {draft.providers.filter(p => p.api_type === 'openai-completions').map(p => (
-                            <option key={p._draftId} value={p.id}>
-                              {p.display_name || p.id} ({p.id})
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-                    <div className={appearanceCss.row}>
-                      <div className={appearanceCss.rowText}>
-                        <span className={appearanceCss.rowTitle}>模型 ID</span>
-                        <span className={appearanceCss.rowHint}>选择或输入该提供商中的模型</span>
-                      </div>
-                      <div className={appearanceCss.control}>
-                        <input
-                          className={modelsCss.input}
-                          aria-label="模型 ID"
-                          list="dsh-observer-model-list"
-                          placeholder={draft.observer_provider ? '选择或输入模型 ID' : (draft.orchestrator_model || '跟随 Worker 模型')}
-                          value={draft.observer_model}
-                          disabled={!draft.observer_provider}
-                          onChange={(e) => { updateDraft({ observer_model: e.target.value }) }}
-                        />
-                        <datalist id="dsh-observer-model-list">
-                          {observerModels.map(m => <option key={m} value={m} />)}
-                        </datalist>
-                      </div>
-                    </div>
-                  </div>
-                  <p className={appearanceCss.footnote}>
-                    单独选择时会复用该提供商已保存的 URL 和 API Key；提供商与模型需同时配置。当前任务开始后，模型路由会写入轨迹。
-                  </p>
-                </div>
-              </div>
             )}
 
             {activeTab === 'plugins' && (

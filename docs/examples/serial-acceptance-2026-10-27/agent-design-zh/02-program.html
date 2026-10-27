@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101a30">
+<title>把任务写成可执行流程｜通用 Agent 设计</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1220;--panel:#111d32;--panel2:#15243b;--ink:#edf3ff;--muted:#a9b8d0;--line:#293b57;--cyan:#72e0d1;--blue:#9cbaff;--gold:#ffd58a;--pink:#ff9da9;--mono:ui-monospace,SFMono-Regular,Consolas,monospace}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(ellipse at 90% 5%,#1c3150 0,transparent 38%),var(--bg);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.7}a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}.wrap{width:min(1120px,calc(100% - 40px));margin:auto}.top{padding:24px 0;border-bottom:1px solid var(--line);font-size:.9rem;color:var(--muted)}.top strong{color:var(--ink);letter-spacing:.08em}.hero{padding:68px 0 52px}.eyebrow{color:var(--cyan);font:700 .78rem var(--mono);letter-spacing:.14em;text-transform:uppercase}.hero h1{font-size:clamp(2.4rem,6vw,4.7rem);letter-spacing:-.045em;line-height:1.08;max-width:850px;margin:18px 0}.hero p{max-width:760px;color:var(--muted);font-size:1.16rem}.hero .tag{display:inline-block;border:1px solid #426080;border-radius:99px;padding:5px 12px;color:var(--blue);font-size:.8rem;margin:14px 8px 0 0}.layout{display:grid;grid-template-columns:240px 1fr;gap:48px;padding-bottom:70px}.toc{position:sticky;top:20px;align-self:start;background:#101a2b99;border:1px solid var(--line);border-radius:16px;padding:20px}.toc b{display:block;margin-bottom:10px}.toc a{display:block;color:var(--muted);font-size:.9rem;padding:5px 0}.toc a:hover{color:var(--cyan)}main section{margin:0 0 48px;scroll-margin-top:24px}h2{font-size:1.75rem;letter-spacing:-.02em;margin:0 0 12px}h3{font-size:1.13rem;margin:0 0 8px}p{margin:8px 0 14px}.lead{color:var(--muted);font-size:1.05rem}.panel{background:linear-gradient(145deg,var(--panel),#0e192a);border:1px solid var(--line);border-radius:18px;padding:24px;margin:18px 0}.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:22px 0}.step{position:relative;background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:16px 14px;min-height:126px}.step:not(:last-child):after{content:"→";position:absolute;right:-15px;top:40%;z-index:2;color:var(--cyan);font-weight:800}.num{font:700 .75rem var(--mono);color:var(--cyan)}.step b{display:block;margin:8px 0 4px}.step small{color:var(--muted)}.roles{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.role{border-radius:16px;padding:20px;background:var(--panel);border:1px solid var(--line)}.role .symbol{font:700 1.1rem var(--mono);color:var(--cyan)}.role:nth-child(2) .symbol{color:var(--gold)}.role:nth-child(3) .symbol{color:var(--blue)}.role p{font-size:.94rem;color:var(--muted)}.code{overflow:auto;background:#080e18;border:1px solid #293950;border-radius:14px;padding:18px 20px;color:#d8e5f7;font: .86rem/1.65 var(--mono);white-space:pre}.callout{border-left:3px solid var(--gold);padding:10px 16px;background:#2a2418;color:#f6dfb8;border-radius:0 12px 12px 0;margin:18px 0}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.mini{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}.mini p{color:var(--muted);font-size:.94rem}.mini code{color:var(--cyan);font-family:var(--mono)}.contrast{display:grid;grid-template-columns:1fr 1fr;gap:14px}.contrast>div{border:1px solid var(--line);border-radius:15px;padding:18px}.contrast .no{background:#281a25}.contrast .yes{background:#142820}.contrast b{display:block;margin-bottom:6px}.contrast p{color:var(--muted);margin-bottom:0}.foot{border-top:1px solid var(--line);padding:28px 0 42px;color:var(--muted);font-size:.88rem}.foot .source{margin-top:12px;color:#8293ae}.badge{font: .75rem var(--mono);color:var(--cyan);border:1px solid #315a64;padding:3px 8px;border-radius:99px;white-space:nowrap}
+@media(max-width:800px){.layout{grid-template-columns:1fr;gap:20px}.toc{position:relative;top:auto;display:flex;flex-wrap:wrap;gap:4px 14px}.toc b{width:100%}.flow{grid-template-columns:1fr}.step{min-height:auto}.step:not(:last-child):after{content:"↓";right:16px;top:auto;bottom:-20px}.roles,.grid2,.contrast{grid-template-columns:1fr}.hero{padding:48px 0 36px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap"><strong>通用 Agent 设计</strong>　/　02　把任务写成可执行流程　<span class="badge">语言版本 12</span></div></header>
+<div class="wrap">
+<section class="hero" aria-labelledby="title">
+<div class="eyebrow">From intent to execution</div>
+<h1 id="title">把任务写成<br>可执行流程</h1>
+<p>让流程代码负责<strong>顺序、数据依赖与控制流</strong>，让 AI 负责明确交给它的理解、生成和业务判断。宿主按规则推进普通代码与工具调用，不把每个表达式都变成一次模型请求。</p>
+<span class="tag">普通计算：确定性执行</span><span class="tag">智能工作：显式虚函数</span><span class="tag">业务验收：看真实证据</span>
+</section>
+<div class="layout">
+<nav class="toc" aria-label="本页目录"><b>本页路线</b><a href="#idea">核心分工</a><a href="#flow">一次执行如何推进</a><a href="#functions">三类调用</a><a href="#example">串行示例</a><a href="#boundary">语言边界</a><a href="#evidence">失败与验收</a></nav>
+<main>
+<section id="idea">
+<h2>先分清：流程与判断不是一回事</h2>
+<p class="lead">版本 12 的流程伪代码借用 JavaScript 基础语法，但不是完整 JavaScript，也没有运行 JavaScript 虚拟机。它把常见流程交给 Rust 宿主执行，把需要智能处理的工作显式交给 AI。</p>
+<div class="roles">
+<article class="role"><div class="symbol">01 / 程序</div><h3>确定“先做什么、再做什么”</h3><p>函数调用、条件、循环、数组收集与断言表达可预先写清的控制流。普通运算由宿主求值，不会因为出现 <code>i + 1</code> 就额外请求模型。</p></article>
+<article class="role"><div class="symbol">02 / AI</div><h3>处理需要理解的工作</h3><p>内容设计、材料理解、语义检查等工作通过有职责说明和返回契约的 <code>@virtual</code> 函数调用。AI 根据实际输入完成任务并返回 JSON。</p></article>
+<article class="role"><div class="symbol">03 / 宿主</div><h3>推进并留下执行事实</h3><p>宿主管理函数帧、程序位置、工具分发、挂起与恢复、持久化、权限和取消。工具返回不会自动变成业务成功结论。</p></article>
+</div>
+<div class="callout">同一输入、相同工具与任务返回值会产生相同控制流；这不意味着 AI 判断、外部操作或整个业务都是确定性的。</div>
+</section>
+<section id="flow">
+<h2>一次执行如何推进</h2>
+<p>主任务提交唯一的 <code>main</code>。Runtime 根据程序继续运行普通代码；到达工具或虚函数调用时才产生相应的实际步骤。</p>
+<div class="flow" aria-label="流程推进示意">
+<div class="step"><span class="num">01 · INPUT</span><b>主目标与输入</b><small>目标、要求、材料按实际参数交接</small></div>
+<div class="step"><span class="num">02 · PROGRAM</span><b>执行 main</b><small>宿主确定性推进代码与条件</small></div>
+<div class="step"><span class="num">03 · TASK / TOOL</span><b>工作发生</b><small>虚函数完成智能职责；工具执行实际操作</small></div>
+<div class="step"><span class="num">04 · RETURN</span><b>结果回到调用点</b><small>函数返回 JSON；程序消费结果继续推进</small></div>
+<div class="step"><span class="num">05 · CHECK</span><b>按要求检查并交付</b><small>对照真实产物与业务标准作判断</small></div>
+</div>
+<div class="panel"><h3>调用、挂起、恢复</h3><p>普通 helper 在 Runtime 的局部函数帧中执行；工具调用保存实际回执；虚函数在当前 AI 任务上下文中完成职责。函数返回后，宿主恢复原调用位置。<code>main</code> 返回表示主程序结束，不代表宿主已认证业务验收通过。</p></div>
+</section>
+<section id="functions">
+<h2>三类调用，三种执行方式</h2>
+<div class="grid2">
+<div class="mini"><h3><code>helper(args)</code>　普通函数</h3><p>已有代码由宿主在局部作用域执行。它不会因为是一个函数就自动创建新的 AI 任务或另一个 Agent。</p></div>
+<div class="mini"><h3><code>@virtual helper(args)</code>　显式 AI 任务</h3><p>当前 AI 依据函数职责、实际参数和返回契约完成理解、生成、转换或检查。函数注释不是自动执行的代码。</p></div>
+<div class="mini"><h3><code>io.read(...)</code>　固定工具方法</h3><p>通过当前公布的固定库名与工具契约调用。获得工具原始 JSON 后，仍由流程或 AI 按业务要求检查。</p></div>
+<div class="mini"><h3><code>fork / join</code>　获授权的并发</h3><p>只有获得并发授权且工作适合拆分时才使用。<code>join</code> 收集函数返回，不自动合并隔离工作区，也不替代验收。</p></div>
+</div>
+</section>
+<section id="example">
+<h2>示例：设计、保存、读回、检查</h2>
+<p>最小串行示例以完整 HTML 为产物：AI 负责设计和检查，确定性的程序负责写入、读回及消费检查结果。</p>
+<pre class="code"><code>function main(request) {
+  const draft = compose(request);
+  const receipt = io.write({path: request.output, content: draft.content});
+  const actual = io.read({path: request.output});
+  const review = inspect(request, actual.content);
+  assert(review.passed, "验收未通过，不能交付");
+  return {path: request.output, receipt, review};
+}
+
+/** @virtual */
+function compose(request) {
+  // 根据目标与要求完成设计，返回 {content:string}。
+}
+
+/** @virtual */
+function inspect(request, content) {
+  // 检查真实读回内容；返回 {passed, issues, evidence}。
+}</code></pre>
+<p>这里的 <code>assert</code> 只在 AI 已返回布尔检查结论后，由宿主确定性消费它。读回正文使检查针对实际文件，而不是只针对生成函数声称输出的内容。</p>
+<div class="callout">这段示例的内容检查本身不包含浏览器渲染。没有执行浏览器检查，就不能据此声称视觉验收通过。</div>
+</section>
+<section id="boundary">
+<h2>基础语言子集：够表达流程，不冒充完整 JS</h2>
+<div class="grid2">
+<div class="mini"><h3>可以表达</h3><p>普通函数、局部 JSON 值、<code>if/else</code>、常见循环、<code>break/continue</code>、三元、模板字符串、受支持的表达式，以及静态的 <code>library.method(args)</code> 调用。</p></div>
+<div class="mini"><h3>明确不开放</h3><p>异步／Promise、生成器、模块导入、TypeScript 类型、箭头函数、闭包、类、动态库方法等完整 JS 能力。未知方法或不匹配的类型会明确报错，不交由 AI 猜含义。</p></div>
+</div>
+<div class="panel"><h3>几个容易误读的规则</h3><p>条件采用 C 风格真值：<code>false</code>、<code>null</code> 与数值零为假，其他 JSON 值为真；空字符串、数组、对象也为真。算术与比较不做隐式类型转换；字符串参与 <code>+</code> 时按规则拼接原始 JSON 值。具体边界以版本 12 语言手册为准。</p></div>
+</section>
+<section id="evidence">
+<h2>检查要有证据；失败不能装作成功</h2>
+<div class="contrast">
+<div class="no"><b>不够：工具成功、函数返回、程序结束</b><p>这些事实说明操作或控制流发生过，不证明产物满足业务要求，也不证明所有检查都已通过。</p></div>
+<div class="yes"><b>更可靠：检查实际对象并记录结果</b><p>按任务要求读取实际产物，让检查职责返回明确结论、问题和证据；失败时停止，或在获准范围内修正并复查。</p></div>
+</div>
+<p>完整源码会在执行前编译；源码错误应依诊断改写源码，不意味着业务操作已执行。运行时失败则不能假定外部写入从未发生；恢复时应依据已有回执和真实状态，避免盲目重放不确定的副作用。</p>
+</section>
+</main>
+</div>
+<footer class="foot"><div>通用 Agent 设计 · 02 / 把任务写成可执行流程</div><div class="source">资料依据：工作区 README.md、docs/agent-program.md（版本 12）与 docs/generic-agent-design.md。此页为概念说明，不替代当前工具契约、适用业务技能或产物验收。</div></footer>
+</div>
+</body>
+</html>

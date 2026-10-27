@@ -70,7 +70,16 @@ pub fn sources(root: &Path, context: &VisualContext, args: &Value) -> Result<Vec
             )?;
             let mut out =
                 json!({"artifact_id":id,"image_hash":m["content_hash"],"source":m["source"]});
-            for key in ["tool", "project_id", "page_index", "source_revision", "source_hash", "source_stable", "source_binding_error", "path"] {
+            for key in [
+                "tool",
+                "project_id",
+                "page_index",
+                "source_revision",
+                "source_hash",
+                "source_stable",
+                "source_binding_error",
+                "path",
+            ] {
                 if !m[key].is_null() {
                     out[key] = m[key].clone();
                 }
@@ -262,7 +271,7 @@ pub fn cancel(root: &Path, task: &str) {
 }
 
 pub fn outstanding_calls(root: &Path, task: &str) -> Result<Vec<(String, Option<String>)>> {
-    reap(root,task)?;
+    reap(root, task)?;
     Ok(db(root)?.prepare("SELECT call_id,owner_node_id FROM agent_visual_jobs WHERE task_id=?1 AND (status IN ('queued','running') OR delivered=0)")?
         .query_map([task],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
@@ -278,43 +287,66 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_queue_migrates_and_identical_checks_keep_separate_step_owners() {
-        let root = std::env::temp_dir().join(format!("vision-owners-{}",agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("vision-owners-{}", agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
-        let state = agent_service::tests::test_state(&root,"127.0.0.1:9".parse().unwrap());
+        let state = agent_service::tests::test_state(&root, "127.0.0.1:9".parse().unwrap());
         let conn = agent_service::open_db(&root).unwrap();
         conn.execute_batch("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','','fake','running',0,0);
             CREATE TABLE agent_visual_jobs(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,turn INTEGER NOT NULL,status TEXT NOT NULL,call_id TEXT NOT NULL,arguments TEXT NOT NULL,sources TEXT NOT NULL,result TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,delivered INTEGER NOT NULL DEFAULT 0);
             INSERT INTO agent_visual_jobs VALUES ('old-job','t',1,'completed','old-call','{}','[]','{}',0,0,1);").unwrap();
         drop(conn);
         let conn = db(&root).unwrap();
-        let old: (i64,Option<String>)=conn.query_row("SELECT delivered,owner_node_id FROM agent_visual_jobs WHERE id='old-job'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(old,(1,None));
+        let old: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT delivered,owner_node_id FROM agent_visual_jobs WHERE id='old-job'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old, (1, None));
         drop(conn);
-        let mut context=VisualContext {identity:json!({"task_id":"t","node_id":"capture","task_node_id":"step-a","agent_id":"worker-a"}),turn:Some(1),..Default::default()};
-        let mut png=std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(8,8).write_to(&mut png,image::ImageFormat::Png).unwrap();
-        let artifact=visual_artifacts::save(&root,&context,json!({"source":"test"}),png.get_ref()).unwrap();
-        context.allowed_artifact_ids=vec![artifact["artifact_id"].as_str().unwrap().to_owned()];
-        let args=json!({"artifact_ids":context.allowed_artifact_ids,"question":"Inspect the same picture","background":true});
-        let cancel=CancellationToken::new();
-        let a=submit(&state,&context,&args,"call_1","fake",&cancel).unwrap();
-        let repeated=submit(&state,&context,&args,"call_1","fake",&cancel).unwrap();
-        assert_eq!(a["job_id"],repeated["job_id"]);
-        context.identity["task_node_id"]=json!("step-b");
-        context.identity["agent_id"]=json!("worker-b");
-        let b=submit(&state,&context,&args,"call_1","fake",&cancel).unwrap();
-        assert_ne!(a["job_id"],b["job_id"],"another step must get its own completion");
-        let owners=outstanding_calls(&root,"t").unwrap();
-        assert_eq!(owners.len(),2);
-        assert!(owners.contains(&("call_1".into(),Some("step-a".into()))));
-        assert!(owners.contains(&("call_1".into(),Some("step-b".into()))));
+        let mut context = VisualContext {
+            identity: json!({"task_id":"t","node_id":"capture","task_node_id":"step-a","agent_id":"worker-a"}),
+            turn: Some(1),
+            ..Default::default()
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let artifact =
+            visual_artifacts::save(&root, &context, json!({"source":"test"}), png.get_ref())
+                .unwrap();
+        context.allowed_artifact_ids = vec![artifact["artifact_id"].as_str().unwrap().to_owned()];
+        let args = json!({"artifact_ids":context.allowed_artifact_ids,"question":"Inspect the same picture","background":true});
+        let cancel = CancellationToken::new();
+        let a = submit(&state, &context, &args, "call_1", "fake", &cancel).unwrap();
+        let repeated = submit(&state, &context, &args, "call_1", "fake", &cancel).unwrap();
+        assert_eq!(a["job_id"], repeated["job_id"]);
+        context.identity["task_node_id"] = json!("step-b");
+        context.identity["agent_id"] = json!("worker-b");
+        let b = submit(&state, &context, &args, "call_1", "fake", &cancel).unwrap();
+        assert_ne!(
+            a["job_id"], b["job_id"],
+            "another step must get its own completion"
+        );
+        let owners = outstanding_calls(&root, "t").unwrap();
+        assert_eq!(owners.len(), 2);
+        assert!(owners.contains(&("call_1".into(), Some("step-a".into()))));
+        assert!(owners.contains(&("call_1".into(), Some("step-b".into()))));
         cancel.cancel();
-        tokio::time::timeout(std::time::Duration::from_secs(5),async {
-            while [a["job_id"].as_str().unwrap(),b["job_id"].as_str().unwrap()].iter().any(|id|running().lock().unwrap().contains_key(*id)) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while [a["job_id"].as_str().unwrap(), b["job_id"].as_str().unwrap()]
+                .iter()
+                .any(|id| running().lock().unwrap().contains_key(*id))
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
-        assert_eq!(ready(&root,"t").unwrap().len(),2);
-        let _=std::fs::remove_dir_all(root);
+        })
+        .await
+        .unwrap();
+        assert_eq!(ready(&root, "t").unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

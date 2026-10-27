@@ -19,14 +19,20 @@ use std::path::{Path as FsPath, PathBuf};
 
 pub const MAX_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_FILES: usize = 20;
-pub const DOCUMENT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "pdf", "docx", "pptx", "txt", "md"];
-const PPTX_MEDIA: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+#[cfg(test)]
+pub const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "pdf", "docx", "pptx", "txt", "md",
+];
+const PPTX_MEDIA: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 /// Pictures one `read_attachment` call may carry over into the project.
 const MAX_PICTURES: usize = 12;
 fn schema(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS agent_attachments(receipt TEXT PRIMARY KEY, task_id TEXT NOT NULL, attachment_id TEXT NOT NULL, reference TEXT NOT NULL, image_artifact TEXT, media_type TEXT NOT NULL, turn INTEGER, remote_scope TEXT, remote_path TEXT); CREATE INDEX IF NOT EXISTS attachment_task ON agent_attachments(task_id,attachment_id); CREATE TABLE IF NOT EXISTS agent_attachment_messages(task_id TEXT NOT NULL, turn INTEGER NOT NULL, request_id TEXT, fingerprint TEXT NOT NULL, content TEXT NOT NULL, PRIMARY KEY(task_id,turn)); CREATE UNIQUE INDEX IF NOT EXISTS attachment_request ON agent_attachment_messages(task_id,request_id) WHERE request_id IS NOT NULL;")?;
     let has_scope: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('agent_attachments') WHERE name='remote_scope')", [], |r| r.get(0))?;
-    if !has_scope {c.execute_batch("ALTER TABLE agent_attachments ADD COLUMN remote_scope TEXT")?;}
+    if !has_scope {
+        c.execute_batch("ALTER TABLE agent_attachments ADD COLUMN remote_scope TEXT")?;
+    }
     Ok(())
 }
 fn leaf(name: &str) -> String {
@@ -528,17 +534,35 @@ pub async fn read(state: &AgentServiceState, task: &str, args: &Value) -> Result
 }
 fn run_pptx_script(input: &PathBuf, mode: &str, target: Option<&str>) -> Result<Value> {
     let mut command = std::process::Command::new("python3");
-    command.arg("-I").arg("-c").arg(include_str!("attachments/read_pptx.py")).arg(input).arg(mode);
+    command
+        .arg("-I")
+        .arg("-c")
+        .arg(include_str!("attachments/read_pptx.py"))
+        .arg(input)
+        .arg(mode);
     if let Some(target) = target {
         command.arg(target);
     }
     let output = command.output()?;
-    ensure!(output.status.success(), "PPTX 解析失败：{}", String::from_utf8_lossy(&output.stderr).chars().take(400).collect::<String>());
-    ensure!(output.stdout.len() <= 256 * 1024 * 1024, "PPTX 提取结果过大");
+    ensure!(
+        output.status.success(),
+        "PPTX 解析失败：{}",
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .take(400)
+            .collect::<String>()
+    );
+    ensure!(
+        output.stdout.len() <= 256 * 1024 * 1024,
+        "PPTX 提取结果过大"
+    );
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 /// A portable extracted picture: PNG, JPEG or WEBP bytes, with its size.
-fn portable_picture(format: &str, data: Vec<u8>) -> Result<(String, &'static str, Vec<u8>, u32, u32)> {
+fn portable_picture(
+    format: &str,
+    data: Vec<u8>,
+) -> Result<(String, &'static str, Vec<u8>, u32, u32)> {
     let (ext, media, data) = match format {
         "png" => ("png", "image/png", data),
         "jpg" | "jpeg" => ("jpg", "image/jpeg", data),
@@ -552,33 +576,64 @@ fn portable_picture(format: &str, data: Vec<u8>) -> Result<(String, &'static str
         other => anyhow::bail!("格式 .{other} 暂不能搬运（支持 png、jpg、webp、gif）"),
     };
     ensure!(data.len() <= MAX_BYTES, "图片超过 20 MiB");
-    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&data)).with_guessed_format()?.into_dimensions()?;
-    ensure!(w > 0 && h > 0 && w <= 8192 && h <= 8192 && u64::from(w) * u64::from(h) <= 64_000_000, "图片尺寸超过限制");
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(&data))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    ensure!(
+        w > 0 && h > 0 && w <= 8192 && h <= 8192 && u64::from(w) * u64::from(h) <= 64_000_000,
+        "图片尺寸超过限制"
+    );
     Ok((ext.into(), media, data, w, h))
 }
 fn picture_file_name(id: &str, name: &str, ext: &str) -> String {
-    let stem: String = name.chars().filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' ')).take(40).collect();
+    let stem: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' '))
+        .take(40)
+        .collect();
     let stem = stem.trim().replace(' ', "_");
-    if stem.is_empty() { format!("{id}.{ext}") } else { format!("{id}_{stem}.{ext}") }
+    if stem.is_empty() {
+        format!("{id}.{ext}")
+    } else {
+        format!("{id}_{stem}.{ext}")
+    }
 }
 /// A PPTX attachment: its text, tables, charts and notes page by page; or, with
 /// `slide` / `picture`, its extracted pictures as ordinary visual artifacts.
-async fn read_pptx(state: &AgentServiceState, task: &str, args: &Value, input: &PathBuf, reference: Value, remote: Option<String>) -> Result<Value> {
-    let target = args["picture"].as_str().map(str::to_owned).or_else(|| args["slide"].as_u64().map(|n| n.to_string()));
+async fn read_pptx(
+    state: &AgentServiceState,
+    task: &str,
+    args: &Value,
+    input: &PathBuf,
+    reference: Value,
+    remote: Option<String>,
+) -> Result<Value> {
+    let target = args["picture"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| args["slide"].as_u64().map(|n| n.to_string()));
     let Some(target) = target else {
         let input = input.clone();
-        let extracted = tokio::task::spawn_blocking(move || run_pptx_script(&input, "text", None)).await??;
-        let text = extracted["text"].as_str().context("missing extracted text")?;
+        let extracted =
+            tokio::task::spawn_blocking(move || run_pptx_script(&input, "text", None)).await??;
+        let text = extracted["text"]
+            .as_str()
+            .context("missing extracted text")?;
         let offset = args["char_offset"].as_u64().unwrap_or(0) as usize;
         let max = args["max_chars"].as_u64().unwrap_or(24000).min(48000) as usize;
         let count = text.chars().count();
         let content: String = text.chars().skip(offset).take(max).collect();
         let end = offset + content.chars().count();
-        return Ok(json!({"attachment":reference,"remote_path":remote,"content":content,"char_offset":offset,"total_chars":count,"next_char_offset":if end<count{Some(end)}else{None},"warnings":extracted["warnings"]}));
+        return Ok(
+            json!({"attachment":reference,"remote_path":remote,"content":content,"char_offset":offset,"total_chars":count,"next_char_offset":if end<count{Some(end)}else{None},"warnings":extracted["warnings"]}),
+        );
     };
     let root = state.workspace.root();
     let script_input = input.clone();
-    let listed = tokio::task::spawn_blocking(move || run_pptx_script(&script_input, "pictures", Some(&target))).await??;
+    let listed = tokio::task::spawn_blocking(move || {
+        run_pptx_script(&script_input, "pictures", Some(&target))
+    })
+    .await??;
     let pictures = listed["pictures"].as_array().cloned().unwrap_or_default();
     let mut moved = Vec::new();
     let mut skipped = Vec::new();
@@ -597,13 +652,17 @@ async fn read_pptx(state: &AgentServiceState, task: &str, args: &Value, input: &
         }.await;
         match outcome {
             Ok(done) => moved.push(done),
-            Err(error) => skipped.push(json!({"id":id,"name":picture["name"],"reason":format!("{error:#}")})),
+            Err(error) => {
+                skipped.push(json!({"id":id,"name":picture["name"],"reason":format!("{error:#}")}))
+            }
         }
     }
     if pictures.len() > MAX_PICTURES {
         skipped.push(json!({"reason":format!("这一页图片超过 {MAX_PICTURES} 张，其余的用 picture 编号逐个搬运")}));
     }
-    Ok(json!({"attachment":reference,"pictures":moved,"skipped":skipped,"next":"Use the returned artifact_id to inspect each picture. A connected plugin may also return a usable src. Preserve the aspect ratio when placing it."}))
+    Ok(
+        json!({"attachment":reference,"pictures":moved,"skipped":skipped,"next":"Use the returned artifact_id to inspect each picture. A connected plugin may also return a usable src. Preserve the aspect ratio when placing it."}),
+    )
 }
 #[derive(Deserialize)]
 pub struct UploadQuery {
@@ -806,11 +865,15 @@ mod tests {
         let parts = vec![json!({"type":"file","receiptId":uploaded["receiptId"]})];
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             assert!(admit(&tx, &f.root, "b", 1, "读材料", &parts, None, None).is_err());
         }
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             let bad = vec![
                 parts[0].clone(),
                 json!({"type":"file","receiptId":"missing"}),
@@ -818,7 +881,9 @@ mod tests {
             assert!(admit(&tx, &f.root, "a", 1, "读材料", &bad, None, None).is_err());
         }
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             let saved = admit(
                 &tx,
                 &f.root,
@@ -836,7 +901,9 @@ mod tests {
         assert!(already(&c, "a", "request-1", "读材料", &parts).unwrap());
         assert!(already(&c, "a", "request-1", "不同内容", &parts).is_err());
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             assert!(admit(&tx, &f.root, "a", 2, "再发", &parts, None, None).is_err());
         }
         let restored = admitted(&f.root, "a", 1).unwrap();
@@ -874,7 +941,9 @@ mod tests {
             json!({"type":"image","mediaType":"image/png","name":"reference.png","data":encoded});
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             let content = admit(&tx, &f.root, "a", 1, "看图", &[part], None, None).unwrap();
             assert_eq!(content[1]["attachment"]["width"], 20);
             assert!(!content[1].to_string().contains("data"));
@@ -914,34 +983,68 @@ mod tests {
     }
     #[test]
     fn pptx_attachments_are_accepted_by_content_and_extension() {
-        let allowed = DOCUMENT_EXTENSIONS.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let allowed = DOCUMENT_EXTENSIONS
+            .iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>();
         let bytes = std::fs::read(sample_pptx()).unwrap();
-        assert_eq!(check(&bytes, "deck.pptx", Some(&allowed)).unwrap(), PPTX_MEDIA);
+        assert_eq!(
+            check(&bytes, "deck.pptx", Some(&allowed)).unwrap(),
+            PPTX_MEDIA
+        );
         assert!(check(b"not a zip", "deck.pptx", Some(&allowed)).is_err());
     }
     #[test]
     fn pptx_text_covers_titles_bullets_tables_charts_notes_and_picture_ids() {
         let extracted = run_pptx_script(&sample_pptx(), "text", None).unwrap();
         let text = extracted["text"].as_str().unwrap();
-        for expected in ["共 2 页", "年度汇报", "- 收入增长 20%", "| Q1 | 12 |", "bar；类别：Q1、Q2", "系列「收入」：12, 15", "强调增长来自老客户", "图片 s1p1：公司标志"] {
+        for expected in [
+            "共 2 页",
+            "年度汇报",
+            "- 收入增长 20%",
+            "| Q1 | 12 |",
+            "bar；类别：Q1、Q2",
+            "系列「收入」：12, 15",
+            "强调增长来自老客户",
+            "图片 s1p1：公司标志",
+        ] {
             assert!(text.contains(expected), "missing {expected}\n{text}");
         }
     }
     #[tokio::test]
     async fn extracting_attachment_pictures_does_not_require_a_plugin_project() {
-        let f=Fixture::new();
-        let result=read_pptx(&f.state,"a",&json!({"slide":1}),&sample_pptx(),json!({"id":"source"}),None).await.unwrap();
-        assert_eq!(result["skipped"].as_array().unwrap().len(),0);
-        assert_eq!(result["pictures"].as_array().unwrap().len(),1);
-        let picture=&result["pictures"][0];
-        assert_eq!(picture["width_px"],40);assert_eq!(picture["height_px"],20);
+        let f = Fixture::new();
+        let result = read_pptx(
+            &f.state,
+            "a",
+            &json!({"slide":1}),
+            &sample_pptx(),
+            json!({"id":"source"}),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["skipped"].as_array().unwrap().len(), 0);
+        assert_eq!(result["pictures"].as_array().unwrap().len(), 1);
+        let picture = &result["pictures"][0];
+        assert_eq!(picture["width_px"], 40);
+        assert_eq!(picture["height_px"], 20);
         assert!(picture.get("src").is_none());
-        let id=picture["artifact_id"].as_str().unwrap();
-        assert!(crate::visual_artifacts::metadata(&f.root,"a",id).is_ok());
-        assert!(crate::visual_artifacts::metadata(&f.root,"b",id).is_err());
-        let conn=agent_service::open_db(&f.root).unwrap();
-        let count:i64=conn.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'ppt_%'",[],|r|r.get(0)).unwrap();
-        assert_eq!(count,0,"ordinary attachment reads must not initialize plugin business tables");
+        let id = picture["artifact_id"].as_str().unwrap();
+        assert!(crate::visual_artifacts::metadata(&f.root, "a", id).is_ok());
+        assert!(crate::visual_artifacts::metadata(&f.root, "b", id).is_err());
+        let conn = agent_service::open_db(&f.root).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'ppt_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "ordinary attachment reads must not initialize plugin business tables"
+        );
     }
 
     #[test]
@@ -950,13 +1053,19 @@ mod tests {
         assert_eq!(by_slide["pictures"].as_array().unwrap().len(), 1);
         let one = run_pptx_script(&sample_pptx(), "pictures", Some("s1p1")).unwrap();
         let picture = &one["pictures"][0];
-        let raw = base64::engine::general_purpose::STANDARD.decode(picture["data"].as_str().unwrap()).unwrap();
-        let (ext, media, _, w, h) = portable_picture(picture["format"].as_str().unwrap(), raw).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(picture["data"].as_str().unwrap())
+            .unwrap();
+        let (ext, media, _, w, h) =
+            portable_picture(picture["format"].as_str().unwrap(), raw).unwrap();
         assert_eq!((ext.as_str(), media, w, h), ("png", "image/png", 40, 20));
         assert!(run_pptx_script(&sample_pptx(), "pictures", Some("s1p9")).is_err());
         assert!(run_pptx_script(&sample_pptx(), "pictures", Some("7")).is_err());
         assert!(portable_picture("emf", vec![1, 2, 3]).is_err());
-        assert_eq!(picture_file_name("s1p1", "公司 标志!", "png"), "s1p1_公司_标志.png");
+        assert_eq!(
+            picture_file_name("s1p1", "公司 标志!", "png"),
+            "s1p1_公司_标志.png"
+        );
     }
     #[test]
     fn attachments_svg_edition_rejects_future_types_and_spoofed_images() {
@@ -975,7 +1084,9 @@ mod tests {
         let f = Fixture::new();
         let up = store(&f.state, "a", "report.csv", b"a,b\n1,2").unwrap();
         let mut c = agent_service::open_db(&f.root).unwrap();
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         assert!(
             admit(
                 &tx,
@@ -1024,7 +1135,9 @@ sys.stdout.buffer.write(b.getvalue())"#).output().unwrap();
         assert!(output.status.success());
         let up = store(&f.state, "a", "资料.docx", &output.stdout).unwrap();
         let mut c = agent_service::open_db(&f.root).unwrap();
-        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         admit(
             &tx,
             &f.root,
@@ -1067,7 +1180,9 @@ sys.stdout.buffer.write(b.getvalue())"#).output().unwrap();
         let id = up["file"]["attachmentId"].clone();
         let mut c = agent_service::open_db(&f.root).unwrap();
         {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
             admit(
                 &tx,
                 &f.root,

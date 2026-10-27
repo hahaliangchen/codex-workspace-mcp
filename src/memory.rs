@@ -345,7 +345,8 @@ pub fn record(
 
 /// Keep conflicting source versions in history. Search projects only evidence
 /// whose observed file hashes still match; no model or source investigation.
-pub fn bind_observer_sources(
+#[cfg(test)]
+fn seed_historical_source_manifest(
     root: &Path,
     summary: &str,
     implementation: &str,
@@ -921,7 +922,7 @@ mod tests {
             make("Mapping fact", "old mapping", vec!["source.rs".into()]),
         )
         .unwrap();
-        bind_observer_sources(&ws,&first.recorded.summary,&first.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"old source")}])).unwrap();
+        seed_historical_source_manifest(&ws,&first.recorded.summary,&first.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"old source")}])).unwrap();
         let route = record(
             &ws,
             make(
@@ -931,7 +932,7 @@ mod tests {
             ),
         )
         .unwrap();
-        bind_observer_sources(
+        seed_historical_source_manifest(
             &ws,
             &route.recorded.summary,
             &route.recorded.implementation,
@@ -957,7 +958,7 @@ mod tests {
             make("Mapping fact", "new mapping", vec!["source.rs".into()]),
         )
         .unwrap();
-        bind_observer_sources(&ws,&new.recorded.summary,&new.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"new source")}])).unwrap();
+        seed_historical_source_manifest(&ws,&new.recorded.summary,&new.recorded.implementation,&serde_json::json!([{"file_path":"source.rs","code_hash":crate::symbol_description::content_hash(b"new source")}])).unwrap();
         let current = search(
             &ws,
             SearchWorkMemoryRequest {

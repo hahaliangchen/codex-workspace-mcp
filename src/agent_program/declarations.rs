@@ -255,13 +255,9 @@ pub fn headers(libraries: &Libraries, definitions: &[Value]) -> String {
             let Some(definition) = definitions.get(target.as_str()) else {
                 continue;
             };
-            let full = text(definition["description"].as_str().unwrap_or(""));
-            let end = full
-                .find(". ")
-                .map(|index| index + 1)
-                .or_else(|| full.find('。').map(|index| index + '。'.len_utf8()))
-                .unwrap_or(full.len());
-            let description = &full[..end];
+            // Planning and native execution must receive the complete same
+            // tool contract, including requirements after its first sentence.
+            let description = text(definition["description"].as_str().unwrap_or(""));
             let returns = definition
                 .get("outputSchema")
                 .filter(|v| !v.is_null())
@@ -399,6 +395,7 @@ mod tests {
             "\"text\" | \"binary\"",
             "content:",
             "* /",
+            "Return actual data.",
         ] {
             assert!(
                 declarations.contains(expected),

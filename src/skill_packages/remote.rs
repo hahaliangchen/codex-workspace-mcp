@@ -219,17 +219,35 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
     ensure!(confirmed["state"] == "ready", "remote plugin not ready");
     let skill_entry = plugin["skill"].as_str().unwrap_or_default();
     if !skill_entry.trim().is_empty() {
-        match remote.asset("resource", &[("path", skill_entry.into())]).await {
-            Ok((_, body)) => {ensure!(body.len() <= 128000, "remote skill body too large"); remote.skill = String::from_utf8(body)?;},
-            Err(error) if error.downcast_ref::<reqwest::Error>().is_some_and(|e|e.status()==Some(reqwest::StatusCode::NOT_FOUND)) => {},
+        match remote
+            .asset("resource", &[("path", skill_entry.into())])
+            .await
+        {
+            Ok((_, body)) => {
+                ensure!(body.len() <= 128000, "remote skill body too large");
+                remote.skill = String::from_utf8(body)?;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND)) => {}
             Err(error) => return Err(error),
         }
     }
     let description = if !remote.skill.trim().is_empty() {
         let fields = super::frontmatter(&remote.skill)?;
         ensure!(fields["name"] == id, "remote skill ID mismatch");
-        fields["description"].as_str().context("skill description required")?.to_owned()
-    } else { plugin["description"].as_str().or_else(||plugin["title"].as_str()).unwrap_or("Remote plugin").to_owned() };
+        fields["description"]
+            .as_str()
+            .context("skill description required")?
+            .to_owned()
+    } else {
+        plugin["description"]
+            .as_str()
+            .or_else(|| plugin["title"].as_str())
+            .unwrap_or("Remote plugin")
+            .to_owned()
+    };
     remote.capabilities = plugin["capabilities"]
         .as_array()
         .into_iter()
@@ -316,11 +334,18 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
         manifest: Manifest {
             version: 1,
             id,
-            library: plugin.get("library").filter(|v| !v.is_null()).map(|v| {
-                let name = v.as_str().context("plugin library must be a string")?;
-                ensure!(crate::agent_program::libraries::valid_namespace(name), "invalid plugin library namespace");
-                Ok::<_, anyhow::Error>(name.to_owned())
-            }).transpose()?,
+            library: plugin
+                .get("library")
+                .filter(|v| !v.is_null())
+                .map(|v| {
+                    let name = v.as_str().context("plugin library must be a string")?;
+                    ensure!(
+                        crate::agent_program::libraries::valid_namespace(name),
+                        "invalid plugin library namespace"
+                    );
+                    Ok::<_, anyhow::Error>(name.to_owned())
+                })
+                .transpose()?,
             title: plugin["title"].as_str().unwrap_or("Remote plugin").into(),
             skill: skill_entry.into(),
             inject: vec![],
@@ -345,10 +370,19 @@ pub(crate) async fn connect_user(mut config: Config, require_binding: bool) -> R
 /// An administrator may register just a service address. User credentials are
 /// supplied when its page connects, never persisted as shared plugin identity.
 pub(crate) fn configured_url(registry: &Registry, id: &str) -> Result<String> {
-    if let Ok(connection)=registry.remote(id) {return Ok(connection.url().to_owned())}
-    let configured=settings()?;
-    ensure!(configured.enabled.get(id)!=Some(&false) && !configured.removed.contains(id),"Plugin disabled");
-    configured.remotes.get(id).map(|c|c.url.clone()).context("Plugin service address is not configured")
+    if let Ok(connection) = registry.remote(id) {
+        return Ok(connection.url().to_owned());
+    }
+    let configured = settings()?;
+    ensure!(
+        configured.enabled.get(id) != Some(&false) && !configured.removed.contains(id),
+        "Plugin disabled"
+    );
+    configured
+        .remotes
+        .get(id)
+        .map(|c| c.url.clone())
+        .context("Plugin service address is not configured")
 }
 pub async fn install(
     runtime: &PluginRuntime,
@@ -502,7 +536,7 @@ mod tests {
     };
     #[tokio::test]
     async fn remote_plugins_may_omit_or_not_have_a_skill_resource() {
-        for entry in [None,Some("skill:missing.md")] {
+        for entry in [None, Some("skill:missing.md")] {
             let app=Router::new().route("/api/plugin/{method}",post(move|Path(method):Path<String>,Json(body):Json<Value>|async move {
                 let value=if method=="handshake" {
                     let mut plugin=json!({"id":"plain-page","title":"No instructions","pages":[],"tools":[{"name":"ping","description":"Ping","inputSchema":{"type":"object"}}]});
@@ -511,11 +545,20 @@ mod tests {
                 } else {assert_eq!(method,"confirm");json!({"state":"ready"})};
                 Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":value}}))
             }));
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let address=listener.local_addr().unwrap();
-            let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
-            let package=connect(Config{url:format!("http://{address}"),token:"test".into()}).await.unwrap();
-            assert!(package.remote.as_ref().unwrap().skill.is_empty(),"tool mapping must not fabricate missing MD");
-            assert_eq!(package.manifest.tools,vec!["plain_page__ping"]);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let package = connect(Config {
+                url: format!("http://{address}"),
+                token: "test".into(),
+            })
+            .await
+            .unwrap();
+            assert!(
+                package.remote.as_ref().unwrap().skill.is_empty(),
+                "tool mapping must not fabricate missing MD"
+            );
+            assert_eq!(package.manifest.tools, vec!["plain_page__ping"]);
             server.abort();
         }
     }
@@ -547,7 +590,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(package.manifest.tools, vec!["note_book__read_file"]);
-        assert_eq!(package.manifest.library.as_deref(),Some("notes"));
+        assert_eq!(package.manifest.library.as_deref(), Some("notes"));
         assert!(package.root.as_os_str().is_empty());
         let (runtime, catalog) = test_runtime();
         let parent = runtime
@@ -569,9 +612,13 @@ mod tests {
             .packages
             .tools(&std::collections::BTreeSet::from(["note-book".into()]));
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["outputSchema"]["properties"]["content"]["type"],"string");
-        let bindings=crate::agent_program::libraries::catalog(&tools,&catalog.packages.catalog());
-        let headers=crate::agent_program::declarations::headers(&bindings,&tools);
+        assert_eq!(
+            tools[0]["function"]["outputSchema"]["properties"]["content"]["type"],
+            "string"
+        );
+        let bindings =
+            crate::agent_program::libraries::catalog(&tools, &catalog.packages.catalog());
+        let headers = crate::agent_program::declarations::headers(&bindings, &tools);
         assert!(headers.contains("declare namespace notes") && headers.contains("content:"));
         assert!(!headers.contains("note_book__read_file"));
         assert_eq!(

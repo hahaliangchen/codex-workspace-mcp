@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Result, ensure};
 use futures::future::BoxFuture;
-use reqwest::Client;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -163,7 +162,7 @@ fn program_handler() -> ToolHandler {
     })
 }
 
-pub struct ToolCatalogPlugin(pub Client);
+pub struct ToolCatalogPlugin;
 
 impl Plugin for ToolCatalogPlugin {
     fn id(&self) -> &'static str {
@@ -178,7 +177,7 @@ impl Plugin for ToolCatalogPlugin {
         context.mount(MemoryPlugin)?;
         context.mount(CodeIndexPlugin)?;
         context.mount(crate::skill_packages::PackagesPlugin)?;
-        context.mount(AgentTasksPlugin(self.0.clone()))?;
+        context.mount(AgentTasksPlugin)?;
         Ok(())
     }
 }
@@ -294,7 +293,7 @@ impl Plugin for CodeIndexPlugin {
     }
 }
 
-pub struct AgentTasksPlugin(pub Client);
+pub struct AgentTasksPlugin;
 
 impl Plugin for AgentTasksPlugin {
     fn id(&self) -> &'static str {
@@ -323,7 +322,6 @@ impl Plugin for AgentTasksPlugin {
         context.effect(move || dispose_cancel.cancel());
         let mut state = AgentServiceState {
             workspace,
-            client: self.0.clone(),
             model_client: crate::model_transport::client()?,
             provider_url: String::new(),
             api_key: String::new(),
@@ -334,16 +332,8 @@ impl Plugin for AgentTasksPlugin {
             reasoning_effort: None,
             fast_mode: false,
             permission_mode: crate::agent_service::PermissionMode::default(),
-
-            observer_enabled: false,
-            observer_provider: String::new(),
-            observer_provider_url: String::new(),
-            observer_api_key: String::new(),
-            observer_model: String::new(),
-            observer_inherits_model: true,
             visual: Default::default(),
             visual_tool_settings: Default::default(),
-            context_agent_settings: Default::default(),
             delegate_agent_settings: Default::default(),
             config: Some(settings.config.clone()),
             config_path: Some(settings.path.clone()),

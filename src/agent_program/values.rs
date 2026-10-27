@@ -44,7 +44,9 @@ pub(super) fn text(v: &Value) -> Result<String> {
         Value::String(s) => s.clone(),
         Value::Null | Value::Bool(_) | Value::Number(_) => v.to_string(),
         _ => {
-            bail!("template/join values must be JSON primitives; use JSON.stringify for containers")
+            bail!(
+                "string concatenation/template/join values must be JSON primitives; use JSON.stringify for containers"
+            )
         }
     })
 }
@@ -117,10 +119,11 @@ pub(super) fn binary(op: &str, a: Value, b: Value) -> Result<Value> {
             _ => !ordering.is_lt(),
         }));
     }
-    if op == "+"
-        && let (Value::String(a), Value::String(b)) = (&a, &b)
-    {
-        return Ok(json!(format!("{a}{b}")));
+    // A string operand selects concatenation, as in ordinary flow source.
+    // Convert JSON primitives directly, preserving 64-bit integer text rather
+    // than passing through f64. Containers still require JSON.stringify.
+    if op == "+" && (a.is_string() || b.is_string()) {
+        return Ok(json!(format!("{}{}", text(&a)?, text(&b)?)));
     }
     if op != "/"
         && let (Some(a), Some(b)) = (integer(&a), integer(&b))

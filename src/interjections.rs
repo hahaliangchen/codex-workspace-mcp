@@ -28,11 +28,25 @@ pub fn submit(root: &std::path::Path, task: &str, text: &str) -> Result<i64> {
     schema(&conn)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let status: String = tx
-        .query_row("SELECT status FROM agent_tasks WHERE id=?1", [task], |r| r.get(0))
+        .query_row("SELECT status FROM agent_tasks WHERE id=?1", [task], |r| {
+            r.get(0)
+        })
         .context("会话不存在")?;
-    ensure!(matches!(status.as_str(), "running"), "NOT_RUNNING: 任务已结束，请直接发送消息");
-    let seq = agent_service::append_event_tx(&tx, task, "user/interjection", &json!({"text":text}), Some("append"))?;
-    tx.execute("INSERT INTO agent_interjections(task_id,seq,text) VALUES (?1,?2,?3)", params![task, seq, text])?;
+    ensure!(
+        matches!(status.as_str(), "running"),
+        "NOT_RUNNING: 任务已结束，请直接发送消息"
+    );
+    let seq = agent_service::append_event_tx(
+        &tx,
+        task,
+        "user/interjection",
+        &json!({"text":text}),
+        Some("append"),
+    )?;
+    tx.execute(
+        "INSERT INTO agent_interjections(task_id,seq,text) VALUES (?1,?2,?3)",
+        params![task, seq, text],
+    )?;
     tx.commit()?;
     Ok(seq)
 }
@@ -56,8 +70,17 @@ pub fn take(tx: &Transaction, task: &str) -> Result<Vec<Value>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut messages = Vec::new();
     for (seq, text) in rows {
-        tx.execute("UPDATE agent_interjections SET delivered=1 WHERE task_id=?1 AND seq=?2", params![task, seq])?;
-        agent_service::append_event_tx(tx, task, "user/interjection_delivered", &json!({"interjection_seq":seq}), Some("append"))?;
+        tx.execute(
+            "UPDATE agent_interjections SET delivered=1 WHERE task_id=?1 AND seq=?2",
+            params![task, seq],
+        )?;
+        agent_service::append_event_tx(
+            tx,
+            task,
+            "user/interjection_delivered",
+            &json!({"interjection_seq":seq}),
+            Some("append"),
+        )?;
         messages.push(json!({"role":"user","name":"user_interjection",
             "content":format!("[The user added this while you were working. Treat it as a correction or addition to the current task and adjust your next steps accordingly.]\n{text}"),
             "source":{"seq":seq,"history_reference":{"task_id":task,"event_seq":seq}}}));
@@ -76,7 +99,11 @@ pub async fn post(
 ) -> Response {
     match submit(state.workspace.root(), &task, &input.text) {
         Ok(seq) => Json(json!({"seq":seq})).into_response(),
-        Err(error) => (StatusCode::CONFLICT, Json(json!({"error":error.to_string()}))).into_response(),
+        Err(error) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -86,25 +113,41 @@ mod tests {
 
     #[test]
     fn interjections_require_a_running_task_and_are_delivered_once() {
-        let root = std::env::temp_dir().join(format!("interjections-{}", agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("interjections-{}", agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         let conn = agent_service::open_db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('t','','fake','completed',0,0)", []).unwrap();
-        assert!(submit(&root, "t", "改用 B 方案").unwrap_err().to_string().contains("NOT_RUNNING"));
-        conn.execute("UPDATE agent_tasks SET status='running' WHERE id='t'", []).unwrap();
+        assert!(
+            submit(&root, "t", "改用 B 方案")
+                .unwrap_err()
+                .to_string()
+                .contains("NOT_RUNNING")
+        );
+        conn.execute("UPDATE agent_tasks SET status='running' WHERE id='t'", [])
+            .unwrap();
         assert!(submit(&root, "t", "  ").is_err());
         submit(&root, "t", "改用 B 方案").unwrap();
         submit(&root, "t", "别动测试").unwrap();
         assert!(pending(&conn, "t").unwrap());
         let mut conn = agent_service::open_db(&root).unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         let messages = take(&tx, "t").unwrap();
         tx.commit().unwrap();
         assert_eq!(messages.len(), 2);
-        assert!(messages[0]["content"].as_str().unwrap().ends_with("改用 B 方案"));
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("改用 B 方案")
+        );
         assert_eq!(messages[1]["name"], "user_interjection");
         assert!(!pending(&conn, "t").unwrap());
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         assert!(take(&tx, "t").unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }

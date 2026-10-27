@@ -37,7 +37,10 @@ pub fn tool_call_node(conn: &Connection, task: &str, call_id: &str) -> Result<Op
         "SELECT DISTINCT node_id FROM agent_task_events WHERE task_id=?1 AND ((kind='tool/call' AND json_extract(data,'$.callId')=?2) OR (kind='subagent/event' AND json_extract(data,'$.event_type')='tool/call' AND json_extract(data,'$.event.callId')=?2)) LIMIT 2",
     )?.query_map(params![task,call_id], |r| r.get::<_,Option<String>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    ensure!(owners.len() <= 1, "ASYNC_JOB_OWNER_AMBIGUOUS: legacy call {call_id} belongs to multiple steps; resubmit the background task explicitly");
+    ensure!(
+        owners.len() <= 1,
+        "ASYNC_JOB_OWNER_AMBIGUOUS: legacy call {call_id} belongs to multiple steps; resubmit the background task explicitly"
+    );
     Ok(owners.into_iter().next().flatten())
 }
 
@@ -52,9 +55,9 @@ pub fn load_events(
         "SELECT seq,timestamp,kind,data,surface_op FROM agent_task_events WHERE task_id=?1"
             .to_owned();
     let mut args = vec![SqlValue::Text(task.to_owned())];
-    if let Some(node)=query.node_id {
+    if let Some(node) = query.node_id {
         args.push(SqlValue::Text(node.to_owned()));
-        let slot=args.len();
+        let slot = args.len();
         sql.push_str(&format!(" AND (COALESCE(node_id,'n0')=?{slot}"));
         if query.include_descendants {
             sql.push_str(&format!(" OR COALESCE(node_id,'n0') IN (WITH RECURSIVE descendants(id) AS (SELECT ?{slot} UNION SELECT n.node_id FROM agent_task_nodes n JOIN descendants d ON n.parent_id=d.id WHERE n.task_id=?1) SELECT id FROM descendants)"));
@@ -115,39 +118,13 @@ pub fn load_events(
 }
 
 /// Freeze a numeric history boundary and the original user record references.
-pub fn requirement_snapshot(conn: &Connection, task: &str) -> Result<(i64, Vec<i64>)> {
-    let through = load_events(
-        conn,
-        task,
-        &EventQuery {
-            newest: Some(1),
-            ..Default::default()
-        },
-    )?
-    .last()
-    .map(|event| event.seq)
-    .unwrap_or(-1);
-    let requirements = load_events(
-        conn,
-        task,
-        &EventQuery {
-            through: Some(through),
-            kinds: &["user/message"],
-            ..Default::default()
-        },
-    )?
-    .into_iter()
-    .map(|event| event.seq)
-    .collect();
-    Ok((through, requirements))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn compression_has_no_private_history_query() {
-        let source = include_str!("../single_agent.rs").replace("\r\n","\n");
+        let source = include_str!("../single_agent.rs").replace("\r\n", "\n");
         let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(
             !production.contains("FROM agent_task_events"),
@@ -187,7 +164,6 @@ mod tests {
             newest.iter().map(|e| e.seq).collect::<Vec<_>>(),
             vec![9, 12]
         );
-        assert_eq!(requirement_snapshot(&conn, "a").unwrap(), (12, vec![9]));
         assert_eq!(
             load_events(
                 &conn,
@@ -246,17 +222,11 @@ pub(super) fn search_events(
     let target = args["task_id"].as_str().unwrap_or(task);
     let role = args["role"].as_str().unwrap_or("all");
     ensure!(
-        matches!(
-            role,
-            "all"
-                | "user"
-                | "agent"
-                | "context_agent"
-                | "worker"
-                | "organizer"
-                | "observer"
-                | "tool"
-        ),
+        role.len() <= 64
+            && !role.is_empty()
+            && role
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.')),
         "invalid history role"
     );
     let query = args["query"].as_str().unwrap_or("").trim().to_lowercase();

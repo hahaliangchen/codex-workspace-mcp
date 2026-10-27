@@ -168,16 +168,16 @@ mod tests {
     use crate::plugin_runtime::{PluginRuntime, ROOT};
     #[tokio::test]
     async fn plugin_policy_filters_models_and_blocks_explicit_bypasses_for_all_task_uses() {
-        let config:crate::ai_proxy::AiProxyConfig=serde_json::from_value(serde_json::json!({
+        let config: crate::ai_proxy::AiProxyConfig = serde_json::from_value(serde_json::json!({
             "orchestrator_provider":"gpt","orchestrator_model":"main",
-            "visual_tool":{"model":"vision"},"context_agent":{"model":"vision","context_window":500000},
-            "observer_provider":"gpt","observer_model":"vision",
+            "visual_tool":{"model":"vision"},
             "providers":{
                 "gpt":{"url":"http://gpt/v1","model_map":{"main":"main","vision":"vision"}},
                 "qwen":{"url":"http://qwen/v1","model_map":{"local":"local","other":"other"}}
             },
             "plugin_models":{"code-flow":[{"provider":"qwen","model":"local"}],"denied":[]}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(
             crate::ai_proxy::plugin_catalog_view(&config, "unconfigured")["models"]
                 .as_array()
@@ -252,12 +252,11 @@ mod tests {
         assert_eq!(explicit.reasoning_effort.as_deref(), Some("medium"));
 
         assert!(!scoped.provider_routes.contains_key("gpt"));
-        for role in [&scoped.visual_tool_settings, &scoped.context_agent_settings] {
+        for role in [&scoped.visual_tool_settings] {
             let resolved = role.resolve(&scoped, "local").unwrap();
             assert_eq!(resolved.provider_name, "qwen");
             assert_eq!(resolved.default_model, "local");
         }
-        assert!(scoped.observer_inherits_model);
         let mut forbidden = serde_json::from_value(
             serde_json::json!({"prompt":"continue","provider":"gpt","model":"main"}),
         )

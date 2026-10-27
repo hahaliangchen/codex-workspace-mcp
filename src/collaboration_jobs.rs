@@ -18,10 +18,16 @@ static RUNNING: OnceLock<Mutex<BTreeMap<String, (PathBuf, String, CancellationTo
     OnceLock::new();
 static INSTANCE: OnceLock<String> = OnceLock::new();
 static CHANGED: Notify = Notify::const_new();
-fn instance() -> &'static str { INSTANCE.get_or_init(agent_service::uuid_like) }
+fn instance() -> &'static str {
+    INSTANCE.get_or_init(agent_service::uuid_like)
+}
 #[cfg(test)]
-pub(crate) fn test_instance() -> &'static str { instance() }
-fn now_ms() -> i64 { chrono::Utc::now().timestamp_millis() }
+pub(crate) fn test_instance() -> &'static str {
+    instance()
+}
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
 fn running() -> &'static Mutex<BTreeMap<String, (PathBuf, String, CancellationToken)>> {
     RUNNING.get_or_init(Default::default)
 }
@@ -35,12 +41,16 @@ pub fn db(root: &Path) -> Result<rusqlite::Connection> {
       UNIQUE(task_id,call_id));
       CREATE INDEX IF NOT EXISTS idx_delegates_parent ON agent_delegates(task_id,status);",
     )?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_delegate_executors(
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_delegate_executors(
       agent_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, lease_until INTEGER NOT NULL,
-      cancel_requested INTEGER NOT NULL DEFAULT 0); ")?;
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_resource_claims(
+      cancel_requested INTEGER NOT NULL DEFAULT 0); ",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_resource_claims(
       resource TEXT PRIMARY KEY, task_id TEXT NOT NULL, owner TEXT NOT NULL,
-      owner_agent TEXT, expires_at INTEGER NOT NULL); ")?;
+      owner_agent TEXT, expires_at INTEGER NOT NULL); ",
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_delegate_assets(
       task_id TEXT NOT NULL, agent_id TEXT NOT NULL, asset_id TEXT NOT NULL,
@@ -105,18 +115,6 @@ fn function(name: &str, description: &str, properties: Value, required: Value) -
 pub fn tools() -> Vec<Value> {
     vec![
         function(
-            "spawn_agent",
-            "Inside execute_program use ordinary fork(helper,args); generator/yield and call() wrappers are rejected. This native tool runs one child function on another Agent and immediately returns its agent_id handle. The child inherits the caller's prepared tool groups, skills and saved parent-scope values, within context capacity, plus this assignment's inputs. Supply only its goal, parameters, owned resources and expected return; do not repeat shared setup or the whole plan. Local working context stays in the child. At most five children run per conversation; child Agents cannot fork again. Use join_agents when the caller needs these returns. Existing permissions, plugin boundaries and Git isolation still apply. A returned function is not proof that its artifacts pass acceptance.",
-            json!({"name":{"type":"string","maxLength":120},"task":{"type":"string","maxLength":24000},"context":{"type":"string","maxLength":48000},"inputs":{"type":"object","description":"Additional assets, pinned materials, node returns, history events and tool_groups. Parent tool groups and saved scope values are inherited even when omitted."},"asset_ids":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":200},"description":"Explicit argument handles; complete bodies are supplied when they fit, otherwise references allow paging."}}),
-            json!(["name", "task"]),
-        ),
-        function(
-            "join_agents",
-            "Inside execute_program use ordinary join(handles); generator/yield and call() wrappers are rejected. This native API suspends this caller until ALL specified fork handles have returned, including failed or cancelled children. Call alone. The host waits without repeated model calls; child completions are delivered with concise return values and saved detail handles. This does not accept results or replay child actions. Inspect the returned artifacts and integrate once before final delivery. Use wait_agents only if an intermediate status is specifically needed.",
-            json!({"agent_ids":{"type":"array","minItems":1,"maxItems":LIMIT,"uniqueItems":true,"items":{"type":"string","minLength":1}}}),
-            json!(["agent_ids"]),
-        ),
-        function(
             "wait_agents",
             "Inspect task-agent status; optionally wait up to 30 seconds when no independent work remains. Finished status and report/asset-index references are delivered automatically before the next main-agent request, in durable completion order. Read bodies only as needed.",
             json!({"wait_ms":{"type":"integer","minimum":0,"maximum":30000}}),
@@ -124,14 +122,22 @@ pub fn tools() -> Vec<Value> {
         ),
         function(
             "review_agent_result",
-            "Record the MAIN agent's acceptance. For accepted, cite successful main-agent tool/result event_seq values in evidence_refs; Git delegates must have an inspected diff and completed merge. The host verifies cited receipts, branch head and merge ancestry. Describe remaining issues for needs_work or unresolved. Every terminal delegate must be reviewed before final delivery.",
+            "Record the MAIN agent's acceptance. For accepted, cite successful main-agent tool/result event_seq values from task_asset_index delivery_reference in evidence_refs; Git delegates must have an inspected diff and completed merge. The host verifies cited receipts, branch head and merge ancestry. Describe remaining issues for needs_work or unresolved. Record this when the workflow requests an explicit review; function return and business acceptance remain separate.",
             json!({"agent_id":{"type":"string"},"decision":{"type":"string","enum":["accepted","needs_work","unresolved"]},"evidence":{"type":"string","minLength":1,"maxLength":12000},"evidence_refs":{"type":"array","items":{"type":"integer"},"maxItems":64},"git_head":{"type":"string"}}),
             json!(["agent_id", "decision", "evidence"]),
         ),
-        function("inspect_agent_changes", "Inspect a completed Git delegate's branch diff against its starting commit. Use its returned head in merge_agent_result and review_agent_result.",
-            json!({"agent_id":{"type":"string"}}),json!(["agent_id"])),
-        function("merge_agent_result", "Merge a completed Git delegate branch into the main checkout after inspecting its diff. A conflict leaves the main checkout for explicit resolution; complete or abort the merge before review.",
-            json!({"agent_id":{"type":"string"},"expected_head":{"type":"string"}}),json!(["agent_id","expected_head"])),
+        function(
+            "inspect_agent_changes",
+            "Inspect a completed Git delegate's branch diff against its starting commit. A fork handle with workspace.integration_required=true writes only in its isolated worktree; join waits and returns function values, it does not copy files or merge. Inspect this diff and use its head in merge_agent_result before reading the delegate's paths in the main checkout. Check changes against the assignment; inspection alone is not business acceptance.",
+            json!({"agent_id":{"type":"string"}}),
+            json!(["agent_id"]),
+        ),
+        function(
+            "merge_agent_result",
+            "Merge a completed Git delegate branch into the main checkout after inspecting its diff. A conflict leaves the main checkout for explicit resolution; complete or abort the merge before review.",
+            json!({"agent_id":{"type":"string"},"expected_head":{"type":"string"}}),
+            json!(["agent_id", "expected_head"]),
+        ),
         function(
             "cancel_agent",
             "Cancel one of this conversation's task agents. Already executed actions are not undone. Collect and review its outcome before final delivery.",
@@ -145,14 +151,21 @@ pub fn is_tool(name: &str) -> bool {
         name,
         "spawn_agent"
             | "join_agents"
-            | "wait_agents" | "review_agent_result" | "cancel_agent" | "inspect_agent_changes" | "merge_agent_result"
+            | "wait_agents"
+            | "review_agent_result"
+            | "cancel_agent"
+            | "inspect_agent_changes"
+            | "merge_agent_result"
     )
 }
 pub fn ensure_active(root: &Path, task: &str, id: &str) -> Result<()> {
     let active: bool = db(root)?.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_delegates d JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.id=?2 AND d.status='running' AND e.owner_id=?3 AND e.cancel_requested=0)",
         params![task,id,instance()],|r|r.get(0))?;
-    ensure!(active,"DELEGATE_EXECUTOR_FENCED: delegate is no longer owned by this host");
+    ensure!(
+        active,
+        "DELEGATE_EXECUTOR_FENCED: delegate is no longer owned by this host"
+    );
     Ok(())
 }
 pub struct ResourceClaim {
@@ -164,42 +177,73 @@ pub struct ResourceClaim {
 impl Drop for ResourceClaim {
     fn drop(&mut self) {
         if self.release_on_drop {
-            if let Ok(conn)=db(&self.root) {
-                let _=conn.execute("DELETE FROM agent_resource_claims WHERE resource=?1 AND owner=?2",
-                    params![self.resource,self.owner]);
+            if let Ok(conn) = db(&self.root) {
+                let _ = conn.execute(
+                    "DELETE FROM agent_resource_claims WHERE resource=?1 AND owner=?2",
+                    params![self.resource, self.owner],
+                );
             }
         }
     }
 }
 pub fn resource_key(workspace: &Path, name: &str, args: &Value) -> Result<Option<String>> {
-    if matches!(name,"write_file"|"edit_file"|"replace_range") {
-        let path=args["path"].as_str().context("write path required")?;
-        return Ok(Some(format!("local:{}",crate::file_edit::workspace_path(workspace,path)?.display())));
+    if matches!(name, "write_file" | "edit_file" | "replace_range") {
+        let path = args["path"].as_str().context("write path required")?;
+        return Ok(Some(format!(
+            "local:{}",
+            crate::file_edit::workspace_path(workspace, path)?.display()
+        )));
     }
     Ok(None)
 }
-pub fn claim_resource(root: &Path, task: &str, agent: Option<&str>, call_id: &str, resource: String) -> Result<ResourceClaim> {
-    let owner=agent.map(|id|format!("delegate:{id}")).unwrap_or_else(||format!("main:{task}:{call_id}"));
-    let mut conn=db(root)?;
-    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let previous=tx.query_row("SELECT owner,owner_agent,expires_at FROM agent_resource_claims WHERE resource=?1",[&resource],
-        |r| {
-                Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,i64>(2)?))
+pub fn claim_resource(
+    root: &Path,
+    task: &str,
+    agent: Option<&str>,
+    call_id: &str,
+    resource: String,
+) -> Result<ResourceClaim> {
+    let owner = agent
+        .map(|id| format!("delegate:{id}"))
+        .unwrap_or_else(|| format!("main:{task}:{call_id}"));
+    let mut conn = db(root)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let previous = tx
+        .query_row(
+            "SELECT owner,owner_agent,expires_at FROM agent_resource_claims WHERE resource=?1",
+            [&resource],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             },
-        ).optional()?;
-    if let Some((other,other_agent,expiry))=previous {
-        if other!=owner {
-            let active=if let Some(id)=other_agent {
+        )
+        .optional()?;
+    if let Some((other, other_agent, expiry)) = previous {
+        if other != owner {
+            let active = if let Some(id) = other_agent {
                 tx.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates d JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.id=?1 AND d.status='running' AND e.lease_until>?2)",
                     params![id,now_ms()],|r|r.get::<_,bool>(0))?
-            } else {expiry>now_ms()};
-            ensure!(!active,"RESOURCE_WRITE_OWNERSHIP_CONFLICT: {resource} is owned by {other}");
+            } else {
+                expiry > now_ms()
+            };
+            ensure!(
+                !active,
+                "RESOURCE_WRITE_OWNERSHIP_CONFLICT: {resource} is owned by {other}"
+            );
         }
     }
     tx.execute("INSERT INTO agent_resource_claims(resource,task_id,owner,owner_agent,expires_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(resource) DO UPDATE SET task_id=excluded.task_id,owner=excluded.owner,owner_agent=excluded.owner_agent,expires_at=excluded.expires_at",
         params![resource,task,owner,agent,now_ms()+30*60*1000])?;
     tx.commit()?;
-    Ok(ResourceClaim{root:root.to_path_buf(),resource,owner,release_on_drop:agent.is_none()})
+    Ok(ResourceClaim {
+        root: root.to_path_buf(),
+        resource,
+        owner,
+        release_on_drop: agent.is_none(),
+    })
 }
 pub fn specification(root: &Path, task: &str, id: &str) -> Result<Value> {
     let raw: String = db(root)?.query_row(
@@ -216,6 +260,32 @@ impl Drop for Guard {
         CHANGED.notify_waiters();
     }
 }
+/// A saved fork reservation is the authority after restart; do not create
+/// another task node or worktree before checking the original call id.
+pub fn submitted_handle(root: &Path, task: &str, call: &str) -> Result<Option<Value>> {
+    let id: Option<String> = db(root)?
+        .query_row(
+            "SELECT id FROM agent_delegates WHERE task_id=?1 AND call_id=?2",
+            params![task, call],
+            |r| r.get(0),
+        )
+        .optional()?;
+    id.map(|id| agent_handle(root, task, &id)).transpose()
+}
+
+/// A control handle describes where effects occur; it never wraps the function's
+/// business return. Rebuild from the durable assignment on submission or recovery.
+pub fn agent_handle(root: &Path, task: &str, id: &str) -> Result<Value> {
+    let spec = specification(root, task, id)?;
+    let workspace = if let Some(path) = spec["git"]["worktree"].as_str() {
+        json!({"mode":"git_worktree","path":path,"repository":spec["git"]["repository"],
+            "branch":spec["git"]["branch"],"integration_required":true})
+    } else {
+        json!({"mode":"shared","path":crate::session_browser::task_workspace(root,task)?,"integration_required":false})
+    };
+    Ok(json!({"agent_id":id,"workspace":workspace}))
+}
+
 pub fn submit(
     state: &AgentServiceState,
     task: &str,
@@ -244,23 +314,6 @@ pub fn submit(
             .filter(|s| s.chars().count() <= 48000)
             .context("context must be a string (up to 48000 characters)")?,
     };
-    let asset_ids = match args.get("asset_ids") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(value) => {
-            let items = value.as_array().context("asset_ids must be an array")?;
-            ensure!(items.len() <= 64, "asset_ids supports at most 64 entries");
-            items
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .filter(|id| !id.is_empty() && id.chars().count() <= 200)
-                        .map(str::to_owned)
-                        .context("asset_ids entries must be non-empty strings up to 200 characters")
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
     reap(state.workspace.root(), task)?;
     let mut conn = db(state.workspace.root())?;
     // Hold the executor registry lock until the durable reservation is registered.
@@ -274,7 +327,8 @@ pub fn submit(
         )
         .optional()?
     {
-        return Ok(json!({"agent_id":id,"status":"already_submitted"}));
+        drop(tx);
+        return agent_handle(state.workspace.root(), task, &id);
     }
     let active: usize = tx.query_row(
         "SELECT count(*) FROM agent_delegates WHERE task_id=?1 AND status='running'",
@@ -286,29 +340,38 @@ pub fn submit(
         "AGENT_CONCURRENCY_LIMIT: five delegates are already running; collect results before dispatching more"
     );
     let id = agent_service::uuid_like();
-    let git = if crate::plugin_sessions::owner(state.workspace.root(),task)?.is_none()
-        && !ban_execution && !matches!(state.permission_mode, agent_service::PermissionMode::ReadOnly) {
+    let git = if crate::plugin_sessions::owner(state.workspace.root(), task)?.is_none()
+        && !ban_execution
+        && !matches!(
+            state.permission_mode,
+            agent_service::PermissionMode::ReadOnly
+        ) {
         // Branch from the project this task works in, not the server's checkout.
-        crate::delegate_git::prepare(&crate::session_browser::task_workspace(state.workspace.root(), task)?, &id)?
-    } else { None };
-    let (through, requirements) = crate::session_history::requirement_snapshot(&tx, task)?;
-    let mut spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"history_through_seq":through,"requirement_event_seqs":requirements,"priority_asset_ids":asset_ids,"delegation_projection":shared_context["delegation_projection"].as_bool().unwrap_or(false),"delegation_source_tokens":shared_context["delegation_source_tokens"].clone(),"delegation_projected_tokens":shared_context["delegation_projected_tokens"].clone(),"delegation_fork_limit":shared_context["delegation_fork_limit"].clone(),"git":git,"authority":"delegated_task_not_a_human_message"});
-    spec["caller_task_node_id"]=shared_context["caller_task_node_id"].clone();
-    spec["program_function"] = json!(shared_context["program"].is_object());
-    if let Some(node)=shared_context.get("task_node") {
-        let mut node:crate::task_tree::Node=serde_json::from_value(node.clone())?;
-        let saved=crate::task_tree::get(&tx,task,&node.node_id)?;
-        ensure!(saved.status=="pending" && saved.executor=="delegate","delegate node is no longer pending");
-        node.agent_id=Some(id.clone());node.status="running".into();
-        spec["task_node_id"]=json!(node.node_id);
-        crate::task_tree::emit(&tx,task,"task/node_started",&mut node,turn)?;
+        crate::delegate_git::prepare(
+            &crate::session_browser::task_workspace(state.workspace.root(), task)?,
+            &id,
+        )?
+    } else {
+        None
+    };
+    let mut spec = json!({"agent_id":id,"name":name,"task":objective,"context":context,"parent_task_id":task,"parent_node_id":node,"git":git,"authority":"delegated_task_not_a_human_message","caller_task_node_id":shared_context["caller_task_node_id"]});
+    if let Some(node) = shared_context.get("task_node") {
+        let mut node: crate::task_tree::Node = serde_json::from_value(node.clone())?;
+        let saved = crate::task_tree::get(&tx, task, &node.node_id)?;
+        ensure!(
+            saved.status == "pending" && saved.executor == "delegate",
+            "delegate node is no longer pending"
+        );
+        node.agent_id = Some(id.clone());
+        node.status = "running".into();
+        spec["task_node_id"] = json!(node.node_id);
+        crate::task_tree::emit(&tx, task, "task/node_started", &mut node, turn)?;
     }
     tx.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,'running',?7)",params![id,task,turn,call,name,spec.to_string(),chrono::Utc::now().timestamp_millis()])?;
-    tx.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,?2,?3)",
-        params![id,instance(),now_ms()+LEASE_MS])?;
-    if let Some(assets) = shared_context.get("delegation_assets") {
-        remember_assets(&tx, task, &id, assets)?;
-    }
+    tx.execute(
+        "INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,?2,?3)",
+        params![id, instance(), now_ms() + LEASE_MS],
+    )?;
     agent_service::append_event_tx(
         &tx,
         task,
@@ -317,6 +380,8 @@ pub fn submit(
         Some("append"),
     )?;
     tx.commit()?;
+    let mut handle = agent_handle(state.workspace.root(), task, &id)?;
+    handle["status"] = json!("accepted");
     let child = cancel.child_token();
     executors.insert(
         id.clone(),
@@ -379,7 +444,9 @@ pub fn submit(
                 Ok(None) => {}
                 Err(error) => {
                     result["status"] = json!("failed");
-                    result["error"] = json!(format!("could not snapshot delegate Git changes: {error:#}"));
+                    result["error"] = json!(format!(
+                        "could not snapshot delegate Git changes: {error:#}"
+                    ));
                 }
             }
         }
@@ -390,8 +457,10 @@ pub fn submit(
             let updated = tx.execute(
                 "UPDATE agent_delegates SET status=?3,result=?4 WHERE id=?1 AND status='running' AND EXISTS (SELECT 1 FROM agent_delegate_executors WHERE agent_id=?1 AND owner_id=?2)",
                 params![job,instance(),result["status"].as_str().unwrap_or("failed"),result.to_string()])?;
-            if updated == 0 { return Ok(()); }
-            crate::task_tree::finish_delegate(&tx,&task,&job,&result,turn)?;
+            if updated == 0 {
+                return Ok(());
+            }
+            crate::task_tree::finish_delegate(&tx, &task, &job, &result, turn)?;
             let seq = agent_service::append_event_tx(
                 &tx,
                 &task,
@@ -399,8 +468,14 @@ pub fn submit(
                 &json!({"agent_id":job,"turn":turn,"result":result,"status":result["status"]}),
                 Some("append"),
             )?;
-            tx.execute("UPDATE agent_delegates SET end_seq=?2 WHERE id=?1",params![job,seq])?;
-            tx.execute("DELETE FROM agent_resource_claims WHERE owner_agent=?1",[&job])?;
+            tx.execute(
+                "UPDATE agent_delegates SET end_seq=?2 WHERE id=?1",
+                params![job, seq],
+            )?;
+            tx.execute(
+                "DELETE FROM agent_resource_claims WHERE owner_agent=?1",
+                [&job],
+            )?;
             discard_working_context(&tx, &task, &job)?;
             tx.commit()?;
             Ok(())
@@ -409,9 +484,7 @@ pub fn submit(
             tracing::error!(agent_id=%job,error=%error,"could not persist delegate completion; restart recovery must treat its outcome as unresolved");
         }
     });
-    Ok(
-        json!({"status":"accepted","agent_id":id,"name":name,"message":"Delegate started. Continue independent work; collect results, verify artifacts and review before final delivery."}),
-    )
+    Ok(handle)
 }
 fn reap(root: &Path, task: &str) -> Result<()> {
     // Same lock order as submit; never mistake an unregistered reservation for a crash.
@@ -425,9 +498,13 @@ fn reap(root: &Path, task: &str) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let orphaned = |id: &String, owner: &Option<String>, lease: &Option<i64>| {
         let local = owner.as_deref() == Some(instance());
-        (local && !executors.contains_key(id)) || (!local && lease.is_none_or(|until| until < now_ms()))
+        (local && !executors.contains_key(id))
+            || (!local && lease.is_none_or(|until| until < now_ms()))
     };
-    if !ids.iter().any(|(id, owner, lease)| orphaned(id, owner, lease)) {
+    if !ids
+        .iter()
+        .any(|(id, owner, lease)| orphaned(id, owner, lease))
+    {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -437,13 +514,15 @@ fn reap(root: &Path, task: &str) -> Result<()> {
         let current = tx.query_row(
             "SELECT e.owner_id,e.lease_until FROM agent_delegates d LEFT JOIN agent_delegate_executors e ON e.agent_id=d.id WHERE d.task_id=?1 AND d.id=?2 AND d.status='running'",
             params![task,id], |r| Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<i64>>(1)?))).optional()?;
-        if let Some((owner, lease)) = current && orphaned(&id, &owner, &lease) {
+        if let Some((owner, lease)) = current
+            && orphaned(&id, &owner, &lease)
+        {
             let result = json!({"status":"interrupted","error":"No live executor after restart. Inspect saved artifacts; the host did not replay the task.","artifact_index":artifact_index(&tx,task,&id)?});
             tx.execute(
                 "UPDATE agent_delegates SET status='interrupted',result=?2 WHERE id=?1",
                 params![id, result.to_string()],
             )?;
-            crate::task_tree::finish_delegate(&tx,task,&id,&result,0)?;
+            crate::task_tree::finish_delegate(&tx, task, &id, &result, 0)?;
             let seq = agent_service::append_event_tx(
                 &tx,
                 task,
@@ -455,7 +534,10 @@ fn reap(root: &Path, task: &str) -> Result<()> {
                 "UPDATE agent_delegates SET end_seq=?2 WHERE id=?1",
                 params![id, seq],
             )?;
-            tx.execute("DELETE FROM agent_resource_claims WHERE owner_agent=?1",[&id])?;
+            tx.execute(
+                "DELETE FROM agent_resource_claims WHERE owner_agent=?1",
+                [&id],
+            )?;
             discard_working_context(&tx, task, &id)?;
         }
     }
@@ -465,8 +547,8 @@ fn reap(root: &Path, task: &str) -> Result<()> {
 pub fn statuses(root: &Path, task: &str) -> Result<Value> {
     reap(root, task)?;
     let conn = db(root)?;
-    let mut stmt=conn.prepare("SELECT id,name,status,delivered,review,COALESCE(json_extract(specification,'$.program_function'),0) FROM agent_delegates WHERE task_id=?1 ORDER BY created_at,rowid")?;
-    Ok(json!(stmt.query_map([task],|r|Ok(json!({"agent_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"delivered":r.get::<_,bool>(3)?,"program_function":r.get::<_,bool>(5)?,"review":r.get::<_,Option<String>>(4)?.map(|s|serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))})))?.collect::<rusqlite::Result<Vec<_>>>()?))
+    let mut stmt=conn.prepare("SELECT id,name,status,delivered,review FROM agent_delegates WHERE task_id=?1 ORDER BY created_at,rowid")?;
+    Ok(json!(stmt.query_map([task],|r|Ok(json!({"agent_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"status":r.get::<_,String>(2)?,"delivered":r.get::<_,bool>(3)?,"review":r.get::<_,Option<String>>(4)?.map(|s|serde_json::from_str::<Value>(&s).unwrap_or(Value::Null))})))?.collect::<rusqlite::Result<Vec<_>>>()?))
 }
 pub fn ready(root: &Path, task: &str) -> Result<Vec<Value>> {
     reap(root, task)?;
@@ -474,13 +556,9 @@ pub fn ready(root: &Path, task: &str) -> Result<Vec<Value>> {
     let mut stmt=conn.prepare("SELECT id,name,result,end_seq FROM agent_delegates WHERE task_id=?1 AND status!='running' AND delivered=0 ORDER BY end_seq")?;
     Ok(stmt.query_map([task],|r|Ok(json!({"agent_id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"result":serde_json::from_str::<Value>(&r.get::<_,String>(2)?).unwrap_or(Value::Null),"end_seq":r.get::<_,i64>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
-pub fn outstanding(root: &Path, task: &str) -> Result<bool> {
-    reap(root, task)?;
-    Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0 OR (review IS NULL AND COALESCE(json_extract(specification,'$.program_function'),0)=0)))",[task],|r|r.get(0))?)
-}
 /// Only work submitted by this task may delay or receive its completion.
 pub fn outstanding_for(root: &Path, task: &str, owner: &str) -> Result<bool> {
-    reap(root,task)?;
+    reap(root, task)?;
     Ok(db(root)?.query_row("SELECT EXISTS(SELECT 1 FROM agent_delegates WHERE task_id=?1 AND (status='running' OR delivered=0) AND (json_extract(specification,'$.caller_task_node_id')=?2 OR json_extract(specification,'$.caller_task_node_id') IS NULL))",params![task,owner],|r|r.get(0))?)
 }
 
@@ -566,47 +644,79 @@ pub async fn join(
 }
 fn terminal_git(root: &Path, task: &str, id: &str) -> Result<Value> {
     let conn = db(root)?;
-    let (status,result): (String,Option<String>) = conn.query_row(
-        "SELECT status,result FROM agent_delegates WHERE task_id=?1 AND id=?2",params![task,id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    let (status, result): (String, Option<String>) = conn.query_row(
+        "SELECT status,result FROM agent_delegates WHERE task_id=?1 AND id=?2",
+        params![task, id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     ensure!(status != "running", "delegate is still running");
-    let spec = specification(root,task,id)?;
+    let spec = specification(root, task, id)?;
     ensure!(spec["git"].is_object(), "delegate has no Git branch");
-    let recorded: Value=serde_json::from_str(result.as_deref().context("delegate result missing")?)?;
-    let head=recorded["git"]["head"].as_str().context("delegate Git snapshot missing")?;
-    ensure!(crate::delegate_git::diff(root,&spec)?["head"].as_str()==Some(head),
-        "delegate branch changed after its archived result");
+    let recorded: Value =
+        serde_json::from_str(result.as_deref().context("delegate result missing")?)?;
+    let head = recorded["git"]["head"]
+        .as_str()
+        .context("delegate Git snapshot missing")?;
+    ensure!(
+        crate::delegate_git::diff(root, &spec)?["head"].as_str() == Some(head),
+        "delegate branch changed after its archived result"
+    );
     Ok(spec)
 }
 pub fn inspect_changes(root: &Path, task: &str, id: &str) -> Result<Value> {
-    crate::delegate_git::diff(root,&terminal_git(root,task,id)?)
+    crate::delegate_git::diff(root, &terminal_git(root, task, id)?)
 }
 pub fn merge_result(root: &Path, task: &str, id: &str, head: &str) -> Result<Value> {
-    let spec = terminal_git(root,task,id)?;
-    ensure!(head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
-        "expected_head must be a reviewed Git commit");
+    let spec = terminal_git(root, task, id)?;
+    ensure!(
+        head.len() == 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected_head must be a reviewed Git commit"
+    );
     let inspected: bool = db(root)?.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_task_events c JOIN agent_task_events r ON r.task_id=c.task_id AND r.kind='tool/result' AND json_extract(r.data,'$.message.toolCallId')=json_extract(c.data,'$.callId') WHERE c.task_id=?1 AND c.kind='tool/call' AND json_extract(c.data,'$.name')='inspect_agent_changes' AND json_extract(json_extract(c.data,'$.arguments'),'$.agent_id')=?2 AND json_extract(r.data,'$.meta.result.head')=?3 AND json_extract(r.data,'$.message.isError')=0)",
         params![task,id,head],|r|r.get(0))?;
-    ensure!(inspected,"inspect the delegate branch diff before merging");
-    crate::delegate_git::merge(root,&spec,head)
+    ensure!(inspected, "inspect the delegate branch diff before merging");
+    crate::delegate_git::merge(root, &spec, head)
 }
-fn checked_receipt(tx: &rusqlite::Transaction<'_>, task: &str, seq: i64, after: i64) -> Result<(String,Value)> {
+fn checked_receipt(
+    tx: &rusqlite::Transaction<'_>,
+    task: &str,
+    seq: i64,
+    after: i64,
+) -> Result<(String, Value)> {
     ensure!(seq > after, "evidence event predates delegate completion");
-    let raw: String = tx.query_row("SELECT data FROM agent_task_events WHERE task_id=?1 AND seq=?2 AND kind='tool/result'",
-        params![task,seq],|r|r.get(0)).context("evidence_refs must cite main Agent tool results")?;
+    let raw: String = tx
+        .query_row(
+            "SELECT data FROM agent_task_events WHERE task_id=?1 AND seq=?2 AND kind='tool/result'",
+            params![task, seq],
+            |r| r.get(0),
+        )
+        .context("evidence_refs must cite main Agent tool results")?;
     let result: Value = serde_json::from_str(&raw)?;
-    ensure!(result["message"]["isError"] == false,"evidence receipt is a failed tool result");
-    let call_id = result["message"]["toolCallId"].as_str().context("evidence receipt has no call id")?;
+    ensure!(
+        result["message"]["isError"] == false,
+        "evidence receipt is a failed tool result"
+    );
+    let call_id = result["message"]["toolCallId"]
+        .as_str()
+        .context("evidence receipt has no call id")?;
     let name: String = tx.query_row("SELECT json_extract(data,'$.name') FROM agent_task_events WHERE task_id=?1 AND kind='tool/call' AND seq<?2 AND json_extract(data,'$.callId')=?3 ORDER BY seq DESC LIMIT 1",
         params![task,seq,call_id],|r|r.get(0)).context("evidence receipt has no main Agent tool call")?;
-    Ok((name,result["meta"]["result"].clone()))
+    Ok((name, result["meta"]["result"].clone()))
 }
 fn fresh_local_read(root: &Path, value: &Value) -> Result<bool> {
-    let Some(path) = value["path"].as_str() else { return Ok(false); };
-    let Some(hash) = value["code_hash"].as_str() else { return Ok(false); };
-    let path = crate::file_edit::workspace_path(root,path)?;
-    let current = match std::fs::read(path) { Ok(bytes)=>bytes, Err(_)=>return Ok(false) };
-    Ok(crate::symbol_description::content_hash(&current)==hash)
+    let Some(path) = value["path"].as_str() else {
+        return Ok(false);
+    };
+    let Some(hash) = value["code_hash"].as_str() else {
+        return Ok(false);
+    };
+    let path = crate::file_edit::workspace_path(root, path)?;
+    let current = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(false),
+    };
+    Ok(crate::symbol_description::content_hash(&current) == hash)
 }
 pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
     let id = args["agent_id"].as_str().context("agent_id required")?;
@@ -618,75 +728,124 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
         .as_str()
         .filter(|s| !s.trim().is_empty() && s.chars().count() <= 12000)
         .context("acceptance evidence or unresolved gaps required")?;
-    let spec = specification(root,task,id)?;
+    let spec = specification(root, task, id)?;
     // Delivered files live in the task's project; `root` only holds the store.
-    let files = crate::session_browser::task_workspace(root,task)?;
+    let files = crate::session_browser::task_workspace(root, task)?;
     let mut conn = db(root)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let refs = args["evidence_refs"].as_array().cloned().unwrap_or_default();
-    ensure!(refs.len() <= 64,"too many evidence_refs");
+    let refs = args["evidence_refs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    ensure!(refs.len() <= 64, "too many evidence_refs");
     let (end_seq,child_result): (i64,String) = tx.query_row("SELECT end_seq,result FROM agent_delegates WHERE task_id=?1 AND id=?2 AND status!='running' AND delivered=1",
         params![task,id],|r|Ok((r.get(0)?,r.get(1)?))).context("delegate unavailable: collect its terminal result before review")?;
-    let child_result: Value=serde_json::from_str(&child_result)?;
+    let child_result: Value = serde_json::from_str(&child_result)?;
     let mut receipts = Vec::new();
     for seq in &refs {
-        receipts.push(checked_receipt(&tx,task,seq.as_i64().context("evidence_refs must be event sequence numbers")?,end_seq)?);
+        receipts.push(checked_receipt(
+            &tx,
+            task,
+            seq.as_i64()
+                .context("evidence_refs must be event sequence numbers")?,
+            end_seq,
+        )?);
     }
     if decision == "accepted" {
-        ensure!(!receipts.is_empty(),"accepted review requires cited main Agent tool results");
+        ensure!(
+            !receipts.is_empty(),
+            "accepted review requires cited main Agent tool results"
+        );
         if spec["git"].is_object() {
-            let head = args["git_head"].as_str().context("accepted Git review requires git_head from inspected diff")?;
-            ensure!(child_result["git"]["head"].as_str()==Some(head),
-                "reviewed Git commit differs from the delegate's archived result");
-            ensure!(receipts.iter().any(|(name,value)| name=="inspect_agent_changes" && value["head"].as_str()==Some(head) && value["branch"]==spec["git"]["branch"]),
-                "accepted Git review must cite the inspected branch diff");
-            ensure!(receipts.iter().any(|(name,value)| name=="merge_agent_result" && value["merged_head"].as_str()==Some(head)),
-                "accepted Git review must cite the merge result");
-            ensure!(crate::delegate_git::is_merged(root,&spec,head)?,"delegate commit is not present in the main branch");
-            let changed=crate::delegate_git::changed_paths(root,&spec)?;
-            let existing=changed.iter().filter(|path| files.join(path).is_file()).collect::<Vec<_>>();
+            let head = args["git_head"]
+                .as_str()
+                .context("accepted Git review requires git_head from inspected diff")?;
+            ensure!(
+                child_result["git"]["head"].as_str() == Some(head),
+                "reviewed Git commit differs from the delegate's archived result"
+            );
+            ensure!(
+                receipts
+                    .iter()
+                    .any(|(name, value)| name == "inspect_agent_changes"
+                        && value["head"].as_str() == Some(head)
+                        && value["branch"] == spec["git"]["branch"]),
+                "accepted Git review must cite the inspected branch diff"
+            );
+            ensure!(
+                receipts
+                    .iter()
+                    .any(|(name, value)| name == "merge_agent_result"
+                        && value["merged_head"].as_str() == Some(head)),
+                "accepted Git review must cite the merge result"
+            );
+            ensure!(
+                crate::delegate_git::is_merged(root, &spec, head)?,
+                "delegate commit is not present in the main branch"
+            );
+            let changed = crate::delegate_git::changed_paths(root, &spec)?;
+            let existing = changed
+                .iter()
+                .filter(|path| files.join(path).is_file())
+                .collect::<Vec<_>>();
             if !existing.is_empty() {
-                ensure!(receipts.iter().any(|(name,value)|
-                    matches!(name.as_str(),"read_file"|"read_file_lines")
-                    && value["path"].as_str().is_some_and(|path|existing.iter().any(|changed|changed.as_str()==path))
-                    && fresh_local_read(&files,value).unwrap_or(false)),
+                ensure!(
+                    receipts.iter().any(|(name, value)| matches!(
+                        name.as_str(),
+                        "read_file" | "read_file_lines"
+                    ) && value["path"].as_str().is_some_and(
+                        |path| existing.iter().any(|changed| changed.as_str() == path)
+                    ) && fresh_local_read(&files, value)
+                        .unwrap_or(false)),
                     "accepted Git review must cite a current read of an integrated changed file: after merging, read_file one of {:?} and add that tool result's event_seq to evidence_refs",
-                    existing.iter().take(8).collect::<Vec<_>>());
+                    existing.iter().take(8).collect::<Vec<_>>()
+                );
             }
         } else {
-            let output_paths=child_result["artifact_index"]["assets"].as_array().into_iter().flatten()
+            let output_paths = child_result["artifact_index"]["assets"]
+                .as_array()
+                .into_iter()
+                .flatten()
                 .filter(|asset| {
                     asset["source_tool"].as_str().is_some_and(|tool| {
-                        matches!(tool,"write_file"|"edit_file"|"replace_range")
+                        matches!(tool, "write_file" | "edit_file" | "replace_range")
                     })
                 })
-                .filter_map(|asset|asset["source_path"].as_str()).collect::<Vec<_>>();
+                .filter_map(|asset| asset["source_path"].as_str())
+                .collect::<Vec<_>>();
             let mut inspected = false;
-            for (name,value) in &receipts {
-                if name=="read_file" || name=="read_file_lines" {
+            for (name, value) in &receipts {
+                if name == "read_file" || name == "read_file_lines" {
                     inspected |= value["path"].as_str().is_some_and(|path| {
                         output_paths.is_empty() || output_paths.contains(&path)
-                    })
-                        && fresh_local_read(&files,value)?;
+                    }) && fresh_local_read(&files, value)?;
                 } else if name.ends_with("__read_file") {
-                    let path=value["data"]["path"].as_str().or_else(||value["path"].as_str());
+                    let path = value["data"]["path"]
+                        .as_str()
+                        .or_else(|| value["path"].as_str());
                     inspected |= path.is_some_and(|path| {
                         output_paths.is_empty() || output_paths.contains(&path)
-                    })
-                        && (value["data"]["revision"].is_number() || value["revision"].is_number());
-                } else if name=="analyze_images" {
-                    inspected |= value["status"]=="succeeded" || value["status"]=="completed";
+                    }) && (value["data"]["revision"].is_number()
+                        || value["revision"].is_number());
+                } else if name == "analyze_images" {
+                    inspected |= value["status"] == "succeeded" || value["status"] == "completed";
                 }
             }
-            ensure!(inspected,"accepted review must cite a current artifact inspection with a checked version");
+            ensure!(
+                inspected,
+                "accepted review must cite a current artifact inspection with a checked version"
+            );
         }
     }
     let value = json!({"decision":decision,"evidence":evidence,"evidence_refs":refs,"git_head":args["git_head"]});
-    if let Some(node_id)=spec["task_node_id"].as_str() {
-        let mut node=crate::task_tree::get(&tx,task,node_id)?;
-        ensure!(decision!="accepted" || node.status=="done","cannot accept a delegate without a verified done return");
-        node.review=Some(decision.to_owned());
-        crate::task_tree::emit(&tx,task,"task/node_reviewed",&mut node,0)?;
+    if let Some(node_id) = spec["task_node_id"].as_str() {
+        let mut node = crate::task_tree::get(&tx, task, node_id)?;
+        ensure!(
+            decision != "accepted" || node.status == "done",
+            "cannot accept a delegate without a verified done return"
+        );
+        node.review = Some(decision.to_owned());
+        crate::task_tree::emit(&tx, task, "task/node_reviewed", &mut node, 0)?;
     }
     let n=tx.execute("UPDATE agent_delegates SET review=?3 WHERE task_id=?1 AND id=?2 AND status!='running' AND delivered=1",params![task,id,value.to_string()])?;
     ensure!(
@@ -705,7 +864,10 @@ pub fn review(root: &Path, task: &str, args: &Value) -> Result<Value> {
 }
 pub fn cancel_one(root: &Path, task: &str, id: &str) -> Result<Value> {
     specification(root, task, id)?;
-    db(root)?.execute("UPDATE agent_delegate_executors SET cancel_requested=1 WHERE agent_id=?1",[id])?;
+    db(root)?.execute(
+        "UPDATE agent_delegate_executors SET cancel_requested=1 WHERE agent_id=?1",
+        [id],
+    )?;
     if let Some((path, parent, token)) = running().lock().unwrap().get(id) {
         ensure!(path == root && parent == task, "delegate scope denied");
         token.cancel();
@@ -842,101 +1004,251 @@ mod tests {
 
     #[test]
     fn polling_live_delegates_does_not_wait_for_a_database_writer() {
-        let root = std::env::temp_dir().join(format!("delegate-poll-{}", agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("delegate-poll-{}", agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         let mut conn = db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('poll-parent','test','fake','running',0,0)",[]).unwrap();
         conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('poll-child','poll-parent',1,'call','work','{}','running',0)",[]).unwrap();
         conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('poll-child','other-host',?1)",[now_ms()+60_000]).unwrap();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-        tx.execute("UPDATE agent_tasks SET updated_at=1 WHERE id='poll-parent'",[]).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "UPDATE agent_tasks SET updated_at=1 WHERE id='poll-parent'",
+            [],
+        )
+        .unwrap();
         let started = std::time::Instant::now();
         let status = statuses(&root, "poll-parent").unwrap();
         assert_eq!(status[0]["status"], "running");
         assert!(ready(&root, "poll-parent").unwrap().is_empty());
-        assert!(outstanding(&root, "poll-parent").unwrap());
-        assert!(started.elapsed() < std::time::Duration::from_secs(1), "read-only polling must not wait for the writer timeout");
+        assert!(outstanding_for(&root, "poll-parent", crate::task_tree::ROOT).unwrap());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "read-only polling must not wait for the writer timeout"
+        );
         tx.commit().unwrap();
         drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn resource_claim_blocks_other_writers_until_delegate_finishes() {
-        let root=std::env::temp_dir().join(format!("delegate-claim-{}",agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("delegate-claim-{}", agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=db(&root).unwrap();
+        let conn = db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
-        for id in ["a","b"] {
+        for id in ["a", "b"] {
             conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,'task',1,?1,?1,'{}','running',0)",[id]).unwrap();
             conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES (?1,'host',?2)",params![id,now_ms()+LEASE_MS]).unwrap();
         }
-        let first=claim_resource(&root,"task",Some("a"),"call","local:/project/file.rs".into()).unwrap();
-        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_err());
-        assert!(claim_resource(&root,"task",None,"main-call","local:/project/file.rs".into()).is_err());
+        let first = claim_resource(
+            &root,
+            "task",
+            Some("a"),
+            "call",
+            "local:/project/file.rs".into(),
+        )
+        .unwrap();
+        assert!(
+            claim_resource(
+                &root,
+                "task",
+                Some("b"),
+                "call",
+                "local:/project/file.rs".into()
+            )
+            .is_err()
+        );
+        assert!(
+            claim_resource(
+                &root,
+                "task",
+                None,
+                "main-call",
+                "local:/project/file.rs".into()
+            )
+            .is_err()
+        );
         drop(first);
-        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_err());
-        conn.execute("UPDATE agent_delegates SET status='completed' WHERE id='a'",[]).unwrap();
-        assert!(claim_resource(&root,"task",Some("b"),"call","local:/project/file.rs".into()).is_ok());
+        assert!(
+            claim_resource(
+                &root,
+                "task",
+                Some("b"),
+                "call",
+                "local:/project/file.rs".into()
+            )
+            .is_err()
+        );
+        conn.execute(
+            "UPDATE agent_delegates SET status='completed' WHERE id='a'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            claim_resource(
+                &root,
+                "task",
+                Some("b"),
+                "call",
+                "local:/project/file.rs".into()
+            )
+            .is_ok()
+        );
         drop(conn);
-        let _=std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn accepted_git_review_requires_inspected_and_merged_commit_receipts() {
-        let parent=std::env::temp_dir().join(format!("delegate-review-{}",agent_service::uuid_like()));
-        let root=parent.join("project");
+        let parent =
+            std::env::temp_dir().join(format!("delegate-review-{}", agent_service::uuid_like()));
+        let root = parent.join("project");
         std::fs::create_dir_all(&root).unwrap();
-        let git=|args:&[&str]| {
-            let output=std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap();
-            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
-        git(&["init","-b","main"]);
-        std::fs::write(root.join("file.txt"),"before\n").unwrap();
-        git(&["add","-A"]);
-        git(&["-c","user.name=Test","-c","user.email=test@local","commit","-m","base"]);
-        let mut conn=db(&root).unwrap();
+        git(&["init", "-b", "main"]);
+        std::fs::write(root.join("file.txt"), "before\n").unwrap();
+        git(&["add", "-A"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@local",
+            "commit",
+            "-m",
+            "base",
+        ]);
+        let mut conn = db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('parent','test','fake','running',0,0)",[]).unwrap();
-        let worktree=crate::delegate_git::prepare(&root,"child").unwrap().unwrap();
-        let spec=json!({"git":worktree});
-        std::fs::write(crate::delegate_git::workspace(&root,&spec).unwrap().join("file.txt"),"after\n").unwrap();
-        let head=crate::delegate_git::finish(&spec).unwrap().unwrap()["head"].as_str().unwrap().to_owned();
-        let end={let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-            let seq=agent_service::append_event_tx(&tx,"parent","subagent/end",&json!({"agent_id":"child"}),Some("append")).unwrap();
-            tx.commit().unwrap();seq};
-        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,result,delivered,end_seq,created_at) VALUES ('child','parent',1,'spawn','work',?1,'completed',?2,1,?3,0)",params![spec.to_string(),json!({"status":"completed","git":{"head":head},"artifact_index":{"assets":[]}}).to_string(),end]).unwrap();
-        let rejected=review(&root,"parent",&json!({"agent_id":"child","decision":"accepted","evidence":"looks fine"}));
-        assert!(rejected.is_err());
-        let record=|conn:&mut rusqlite::Connection,call:&str,name:&str,args:Value,result:Value| -> i64 {
-            let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
-            agent_service::append_event_tx(&tx,"parent","tool/call",&json!({"callId":call,"name":name,"arguments":args.to_string()}),None).unwrap();
-            let seq=agent_service::append_event_tx(&tx,"parent","tool/result",&json!({"message":{"toolCallId":call,"isError":false},"meta":{"result":result}}),None).unwrap();
-            tx.commit().unwrap();seq
+        let worktree = crate::delegate_git::prepare(&root, "child")
+            .unwrap()
+            .unwrap();
+        let spec = json!({"git":worktree});
+        std::fs::write(
+            crate::delegate_git::workspace(&root, &spec)
+                .unwrap()
+                .join("file.txt"),
+            "after\n",
+        )
+        .unwrap();
+        let head = crate::delegate_git::finish(&spec).unwrap().unwrap()["head"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let end = {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            let seq = agent_service::append_event_tx(
+                &tx,
+                "parent",
+                "subagent/end",
+                &json!({"agent_id":"child"}),
+                Some("append"),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            seq
         };
-        let inspected=inspect_changes(&root,"parent","child").unwrap();
-        let inspect_seq=record(&mut conn,"inspect","inspect_agent_changes",json!({"agent_id":"child"}),inspected);
-        let merged=merge_result(&root,"parent","child",&head).unwrap();
-        let merge_seq=record(&mut conn,"merge","merge_agent_result",json!({"agent_id":"child","expected_head":head}),merged);
-        let bytes=std::fs::read(root.join("file.txt")).unwrap();
-        let read_seq=record(&mut conn,"read","read_file",json!({"path":"file.txt"}),
-            json!({"path":"file.txt","code_hash":crate::symbol_description::content_hash(&bytes),"content":"after\n"}));
+        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,result,delivered,end_seq,created_at) VALUES ('child','parent',1,'spawn','work',?1,'completed',?2,1,?3,0)",params![spec.to_string(),json!({"status":"completed","git":{"head":head},"artifact_index":{"assets":[]}}).to_string(),end]).unwrap();
+        let rejected = review(
+            &root,
+            "parent",
+            &json!({"agent_id":"child","decision":"accepted","evidence":"looks fine"}),
+        );
+        assert!(rejected.is_err());
+        let record = |conn: &mut rusqlite::Connection,
+                      call: &str,
+                      name: &str,
+                      args: Value,
+                      result: Value|
+         -> i64 {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            agent_service::append_event_tx(
+                &tx,
+                "parent",
+                "tool/call",
+                &json!({"callId":call,"name":name,"arguments":args.to_string()}),
+                None,
+            )
+            .unwrap();
+            let seq = agent_service::append_event_tx(
+                &tx,
+                "parent",
+                "tool/result",
+                &json!({"message":{"toolCallId":call,"isError":false},"meta":{"result":result}}),
+                None,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            seq
+        };
+        let inspected = inspect_changes(&root, "parent", "child").unwrap();
+        let inspect_seq = record(
+            &mut conn,
+            "inspect",
+            "inspect_agent_changes",
+            json!({"agent_id":"child"}),
+            inspected,
+        );
+        let merged = merge_result(&root, "parent", "child", &head).unwrap();
+        let merge_seq = record(
+            &mut conn,
+            "merge",
+            "merge_agent_result",
+            json!({"agent_id":"child","expected_head":head}),
+            merged,
+        );
+        let bytes = std::fs::read(root.join("file.txt")).unwrap();
+        let read_seq = record(
+            &mut conn,
+            "read",
+            "read_file",
+            json!({"path":"file.txt"}),
+            json!({"path":"file.txt","code_hash":crate::symbol_description::content_hash(&bytes),"content":"after\n"}),
+        );
         let accepted=review(&root,"parent",&json!({"agent_id":"child","decision":"accepted","evidence":"Reviewed the branch diff, merged commit and integrated file","evidence_refs":[inspect_seq,merge_seq,read_seq],"git_head":head})).unwrap();
-        assert_eq!(accepted["review"]["decision"],"accepted");
-        let path=crate::delegate_git::workspace(&root,&spec).unwrap();
-        git(&["worktree","remove","--force",path.to_str().unwrap()]);
+        assert_eq!(accepted["review"]["decision"], "accepted");
+        let path = crate::delegate_git::workspace(&root, &spec).unwrap();
+        git(&["worktree", "remove", "--force", path.to_str().unwrap()]);
         drop(conn);
-        let _=std::fs::remove_dir_all(parent);
+        let _ = std::fs::remove_dir_all(parent);
     }
     #[test]
     fn live_foreign_executor_is_not_reaped_and_expired_one_is() {
-        let root=std::env::temp_dir().join(format!("delegate-lease-{}",agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("delegate-lease-{}", agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
-        let conn=db(&root).unwrap();
+        let conn = db(&root).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('parent','x','fake','running',0,0)",[]).unwrap();
         conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('foreign','parent',1,'call','work','{}','running',0)",[]).unwrap();
         conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('foreign','other-host',?1)",[now_ms()+LEASE_MS]).unwrap();
-        assert_eq!(statuses(&root,"parent").unwrap()[0]["status"],"running");
-        conn.execute("UPDATE agent_delegate_executors SET lease_until=?1 WHERE agent_id='foreign'",[now_ms()-1]).unwrap();
-        assert_eq!(statuses(&root,"parent").unwrap()[0]["status"],"interrupted");
-        let _=std::fs::remove_dir_all(root);
+        assert_eq!(statuses(&root, "parent").unwrap()[0]["status"], "running");
+        conn.execute(
+            "UPDATE agent_delegate_executors SET lease_until=?1 WHERE agent_id='foreign'",
+            [now_ms() - 1],
+        )
+        .unwrap();
+        assert_eq!(
+            statuses(&root, "parent").unwrap()[0]["status"],
+            "interrupted"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
     #[tokio::test]
     async fn five_slots_exclude_compression_and_enforce_parent_cancellation_scope() {
@@ -957,7 +1269,7 @@ mod tests {
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_runtime_windows(task_id TEXT NOT NULL,scope TEXT NOT NULL,state TEXT NOT NULL,PRIMARY KEY(task_id,scope));INSERT INTO agent_runtime_windows VALUES ('parent','context:compression','{}');").unwrap();
         let cancel = CancellationToken::new();
-        let args = json!({"name":"isolated task","task":"Do assigned work only","context":"shared constraints","asset_ids":["asset-a","asset-b"]});
+        let args = json!({"name":"isolated task","task":"Do assigned work only","context":"shared constraints"});
         let mut ids = Vec::new();
         for i in 0..5 {
             let result = submit(
@@ -976,9 +1288,9 @@ mod tests {
             ids.push(result["agent_id"].as_str().unwrap().to_owned());
         }
         let spec = specification(&root, "parent", &ids[0]).unwrap();
-        assert_eq!(spec["priority_asset_ids"], json!(["asset-a", "asset-b"]));
-        assert!(spec["requirement_event_seqs"].is_array());
-        assert_eq!(spec["delegation_projection"].as_bool(), Some(false));
+        assert_eq!(spec["context"], "shared constraints");
+        assert!(spec.get("priority_asset_ids").is_none());
+        assert!(spec.get("delegation_projection").is_none());
         assert!(
             submit(
                 &state,
@@ -1077,7 +1389,9 @@ mod tests {
             )
             .unwrap();
         }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
         remember_assets(&tx,"parent","orphan",&json!([{"asset_reference":{"asset_id":"saved-before-compression","source_path":"edited.rs","read_reference":{"tool":"read_asset","arguments":{"asset_id":"saved-before-compression"}}}}])).unwrap();
         // Empty later windows must not erase previously indexed references.
         remember_assets(&tx, "parent", "orphan", &json!([])).unwrap();
@@ -1114,7 +1428,7 @@ mod tests {
             statuses(&root, "parent").unwrap()[0]["status"],
             "interrupted"
         );
-        assert!(outstanding(&root, "parent").unwrap());
+        assert!(outstanding_for(&root, "parent", crate::task_tree::ROOT).unwrap());
         assert_eq!(ready(&root, "parent").unwrap().len(), 1);
         assert_eq!(ready(&root, "parent").unwrap().len(), 1);
         assert_eq!(
@@ -1167,7 +1481,7 @@ mod tests {
         )
         .unwrap();
         review(&root,"parent",&json!({"agent_id":"orphan","decision":"unresolved","evidence":"No executor after restart; original actions not repeated"})).unwrap();
-        assert!(!outstanding(&root, "parent").unwrap());
+        assert!(!outstanding_for(&root, "parent", crate::task_tree::ROOT).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

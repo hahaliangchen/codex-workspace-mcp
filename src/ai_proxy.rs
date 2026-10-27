@@ -102,16 +102,8 @@ pub(crate) struct AiProxyConfig {
     fast_mode: bool,
     #[serde(default)]
     model_capabilities: HashMap<String, HashMap<String, ModelCapabilities>>,
-    #[serde(default = "observer_enabled_by_default")]
-    observer_enabled: bool,
-    #[serde(default)]
-    observer_provider: Option<String>,
-    #[serde(default)]
-    observer_model: Option<String>,
     #[serde(default)]
     visual_tool: crate::model_settings::ModelSettings,
-    #[serde(default)]
-    context_agent: crate::model_settings::ModelSettings,
     /// Task delegates; empty fields inherit the conversation's model.
     #[serde(default)]
     delegate_agent: crate::model_settings::ModelSettings,
@@ -125,16 +117,11 @@ pub(crate) struct AiProxyConfig {
     extra: HashMap<String, Value>,
 }
 
-fn observer_enabled_by_default() -> bool {
-    true
-}
-
 pub(crate) fn apply_agent_config(
     state: &mut crate::agent_service::AgentServiceState,
     config: &AiProxyConfig,
 ) {
     state.visual_tool_settings = config.visual_tool.clone();
-    state.context_agent_settings = config.context_agent.clone();
     state.delegate_agent_settings = config.delegate_agent.clone();
     let main_name = config
         .orchestrator_provider
@@ -163,30 +150,25 @@ pub(crate) fn apply_agent_config(
                     api_key: provider.api_key.clone(),
                     models: provider.model_map.clone(),
                     max_output_tokens: provider.max_output_tokens.clone(),
-                    context_windows: provider.model_metadata.iter().filter_map(|(id, metadata)| {
-                        let tokens = metadata["contextWindow"].as_u64().and_then(|n| usize::try_from(n).ok())?;
-                        (tokens > 0).then(|| (provider.model_map.get(id).cloned().unwrap_or_else(|| id.clone()), tokens))
-                    }).collect(),
-                    context_request_options: provider
-                        .extra
-                        .get("contextRequestOptions")
-                        .and_then(Value::as_object)
-                        .map(|models| {
-                            models
-                                .iter()
-                                .map(|(name, options)| {
-                                    (
-                                        provider
-                                            .model_map
-                                            .get(name)
-                                            .cloned()
-                                            .unwrap_or_else(|| name.clone()),
-                                        options.clone(),
-                                    )
-                                })
-                                .collect()
+                    context_windows: provider
+                        .model_metadata
+                        .iter()
+                        .filter_map(|(id, metadata)| {
+                            let tokens = metadata["contextWindow"]
+                                .as_u64()
+                                .and_then(|n| usize::try_from(n).ok())?;
+                            (tokens > 0).then(|| {
+                                (
+                                    provider
+                                        .model_map
+                                        .get(id)
+                                        .cloned()
+                                        .unwrap_or_else(|| id.clone()),
+                                    tokens,
+                                )
+                            })
                         })
-                        .unwrap_or_default(),
+                        .collect(),
                 },
             )
         })
@@ -201,22 +183,6 @@ pub(crate) fn apply_agent_config(
         .clone()
         .or_else(|| main.and_then(|p| p.model_map.values().next().cloned()))
         .unwrap_or_default();
-    let observer_name = config.observer_provider.as_deref().unwrap_or(main_name);
-    let observer = config
-        .providers
-        .get(observer_name)
-        .filter(|provider| provider.api_type == "openai-completions");
-    state.observer_provider = observer
-        .map(|_| observer_name.to_owned())
-        .unwrap_or_default();
-    state.observer_provider_url = observer.map(|p| p.url.clone()).unwrap_or_default();
-    state.observer_api_key = observer.map(|p| p.api_key.clone()).unwrap_or_default();
-    state.observer_model = config.observer_model.clone().unwrap_or_default();
-    state.observer_inherits_model =
-        config.observer_provider.is_none() && config.observer_model.is_none();
-    state.observer_enabled = config.observer_enabled
-        && observer.is_some()
-        && (state.observer_inherits_model || !state.observer_model.is_empty());
     state.visual.capabilities = config
         .model_capabilities
         .iter()
@@ -259,10 +225,6 @@ fn credentials_path(config_path: &Path) -> std::path::PathBuf {
         .and_then(Path::parent)
         .expect("DSH profile path has a home directory")
         .join(".credentials.yaml")
-}
-
-fn observer_settings_path(config_path: &Path) -> std::path::PathBuf {
-    config_path.with_file_name("codex-workspace-observer.yml")
 }
 
 fn generation_settings_path(config_path: &Path) -> std::path::PathBuf {
@@ -480,19 +442,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         config.orchestrator_model = main.get("model").and_then(Value::as_str).map(str::to_owned);
         config.default_provider = config.orchestrator_provider.clone();
     }
-    let observer = read_yaml(&observer_settings_path(config_path), json!({}))?;
-    config.observer_enabled = observer
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    config.observer_provider = observer
-        .get("provider")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    config.observer_model = observer
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
     let generation = read_yaml(&generation_settings_path(config_path), json!({}))?;
     for (id, provider) in &mut config.providers {
         if let Some(prefix) =
@@ -513,12 +462,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
         .unwrap_or(false);
     config.visual_tool =
         serde_json::from_value(generation.get("visual_tool").cloned().unwrap_or(json!({})))?;
-    config.context_agent = serde_json::from_value(
-        generation
-            .get("context_agent")
-            .cloned()
-            .unwrap_or(json!({})),
-    )?;
     config.delegate_agent = serde_json::from_value(
         generation
             .get("delegate_agent")
@@ -526,7 +469,6 @@ pub(crate) fn load_config(config_path: &Path) -> anyhow::Result<AiProxyConfig> {
             .unwrap_or(json!({})),
     )?;
     config.visual_tool.normalize()?;
-    config.context_agent.normalize()?;
     config.delegate_agent.normalize()?;
     config.plugin_models = serde_json::from_value(
         generation
@@ -583,7 +525,6 @@ fn disk_revision(config_path: &Path) -> anyhow::Result<String> {
     for path in [
         config_path.to_path_buf(),
         credentials_path(config_path),
-        observer_settings_path(config_path),
         generation_settings_path(config_path),
     ] {
         match std::fs::read(path) {
@@ -618,10 +559,7 @@ fn settings_view(config: &AiProxyConfig, revision: String) -> Value {
         "orchestrator_model": config.orchestrator_model,
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
-        "observer_enabled": config.observer_enabled,
-        "observer_provider": config.observer_provider,
-        "observer_model": config.observer_model,
-                "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,
+                "visual_tool":config.visual_tool,"delegate_agent":config.delegate_agent,
         "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     })
 }
@@ -668,8 +606,7 @@ pub(crate) fn catalog_view(config: &AiProxyConfig) -> Value {
     });
     json!({"version":1,"models":models,"defaults":{
         "agent":{"provider":config.orchestrator_provider,"model":config.orchestrator_model},
-        "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,"plugin_generation":config.plugin_generation,
-        "observer":{"provider":config.observer_provider,"model":config.observer_model},
+        "visual_tool":config.visual_tool,"delegate_agent":config.delegate_agent,"plugin_generation":config.plugin_generation,
     }})
 }
 
@@ -729,7 +666,7 @@ pub(crate) fn restricted_config(
     scoped.orchestrator_provider = Some(selected.provider.clone());
     scoped.orchestrator_model = Some(selected.model.clone());
     scoped.default_provider = Some(selected.provider.clone());
-    for role in [&mut scoped.visual_tool, &mut scoped.context_agent, &mut scoped.delegate_agent] {
+    for role in [&mut scoped.visual_tool, &mut scoped.delegate_agent] {
         if role.provider.is_some() || role.model.is_some() {
             let p = role
                 .provider
@@ -748,20 +685,6 @@ pub(crate) fn restricted_config(
                 role.model = m.cloned();
             }
         }
-    }
-    if scoped
-        .observer_provider
-        .as_deref()
-        .zip(scoped.observer_model.as_deref())
-        .is_some_and(|(p, m)| {
-            !scoped
-                .providers
-                .get(p)
-                .is_some_and(|r| r.model_map.contains_key(m))
-        })
-    {
-        scoped.observer_provider = None;
-        scoped.observer_model = None;
     }
     let cap = scoped
         .model_capabilities
@@ -888,15 +811,7 @@ struct SettingsEdit {
     #[serde(default)]
     fast_mode: Option<bool>,
     #[serde(default)]
-    observer_enabled: Option<bool>,
-    #[serde(default)]
-    observer_provider: Option<String>,
-    #[serde(default)]
-    observer_model: Option<String>,
-    #[serde(default)]
     visual_tool: Option<crate::model_settings::ModelSettings>,
-    #[serde(default)]
-    context_agent: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
     delegate_agent: Option<crate::model_settings::ModelSettings>,
     #[serde(default)]
@@ -1215,14 +1130,8 @@ fn save_settings(
     config.model_capabilities = model_capabilities;
     config.orchestrator_provider = nonempty(request.orchestrator_provider);
     config.orchestrator_model = nonempty(request.orchestrator_model);
-    if let Some(enabled) = request.observer_enabled {
-        config.observer_enabled = enabled;
-    }
-    config.observer_provider = nonempty(request.observer_provider);
-    config.observer_model = nonempty(request.observer_model);
     for (edit, target) in [
         (request.visual_tool, &mut config.visual_tool),
-        (request.context_agent, &mut config.context_agent),
         (request.delegate_agent, &mut config.delegate_agent),
     ] {
         if let Some(mut edit) = edit {
@@ -1341,10 +1250,7 @@ fn save_settings(
         config.reasoning_effort = None;
         config.fast_mode = false;
     }
-    for name in [&config.orchestrator_provider, &config.observer_provider]
-        .into_iter()
-        .flatten()
-    {
+    for name in [&config.orchestrator_provider].into_iter().flatten() {
         anyhow::ensure!(
             config.providers.contains_key(name),
             "selected provider {name} does not exist"
@@ -1354,14 +1260,7 @@ fn save_settings(
         config.orchestrator_provider.is_some() == config.orchestrator_model.is_some(),
         "choose both a main-agent provider and model"
     );
-    anyhow::ensure!(
-        config.observer_provider.is_some() == config.observer_model.is_some(),
-        "choose both an observer provider and model"
-    );
-    for (provider, model) in [
-        (&config.orchestrator_provider, &config.orchestrator_model),
-        (&config.observer_provider, &config.observer_model),
-    ] {
+    for (provider, model) in [(&config.orchestrator_provider, &config.orchestrator_model)] {
         if let (Some(provider), Some(model)) = (provider, model) {
             anyhow::ensure!(
                 config.providers[provider].model_map.contains_key(model),
@@ -1369,10 +1268,7 @@ fn save_settings(
             );
         }
     }
-    for name in [&config.orchestrator_provider, &config.observer_provider]
-        .into_iter()
-        .flatten()
-    {
+    for name in [&config.orchestrator_provider].into_iter().flatten() {
         anyhow::ensure!(
             config.providers[name].api_type == "openai-completions",
             "agent route {name} requires OpenAI Chat Completions protocol"
@@ -1488,23 +1384,21 @@ fn save_settings(
             .retain(|entry| entry.get("id").and_then(Value::as_str) != Some("agent-default-model"));
     }
     let secret_path = credentials_path(config_path);
-    let observer_path = observer_settings_path(config_path);
-    let original_observer = read_yaml(&observer_path, json!({}))?;
-    let observer_settings = json!({
-        "enabled": config.observer_enabled,
-        "provider": config.observer_provider,
-        "model": config.observer_model,
-    });
     let generation_path = generation_settings_path(config_path);
     let original_generation = read_yaml(&generation_path, json!({}))?;
-    let generation_settings = json!({
+    let mut generation_settings = original_generation.clone();
+    let current_generation = json!({
         "provider_compatibility":config.providers.iter().map(|(id,p)|(id.clone(),json!({"prefix_system_messages":p.extra.get("prefixSystemMessages").and_then(Value::as_bool).unwrap_or(false)}))).collect::<HashMap<_,_>>(),
         "reasoning_effort": config.reasoning_effort,
         "fast_mode": config.fast_mode,
         "model_capabilities": config.model_capabilities,
-                "visual_tool":config.visual_tool,"context_agent":config.context_agent,"delegate_agent":config.delegate_agent,
+                "visual_tool":config.visual_tool,"delegate_agent":config.delegate_agent,
         "plugin_models":config.plugin_models,"plugin_generation":config.plugin_generation,
     });
+    generation_settings
+        .as_object_mut()
+        .context("generation settings must be an object")?
+        .extend(current_generation.as_object().unwrap().clone());
     if disk_revision(config_path)? != request.revision {
         return Ok(Err(
             "settings changed while saving; reload before retrying".into()
@@ -1526,9 +1420,6 @@ fn save_settings(
     }
     if patch != original_patch {
         write_yaml_atomic(config_path, &patch)?;
-    }
-    if observer_settings != original_observer {
-        write_yaml_atomic(&observer_path, &observer_settings)?;
     }
     if generation_settings != original_generation {
         write_yaml_atomic(&generation_path, &generation_settings)?;
@@ -1800,7 +1691,15 @@ async fn remote_page_request(
                 .into_response();
         }
     };
-    crate::remote_sessions::request(&state.runtime, (*agent).clone(), &id, &method, headers, args).await
+    crate::remote_sessions::request(
+        &state.runtime,
+        (*agent).clone(),
+        &id,
+        &method,
+        headers,
+        args,
+    )
+    .await
 }
 async fn reload_skill_package(
     State(state): State<AiProxyState>,
@@ -1958,10 +1857,7 @@ pub async fn run(
         plugin_runtime::ROOT,
         crate::model_catalog::ModelCatalogPlugin,
     )?;
-    let tools_scope = runtime.mount(
-        plugin_runtime::ROOT,
-        builtin_plugins::ToolCatalogPlugin(client.clone()),
-    )?;
+    let tools_scope = runtime.mount(plugin_runtime::ROOT, builtin_plugins::ToolCatalogPlugin)?;
     let agent_state = (*runtime
         .service::<crate::agent_service::AgentServiceState>(tools_scope, "agent-tasks")?)
     .clone();
@@ -2020,18 +1916,37 @@ pub async fn run(
             "/agent/sessions",
             post(crate::agent_service::create_draft_task),
         )
-        .route("/agent/workspaces", get(crate::session_browser::projects).post(crate::session_browser::add_project).patch(crate::session_browser::rename_project).delete(crate::session_browser::remove_project))
-        .route("/agent/sessions/search", get(crate::session_browser::search))
+        .route(
+            "/agent/workspaces",
+            get(crate::session_browser::projects)
+                .post(crate::session_browser::add_project)
+                .patch(crate::session_browser::rename_project)
+                .delete(crate::session_browser::remove_project),
+        )
+        .route(
+            "/agent/sessions/search",
+            get(crate::session_browser::search),
+        )
         .route("/agent/memories", get(crate::memory_panel::get))
-        .route("/agent/memories/{kind}/{id}", axum::routing::patch(crate::memory_panel::patch).delete(crate::memory_panel::delete))
-        .route("/agent/sessions/{task_id}", axum::routing::delete(crate::session_browser::delete_session).patch(crate::session_browser::update_session))
+        .route(
+            "/agent/memories/{kind}/{id}",
+            axum::routing::patch(crate::memory_panel::patch).delete(crate::memory_panel::delete),
+        )
+        .route(
+            "/agent/sessions/{task_id}",
+            axum::routing::delete(crate::session_browser::delete_session)
+                .patch(crate::session_browser::update_session),
+        )
         .route(
             "/agent/tasks/{task_id}",
             get(crate::agent_service::get_task)
                 .patch(crate::agent_service::update_task)
                 .delete(crate::agent_service::cancel_task),
         )
-        .route("/agent/tasks/{task_id}/definition/decision", post(crate::agent_service::decide_task_definition))
+        .route(
+            "/agent/tasks/{task_id}/definition/decision",
+            post(crate::agent_service::decide_task_definition),
+        )
         .route(
             "/agent/tasks/{task_id}/events",
             get(crate::agent_service::get_events),
@@ -2064,10 +1979,7 @@ pub async fn run(
             "/agent/tasks/{task_id}/visual-artifacts/{id}/image",
             get(crate::visual_artifacts::image_route),
         )
-        .route(
-            "/agent/tasks/{task_id}/rewind",
-            post(crate::rewind::post),
-        )
+        .route("/agent/tasks/{task_id}/rewind", post(crate::rewind::post))
         .route(
             "/agent/tasks/{task_id}/interjections",
             post(crate::interjections::post),
@@ -2183,6 +2095,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_role_settings_are_not_executed_or_exposed_and_saved_files_survive() {
+        let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
+        let path = root.join("profiles/web/cordis.patch.yml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_yaml_atomic(&path,&json!([
+            {"id":"llm-pi-ai","config":{"providers":{"test":{"baseURL":"http://localhost:1/v1","api":"openai-completions","models":[{"id":"m"}]}}}},
+            {"id":"agent-default-model","config":{"provider":"test","model":"m"}}
+        ])).unwrap();
+        write_yaml_atomic(
+            &credentials_path(&path),
+            &json!({"version":1,"refs":{},"records":{}}),
+        )
+        .unwrap();
+        let retired = path.with_file_name("codex-workspace-observer.yml");
+        let original = "enabled: true\nprovider: no-longer-installed\nmodel: old-model\n";
+        std::fs::write(&retired, original).unwrap();
+        let preserved = json!({"provider":"also-retired","model":"old-context-model"});
+        write_yaml_atomic(
+            &generation_settings_path(&path),
+            &json!({"context_agent":preserved,"unrecognized_field":{"keep":true}}),
+        )
+        .unwrap();
+        let loaded = load_config(&path).unwrap();
+        let catalog = catalog_view(&loaded);
+        assert!(catalog["defaults"].get("observer").is_none());
+        assert!(catalog["defaults"].get("context_agent").is_none());
+        let edit:SettingsEdit=serde_json::from_value(json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m"]}],"orchestrator_provider":"test","orchestrator_model":"m"})).unwrap();
+        save_settings(&path, edit).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&retired).unwrap(), original);
+        let saved = read_yaml(&generation_settings_path(&path), json!({})).unwrap();
+        assert_eq!(saved["context_agent"], preserved);
+        assert_eq!(saved["unrecognized_field"], json!({"keep":true}));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn image_probe_evidence_is_persisted_and_bound_to_the_saved_route() {
         let root = std::env::temp_dir().join(format!(
             "codex-image-config-{}",
@@ -2245,7 +2193,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
-    fn tool_and_compression_settings_roundtrip_preserve_omitted_and_clear_explicitly() {
+    fn dedicated_model_settings_roundtrip_preserve_omitted_and_clear_explicitly() {
         let root = std::env::temp_dir().join(crate::visual_artifacts::new_id());
         let path = root.join("profiles/web/cordis.patch.yml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2255,7 +2203,7 @@ mod tests {
             &json!({"version":1,"refs":{},"records":{}}),
         )
         .unwrap();
-        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m","gpt-6.1-sol"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"context_agent":{"model":"gpt-6.1-sol","reasoning_effort":"low","context_window":500000},"delegate_agent":{"model":"m","reasoning_effort":"medium"}});
+        let mut payload = json!({"revision":disk_revision(&path).unwrap(),"providers":[{"id":"test","url":"http://localhost:1/v1","models":["m","gpt-6.1-sol"]}],"orchestrator_provider":"test","orchestrator_model":"m","visual_tool":{"model":"gpt-6.1-sol","reasoning_effort":"medium"},"delegate_agent":{"model":"m","reasoning_effort":"medium"}});
         payload["plugin_models"] =
             json!({"ppt-master":[{"provider":"test","model":"gpt-6.1-sol"}]});
         payload["plugin_generation"] =
@@ -2264,9 +2212,11 @@ mod tests {
             .unwrap()
             .unwrap();
         let loaded = load_config(&path).unwrap();
-        assert_eq!(loaded.context_agent.context_window, Some(500000));
         assert_eq!(loaded.delegate_agent.model.as_deref(), Some("m"));
-        assert_eq!(loaded.delegate_agent.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            loaded.delegate_agent.reasoning_effort.as_deref(),
+            Some("medium")
+        );
         assert_eq!(
             loaded.plugin_generation["ppt-master"]
                 .reasoning_effort
@@ -2344,18 +2294,12 @@ mod tests {
         );
         payload["revision"] = json!(disk_revision(&path).unwrap());
         payload.as_object_mut().unwrap().remove("visual_tool");
-        payload.as_object_mut().unwrap().remove("context_agent");
         payload.as_object_mut().unwrap().remove("plugin_models");
         save_settings(&path, serde_json::from_value(payload.clone()).unwrap())
             .unwrap()
             .unwrap();
-        assert_eq!(
-            load_config(&path).unwrap().context_agent,
-            loaded.context_agent
-        );
         payload["revision"] = json!(disk_revision(&path).unwrap());
         payload["visual_tool"] = json!({});
-        payload["context_agent"] = json!({});
         save_settings(&path, serde_json::from_value(payload).unwrap())
             .unwrap()
             .unwrap();
@@ -2367,7 +2311,6 @@ mod tests {
                 .len(),
             1
         );
-        assert_eq!(cleared.context_agent, Default::default());
         assert_eq!(cleared.visual_tool, Default::default());
         assert_eq!(cleared.orchestrator_model.as_deref(), Some("m"));
         let _ = std::fs::remove_dir_all(root);
@@ -2401,12 +2344,19 @@ mod tests {
         assert_eq!(view["models"][0]["name"], "Visible model");
         assert_eq!(view["models"][0]["context_window"], 500000);
         assert_eq!(view["models"][0]["max_output_tokens"], 65536);
-        let root = std::env::temp_dir().join(format!("catalog-budget-{}",crate::agent_service::uuid_like()));
+        let root = std::env::temp_dir().join(format!(
+            "catalog-budget-{}",
+            crate::agent_service::uuid_like()
+        ));
         std::fs::create_dir_all(&root).unwrap();
-        let mut state = crate::agent_service::tests::test_state(&root,"127.0.0.1:1".parse().unwrap());
-        apply_agent_config(&mut state,&config);
-        assert_eq!(crate::model_settings::context_window(&state,"upstream-m"),500000);
-        assert_eq!(crate::model_settings::context_window(&state,"m"),500000);
+        let mut state =
+            crate::agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
+        apply_agent_config(&mut state, &config);
+        assert_eq!(
+            crate::model_settings::context_window(&state, "upstream-m"),
+            500000
+        );
+        assert_eq!(crate::model_settings::context_window(&state, "m"), 500000);
         let _ = std::fs::remove_dir_all(root);
         assert_eq!(view["defaults"]["visual_tool"]["model"], "m");
         let encoded = view.to_string();

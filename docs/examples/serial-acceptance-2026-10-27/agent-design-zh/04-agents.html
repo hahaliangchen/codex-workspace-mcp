@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#101b2d">
+<title>并发 Agent 与工作区整合｜通用 Agent 设计</title>
+<style>
+:root{color-scheme:light;--ink:#182439;--muted:#5d6b80;--paper:#f4f7fb;--card:#fff;--line:#dce4ef;--navy:#101b2d;--blue:#2359d1;--cyan:#c8f3ef;--amber:#f6c46a;--green:#14765f;--shadow:0 18px 48px rgba(21,42,76,.09)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,"Noto Sans SC","Microsoft YaHei",system-ui,sans-serif;line-height:1.72}.shell{max-width:1120px;margin:auto;padding:0 28px}.topbar{padding:20px 0;border-bottom:1px solid rgba(255,255,255,.14);color:#d7e3f5;font-size:13px;letter-spacing:.08em}.hero{background:radial-gradient(ellipse at 88% 10%,#27548b 0,transparent 34%),linear-gradient(135deg,#101b2d 0%,#152a48 68%,#143b53 100%);color:#f7f9ff;padding:0 0 76px;position:relative;overflow:hidden}.hero:after{content:"";position:absolute;width:340px;height:340px;border:1px solid #ffffff20;border-radius:50%;right:-80px;bottom:-210px;box-shadow:0 0 0 38px #ffffff08,0 0 0 78px #ffffff06}.hero-main{padding-top:62px;max-width:820px;position:relative;z-index:1}.eyebrow{display:inline-flex;align-items:center;gap:10px;color:#a7e7df;font-weight:700;font-size:12px;letter-spacing:.14em;text-transform:uppercase}.eyebrow:before{content:"";width:23px;height:2px;background:var(--amber)}h1{font-size:clamp(36px,6vw,66px);line-height:1.11;letter-spacing:-.045em;margin:23px 0 20px;max-width:780px}.hero p{font-size:18px;color:#d0dced;max-width:740px;margin:0}.hero-meta{display:flex;gap:10px;flex-wrap:wrap;margin-top:28px}.pill{border:1px solid #ffffff30;border-radius:999px;padding:6px 12px;color:#e4edfa;font-size:12px}.layout{display:grid;grid-template-columns:220px minmax(0,1fr);gap:54px;padding-top:44px;padding-bottom:78px}.toc{position:sticky;top:20px;align-self:start;padding:18px 0;border-right:1px solid var(--line)}.toc strong{font-size:11px;color:#8390a3;letter-spacing:.13em;text-transform:uppercase;display:block;margin-bottom:12px}.toc a{display:block;text-decoration:none;color:var(--muted);font-size:13px;padding:7px 12px;border-left:2px solid transparent}.toc a:hover,.toc a:focus{color:var(--blue);border-color:var(--blue)}main{min-width:0}.intro{font-size:18px;color:#40516b;margin:0 0 32px}.section{margin:0 0 52px;scroll-margin-top:22px}.section h2{font-size:25px;letter-spacing:-.025em;margin:0 0 16px;line-height:1.3}.section h2 .num{color:var(--blue);font:700 12px/1 system-ui;letter-spacing:.1em;display:block;margin-bottom:10px}.section p{margin:12px 0;color:#43526a}.callout{background:#e9f2ff;border-left:4px solid var(--blue);padding:16px 19px;border-radius:0 12px 12px 0;color:#263f67;margin:22px 0}.callout strong{color:#173a77}.flow{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:25px 0}.flow-item{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:15px 13px;box-shadow:0 5px 18px #172d4a09;position:relative}.flow-item:not(:last-child):after{content:"›";position:absolute;right:-10px;top:27px;color:var(--blue);font-size:23px;font-weight:800;z-index:2}.flow-item b{display:block;font-size:14px;color:#1a3155;margin-bottom:6px}.flow-item span{display:block;font-size:12px;line-height:1.55;color:var(--muted)}.flow-item em{display:inline-block;font-style:normal;color:var(--blue);font-size:10px;font-weight:800;letter-spacing:.1em;margin-bottom:8px}.compare{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:22px 0}.compare article{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:var(--shadow)}.compare article h3{margin:0 0 9px;font-size:16px}.compare article p{font-size:14px;margin:0;color:var(--muted)}.tag{font-size:10px;text-transform:uppercase;letter-spacing:.1em;font-weight:800;color:var(--green);display:block;margin-bottom:9px}.tag.git{color:#9b6100}.contract{background:var(--navy);color:#eef4ff;border-radius:16px;padding:22px 24px;margin:24px 0;overflow:auto;box-shadow:var(--shadow)}.contract .label{color:#a4d8d2;font-size:11px;letter-spacing:.13em;font-weight:800;text-transform:uppercase;margin-bottom:10px}pre{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace;color:#dce8fa}.steps{counter-reset:stage;list-style:none;padding:0;margin:22px 0}.steps li{counter-increment:stage;position:relative;padding:0 0 22px 55px;color:#43526a}.steps li:before{content:counter(stage,decimal-leading-zero);position:absolute;left:0;top:0;width:38px;height:38px;border-radius:12px;display:grid;place-items:center;background:#e2ecff;color:#2359d1;font-size:11px;font-weight:900}.steps li:not(:last-child):after{content:"";position:absolute;left:18px;top:42px;bottom:3px;border-left:1px dashed #a9bad3}.steps b{display:block;color:#1c2b42;margin:0 0 3px}.warning{border:1px solid #f0d9a9;background:#fff8e9;border-radius:14px;padding:17px 19px;margin:23px 0;color:#624714}.warning strong{color:#805400}.checklist{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:19px}.check{background:#fff;border:1px solid var(--line);border-radius:12px;padding:13px 15px;font-size:13px;color:#45546a}.check:before{content:"✓";color:var(--green);font-weight:900;margin-right:9px}.sources{border-top:1px solid var(--line);padding-top:22px;color:#68768a;font-size:12px}.sources h3{font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#45546a;margin:0 0 8px}.footer{background:#101b2d;color:#9eacc0;padding:25px 0;font-size:12px}.footer .shell{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.footer strong{color:#e8eff9}@media(max-width:850px){.layout{grid-template-columns:1fr;gap:22px}.toc{position:static;border-right:0;border-bottom:1px solid var(--line);padding:0 0 14px;display:flex;flex-wrap:wrap;gap:2px 8px}.toc strong{width:100%}.toc a{padding:5px 8px}.flow{grid-template-columns:1fr 1fr}.flow-item:not(:last-child):after{display:none}}@media(max-width:560px){.shell{padding:0 18px}.hero{padding-bottom:52px}.hero-main{padding-top:42px}.hero p{font-size:16px}.layout{padding-top:28px}.flow,.compare,.checklist{grid-template-columns:1fr}.section h2{font-size:22px}.flow-item{padding:13px}.footer .shell{display:block}.footer .shell span{display:block;margin:5px 0}}
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="shell">
+    <div class="topbar">通用 Agent 设计 <span aria-hidden="true">/</span> 执行与协作</div>
+    <div class="hero-main">
+      <div class="eyebrow">协作模型 · 第 04 页</div>
+      <h1>并发不是“多开几个任务”<br>而是明确分工与交接</h1>
+      <p>当工作可独立拆分且已获授权，主 Agent 可以 fork 一个子 Agent 并行执行。join 只收回函数结果；主 Agent 仍需根据实际工作区检查、整合文件，并验收真实产物。</p>
+      <div class="hero-meta"><span class="pill">一个主 Agent + 一个子 Agent</span><span class="pill">fork → join → 整合 → 验收</span><span class="pill">共享目录与 Git worktree</span></div>
+    </div>
+  </div>
+</header>
+<div class="shell layout">
+  <nav class="toc" aria-label="页面目录"><strong>本页导览</strong><a href="#sequence">协作顺序</a><a href="#responsibility">谁负责什么</a><a href="#workspace">两类工作区</a><a href="#integration">Git 交接步骤</a><a href="#acceptance">整合后的验收</a><a href="#boundaries">容易混淆的边界</a></nav>
+  <main>
+    <p class="intro">本页聚焦并发 Agent 的职责划分、工作区所有权与文件整合。它们不是隐藏在 join 后面的自动行为，而是流程必须显式表达并用实际结果完成的工作。</p>
+    <section class="section" id="sequence">
+      <h2><span class="num">01 / SEQUENCE</span>从独立分工到可交付结果</h2>
+      <p>先准备公共要求和材料，再把不重叠的任务分给两路。并发执行结束后，主 Agent 负责将分支成果纳入自己的工作区，逐项读回并验收。</p>
+      <div class="flow" aria-label="并发交付流程">
+        <div class="flow-item"><em>01 · PREPARE</em><b>主 Agent 准备</b><span>整理共享要求、实际源材料与各自的任务清单。</span></div>
+        <div class="flow-item"><em>02 · FORK</em><b>启动两路</b><span>先后调用 fork；公共材料相同，独占职责不同。</span></div>
+        <div class="flow-item"><em>03 · JOIN</em><b>收齐结果</b><span>join 按句柄顺序返回函数结果，不搬运或合并文件。</span></div>
+        <div class="flow-item"><em>04 · INTEGRATE</em><b>主 Agent 整合</b><span>按句柄工作区信息决定检查并合并，或沿用共享目录。</span></div>
+        <div class="flow-item"><em>05 · VERIFY</em><b>读回验收</b><span>读取实际产物，对照目标检查；失败时处理并复查。</span></div>
+      </div>
+      <div class="callout"><strong>关键区别：</strong>join 代表分支函数已返回，不代表分支文件已出现在主工作区，更不代表业务产物已经通过检查。</div>
+    </section>
+    <section class="section" id="responsibility">
+      <h2><span class="num">02 / OWNERSHIP</span>分工要互补，交付要可追溯</h2>
+      <div class="compare">
+        <article><span class="tag">主 Agent</span><h3>组织公共输入，拥有整合与最终验收</h3><p>准备共享材料和各路独占任务；启动并等待分支；检查分支工作区与改动；整合后读回实际文件，按要求检查并负责如实交付。</p></article>
+        <article><span class="tag git">子 Agent</span><h3>只完成明确分配的那一部分</h3><p>使用显式传入的公共材料，完成自己的 assignment，并返回实际结果。分支的局部对话不会整份复制给父任务；所需证据应由返回值或稳定引用明确交接。</p></article>
+      </div>
+      <div class="contract"><div class="label">数据流示意 · 两个实参分别绑定</div><pre>const a = fork(work, shared, leftAssignment);
+const b = fork(work, shared, rightAssignment);
+const results = join(a, b); // [a 的结果, b 的结果]
+integrate(a);
+integrate(b);
+// 再读回实际产物并逐项检查</pre></div>
+      <p>每个分支收到相同的 <code>shared</code> 和不同的职责清单。fork 使用 <code>work(shared, assignment)</code> 的两个位置实参，不会自动打包成一个输入信封。独占分工有助于减少覆盖冲突；分支结果仍由主 Agent 核验。</p>
+    </section>
+    <section class="section" id="workspace">
+      <h2><span class="num">03 / WORKSPACE</span>工作区模式决定文件如何到达主任务</h2>
+      <div class="compare">
+        <article><span class="tag">SHARED · 共享目录</span><h3>同一目录，不需要 Git 合并</h3><p>在普通共享目录中，分支使用共享工作区。join 后可以在该目录检查文件；仍需读回和验收。跳过的是 Git 整合，不是业务检查。</p></article>
+        <article><span class="tag git">GIT_WORKTREE · 独立工作树</span><h3>分支目录隔离，需要显式整合</h3><p>Git 可写项目中的分支在独立 worktree 工作。分支文件不会仅因 join 而自动出现在主目录；应按句柄的 <code>integration_required</code> 和实际路径处理。</p></article>
+      </div>
+      <p>fork 句柄提供宿主实际分配的工作区信息，包括模式、路径与是否需要整合。分支返回的相对路径以其工作区为基准；在 Git 分支尚未合并时，不能拿同一路径直接读取主目录并假定文件存在。</p>
+      <div class="warning"><strong>Git 派发前提：</strong>从仓库根目录和干净、已提交的基线启动。先 fork 所需分支，再进行主 Agent 自己的新写入；否则脏工作树可能使后续 fork 被拒绝。需要子 Agent 使用的新材料应在 fork 前准备好并明确传入。</div>
+    </section>
+    <section class="section" id="integration">
+      <h2><span class="num">04 / GIT HANDOFF</span>Git worktree：先检查差异，再合并</h2>
+      <ol class="steps">
+        <li><b>检查真实句柄</b>确认工作区模式、实际路径和 <code>integration_required</code>；不要凭“用了 fork”推断一定要合并。</li>
+        <li><b>检查分支改动</b>需要 Git 整合时，使用句柄中的 <code>agent_id</code> 检查实际差异，核对改动是否属于该分支的分工。</li>
+        <li><b>按检查到的 head 合并</b>将检查结果中的 <code>head</code> 用作合并期望版本；由宿主执行分支合并，而不是手工复制文件模拟成功。</li>
+        <li><b>回到主工作区读回</b>只有整合成功后，才从主工作区读取分支产物。冲突、整合失败或状态未知时停止并如实处理。</li>
+      </ol>
+      <div class="contract"><div class="label">流程概念示意 · 以当前工具契约为准</div><pre>if (handle.workspace.integration_required) {
+  const changes = host.inspect_agent_changes({agent_id: handle.agent_id});
+  host.merge_agent_result({
+    agent_id: handle.agent_id,
+    expected_head: changes.head
+  });
+}
+// shared 模式不做 Git merge；两种模式都继续验收。</pre></div>
+      <p>检查与合并是显式流程步骤，不是 join 的隐式副作用。若分支差异不符合预期、合并冲突或宿主返回失败，不能把“子 Agent 返回了结果”包装成整合成功。</p>
+    </section>
+    <section class="section" id="acceptance">
+      <h2><span class="num">05 / ACCEPTANCE</span>整合完成后，验收真实产物</h2>
+      <p>主 Agent 应从正确的工作区读回实际文件，再按用户目标和适用技能检查内容与结构。工具受理、函数返回、正确的文件数量或 Git 合并成功，都不能单独证明内容符合要求。</p>
+      <div class="checklist">
+        <div class="check">文件来自已确认的工作区，并且确实可读。</div>
+        <div class="check">每份产物对应分配给它的具体职责。</div>
+        <div class="check">内容忠于传入材料，未把历史测试结果说成当前事实。</div>
+        <div class="check">检查结论基于读回的实际产物和适用的验收标准。</div>
+      </div>
+      <p>若同一个验收 AI 函数发现可修复问题，应在自己的上下文中依据问题证据处理，随后重新读回实际对象并复查；复查未通过就停止交付并报告具体原因。不能用修复者的自述替代独立的实际复核。</p>
+      <div class="callout"><strong>视觉边界：</strong>文本读回与结构检查不等同于浏览器渲染。没有实际执行浏览器渲染和相应检查，就只能报告已完成的文本／结构验证，不能宣称视觉验收通过。</div>
+    </section>
+    <section class="section" id="boundaries">
+      <h2><span class="num">06 / BOUNDARIES</span>并发、函数调用与 AI 判断各有边界</h2>
+      <div class="compare">
+        <article><span class="tag">FUNCTION ≠ AGENT</span><h3>普通 helper 调用不启动新 Agent</h3><p>普通函数在当前 Runtime 的局部函数帧执行。只有获授权的 <code>fork</code> 才建立协作分支；有待办清单并不自动意味着应并发。</p></article>
+        <article><span class="tag">JOIN ≠ ACCEPTANCE</span><h3>汇合不是业务成功判定</h3><p><code>join</code> 只等待并按句柄顺序收集函数返回。文件交接、实际检查、必要修复与交付仍属于明确的后续流程。</p></article>
+      </div>
+      <p>通用宿主提供调用、作用域、持久化、权限、取消和工作区交接机制；具体业务的页数、生产步骤、内容规范和验收要求由用户输入与适用技能决定。并发只能在授权范围内运行，不因共享父环境或传递变量扩大权限。</p>
+    </section>
+    <div class="sources"><h3>来源与适用说明</h3><p>依据工作区 <code>README.md</code>、<code>docs/agent-program.md</code> 与 <code>docs/generic-agent-design.md</code> 的项目设计说明编写。页面聚焦 fork/join、分工、Git worktree、显式结果整合及验收边界；不修改源文档。本文未执行浏览器渲染，因此不声称完成视觉验收。</p></div>
+  </main>
+</div>
+<footer class="footer"><div class="shell"><strong>通用 Agent 设计 · 并发协作</strong><span>第 04 / 05 页　·　以当前版本文档与实际工具契约为准</span></div></footer>
+</body>
+</html>

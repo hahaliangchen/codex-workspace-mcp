@@ -114,9 +114,14 @@ pub async fn poll(task: &str, page: &str, wait: Duration) -> Result<Value> {
 pub fn reply(task: &str, page: &str, call: &str, result: Value) -> Result<()> {
     valid_page(page)?;
     let mut tasks = broker().tasks.lock().unwrap();
-    let entry = tasks.get_mut(task).ok_or_else(|| anyhow::anyhow!("no page tool calls for this task"))?;
+    let entry = tasks
+        .get_mut(task)
+        .ok_or_else(|| anyhow::anyhow!("no page tool calls for this task"))?;
     entry.seen.insert(page.to_owned(), Instant::now());
-    ensure!(entry.owner.as_deref() == Some(page), "another page runs this task's tools");
+    ensure!(
+        entry.owner.as_deref() == Some(page),
+        "another page runs this task's tools"
+    );
     let (sender, _) = entry
         .waiting
         .remove(call)
@@ -134,7 +139,12 @@ fn alive(entry: &TaskPages) -> bool {
 }
 
 /// Run `name` in the task's page and return what the page answered.
-pub async fn call(task: &str, name: &str, arguments: Value, cancel: &CancellationToken) -> Result<Value> {
+pub async fn call(
+    task: &str,
+    name: &str,
+    arguments: Value,
+    cancel: &CancellationToken,
+) -> Result<Value> {
     let id = crate::agent_service::uuid_like();
     let (sender, mut receiver) = oneshot::channel();
     {
@@ -144,7 +154,11 @@ pub async fn call(task: &str, name: &str, arguments: Value, cancel: &Cancellatio
             bail!("{PAGE_CLOSED}: 执行这个工具的页面已经关闭，任务已放弃");
         }
         entry.waiting.insert(id.clone(), (sender, None));
-        entry.queue.push_back(Call { id: id.clone(), name: name.to_owned(), arguments });
+        entry.queue.push_back(Call {
+            id: id.clone(),
+            name: name.to_owned(),
+            arguments,
+        });
     }
     broker().notify.notify_waiters();
     let forget = |reason: &str| -> anyhow::Error {
@@ -177,12 +191,15 @@ pub async fn call(task: &str, name: &str, arguments: Value, cancel: &Cancellatio
             }
         };
         if gone {
-            return Err(forget(&format!("{PAGE_CLOSED}: 执行这个工具的页面没有响应（已关闭或断开），任务已放弃")));
+            return Err(forget(&format!(
+                "{PAGE_CLOSED}: 执行这个工具的页面没有响应（已关闭或断开），任务已放弃"
+            )));
         }
     }
 }
 
 /// Drop the page state of a finished or deleted task.
+#[cfg(test)]
 pub fn forget_task(task: &str) {
     broker().tasks.lock().unwrap().remove(task);
 }
@@ -198,17 +215,35 @@ mod tests {
         let cancel = CancellationToken::new();
         let caller = {
             let task = task.clone();
-            tokio::spawn(async move { call(&task, "render_slide", json!({"slide":1}), &cancel).await })
+            tokio::spawn(
+                async move { call(&task, "render_slide", json!({"slide":1}), &cancel).await },
+            )
         };
         // Another tab polls: it is alive but gets nothing.
-        let other = poll(&task, "page-b", Duration::from_millis(50)).await.unwrap();
+        let other = poll(&task, "page-b", Duration::from_millis(50))
+            .await
+            .unwrap();
         assert_eq!(other["owner"], false);
         let taken = poll(&task, "page-a", Duration::from_secs(2)).await.unwrap();
         let calls = taken["calls"].as_array().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["name"], "render_slide");
-        assert!(reply(&task, "page-b", calls[0]["call_id"].as_str().unwrap(), json!({})).is_err());
-        reply(&task, "page-a", calls[0]["call_id"].as_str().unwrap(), json!({"ok":true})).unwrap();
+        assert!(
+            reply(
+                &task,
+                "page-b",
+                calls[0]["call_id"].as_str().unwrap(),
+                json!({})
+            )
+            .is_err()
+        );
+        reply(
+            &task,
+            "page-a",
+            calls[0]["call_id"].as_str().unwrap(),
+            json!({"ok":true}),
+        )
+        .unwrap();
         assert_eq!(caller.await.unwrap().unwrap(), json!({"ok":true}));
         forget_task(&task);
     }
@@ -216,7 +251,9 @@ mod tests {
     #[tokio::test]
     async fn a_task_without_a_live_page_fails_at_once() {
         let task = format!("task-{}", crate::agent_service::uuid_like());
-        let error = call(&task, "build_deck", json!({}), &CancellationToken::new()).await.unwrap_err();
+        let error = call(&task, "build_deck", json!({}), &CancellationToken::new())
+            .await
+            .unwrap_err();
         assert!(error.to_string().starts_with(PAGE_CLOSED));
         forget_task(&task);
     }
@@ -231,7 +268,9 @@ mod tests {
             let task = task.clone();
             tokio::spawn(async move { call(&task, "apply_edits", json!({}), &cancel).await })
         };
-        let a = poll(&task, "page-a", Duration::from_millis(50)).await.unwrap();
+        let a = poll(&task, "page-a", Duration::from_millis(50))
+            .await
+            .unwrap();
         assert_eq!(a["calls"].as_array().unwrap().len(), 0);
         let b = poll(&task, "page-b", Duration::from_secs(2)).await.unwrap();
         let id = b["calls"][0]["call_id"].as_str().unwrap().to_owned();

@@ -62,7 +62,11 @@ fn run(root: PathBuf, generation: u64, jobs: Receiver<Job>) {
                         job
                     }
                     Err(_) => {
-                        if registry.1.get(&root).is_some_and(|writer| writer.generation == generation) {
+                        if registry
+                            .1
+                            .get(&root)
+                            .is_some_and(|writer| writer.generation == generation)
+                        {
                             registry.1.remove(&root);
                         }
                         return;
@@ -84,7 +88,11 @@ fn run(root: PathBuf, generation: u64, jobs: Receiver<Job>) {
 
 fn forget(root: &Path, generation: u64) {
     let mut registry = writers().lock().unwrap();
-    if registry.1.get(root).is_some_and(|writer| writer.generation == generation) {
+    if registry
+        .1
+        .get(root)
+        .is_some_and(|writer| writer.generation == generation)
+    {
         registry.1.remove(root);
     }
 }
@@ -104,7 +112,9 @@ fn submit(root: &Path, job: Job) -> Result<()> {
     registry.0 += 1;
     let generation = registry.0;
     let (sender, receiver) = mpsc::channel();
-    sender.send(job).map_err(|_| anyhow!("database writer channel closed"))?;
+    sender
+        .send(job)
+        .map_err(|_| anyhow!("database writer channel closed"))?;
     let thread_root = root.clone();
     std::thread::Builder::new()
         .name("db-writer".into())
@@ -162,7 +172,8 @@ mod tests {
     use serde_json::json;
 
     fn root() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("db_writer_{}", crate::agent_service::uuid_like()));
+        let root =
+            std::env::temp_dir().join(format!("db_writer_{}", crate::agent_service::uuid_like()));
         std::fs::create_dir_all(&root).unwrap();
         let conn = crate::agent_service::open_db(&root).unwrap();
         conn.execute(
@@ -176,7 +187,13 @@ mod tests {
     fn append(root: &Path, step: usize) -> Result<i64> {
         write(root, move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let seq = crate::agent_service::append_event_tx(&tx, "task", "test/event", &json!({ "step": step }), None)?;
+            let seq = crate::agent_service::append_event_tx(
+                &tx,
+                "task",
+                "test/event",
+                &json!({ "step": step }),
+                None,
+            )?;
             tx.commit()?;
             Ok(seq)
         })
@@ -188,14 +205,27 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|writer| {
                 let root = root.clone();
-                std::thread::spawn(move || (0..50).map(|step| append(&root, writer * 100 + step).unwrap()).collect::<Vec<_>>())
+                std::thread::spawn(move || {
+                    (0..50)
+                        .map(|step| append(&root, writer * 100 + step).unwrap())
+                        .collect::<Vec<_>>()
+                })
             })
             .collect();
-        let mut seqs: Vec<i64> = threads.into_iter().flat_map(|thread| thread.join().unwrap()).collect();
+        let mut seqs: Vec<i64> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .collect();
         seqs.sort();
-        assert_eq!(seqs, (0..400).collect::<Vec<_>>(), "every write got its own sequence number");
+        assert_eq!(
+            seqs,
+            (0..400).collect::<Vec<_>>(),
+            "every write got its own sequence number"
+        );
         let conn = crate::agent_service::open_db(&root).unwrap();
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM agent_task_events", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_task_events", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 400);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -218,7 +248,11 @@ mod tests {
         // The open transaction was rolled back, and the writer still takes work.
         assert_eq!(append(&root, 1).unwrap(), 0);
         let conn = crate::agent_service::open_db(&root).unwrap();
-        let status: String = conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| r.get(0)).unwrap();
+        let status: String = conn
+            .query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(status, "running");
         let _ = std::fs::remove_dir_all(root);
     }
@@ -240,8 +274,15 @@ mod tests {
                 let root = root.clone();
                 tokio::spawn(async move {
                     write_async(&root, move |conn| {
-                        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                        let seq = crate::agent_service::append_event_tx(&tx, "task", "test/async", &json!({ "step": step }), None)?;
+                        let tx = conn
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        let seq = crate::agent_service::append_event_tx(
+                            &tx,
+                            "task",
+                            "test/async",
+                            &json!({ "step": step }),
+                            None,
+                        )?;
                         tx.commit()?;
                         Ok(seq)
                     })

@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use swc_common::{FileName, SourceMap, Span, Spanned, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast as ast;
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
+use swc_ecma_visit::{Visit, VisitWith};
 
 struct Compiler {
     map: Lrc<SourceMap>,
@@ -11,6 +12,8 @@ struct Compiler {
     arities: BTreeMap<String, usize>,
     libraries: super::libraries::Libraries,
     vars: BTreeMap<String, bool>,
+    available_names: BTreeSet<String>,
+    captures: std::cell::RefCell<BTreeSet<String>>,
     code: Vec<Instruction>,
     temp: usize,
     loops: Vec<LoopContext>,
@@ -204,10 +207,14 @@ impl Compiler {
             E::Ident(i) if self.vars.contains_key(i.sym.as_ref()) => {
                 Expr::Variable(i.sym.to_string())
             }
+            E::Ident(i) if self.available_names.contains(i.sym.as_ref()) => {
+                self.captures.borrow_mut().insert(i.sym.to_string());
+                Expr::Variable(i.sym.to_string())
+            }
             E::Ident(_) => {
                 return self.error(
                     e.span(),
-                    "unknown variable; pass parent values as function parameters",
+                    "unknown variable; declare it in an accessible function or pass it as a parameter",
                 );
             }
             E::Paren(p) => return self.expr(&p.expr),
@@ -365,11 +372,11 @@ impl Compiler {
         if matches!(
             target.as_str(),
             "execute_program"
+                | "check_program"
                 | "define_task_body"
                 | "create_task"
                 | "spawn_agent"
                 | "join_agents"
-                | "return_task"
         ) {
             return self.error(call.span,"use local functions and fork/join rather than recursively controlling program/task execution");
         }
@@ -507,7 +514,8 @@ impl Compiler {
                 Ok(if u.prefix { Expr::Variable(name) } else { old })
             }
             ast::Expr::Call(call) => {
-                if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if matches!(&*m.obj,ast::Expr::Ident(i) if i.sym==*"tools"))) {
+                if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if matches!(&*m.obj,ast::Expr::Ident(i) if i.sym==*"tools")))
+                {
                     return self.error(call.span,"tools.* is unsupported; use the fixed library.method(args) names in program_tool_headers");
                 }
                 if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Ident(i) if i.sym==*"assert"))
@@ -625,8 +633,7 @@ impl Compiler {
                 let target = match &call.callee {
                     ast::Callee::Expr(e) => &**e,
                     _ => {
-                        return self
-                            .error(call.span, "use a declared function or library.method");
+                        return self.error(call.span, "use a declared function or library.method");
                     }
                 };
                 for (index, arg) in call.args.iter().enumerate() {
@@ -961,9 +968,11 @@ impl Compiler {
     }
 }
 
+#[cfg(test)]
 pub fn compile(source: &str) -> Result<Program> {
     compile_with_libraries(source, super::libraries::builtin())
 }
+#[cfg(test)]
 pub fn compile_body(source: &str, entry: &str) -> Result<Program> {
     compile_body_with_libraries(source, entry, super::libraries::builtin())
 }
@@ -971,35 +980,47 @@ pub fn compile_with_libraries(
     source: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    compile_inner(source, "main", false, libraries)
+    compile_inner(source, "main", false, libraries, BTreeSet::new())
 }
+#[cfg(test)]
 pub fn compile_body_with_libraries(
     source: &str,
     entry: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    let program = compile_inner(source, entry, true, libraries)?;
+    compile_body_with_scope(source, entry, libraries, BTreeSet::new())
+}
+pub fn compile_body_with_scope(
+    source: &str,
+    entry: &str,
+    libraries: super::libraries::Libraries,
+    external_names: BTreeSet<String>,
+) -> Result<Program> {
+    let program = compile_inner(source, entry, true, libraries, external_names)?;
     ensure!(
-        !program.functions[entry].comment_only,
+        !program.functions[entry].virtual_task,
         "define_task_body must implement the current function, not return another empty stub"
     );
     Ok(program)
 }
+#[cfg(test)]
 pub fn compile_entry(source: &str, entry: &str) -> Result<Program> {
     compile_entry_with_libraries(source, entry, super::libraries::builtin())
 }
+#[cfg(test)]
 pub fn compile_entry_with_libraries(
     source: &str,
     entry: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    compile_inner(source, entry, false, libraries)
+    compile_inner(source, entry, false, libraries, BTreeSet::new())
 }
 fn compile_inner(
     source: &str,
     entry: &str,
     refinement: bool,
     libraries: super::libraries::Libraries,
+    external_names: BTreeSet<String>,
 ) -> Result<Program> {
     ensure!(
         source.len() <= 100_000,
@@ -1035,6 +1056,15 @@ fn compile_inner(
         .collect::<Vec<_>>();
     notes.sort_by_key(|c| c.span.lo);
     notes.dedup_by_key(|c| (c.span.lo, c.span.hi));
+    struct BindingNames(BTreeSet<String>);
+    impl Visit for BindingNames {
+        fn visit_binding_ident(&mut self, node: &ast::BindingIdent) {
+            self.0.insert(node.id.sym.to_string());
+        }
+    }
+    let mut bindings = BindingNames(BTreeSet::new());
+    module.visit_with(&mut bindings);
+    bindings.0.extend(external_names);
     let mut declarations = Vec::new();
     for item in module.body {
         match item {
@@ -1094,6 +1124,8 @@ fn compile_inner(
             arities: arities.clone(),
             libraries: libraries.clone(),
             vars: BTreeMap::new(),
+            available_names: bindings.0.clone(),
+            captures: std::cell::RefCell::new(BTreeSet::new()),
             code: Vec::new(),
             temp: 0,
             loops: Vec::new(),
@@ -1121,20 +1153,64 @@ fn compile_inner(
             .body
             .as_ref()
             .context("function body is required")?;
-        let description = notes
+        // A leading JSDoc and comments inside the body form the task contract.
+        // Walk only adjacent comments: a tag inside the previous function must
+        // never attach to the next declaration.
+        let mut header_start = f.function.span.lo;
+        let mut header = Vec::new();
+        for note in notes
             .iter()
-            .filter(|n| n.span.lo >= body.span.lo && n.span.hi <= body.span.hi)
-            .map(|n| n.text.to_string())
+            .rev()
+            .filter(|n| n.span.hi <= f.function.span.lo)
+        {
+            let lo = (note.span.hi.0 - file.start_pos.0) as usize;
+            let hi = (header_start.0 - file.start_pos.0) as usize;
+            if !source.get(lo..hi).is_some_and(|gap| gap.trim().is_empty()) {
+                break;
+            }
+            header.push(note.text.to_string());
+            header_start = note.span.lo;
+        }
+        header.reverse();
+        header.extend(
+            notes
+                .iter()
+                .filter(|n| n.span.lo >= body.span.lo && n.span.hi <= body.span.hi)
+                .map(|n| n.text.to_string()),
+        );
+        let contract = header.join("\n");
+        let virtual_task = contract
+            .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '@' | '_')))
+            .any(|word| word == "@virtual");
+        let description = contract
+            .lines()
+            .map(|line| line.trim().trim_start_matches('*').trim())
+            .map(|line| {
+                if virtual_task {
+                    line.replace("@virtual", "")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .filter(|line| !line.trim().is_empty())
             .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_owned();
+            .join("\n");
         let empty = body.stmts.iter().all(|s| matches!(s, ast::Stmt::Empty(_)));
-        if empty && !description.is_empty() {
+        if virtual_task {
+            if !empty {
+                return c.error(body.span,
+                    "@virtual declares AI work: leave its body empty; put the return contract in comments, not a placeholder return. Use define_task_body without @virtual for a concrete implementation");
+            }
+            if description.is_empty() {
+                return c.error(
+                    body.span,
+                    "@virtual needs a task description and return contract",
+                );
+            }
             if f.ident.sym == *"main" {
                 return c.error(
                     body.span,
-                    "main must orchestrate the complete task; put comment-only work in a helper",
+                    "main must orchestrate the complete task and cannot be @virtual",
                 );
             }
             let input = Expr::Object(
@@ -1160,7 +1236,7 @@ fn compile_inner(
             if empty {
                 return c.error(
                     body.span,
-                    "an empty helper needs comments describing its task and return value",
+                    "an empty helper must be explicitly marked @virtual with its task description and return contract",
                 );
             }
             for s in &body.stmts {
@@ -1173,7 +1249,8 @@ fn compile_inner(
             f.ident.sym.to_string(),
             Function {
                 description,
-                comment_only: empty,
+                virtual_task,
+                captures: c.captures.into_inner(),
                 params,
                 code: c.code,
             },

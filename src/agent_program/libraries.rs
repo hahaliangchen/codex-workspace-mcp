@@ -182,18 +182,14 @@ pub fn control(name: &str) -> bool {
     matches!(
         name,
         "execute_program"
+            | "check_program"
             | "define_task_body"
             | "create_task"
             | "spawn_agent"
             | "join_agents"
-            | "return_task"
-            | "create_step"
             | "list_skills"
             | "read_skill"
             | "unload_skill"
-            | "list_tool_groups"
-            | "load_tool_group"
-            | "unload_tool_group"
             | "release_assets"
     )
 }

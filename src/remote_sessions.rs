@@ -249,8 +249,9 @@ impl crate::plugin_io::SessionIo for Transport {
             let prefix = format!("{}__", plugin.replace('-', "_"));
             let raw = tool.strip_prefix(&prefix).unwrap_or(tool);
             // The plugin writes instructions against the plan the user confirmed here.
-            let board = crate::main_task_anchor::board(state.workspace.root(), &conversation, None)?
-                .unwrap_or(Value::Null);
+            let board =
+                crate::main_task_anchor::board(state.workspace.root(), &conversation, None)?
+                    .unwrap_or(Value::Null);
             let plan = json!({"confirmed":board["plan_confirmed"],"version":board["plan"]["version"],"plan":board["plan"]["plan"]});
             let brief = c
                 .rpc(
@@ -258,7 +259,10 @@ impl crate::plugin_io::SessionIo for Transport {
                     json!({"context":context(task,&conversation),"tool":raw,"arguments":args,"document":document,"images":images,"plan":plan}),
                 )
                 .await?;
-            let Some(instructions) = brief["instructions"].as_str().filter(|text| !text.trim().is_empty()) else {
+            let Some(instructions) = brief["instructions"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+            else {
                 return Ok(None);
             };
             // One subject per image; a single `subject` describes every image.
@@ -269,7 +273,9 @@ impl crate::plugin_io::SessionIo for Transport {
                     None => brief["subject"].clone(),
                 })
                 .collect::<Vec<_>>();
-            Ok(Some(json!({"instructions":instructions,"subjects":subjects})))
+            Ok(Some(
+                json!({"instructions":instructions,"subjects":subjects}),
+            ))
         })
     }
 }
@@ -328,7 +334,7 @@ async fn handle(
         .packages;
     if method == "connect" {
         // URL is administrator-configured, never selected by an untrusted page.
-        let url = remote::configured_url(registry,plugin)?;
+        let url = remote::configured_url(registry, plugin)?;
         let package = remote::connect_user(
             remote::Config {
                 url,
@@ -626,10 +632,19 @@ mod tests {
         assert_eq!(board["plan"]["plan"]["items"][0]["id"], "a");
         assert_eq!(board["plan_confirmed"], false);
         // A plugin that does not declare visual_review is never asked for review instructions.
-        assert!(crate::plugin_io::review_brief(&state, "child", "notes_test__save", &json!({}), &json!({}), &json!([]))
+        assert!(
+            crate::plugin_io::review_brief(
+                &state,
+                "child",
+                "notes_test__save",
+                &json!({}),
+                &json!({}),
+                &json!([])
+            )
             .await
             .unwrap()
-            .is_none());
+            .is_none()
+        );
         // Re-authentication restores an existing binding without accepting a different subject.
         active().write().unwrap().remove(task);
         let opened=value(handle(&runtime,state.clone(),"notes-test","session",headers("alice"),json!({"connection_handle":alice["connection_handle"],"task_id":task,"method":"open"})).await.unwrap()).await;
@@ -664,8 +679,10 @@ mod tests {
             }
             ids
         };
-        let call = |name: &str, args: Value, n: usize| json!({"role":"assistant","content":null,
-            "tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+        let call = |name: &str, args: Value, n: usize| {
+            json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":format!("c{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+        };
         let app = Router::new()
             .route("/api/plugin/{method}", post({
                 let plugin_calls = plugin_calls.clone();
@@ -705,7 +722,7 @@ mod tests {
                         let n = rounds.fetch_add(1, Ordering::SeqCst);
                         let message = match n {
                             0 => call("create_task", json!({"goal":"Render and review page 1"}), n),
-                            1 => call("load_tool_group", json!({"group":"vision"}), n),
+                            1 => call("read_task_board", json!({}), n),
                             2 => call("review_lab__render", json!({"slides":[1,2]}), n),
                             3 => call("analyze_images", json!({"artifact_ids":ids_in(&body, "visual-"),"question":"I just changed the subtitle."}), n),
                             4 => call("review_lab__record", json!({"analysis_ids":ids_in(&body, "analysis-")}), n),
@@ -718,31 +735,62 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let root = std::env::temp_dir().join(format!("remote-review-{}", crate::agent_service::uuid_like()));
+        let root = std::env::temp_dir().join(format!(
+            "remote-review-{}",
+            crate::agent_service::uuid_like()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let (runtime, catalog) = crate::skill_packages::test_runtime();
-        let package = remote::connect_user(remote::Config { url: format!("http://{address}"), token: "admin".into() }, true)
-            .await
-            .unwrap();
+        let package = remote::connect_user(
+            remote::Config {
+                url: format!("http://{address}"),
+                token: "admin".into(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
         remote::mount_user_package(&runtime, &catalog.packages, package).unwrap();
         let mut state = crate::agent_service::tests::test_state(&root, address);
         state.tool_catalog = Some(catalog.clone());
         state.visual_tool_settings.model = Some("vision-only".into());
-        let alice = value(handle(&runtime, state.clone(), "review-lab", "connect", headers("alice"), json!({})).await.unwrap()).await;
+        let alice = value(
+            handle(
+                &runtime,
+                state.clone(),
+                "review-lab",
+                "connect",
+                headers("alice"),
+                json!({}),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
         let created = value(handle(&runtime, state.clone(), "review-lab", "session", headers("alice"),
             json!({"connection_handle":alice["connection_handle"],"method":"create","document":"D1"})).await.unwrap()).await;
         let task = created["task_id"].as_str().unwrap().to_owned();
-        crate::agent_service::open_db(&root).unwrap()
-            .execute("UPDATE agent_tasks SET status='running',model='fake' WHERE id=?1", [&task]).unwrap();
+        crate::agent_service::open_db(&root)
+            .unwrap()
+            .execute(
+                "UPDATE agent_tasks SET status='running',model='fake' WHERE id=?1",
+                [&task],
+            )
+            .unwrap();
         crate::page_tools::claim(&task, "page-1").unwrap();
         let page = {
             let task = task.clone();
             tokio::spawn(async move {
                 let mut png = Vec::new();
-                image::DynamicImage::new_rgb8(8, 8).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+                image::DynamicImage::new_rgb8(8, 8)
+                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                    .unwrap();
                 let data = base64::engine::general_purpose::STANDARD.encode(png);
                 loop {
-                    let taken = crate::page_tools::poll(&task, "page-1", std::time::Duration::from_secs(2)).await.unwrap();
+                    let taken =
+                        crate::page_tools::poll(&task, "page-1", std::time::Duration::from_secs(2))
+                            .await
+                            .unwrap();
                     for call in taken["calls"].as_array().into_iter().flatten() {
                         let mut content = call["arguments"]["slides"].as_array().unwrap().iter()
                             .map(|slide| json!({"type":"image","mimeType":"image/png","data":data,"meta":{"slide":slide}}))
@@ -754,41 +802,96 @@ mod tests {
                 }
             })
         };
-        crate::single_agent::run_task(state.clone(), task.clone(), "fake".into(), "Review page 1".into(), 12,
-            tokio_util::sync::CancellationToken::new(), 1, false).await.unwrap();
+        crate::single_agent::run_task(
+            state.clone(),
+            task.clone(),
+            "fake".into(),
+            "Review page 1".into(),
+            12,
+            tokio_util::sync::CancellationToken::new(),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
         page.abort();
 
         let calls = plugin_calls.lock().unwrap().clone();
-        let (_, brief_request) = calls.iter().find(|(method, _)| method == "reviewBrief").expect("plugin was asked for review instructions");
+        let (_, brief_request) = calls
+            .iter()
+            .find(|(method, _)| method == "reviewBrief")
+            .expect("plugin was asked for review instructions");
         assert_eq!(brief_request["tool"], "render");
         assert_eq!(brief_request["arguments"], json!({"slides":[1,2]}));
-        assert_eq!(brief_request["images"], json!([{"slide":1},{"slide":2}]), "each image says which page it shows");
-        assert_eq!(brief_request["document"], json!({"revision":2,"stable":true}));
+        assert_eq!(
+            brief_request["images"],
+            json!([{"slide":1},{"slide":2}]),
+            "each image says which page it shows"
+        );
+        assert_eq!(
+            brief_request["document"],
+            json!({"revision":2,"stable":true})
+        );
         assert_eq!(brief_request["context"], context(&task, &task));
         assert!(brief_request["plan"].get("plan").is_some());
 
         let vision = vision_bodies.lock().unwrap().clone();
         assert_eq!(vision.len(), 1);
         let messages = vision[0]["messages"].as_array().unwrap();
-        assert_eq!(messages[0], json!({"role":"system","content":format!(
+        assert_eq!(
+            messages[0],
+            json!({"role":"system","content":format!(
             "{INSTRUCTIONS}\n\nImage 1:\n{}\n\nImage 2:\n{}", subject(&json!(1)), subject(&json!(2)))}),
-            "each image is reviewed against its own outline entry");
-        assert_eq!(messages[1]["content"][0], json!({"type":"text","text":"I just changed the subtitle."}));
-        assert_eq!(messages[1]["content"][1], json!({"type":"text","text":"Image 1"}));
-        assert_eq!(messages[1]["content"][3], json!({"type":"text","text":"Image 2"}));
+            "each image is reviewed against its own outline entry"
+        );
+        assert_eq!(
+            messages[1]["content"][0],
+            json!({"type":"text","text":"I just changed the subtitle."})
+        );
+        assert_eq!(
+            messages[1]["content"][1],
+            json!({"type":"text","text":"Image 1"})
+        );
+        assert_eq!(
+            messages[1]["content"][3],
+            json!({"type":"text","text":"Image 2"})
+        );
 
-        let (_, record) = calls.iter().find(|(method, args)| method == "call" && args["tool"] == "record").expect("record call");
+        let (_, record) = calls
+            .iter()
+            .find(|(method, args)| method == "call" && args["tool"] == "record")
+            .expect("record call");
         let evidence = &record["context"]["analyses"][0];
-        assert_eq!(evidence["analysis"], VISION, "the plugin reads the vision model's own text");
-        assert_eq!(evidence["analysis_id"], record["arguments"]["analysis_ids"][0]);
+        assert_eq!(
+            evidence["analysis"], VISION,
+            "the plugin reads the vision model's own text"
+        );
+        assert_eq!(
+            evidence["analysis_id"],
+            record["arguments"]["analysis_ids"][0]
+        );
         assert_eq!(evidence["images"][0]["source"]["meta"], json!({"slide":1}));
         assert_eq!(evidence["images"][1]["source"]["meta"], json!({"slide":2}));
-        assert_eq!(evidence["images"][1]["source"]["arguments"], json!({"slides":[1,2]}));
+        assert_eq!(
+            evidence["images"][1]["source"]["arguments"],
+            json!({"slides":[1,2]})
+        );
         assert_eq!(evidence["images"][0]["source"]["document"]["revision"], 2);
-        assert_eq!(evidence["images"][0]["source"]["tool"], "review_lab__render");
+        assert_eq!(
+            evidence["images"][0]["source"]["tool"],
+            "review_lab__render"
+        );
 
-        let forged = crate::plugin_io::execute(&state, &task, state.workspace.clone(), "review_lab__record",
-            json!({"analysis_ids":["analysis-forged"]})).await.unwrap_err().to_string();
+        let forged = crate::plugin_io::execute(
+            &state,
+            &task,
+            state.workspace.clone(),
+            "review_lab__record",
+            json!({"analysis_ids":["analysis-forged"]}),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(forged.contains("Unknown analysis_id"), "{forged}");
         crate::page_tools::forget_task(&task);
         runtime.shutdown().unwrap();

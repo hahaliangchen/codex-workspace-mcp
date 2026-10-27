@@ -172,14 +172,26 @@ fn single_bodies(w: &mut Window) -> usize {
 }
 
 /// Completed rounds keep their native exchange until the working view passes
-/// FOLD_AT percent of the input budget; the oldest then fold until it is back
-/// under FOLD_TO. Materials read in nearby rounds stay usable together.
-const FOLD_AT: usize = 40;
-const FOLD_TO: usize = 25;
+/// FOLD_AT percent of the space remaining after fixed inputs; old exchanges
+/// fold toward FOLD_TO of that working space. Fixed rules do not evict work.
+const FOLD_AT: usize = 80;
+const FOLD_TO: usize = 60;
 
 /// Where completed steps start to fold; reported to the context ring.
-pub(super) fn fold_at(input_budget: usize) -> usize {
-    input_budget * FOLD_AT / 100
+pub(super) fn limits(s: &Session<'_>, w: &Window, definitions: &[Value]) -> (usize, usize, usize) {
+    let fixed_messages = w
+        .messages
+        .iter()
+        .filter(|message| protected(message))
+        .cloned()
+        .collect::<Vec<_>>();
+    let fixed = w.input_tokens(s, &request(s, &fixed_messages, definitions));
+    let working = s.input_budget.saturating_sub(fixed);
+    (
+        fixed,
+        fixed + working * FOLD_AT / 100,
+        fixed + working * FOLD_TO / 100,
+    )
 }
 
 /// Fold only this task's older completed rounds, oldest first, and only over
@@ -251,10 +263,10 @@ fn fold(s: &Session<'_>, w: &mut Window, definitions: &[Value]) -> Result<FoldSt
         before: estimated,
         ..Default::default()
     };
-    if estimated <= s.input_budget * FOLD_AT / 100 {
+    let (_, threshold, target) = limits(s, w, definitions);
+    if estimated <= threshold {
         return Ok(stats);
     }
-    let target = s.input_budget * FOLD_TO / 100;
     let mut remaining = estimated;
     let mut candidates = old.values().copied().collect::<Vec<_>>();
     candidates.sort_by_key(|node| node.ordinal);
@@ -485,7 +497,7 @@ async fn restore_references(
         if released.contains(id) {
             continue;
         }
-        match load_saved_asset(s, &json!({"asset_id":id}), None).await {
+        match load_saved_asset(s, &json!({"asset_id":id})).await {
             Ok(delivery) => {
                 let reference = &delivery["asset_reference"];
                 let mut message = assets::tagged(
@@ -533,8 +545,31 @@ async fn restore_references(
     Ok(restored)
 }
 
+/// Reserve room for an incoming result before withholding it. Old working
+/// exchanges may fold; current arguments and the pending call stay untouched.
+pub(super) async fn make_room(
+    s: &Session<'_>,
+    w: &mut Window,
+    definitions: &[Value],
+    reserve: usize,
+) -> Result<()> {
+    let pressure = Session {
+        input_budget: s.input_budget.saturating_sub(reserve),
+        ..s.clone()
+    };
+    let stats = fold(&pressure, w, definitions)?;
+    if stats.folded > 0 || stats.merged > 0 {
+        let (fixed, at, to) = limits(&pressure, w, definitions);
+        append(s,"context/step_view",json!({"turn":s.turn,"reason":"incoming_delivery","folded_steps":stats.folded,"merged_steps":stats.merged,
+            "restored_assets":0,"repeated_bodies":0,"estimated_input_tokens":stats.before,
+            "after_input_tokens":w.input_tokens(s,&request(s,&w.messages,definitions)),
+            "fixed_input_tokens":fixed,"fold_at_tokens":at,"fold_to_tokens":to}),false).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn prepare(s: &Session<'_>, w: &mut Window, definitions: &[Value]) -> Result<()> {
-    if s.mode != Mode::Main || task_frames::no_task(s, w) {
+    if task_frames::no_task(s, w) {
         return Ok(());
     };
     let repeated = single_bodies(w);
@@ -547,12 +582,14 @@ pub(super) async fn prepare(s: &Session<'_>, w: &mut Window, definitions: &[Valu
         stats.expired |= after_restore.expired;
     }
     if stats.folded > 0 || stats.merged > 0 || restored > 0 || repeated > 0 || stats.expired {
+        let (fixed, at, to) = limits(s, w, definitions);
         append(
             s,
             "context/step_view",
             json!({"turn":s.turn,"folded_steps":stats.folded,"merged_steps":stats.merged,"restored_assets":restored,"repeated_bodies":repeated,
                 "estimated_input_tokens":stats.before,"after_input_tokens":w.input_tokens(s,&request(s,&w.messages,definitions)),
-                "fold_at_tokens":s.input_budget*FOLD_AT/100,"fold_to_tokens":s.input_budget*FOLD_TO/100}),
+                "fixed_input_tokens":fixed,
+                "fold_at_tokens":at,"fold_to_tokens":to}),
             false,
         )
         .await?;
@@ -582,7 +619,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut window = Window {
             messages: vec![
-                json!({"role":"system","content":Mode::Main.prompt()}),
+                json!({"role":"system","content":MAIN_PROMPT}),
                 json!({"role":"user","content":"USER_REQUIREMENT_KEEP"}),
             ],
             ..Default::default()
@@ -612,7 +649,6 @@ mod tests {
             turn: 1,
             cancel,
             ban_execution: false,
-            mode: Mode::Main,
             scope: "main".into(),
             parent: None,
             input_budget: INPUT_BUDGET,
@@ -628,7 +664,9 @@ mod tests {
         percent: usize,
     ) -> Session<'a> {
         let s = session(state, cancel);
-        let input_budget = w.input_tokens(&s, &request(&s, &w.messages, &[])) * 100 / percent;
+        let fixed = limits(&s, w, &[]).0;
+        let total = w.input_tokens(&s, &request(&s, &w.messages, &[]));
+        let input_budget = fixed + (total.saturating_sub(fixed)) * 100 / percent;
         Session { input_budget, ..s }
     }
 
@@ -716,7 +754,7 @@ mod tests {
         .map(|row| (row.seq, row.raw))
         .collect::<Vec<_>>();
         drop(conn);
-        let s = occupied(&state, &cancel, &w, 50);
+        let s = occupied(&state, &cancel, &w, 90);
         prepare(&s, &mut w, &[]).await.unwrap();
         let wire = request(&s, &w.messages, &[]);
         assert!(!wire.to_string().contains(&old));
@@ -805,12 +843,13 @@ mod tests {
             old["asset_id"], repeated["asset_id"],
             "identical content reuses its immutable snapshot"
         );
+        let s = occupied(&state, &cancel, &w, 90);
         let before = w.input_tokens(&s, &request(&s, &w.messages, &[]));
         prepare(&s, &mut w, &[]).await.unwrap();
         let wire = request(&s, &w.messages, &[]);
         let after = w.input_tokens(&s, &wire);
         assert!(
-            after < before && after <= s.input_budget * FOLD_AT / 100,
+            after < before && after <= limits(&s, &w, &[]).1,
             "repeated rounds stay within the working view: {before} -> {after}"
         );
         let text = wire.to_string();
@@ -889,7 +928,9 @@ mod tests {
             json!({"asset_id":outer["asset_id"]}),
         )
         .await;
-        let s = occupied(&state, &cancel, &w, 50);
+        // Fold the old exchanges, then test restoration with real delivery room.
+        fold(&exhausted(&state, &cancel), &mut w, &[]).unwrap();
+        let s = session(&state, &cancel);
         prepare(&s, &mut w, &[]).await.unwrap();
         prepare(&s, &mut w, &[]).await.unwrap();
         let wire = request(&s, &w.messages, &[]).to_string();
@@ -916,9 +957,10 @@ mod tests {
         // frame input survives until the frame/user explicitly releases it.
         prepare(&s, &mut w, &[]).await.unwrap();
         assert!(!w.messages.iter().any(|m| m["name"] == "step_asset"));
-        assert!(w.messages.iter().any(|m| m["name"] == "saved_asset"
-            && m["_frame_input"] == true
-            && m.get(RESTORED_FOR).is_none()));
+        assert!(
+            w.messages.iter().any(|m| m["name"] == "saved_asset"
+                && m["_frame_input"] == m.get(RESTORED_FOR).is_none())
+        );
         assets::release(
             &mut w.messages,
             &[outer["asset_id"].as_str().unwrap().to_owned()],
@@ -954,7 +996,9 @@ mod tests {
         )
         .await;
         round(&s,&mut w,"example__inspect",json!({}),json!({"status":"issue","evidence":{"asset_reference":{"asset_id":old["asset_id"]}},"finding":"Needs correction"})).await;
-        let s = occupied(&state, &cancel, &w, 50);
+        // Fold the old exchanges, then test restoration with real delivery room.
+        fold(&exhausted(&state, &cancel), &mut w, &[]).unwrap();
+        let s = session(&state, &cancel);
         prepare(&s, &mut w, &[]).await.unwrap();
         let restored = w
             .messages
@@ -1081,7 +1125,7 @@ mod tests {
             )
             .await;
         }
-        let s = occupied(&state, &cancel, &w, 50);
+        let s = occupied(&state, &cancel, &w, 90);
         prepare(&s, &mut w, &[]).await.unwrap();
         let wire = request(&s, &w.messages, &[]);
         let text = wire.to_string();
@@ -1101,7 +1145,7 @@ mod tests {
                 .count(),
             first
         );
-        assert!(w.input_tokens(&s, &wire) <= s.input_budget * FOLD_AT / 100);
+        assert!(w.input_tokens(&s, &wire) <= limits(&s, &w, &[]).1);
         let count = w.messages.len();
         prepare(&s, &mut w, &[]).await.unwrap();
         assert_eq!(
@@ -1206,11 +1250,11 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         drop(conn);
-        let pressure = occupied(&state, &cancel, &w, 50);
+        let pressure = occupied(&state, &cancel, &w, 90);
         prepare(&pressure, &mut w, &[]).await.unwrap();
         assert!(
             w.input_tokens(&pressure, &request(&pressure, &w.messages, &[]))
-                < pressure.input_budget * FOLD_TO / 100
+                < limits(&pressure, &w, &[]).2
         );
         assert_eq!(w.current_step_node_id, latest);
         for message in recent {
@@ -1219,6 +1263,9 @@ mod tests {
                 "newest exchange is untouched"
             );
         }
+        // Stronger pressure explicitly exercises prefix merging; ordinary
+        // folding may already fit without merging its per-step records.
+        fold(&exhausted(&state, &cancel), &mut w, &[]).unwrap();
         let ranges = w
             .messages
             .iter()
@@ -1338,10 +1385,75 @@ mod tests {
             once, w.messages,
             "a withheld restoration is not retried every round"
         );
-        let page = load_saved_asset(&pressure, &data["next_read"]["arguments"], None)
+        let page = load_saved_asset(&pressure, &data["next_read"]["arguments"])
             .await
             .unwrap();
         assert_eq!(page["returned_chars"], PAGE_CHARS);
         assert!(page["next_char_offset"].as_u64().is_some());
+    }
+    #[tokio::test]
+    async fn fixed_scope_overhead_does_not_evict_two_inputs_and_natural_work_growth_still_folds() {
+        let (_root, state, cancel, mut w) = fixture().await;
+        w.messages.push(json!({"role":"user","name":"declared_rules","content":"FIXED_SCOPE_".repeat(4000),"_frame_input":true}));
+        let original = session(&state, &cancel);
+        let fixed = limits(&original, &w, &[]).0;
+        let s = Session {
+            input_budget: fixed * 2 + 8000,
+            ..original
+        };
+        let a = "CURRENT_INPUT_A_".repeat(1000);
+        let b = "CURRENT_INPUT_B_".repeat(1000);
+        round(
+            &s,
+            &mut w,
+            "read_file",
+            json!({"path":"a"}),
+            json!({"content":a}),
+        )
+        .await;
+        prepare(&s, &mut w, &[]).await.unwrap();
+        round(
+            &s,
+            &mut w,
+            "read_file",
+            json!({"path":"b"}),
+            json!({"content":b}),
+        )
+        .await;
+        prepare(&s, &mut w, &[]).await.unwrap();
+        let wire = request(&s, &w.messages, &[]);
+        let size = w.input_tokens(&s, &wire);
+        assert!(
+            size > s.input_budget * 40 / 100,
+            "the fixture must reproduce pressure under the old total-budget rule"
+        );
+        assert!(
+            wire.to_string().contains(&a) && wire.to_string().contains(&b),
+            "both current input bodies remain usable together"
+        );
+        for n in 0..24 {
+            round(
+                &s,
+                &mut w,
+                "read_file",
+                json!({"path":format!("older-{n}")}),
+                json!({"content":format!("NATURAL_WORK_{n}_").repeat(1800)}),
+            )
+            .await;
+            prepare(&s, &mut w, &[]).await.unwrap();
+            assert!(
+                w.input_tokens(&s, &request(&s, &w.messages, &[])) < s.input_budget,
+                "ordinary work growth stays below the hard input budget"
+            );
+        }
+        let text = request(&s, &w.messages, &[]).to_string();
+        assert!(text.contains("FIXED_SCOPE_"));
+        assert!(text.contains("NATURAL_WORK_23_"));
+        assert!(
+            !text.contains(&"NATURAL_WORK_0_".repeat(1800)),
+            "unneeded old working bodies fold naturally"
+        );
+        let conn = agent_service::open_db(s.state.workspace.root()).unwrap();
+        assert!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='context/step_view' AND json_extract(data,'$.folded_steps')>0",[],|r|r.get::<_,i64>(0)).unwrap()>0);
     }
 }

@@ -10,7 +10,9 @@ use std::{
 fn git_path(path: &Path) -> Result<String> {
     let raw = path.to_str().context("Git path must be UTF-8")?;
     if cfg!(windows) {
-        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") { return Ok(format!(r"\\{unc}")); }
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return Ok(format!(r"\\{unc}"));
+        }
         return Ok(raw.strip_prefix(r"\\?\").unwrap_or(raw).to_owned());
     }
     Ok(raw.to_owned())
@@ -39,7 +41,9 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
 /// task in any registered project merges back into that project, not into
 /// the server's own checkout; older delegates fall back to `root`.
 fn repository(root: &Path, spec: &Value) -> PathBuf {
-    spec["git"]["repository"].as_str().map_or_else(|| root.to_path_buf(), PathBuf::from)
+    spec["git"]["repository"]
+        .as_str()
+        .map_or_else(|| root.to_path_buf(), PathBuf::from)
 }
 
 fn worktree_parent(root: &Path) -> Result<PathBuf> {
@@ -66,13 +70,20 @@ fn clean_checkout(root: &Path) -> Result<bool> {
 const STATE_DIR: &str = ".codex-workspace-mcp";
 
 fn exclude_state_dir(root: &Path) -> Result<()> {
-    let common = PathBuf::from(git(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
+    let common = PathBuf::from(git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?);
     let exclude = common.join("info").join("exclude");
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
     let rule = format!("/{STATE_DIR}/");
     if !current.lines().any(|line| line.trim() == rule) {
         std::fs::create_dir_all(exclude.parent().context("exclude file has no parent")?)?;
-        let separator = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+        let separator = if current.is_empty() || current.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
         std::fs::write(&exclude, format!("{current}{separator}{rule}\n"))?;
     }
     Ok(())
@@ -194,13 +205,14 @@ pub fn changed_paths(root: &Path, spec: &Value) -> Result<Vec<String>> {
     let base = spec["git"]["base"]
         .as_str()
         .context("missing delegate base")?;
-    Ok(
-        git_output(&repository(root, spec), &["diff", "--name-only", "-z", base, branch, "--"])?
-            .split('\0')
-            .filter(|path| !path.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
+    Ok(git_output(
+        &repository(root, spec),
+        &["diff", "--name-only", "-z", base, branch, "--"],
+    )?
+    .split('\0')
+    .filter(|path| !path.is_empty())
+    .map(str::to_owned)
+    .collect())
 }
 
 pub fn merge(root: &Path, spec: &Value, expected_head: &str) -> Result<Value> {
@@ -260,7 +272,10 @@ mod tests {
     use super::*;
     #[test]
     fn delegates_merge_into_the_project_they_branched_from() {
-        let parent = std::env::temp_dir().join(format!("delegate-repo-{}", crate::agent_service::uuid_like()));
+        let parent = std::env::temp_dir().join(format!(
+            "delegate-repo-{}",
+            crate::agent_service::uuid_like()
+        ));
         let (server, project) = (parent.join("server"), parent.join("project"));
         for root in [&server, &project] {
             std::fs::create_dir_all(root).unwrap();
@@ -268,27 +283,73 @@ mod tests {
             git(root, &["config", "core.autocrlf", "false"]).unwrap();
             std::fs::write(root.join("file.txt"), "before\n").unwrap();
             git(root, &["add", "-A"]).unwrap();
-            git(root, &["-c", "user.name=Test", "-c", "user.email=test@local", "commit", "-m", "base"]).unwrap();
+            git(
+                root,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@local",
+                    "commit",
+                    "-m",
+                    "base",
+                ],
+            )
+            .unwrap();
         }
         let spec = json!({"git":prepare(&project, "child").unwrap().unwrap()});
         // Callers pass the server root; the recorded repository wins.
         let child = workspace(&server, &spec).unwrap();
-        assert!(child.starts_with(parent.canonicalize().unwrap().join(".codex-workspace-mcp-worktrees").join("project")));
+        assert!(
+            child.starts_with(
+                parent
+                    .canonicalize()
+                    .unwrap()
+                    .join(".codex-workspace-mcp-worktrees")
+                    .join("project")
+            )
+        );
         std::fs::write(child.join("file.txt"), "after\n").unwrap();
         // Both checkouts have their own host state store; neither may be committed or clobbered.
         for dir in [&child, &project] {
             std::fs::create_dir_all(dir.join(STATE_DIR)).unwrap();
-            std::fs::write(dir.join(STATE_DIR).join("codex_state.db"), dir.to_string_lossy().as_bytes()).unwrap();
+            std::fs::write(
+                dir.join(STATE_DIR).join("codex_state.db"),
+                dir.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
         }
-        let head = finish(&spec).unwrap().unwrap()["head"].as_str().unwrap().to_owned();
-        assert!(diff(&server, &spec).unwrap()["diff"].as_str().unwrap().contains("+after"));
-        assert!(!diff(&server, &spec).unwrap()["stat"].as_str().unwrap().contains(STATE_DIR));
+        let head = finish(&spec).unwrap().unwrap()["head"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            diff(&server, &spec).unwrap()["diff"]
+                .as_str()
+                .unwrap()
+                .contains("+after")
+        );
+        assert!(
+            !diff(&server, &spec).unwrap()["stat"]
+                .as_str()
+                .unwrap()
+                .contains(STATE_DIR)
+        );
         merge(&server, &spec, &head).unwrap();
         assert!(is_merged(&server, &spec, &head).unwrap());
         assert_eq!(changed_paths(&server, &spec).unwrap(), vec!["file.txt"]);
-        assert_eq!(std::fs::read_to_string(project.join("file.txt")).unwrap(), "after\n");
-        assert_eq!(std::fs::read_to_string(server.join("file.txt")).unwrap(), "before\n");
-        assert_eq!(std::fs::read_to_string(project.join(STATE_DIR).join("codex_state.db")).unwrap(), project.to_string_lossy());
+        assert_eq!(
+            std::fs::read_to_string(project.join("file.txt")).unwrap(),
+            "after\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.join("file.txt")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join(STATE_DIR).join("codex_state.db")).unwrap(),
+            project.to_string_lossy()
+        );
         let _ = std::fs::remove_dir_all(&parent);
     }
 

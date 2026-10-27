@@ -3,9 +3,22 @@ use runtime::ActionKind;
 
 // Test-only effect targets, declared just like plugin methods.
 fn compile(source: &str) -> anyhow::Result<Program> {
-    let mut bindings=libraries::builtin();
-    bindings.insert("test".into(),["record","never","selected"].into_iter().map(|n|(n.into(),n.into())).collect());
-    compile_with_libraries(source,bindings)
+    let mut bindings = libraries::builtin();
+    bindings.insert(
+        "host".into(),
+        ["inspect_agent_changes", "merge_agent_result"]
+            .into_iter()
+            .map(|n| (n.into(), n.into()))
+            .collect(),
+    );
+    bindings.insert(
+        "test".into(),
+        ["record", "never", "selected"]
+            .into_iter()
+            .map(|n| (n.into(), n.into()))
+            .collect(),
+    );
+    compile_with_libraries(source, bindings)
 }
 fn runtime(source: &str) -> Runtime {
     Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap()
@@ -65,9 +78,7 @@ fn child_failure_unwinds_to_callers_catch_and_skips_following_effect() {
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!({"message":"not found"}), true).unwrap();
     assert_eq!(returned(r), json!("not found"));
-    let mut r = runtime(
-        "function main(){ io.read({path:'missing'}); io.write({path:'bad'}); }",
-    );
+    let mut r = runtime("function main(){ io.read({path:'missing'}); io.write({path:'bad'}); }");
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!({"message":"not found"}), true).unwrap();
     let State::Failed(error) = r.next() else {
@@ -155,7 +166,7 @@ fn deterministic_expressions_return_without_model_actions() {
             );
         }
     }
-    assert!(compile(include_str!("fixtures/two-workers.ts")).is_err());
+    assert!(compile("function* main(){yield io.read({path: 'x'});}").is_err());
     assert_eq!(
         returned(runtime(
             "function main(){return 'function* x(){yield call();}';}"
@@ -191,7 +202,7 @@ fn executable_extensions_and_unknown_data_methods_are_rejected_before_effects() 
 
 #[test]
 fn business_judgment_is_an_explicit_task_with_named_inputs_and_evidence() {
-    let source = "function main(要求){let 产物={path:'artifact.html'};const check=检查(产物,要求);if(!check.passed){产物={path:'repaired.html'};}return 产物;} function 检查(产物,要求){// Inspect real artifacts; return {passed:boolean,evidence:[...]}.\n}";
+    let source = "function main(要求){let 产物={path:'artifact.html'};const check=检查(产物,要求);if(!check.passed){产物={path:'repaired.html'};}return 产物;} function 检查(产物,要求){/* @virtual */ // Inspect real artifacts; return {passed:boolean,evidence:[...]}.\n}";
     for (passed, path) in [(true, "artifact.html"), (false, "repaired.html")] {
         let mut r = Runtime::new(
             compile(source).unwrap(),
@@ -202,7 +213,6 @@ fn business_judgment_is_an_explicit_task_with_named_inputs_and_evidence() {
         let State::Action(action) = r.next() else {
             panic!()
         };
-        assert!(action.semantic_boolean.is_none());
         assert!(
             matches!(action.kind,ActionKind::Task{name,description,input} if name=="检查" && description.contains("evidence") && input["产物"]["path"]=="artifact.html" && input["要求"]["expected"]=="approved")
         );
@@ -235,7 +245,6 @@ fn type_errors_and_assertions_use_the_existing_exception_path() {
     for expression in [
         "1/0",
         "1%0",
-        "1+'x'",
         "true+1",
         "1<false",
         "18446744073709551615+1",
@@ -273,7 +282,7 @@ fn if_else_uses_returned_boolean_or_field_directly() {
         );
     }
     let mut r = runtime(
-        "function main(){const ok=check();if(ok){return 'yes';}else{return 'no';}} function check(){// Return a boolean conclusion from actual evidence.\n}",
+        "function main(){const ok=check();if(ok){return 'yes';}else{return 'no';}} function check(){/* @virtual */ // Return a boolean conclusion from actual evidence.\n}",
     );
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!(false), false).unwrap();
@@ -375,6 +384,7 @@ function process(content, request) {
   // Explicit tool calls and task calls share one sequence.
   return io.write({path: request.output, content: transform(content, request).content});
 }
+/** @virtual */
 function transform(content, request) {
   // Transform content according to request; preserve the requested scope.
   /* Return {content: string} with the transformed text. */
@@ -413,7 +423,7 @@ function transform(content, request) {
 #[test]
 fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
     let mut r = runtime(
-        "function check(){// Return {passed:boolean} after inspecting actual artifacts.\n} function main(){try{if(check().passed){return 'ok';}else{throw 'bad';}}catch(error){return {error};}}",
+        "function check(){/* @virtual */ // Return {passed:boolean} after inspecting actual artifacts.\n} function main(){try{if(check().passed){return 'ok';}else{throw 'bad';}}catch(error){return {error};}}",
     );
     assert!(matches!(
         r.next(),
@@ -425,7 +435,7 @@ fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
     r.resume(json!({"passed":false}), false).unwrap();
     assert_eq!(returned(r)["error"]["message"], json!("bad"));
     let mut r = runtime(
-        "function work(){// Complete the assigned work.\n} function main(){try{return work();}catch(error){return error;}}",
+        "function work(){/* @virtual */ // Complete the assigned work.\n} function main(){try{return work();}catch(error){return error;}}",
     );
     assert!(matches!(r.next(), State::Action(_)));
     r.resume(json!({"message":"cannot complete"}), true)
@@ -445,18 +455,14 @@ fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
 }
 
 #[test]
-fn task_refinement_has_no_new_main_and_scoped_calls_are_external_tasks() {
+fn task_refinement_has_no_new_main_and_ordinary_calls_use_frames() {
     let p = compile_body(
         "function phase(input){return helper(input);} function helper(input){return input;}",
         "phase",
     )
     .unwrap();
-    let mut r = Runtime::task_program(p, "phase", vec![json!({"ok":true})]).unwrap();
-    assert!(
-        matches!(r.next(),State::Action(Action{kind:ActionKind::Call{name,args},..}) if name=="helper" && args==vec![json!({"ok":true})])
-    );
-    r.resume(json!("READY"), false).unwrap();
-    assert_eq!(returned(r), json!("READY"));
+    let r = Runtime::task_program(p, "phase", vec![json!({"ok":true})]).unwrap();
+    assert_eq!(returned(r), json!({"ok":true}));
     assert!(
         compile_body(
             "function main(){return null;} function phase(){return null;}",
@@ -471,13 +477,7 @@ fn task_refinement_has_no_new_main_and_scoped_calls_are_external_tasks() {
 #[test]
 fn local_result_arrays_collect_nested_task_returns_without_operators() {
     let source = "function main(){const rows=[];for(const item of [{n:1},{n:2}]){rows.push(process(item));}const length=rows.push({n:3});return {rows,length};} function process(item){return item;}";
-    let mut r = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
-    for n in [1, 2] {
-        assert!(
-            matches!(r.next(),State::Action(Action{kind:ActionKind::Call{name,args},..}) if name=="process" && args[0]["n"]==n)
-        );
-        r.resume(json!({"n":n}), false).unwrap();
-    }
+    let r = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
     let restored: Runtime = serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
     assert_eq!(
         returned(restored),
@@ -490,6 +490,77 @@ fn local_result_arrays_collect_nested_task_returns_without_operators() {
     assert_eq!(
         returned(runtime("function main(){const x=[];x.push(1+2);return x;}")),
         json!([3])
+    );
+}
+
+#[test]
+fn ordinary_frames_suspend_for_virtual_work_and_survive_restore() {
+    let source = r#"
+function main(){const outer='OUTER';const result=work('INPUT');return {result,outer};}
+function work(input){const local='LOCAL';const answer=think(input);return {answer,local};}
+/** @virtual */ function think(input){/* Return the inspected result. */}
+"#;
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("expected virtual task")
+    };
+    assert!(
+        matches!(&action.kind, ActionKind::Call { name, args } if name == "think" && args == &vec![json!("INPUT")])
+    );
+    assert_eq!(run.named_bindings()["outer"], "OUTER");
+    assert_eq!(run.named_bindings()["local"], "LOCAL");
+    let mut restored: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert!(matches!(restored.next(), State::Action(ref pending) if pending.id == action.id));
+    restored.resume(json!("DONE"), false).unwrap();
+    assert_eq!(
+        returned(restored),
+        json!({"result":{"answer":"DONE","local":"LOCAL"},"outer":"OUTER"})
+    );
+}
+
+#[test]
+fn ordinary_frames_restore_tool_receipts_and_propagate_errors_to_caller() {
+    let source = r#"
+function main(){try{return helper();}catch(problem){return {error:problem.message};}}
+function helper(){return io.write({path:'out.txt',content:'hello'});}
+"#;
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("expected write")
+    };
+    assert!(matches!(&action.kind, ActionKind::Tool { name, .. } if name == "write_file"));
+    let saved = serde_json::to_value(run).unwrap();
+    let mut success: Runtime = serde_json::from_value(saved.clone()).unwrap();
+    assert!(matches!(success.next(), State::Action(ref pending) if pending.id == action.id));
+    success.resume(json!({"path":"out.txt"}), false).unwrap();
+    assert_eq!(returned(success), json!({"path":"out.txt"}));
+    let mut failure: Runtime = serde_json::from_value(saved).unwrap();
+    failure
+        .resume(json!({"error":"write failed"}), true)
+        .unwrap();
+    assert_eq!(returned(failure), json!({"error":"write failed"}));
+}
+
+#[test]
+fn inline_caller_bindings_preserve_inner_shadowing() {
+    let source = r#"
+function main(){const shared='OUTER';const result=helper();return {shared,result};}
+function helper(){const shared='INNER';const result=think();return {shared,result};}
+/** @virtual */ function think(){/* Return a result. */}
+"#;
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    assert!(matches!(
+        run.next(),
+        State::Action(Action {
+            kind: ActionKind::Call { .. },
+            ..
+        })
+    ));
+    assert_eq!(run.named_bindings()["shared"], "INNER");
+    run.resume(json!("OK"), false).unwrap();
+    assert_eq!(
+        returned(run),
+        json!({"shared":"OUTER","result":{"shared":"INNER","result":"OK"}})
     );
 }
 
@@ -669,10 +740,20 @@ fn embedded_skill_and_tool_contracts_advertise_the_same_source_whitelist() {
 }
 
 #[test]
+fn recorded_twenty_page_parallel_example_compiles_with_declared_host_tools() {
+    let source = include_str!("../../skills/task-program/examples/parallel-twenty-html.js");
+    let program =
+        compile(source).expect("recorded example must compile against its declared tools");
+    assert!(program.functions["designStyles"].virtual_task);
+    assert!(program.functions["generatePageBodies"].virtual_task);
+    assert!(!program.functions["writePages"].virtual_task);
+}
+
+#[test]
 fn published_flow_examples_compile_with_the_fixed_whitelist() {
     for text in [SKILL, include_str!("../../docs/agent-program.md")] {
         let mut examples = 0;
-        let text=text.replace("\r\n","\n");
+        let text = text.replace("\r\n", "\n");
         for block in text.split("```js\n").skip(1) {
             let source = block.split("```").next().unwrap();
             let result = if source.contains("function main(") {
@@ -684,6 +765,228 @@ fn published_flow_examples_compile_with_the_fixed_whitelist() {
             examples += 1;
         }
         assert!(examples >= 2);
+    }
+}
+
+// Run the published files themselves. Tool/AI observations are controlled here;
+// this verifies flow semantics, not real model quality or wall-clock parallelism.
+#[derive(Default)]
+struct TutorialRun {
+    files: BTreeMap<String, String>,
+    events: Vec<String>,
+    workers: BTreeMap<String, Runtime>,
+    reject_review: bool,
+}
+
+impl TutorialRun {
+    fn run(&mut self, mut run: Runtime) -> Result<Value, Value> {
+        loop {
+            let action = match run.next() {
+                State::Returned(value) => return Ok(value),
+                State::Failed(error) => return Err(error),
+                State::Action(action) => action,
+            };
+            let result = match action.kind {
+                ActionKind::Call { name, args } => {
+                    self.run(Runtime::task_program(run.program.clone(), &name, args).unwrap())
+                }
+                ActionKind::Tool { name, args } => {
+                    let path = args["path"].as_str().unwrap();
+                    self.events.push(format!("{name}:{path}"));
+                    match name.as_str() {
+                        "read_file" => Ok(json!({"content":self.files[path]})),
+                        "write_file" => {
+                            self.files
+                                .insert(path.into(), args["content"].as_str().unwrap().into());
+                            Ok(json!({"changed":true}))
+                        }
+                        _ => panic!("unexpected tutorial tool {name}"),
+                    }
+                }
+                ActionKind::Task { name, input, .. } => {
+                    self.events.push(name.clone());
+                    match name.as_str() {
+                        "compose" => {
+                            assert!(input["request"]["topic"].is_string());
+                            Ok(json!({"content":"<html><body>串行示例</body></html>"}))
+                        }
+                        "designPage" => {
+                            assert_eq!(input["shared"]["source_content"], "SOURCE");
+                            assert!(input["shared"]["requirements"].is_string());
+                            let title = input["page"]["title"].as_str().unwrap();
+                            Ok(json!({"content":format!("<html><body>{title}</body></html>")}))
+                        }
+                        "inspect" | "inspectPage" => {
+                            let content = input["content"].as_str().unwrap();
+                            assert!(
+                                self.files.values().any(|value| value == content),
+                                "must inspect actual saved content"
+                            );
+                            if name == "inspectPage" {
+                                let path = input["page"]["path"].as_str().unwrap();
+                                assert_eq!(self.files[path], content);
+                                assert_eq!(input["shared"]["source_content"], "SOURCE");
+                                assert!(content.contains(input["page"]["title"].as_str().unwrap()));
+                            }
+                            Ok(
+                                json!({"passed":!self.reject_review,"issues":[],"evidence":[content]}),
+                            )
+                        }
+                        _ => panic!("unexpected tutorial task {name}"),
+                    }
+                }
+                ActionKind::Fork { entry, args } => {
+                    assert_eq!(entry, "makePages");
+                    assert_eq!(
+                        args.len(),
+                        2,
+                        "shared and pages are separate positional arguments"
+                    );
+                    let id = format!("worker-{}", self.workers.len());
+                    self.events
+                        .push(format!("fork:{}", args[1].as_array().unwrap().len()));
+                    self.workers.insert(
+                        id.clone(),
+                        Runtime::task_program(run.program.clone(), &entry, args).unwrap(),
+                    );
+                    Ok(
+                        json!({"agent_id":id,"workspace":{"mode":"shared","integration_required":false}}),
+                    )
+                }
+                ActionKind::Join { ids } => {
+                    self.events.push("join".into());
+                    let mut outputs = Vec::new();
+                    for id in ids {
+                        let worker = self.workers.remove(&id).unwrap();
+                        outputs.push(self.run(worker)?);
+                    }
+                    Ok(Value::Array(outputs))
+                }
+            };
+            let failed = result.is_err();
+            run.resume(result.unwrap_or_else(|error| error), failed)
+                .unwrap();
+        }
+    }
+}
+
+fn tutorial(source: &str, input: &str) -> Runtime {
+    assert!(
+        SKILL.contains(source.trim()),
+        "the AI must receive the same example that is tested"
+    );
+    Runtime::task_program(
+        compile(source).unwrap(),
+        "main",
+        vec![serde_json::from_str(input).unwrap()],
+    )
+    .unwrap()
+}
+
+#[test]
+fn documented_serial_example_writes_reads_and_checks_without_fork() {
+    let mut harness = TutorialRun::default();
+    let output = harness
+        .run(tutorial(
+            include_str!("../../skills/task-program/examples/serial.js"),
+            include_str!("../../skills/task-program/examples/serial.input.json"),
+        ))
+        .unwrap();
+    assert_eq!(output["path"], "agent-overview.html");
+    assert_eq!(output["review"]["passed"], true);
+    assert_eq!(
+        harness.events,
+        vec![
+            "compose",
+            "write_file:agent-overview.html",
+            "read_file:agent-overview.html",
+            "inspect"
+        ]
+    );
+    assert!(harness.workers.is_empty());
+}
+
+#[test]
+fn documented_parallel_example_forks_disjoint_parts_then_checks_all_five() {
+    let mut harness = TutorialRun::default();
+    harness
+        .files
+        .insert("docs/generic-agent-design.md".into(), "SOURCE".into());
+    let output = harness
+        .run(tutorial(
+            include_str!("../../skills/task-program/examples/parallel-five-pages.js"),
+            include_str!("../../skills/task-program/examples/parallel-five-pages.input.json"),
+        ))
+        .unwrap();
+    assert_eq!(
+        &harness.events[..4],
+        [
+            "read_file:docs/generic-agent-design.md",
+            "fork:3",
+            "fork:2",
+            "join"
+        ]
+    );
+    assert_eq!(output["files"].as_array().unwrap().len(), 5);
+    assert_eq!(output["reviews"].as_array().unwrap().len(), 5);
+    assert_eq!(harness.files.len(), 6); // one source plus five distinct outputs
+    assert_eq!(
+        harness.events.iter().filter(|e| *e == "designPage").count(),
+        5
+    );
+    assert_eq!(
+        harness
+            .events
+            .iter()
+            .filter(|e| *e == "inspectPage")
+            .count(),
+        5
+    );
+    for file in output["files"].as_array().unwrap() {
+        let path = file["path"].as_str().unwrap();
+        for operation in ["write_file", "read_file"] {
+            assert_eq!(
+                harness
+                    .events
+                    .iter()
+                    .filter(|e| **e == format!("{operation}:{path}"))
+                    .count(),
+                1
+            );
+        }
+    }
+    assert!(harness.workers.is_empty());
+}
+
+#[test]
+fn documented_examples_fail_instead_of_delivering_failed_reviews() {
+    for (source, input) in [
+        (
+            include_str!("../../skills/task-program/examples/serial.js"),
+            include_str!("../../skills/task-program/examples/serial.input.json"),
+        ),
+        (
+            include_str!("../../skills/task-program/examples/parallel-five-pages.js"),
+            include_str!("../../skills/task-program/examples/parallel-five-pages.input.json"),
+        ),
+    ] {
+        let mut harness = TutorialRun {
+            reject_review: true,
+            ..Default::default()
+        };
+        harness
+            .files
+            .insert("docs/generic-agent-design.md".into(), "SOURCE".into());
+        let error = harness.run(tutorial(source, input)).unwrap_err();
+        assert!(error["message"].as_str().unwrap().contains("验收"));
+        assert_eq!(
+            harness
+                .events
+                .iter()
+                .filter(|e| matches!(e.as_str(), "inspect" | "inspectPage"))
+                .count(),
+            1
+        );
     }
 }
 
@@ -815,11 +1118,11 @@ fn no_implicit_semantic_effects_are_emitted_or_executed() {
         compile("function main(){var total=0;for(var i=0;i<4;i++){total+=i;}return `${total}`;}")
             .unwrap();
     assert!(
-        !program
+        program
             .functions
             .values()
             .flat_map(|f| &f.code)
-            .any(|i| matches!(i.op, Op::Effect(_, Effect::Semantic { .. } | Effect::Ai(_))))
+            .all(|i| !matches!(i.op, Op::Effect(_, _)))
     );
     let mut runtime = Runtime::task_program(program, "main", vec![]).unwrap();
     assert!(matches!(runtime.next(),State::Returned(v) if v=="6"));
@@ -827,8 +1130,11 @@ fn no_implicit_semantic_effects_are_emitted_or_executed() {
 
 #[test]
 fn library_calls_compile_to_exact_tools_and_keep_json_arguments() {
-    let mut bindings=libraries::builtin();
-    bindings.insert("ppt".into(),BTreeMap::from([("get_design".into(),"presentation__get_design".into())]));
+    let mut bindings = libraries::builtin();
+    bindings.insert(
+        "ppt".into(),
+        BTreeMap::from([("get_design".into(), "presentation__get_design".into())]),
+    );
     for (source, name, args) in [
         (
             "function main(){return io.read({path:'source.txt'});}",
@@ -879,10 +1185,7 @@ fn library_catalog_uses_real_ownership_and_omits_unavailable_or_ambiguous_names(
     let catalog = libraries::catalog(&definitions, &packages);
     assert_eq!(catalog["io"]["read"], "read_file");
     assert!(!catalog["io"].contains_key("write"));
-    assert_eq!(
-        catalog["ppt"]["get_design"],
-        "ppt_master__get_design"
-    );
+    assert_eq!(catalog["ppt"]["get_design"], "ppt_master__get_design");
     assert!(!catalog["ppt"].contains_key("missing"));
     assert!(!catalog.contains_key("other"));
     let collision = json!([
@@ -920,9 +1223,249 @@ fn numeric_and_null_short_circuits_preserve_c_boolean_results_and_skip_effects()
 
 #[test]
 fn raw_tool_spellings_are_rejected_before_any_effect() {
-    for body in ["return tools.read_file({path:'x'});", "return tools['read_file']({});", "return invoke_library({method:'io.read',args:{}});"] {
-        for source in [format!("function main(){{io.write({{path:'never'}});{body}}}"),format!("function main(){{return null;}} function unused(){{{body}}}")] {assert!(super::compile(&source).is_err(),"{source}");}
+    for body in [
+        "return tools.read_file({path:'x'});",
+        "return tools['read_file']({});",
+        "return invoke_library({method:'io.read',args:{}});",
+    ] {
+        for source in [
+            format!("function main(){{io.write({{path:'never'}});{body}}}"),
+            format!("function main(){{return null;}} function unused(){{{body}}}"),
+        ] {
+            assert!(super::compile(&source).is_err(), "{source}");
+        }
     }
-    assert!(super::tool()["function"]["parameters"]["properties"].get("libraries").is_none());
-    assert!(super::body_tool()["function"]["parameters"]["properties"].get("libraries").is_none());
+    assert!(
+        super::tool()["function"]["parameters"]["properties"]
+            .get("libraries")
+            .is_none()
+    );
+    assert!(
+        super::body_tool()["function"]["parameters"]["properties"]
+            .get("libraries")
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_virtual_contract_runs_ai_and_preserves_result_across_restore() {
+    let source = r#"
+function main(request) { return inspect(request); }
+/**
+ * @virtual
+ * Read actual evidence for request; return {passed, evidence}.
+ */
+function inspect(request) {}
+"#;
+    let program = compile(source).unwrap();
+    assert!(program.functions["inspect"].virtual_task);
+    assert!(!program.functions["main"].virtual_task);
+    let mut run = Runtime::new(program, "main", vec![json!({"path":"real.txt"})]).unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("must enter AI work")
+    };
+    assert!(
+        matches!(action.kind, ActionKind::Task { ref name, ref description, ref input }
+        if name == "inspect" && description.contains("actual evidence") && !description.contains("@virtual") && input["request"]["path"] == "real.txt")
+    );
+    let mut restored: Runtime =
+        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    let State::Action(pending) = restored.next() else {
+        panic!()
+    };
+    assert_eq!(pending.id, action.id);
+    let actual = json!({"passed":true,"evidence":[{"path":"real.txt","content":"actual"}]});
+    restored.resume(actual.clone(), false).unwrap();
+    assert_eq!(returned(restored), actual);
+}
+
+#[test]
+fn virtual_placeholders_and_ambiguous_empty_helpers_fail_before_effects() {
+    for declaration in [
+        "/** @virtual Create actual outputs; return {files}. */ function work(){return {status:'completed'};}",
+        "function work(){/* @virtual Create actual outputs; return {files}. */ io.write({path:'bad'});}",
+        "/** @virtual */ function work(){}",
+        "function work(){// Create outputs and return their paths.\n}",
+    ] {
+        let error = compile(&format!(
+            "function main(){{io.write({{path:'never'}});return work();}} {declaration}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("@virtual"), "{error}");
+        assert!(error.starts_with("TS_PROGRAM "), "{error}");
+    }
+    assert!(compile("/** @virtual Execute the main task. */ function main(){}").is_err());
+}
+
+#[test]
+fn virtual_tags_are_local_and_concrete_refinement_can_call_another_virtual_task() {
+    let source = r#"
+function main() {return concrete();}
+/** @virtual Read the real evidence; return a JSON result. */
+function inspect() {}
+function concrete() { /* A normal code comment. */ return {status:'computed'}; }
+"#;
+    assert_eq!(returned(runtime(source)), json!({"status":"computed"}));
+    // A word that merely starts with the tag is not a declaration marker.
+    assert_eq!(
+        returned(runtime(
+            "function main(){/* @virtualized is ordinary prose. */return 3;}"
+        )),
+        json!(3)
+    );
+    let concrete = compile_body(
+        r#"
+function phase(input) {return inspect(input);}
+/** @virtual Inspect actual input; return {passed,evidence}. */
+function inspect(input) {}
+"#,
+        "phase",
+    )
+    .unwrap();
+    assert!(!concrete.functions["phase"].virtual_task);
+    assert!(concrete.functions["inspect"].virtual_task);
+    assert!(
+        compile_body(
+            "/** @virtual Restate work and return results. */ function phase(){}",
+            "phase"
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn string_concatenation_accepts_primitives_and_preserves_numeric_addition_order() {
+    for (expression, expected) in [
+        ("'字符数=' + 8000", json!("字符数=8000")),
+        ("8000 + '字'", json!("8000字")),
+        ("'数值=' + -2.5", json!("数值=-2.5")),
+        ("'状态=' + true + '/' + null", json!("状态=true/null")),
+        ("1 + 2 + '项'", json!("3项")),
+        ("'项' + 1 + 2", json!("项12")),
+        (
+            "'大整数=' + 9007199254740993",
+            json!("大整数=9007199254740993"),
+        ),
+        (
+            "18446744073709551615 + '字'",
+            json!("18446744073709551615字"),
+        ),
+    ] {
+        assert_eq!(
+            returned(runtime(&format!("function main(){{return {expression};}}"))),
+            expected
+        );
+    }
+    assert_eq!(
+        returned(runtime(
+            "function main(){let label='数量=';label+=2;let total=3;total+=2;return {label,total};}"
+        )),
+        json!({"label":"数量=2","total":5})
+    );
+    for expression in ["'x'+{}", "[]+'x'", "true+1", "'3'-1", "'3'<4"] {
+        assert!(
+            matches!(
+                runtime(&format!("function main(){{return {expression};}}")).next(),
+                State::Failed(_)
+            ),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn captured_receipt_concatenation_allows_both_writes_and_resumes_without_replay() {
+    let source = include_str!("fixtures/receipt-string-number.js");
+    let program = compile_body(source, "build_pages").unwrap();
+    let mut run = Runtime::new(
+        program,
+        "build_pages",
+        vec![json!({"assignment":{"owner":"worker"},"shared":{}})],
+    )
+    .unwrap();
+    assert!(
+        matches!(run.next(),State::Action(Action{kind:ActionKind::Task{name,..},..}) if name=="create_page_content")
+    );
+    run.resume(json!({"pages":[{"path":"one.html","title":"One","content":"first"},{"path":"two.html","title":"Two","content":"second"}]}),false).unwrap();
+    for path in ["one.html", "two.html"] {
+        let State::Action(action) = run.next() else {
+            panic!("both writes must be reached")
+        };
+        assert!(
+            matches!(action.kind,ActionKind::Tool{name,args} if name=="write_file" && args["path"]==path)
+        );
+        run.resume(json!({"path":path,"changed":true}), false)
+            .unwrap();
+        // The second iteration must preserve the first receipt after recovery.
+        run = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    }
+    let result = returned(run);
+    assert_eq!(result["files"].as_array().unwrap().len(), 2);
+    assert!(
+        result["files"][0]["evidence"]
+            .as_str()
+            .unwrap()
+            .ends_with("字符数=5")
+    );
+    assert!(
+        result["files"][1]["evidence"]
+            .as_str()
+            .unwrap()
+            .ends_with("字符数=6")
+    );
+}
+
+#[test]
+fn caller_can_reject_an_inspection_result_for_a_different_input() {
+    let source = "function main(){const subject={id:'correct'};const result=inspect(subject);assert(result.id===subject.id,'result does not match its input');return result;} /** @virtual Return the inspected id and conclusion. */ function inspect(subject){}";
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    assert!(matches!(run.next(), State::Action(_)));
+    run.resume(json!({"id":"other","passed":true}), false)
+        .unwrap();
+    assert!(
+        matches!(run.next(), State::Failed(error) if error["message"] == "result does not match its input")
+    );
+}
+
+#[test]
+fn caller_visible_variables_are_captured_only_when_the_function_uses_them() {
+    let source = "function main(){const wanted='YES';const unused='NO';return helper();} function helper(){return wanted;}";
+    let program = compile(source).unwrap();
+    assert_eq!(
+        program.functions["helper"].captures,
+        ["wanted".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        returned(Runtime::new(program, "main", vec![]).unwrap()),
+        json!("YES")
+    );
+    let missing = "function main(){return helper();} function other(){const wanted='wrong scope';return wanted;} function helper(){return wanted;}";
+    let mut run = Runtime::new(compile(missing).unwrap(), "main", vec![]).unwrap();
+    assert!(
+        matches!(run.next(), State::Failed(e) if e["message"].as_str().unwrap().contains("not visible"))
+    );
+}
+
+#[test]
+fn source_variables_remain_visible_until_their_function_returns() {
+    let source = "function main(){const doc=io.read({path:'large.txt'});const count=measure(doc.content);io.write({path:'count.txt',content:`${count}`});return count;} function measure(text){return text.length;}";
+    let mut runtime = Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap();
+    let State::Action(_read) = runtime.next() else {
+        panic!("read required")
+    };
+    let payload = "DEAD_INPUT_".repeat(6000);
+    runtime.resume(json!({"content":payload}), false).unwrap();
+    let State::Action(_write) = runtime.next() else {
+        panic!("write required")
+    };
+    assert_eq!(runtime.named_bindings()["doc"]["content"], payload);
+    let saved = serde_json::to_string(&runtime).unwrap();
+    assert!(
+        saved.contains("DEAD_INPUT_"),
+        "source variables remain available to inherited AI scopes"
+    );
+    let mut restored: Runtime = serde_json::from_str(&saved).unwrap();
+    restored.resume(json!({"saved":true}), false).unwrap();
+    assert!(matches!(restored.next(),State::Returned(value) if value==payload.chars().count()));
 }
