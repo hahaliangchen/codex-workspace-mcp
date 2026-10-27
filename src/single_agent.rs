@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 mod documented_examples;
 mod function_scope;
+mod managed_files;
 mod program_flow;
 mod step_context;
 mod task_frames;
@@ -1187,9 +1188,19 @@ async fn business_tool(
     } else {
         None
     };
+    let managed = if matches!(name, "write_file" | "edit_file" | "replace_range") {
+        let prepared = managed_files::prepare(s.state.workspace.root(), s.task, tool_workspace.root(), name, args.clone())?;
+        if prepared.conflict()? {
+            return prepared.preserve(s.state.workspace.root());
+        }
+        Some(prepared)
+    } else {
+        None
+    };
+    let args = managed.as_ref().map(|p| p.args.clone()).unwrap_or(args);
     // The main agent's edits are tracked in whichever project the task uses;
     // git delegates and plugin pages keep their own records.
-    if crate::workspace_changes::is_mutation(name)
+    let result = if crate::workspace_changes::is_mutation(name)
         && s.delegate_id().is_none()
         && s.plugin.is_none()
     {
@@ -1199,14 +1210,14 @@ async fn business_tool(
             s.task.to_owned(),
             s.turn,
             name.to_owned(),
-            args,
+            args.clone(),
             s.cancel.clone(),
         )
         .await
     } else if crate::workspace_changes::is_mutation(name) {
         // Git delegates keep their own branch diff; parent turn snapshots refer
         // to the main checkout and must not record isolated worktree edits.
-        agent_service::execute_tool(tool_workspace, s.state.tool_catalog.as_deref(), name, args)
+        agent_service::execute_tool(tool_workspace.clone(), s.state.tool_catalog.as_deref(), name, args.clone())
             .await
     } else if crate::browser_control::is_tool(name) {
         let mut visual = visual_context(s, node)?;
@@ -1238,7 +1249,7 @@ async fn business_tool(
         {
             let queried = args["task_id"].as_str().map(str::to_owned);
             let mut output = tokio::select! {
-                result = crate::plugin_io::execute(s.state, s.task, tool_workspace, name, args) => result?,
+                result = crate::plugin_io::execute(s.state, s.task, tool_workspace.clone(), name, args.clone()) => result?,
                 _ = s.cancel.cancelled() => anyhow::bail!("task cancelled during skill tool execution"),
             };
             let root = s.state.workspace.root();
@@ -1270,9 +1281,32 @@ async fn business_tool(
             }
             return Ok(output);
         }
-        agent_service::execute_tool(tool_workspace, s.state.tool_catalog.as_deref(), name, args)
+        agent_service::execute_tool(tool_workspace.clone(), s.state.tool_catalog.as_deref(), name, args.clone())
             .await
+    };
+    if let Some(prepared) = managed {
+        return match result {
+            Ok(value) => {
+                if prepared.committed(s.state.workspace.root(), s.task)? {
+                    Ok(value)
+                } else {
+                    prepared.preserve(s.state.workspace.root())
+                }
+            }
+            Err(error) if format!("{error:#}").contains("write_conflict:") || prepared.conflict()? => {
+                prepared.preserve(s.state.workspace.root())
+            }
+            Err(error) => Err(error),
+        };
     }
+    if matches!(name, "read_file" | "read_file_lines") {
+        if let Ok(value) = &result {
+            if let Some(conflict) = managed_files::observe(s.state.workspace.root(), s.task, tool_workspace.root(), &args, value)? {
+                return Ok(conflict);
+            }
+        }
+    }
+    result
 }
 
 async fn load_saved_asset(s: &Session<'_>, args: &Value) -> Result<Value> {
@@ -2003,7 +2037,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     },
                 }
             }.await;
-            let is_error = output.is_err();
+            let is_error = output.is_err() || output.as_ref().is_ok_and(|value| value["error_code"] == "ASSET_CONFLICT");
             let result = output.unwrap_or_else(|error| {
                 if validating_source {
                     let args =
@@ -2137,6 +2171,15 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                 image_messages.push(image);
             }
             save(s, w).await?;
+            if result["error_code"] == "ASSET_CONFLICT" {
+                let message = if let Some(copy) = result["candidate_path"].as_str() {
+                    format!("文件 {} 在任务期间被外部修改，当前文件未覆盖。待写副本保存在 {}。请决定如何处理；系统不会自动合并或重试。", result["path"].as_str().unwrap_or(""), copy)
+                } else {
+                    format!("文件 {} 在读取期间发生变化，未进行编辑。请决定如何处理；系统不会自动重试。", result["path"].as_str().unwrap_or(""))
+                };
+                append(s, "assistant/message", json!({"actor":"host","turn":s.turn,"message":{"role":"assistant","content":message}}), true).await?;
+                anyhow::bail!("ASSET_CONFLICT: {}", result);
+            }
         }
         // Keep all native results adjacent to their assistant call message.
         // Image inputs follow the complete exchange, even if a provider returns

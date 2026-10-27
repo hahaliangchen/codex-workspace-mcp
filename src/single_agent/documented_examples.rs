@@ -13,6 +13,14 @@ static FAULT: std::sync::LazyLock<
     std::sync::Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+fn latest_run_marker(name: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir().join(name)
+    } else {
+        Path::new("/tmp").join(name)
+    }
+}
+
 pub(super) fn inject_before_read(root: &Path, name: &str, args: &Value) -> Result<()> {
     if name != "read_file" {
         return Ok(());
@@ -569,7 +577,7 @@ async fn documented_file_examples_with_configured_model() -> Result<()> {
     ));
     std::fs::create_dir_all(&batch)?;
     std::fs::write(
-        "/tmp/documented-examples-latest",
+        latest_run_marker("documented-examples-latest"),
         batch.to_string_lossy().as_bytes(),
     )?;
     let mut failures = Vec::new();
@@ -836,7 +844,7 @@ async fn run_luna_five_pages(inject_fault: bool, simple: bool) -> Result<()> {
     std::fs::create_dir_all(root.join("docs"))?;
     std::fs::create_dir_all(evidence.join("flows"))?;
     std::fs::write(
-        "/tmp/luna-five-repair-latest",
+        latest_run_marker("luna-five-repair-latest"),
         evidence.to_string_lossy().as_bytes(),
     )?;
     let mut materials = BTreeMap::new();

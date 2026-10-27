@@ -1673,10 +1673,20 @@ pub(crate) fn local_tools(
         "search_symbol_business_context",
     ];
     definitions.as_array().into_iter().flatten().filter(|tool| tool.get("name").and_then(Value::as_str).is_some_and(|n| (!ban_run_command || (n != "run_program" && !crate::project_process::is_execution(n))) && catalog.map_or(allowed.contains(&n), |catalog| catalog.contains(n) && !catalog.packages.declares_tool(n)))).map(|tool| {
-        let name=tool["name"].as_str().unwrap_or_default(); let description=tool["description"].as_str().unwrap_or_default();
+        let name=tool["name"].as_str().unwrap_or_default(); let mut description=tool["description"].as_str().unwrap_or_default().to_owned();
         let mut schema=tool.get("inputSchema").cloned().unwrap_or_else(||json!({"type":"object","properties":{}}));
         if let Some(props)=schema.get_mut("properties").and_then(Value::as_object_mut) {props.remove("workspace_root");}
         if let Some(required)=schema.get_mut("required").and_then(Value::as_array_mut) {required.retain(|name| name.as_str()!=Some("workspace_root"));}
+        if matches!(name, "write_file" | "replace_range" | "edit_file") {
+            if let Some(props)=schema.get_mut("properties").and_then(Value::as_object_mut) { props.remove("expected_code_hash"); }
+            if let Some(required)=schema.get_mut("required").and_then(Value::as_array_mut) { required.retain(|item| item.as_str()!=Some("expected_code_hash")); }
+            description = match name {
+                "write_file" => "Create or replace a UTF-8 file. The host manages the file baseline and stops for user action if the file changed externally.",
+                "edit_file" => "Apply unique text replacements to a UTF-8 file. The host manages the file baseline and stops for user action if the file changed externally.",
+                _ => "Replace an inclusive 1-indexed line range. The host manages the file baseline and stops for user action if the file changed externally.",
+            }.to_owned();
+            if let Some(prop)=schema.pointer_mut("/properties/expected_old_text") { prop["description"]=json!("Optional exact selected text, used to validate the requested edit."); }
+        }
         json!({"type":"function","function":{"name":name,"description":description,"parameters":schema}})
     }).collect()
 }
