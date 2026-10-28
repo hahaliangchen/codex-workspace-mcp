@@ -161,6 +161,23 @@ pub(super) fn unary(op: &str, v: Value) -> Result<Value> {
     match op {
         "!" => Ok(json!(!boolean(&v)?)),
         "bool" => Ok(json!(boolean(&v)?)),
+        "typeof" => Ok(json!(match v {
+            Value::Null | Value::Array(_) | Value::Object(_) => "object",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+        })),
+        "isArray" => Ok(json!(v.is_array())),
+        "objectKeys" | "objectValues" => {
+            let object = v
+                .as_object()
+                .context("Object.keys/values requires a JSON object")?;
+            Ok(if op == "objectKeys" {
+                json!(object.keys().collect::<Vec<_>>())
+            } else {
+                json!(object.values().collect::<Vec<_>>())
+            })
+        }
         "+" => {
             ensure!(v.is_number(), "numeric operand required");
             Ok(v)
@@ -177,12 +194,78 @@ pub(super) fn unary(op: &str, v: Value) -> Result<Value> {
 }
 pub(super) fn method_arity(name: &str) -> Option<(usize, usize)> {
     Some(match name {
-        "includes" | "indexOf" | "startsWith" | "endsWith" | "split" => (1, 1),
+        "includes" | "indexOf" | "lastIndexOf" | "startsWith" | "endsWith" | "split" | "match"
+        | "test" => (1, 1),
+        "replace" | "replaceAll" => (2, 2),
         "slice" => (1, 2),
+        "at" | "concat" => (1, 1),
         "trim" | "toLowerCase" | "toUpperCase" => (0, 0),
         "join" => (0, 1),
         _ => return None,
     })
+}
+const REGEX_PATTERN_LIMIT: usize = 8 * 1024;
+const REGEX_INPUT_LIMIT: usize = 2 * 1024 * 1024;
+const REGEX_RESULT_LIMIT: usize = 10_000;
+const TEXT_RESULT_LIMIT: usize = 4 * 1024 * 1024;
+
+pub(super) fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
+    ensure!(
+        pattern.len() <= REGEX_PATTERN_LIMIT,
+        "regex pattern exceeds 8192 bytes"
+    );
+    let mut seen = String::new();
+    for flag in flags.chars() {
+        ensure!(
+            matches!(flag, 'g' | 'i' | 'm' | 's' | 'u'),
+            "unsupported regex flag: {flag}"
+        );
+        ensure!(!seen.contains(flag), "duplicate regex flag: {flag}");
+        seen.push(flag);
+    }
+    // In a JavaScript regex literal, the delimiter must be escaped. Rust regex
+    // does not recognize `\/` as an escape, so remove only that delimiter
+    // escape while preserving escaped backslashes and other regex escapes.
+    let mut normalized = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('/') => normalized.push('/'),
+                Some(next) => {
+                    normalized.push('\\');
+                    normalized.push(next);
+                }
+                None => normalized.push('\\'),
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let mut builder = regex::RegexBuilder::new(&normalized);
+    builder
+        .case_insensitive(flags.contains('i'))
+        .multi_line(flags.contains('m'))
+        .dot_matches_new_line(flags.contains('s'))
+        .size_limit(1024 * 1024);
+    Ok(builder.build()?)
+}
+
+fn regex_parts(value: &Value) -> Option<(&str, &str)> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let descriptor = object.get("$flow_regex")?.as_object()?;
+    Some((
+        descriptor.get("pattern")?.as_str()?,
+        descriptor.get("flags")?.as_str()?,
+    ))
+}
+
+fn checked_regex_input(s: &str) -> Result<()> {
+    ensure!(s.len() <= REGEX_INPUT_LIMIT, "regex input exceeds 2 MiB");
+    Ok(())
 }
 fn index(v: &Value, len: usize) -> Result<usize> {
     let n = integer(v).context("slice index must be an integer")?;
@@ -195,6 +278,81 @@ pub(super) fn method(receiver: Value, name: &str, args: Vec<Value>) -> Result<Va
         (min..=max).contains(&args.len()),
         "invalid method argument count"
     );
+    if name == "test" {
+        let (pattern, flags) = regex_parts(&receiver).context("test requires a regex receiver")?;
+        let input = args[0].as_str().context("regex test needs a string")?;
+        checked_regex_input(input)?;
+        return Ok(json!(compile_regex(pattern, flags)?.is_match(input)));
+    }
+    if name == "match" {
+        let input = receiver.as_str().context("match needs a string receiver")?;
+        let (pattern, flags) = regex_parts(&args[0]).context("match needs a regex argument")?;
+        checked_regex_input(input)?;
+        let re = compile_regex(pattern, flags)?;
+        if flags.contains('g') {
+            let mut matches = Vec::new();
+            for m in re.find_iter(input) {
+                ensure!(
+                    matches.len() < REGEX_RESULT_LIMIT,
+                    "regex match result exceeds 10000 items"
+                );
+                matches.push(m.as_str());
+            }
+            return Ok(if matches.is_empty() {
+                Value::Null
+            } else {
+                json!(matches)
+            });
+        }
+        return Ok(match re.captures(input) {
+            None => Value::Null,
+            Some(captures) => {
+                ensure!(
+                    captures.len() <= REGEX_RESULT_LIMIT,
+                    "regex capture result exceeds 10000 items"
+                );
+                let mut bytes = 0usize;
+                let mut result = Vec::with_capacity(captures.len());
+                for m in captures.iter() {
+                    if let Some(m) = m {
+                        bytes = bytes.saturating_add(m.as_str().len());
+                        ensure!(
+                            bytes <= TEXT_RESULT_LIMIT,
+                            "regex capture result exceeds 4 MiB"
+                        );
+                        result.push(json!(m.as_str()));
+                    } else {
+                        result.push(Value::Null);
+                    }
+                }
+                Value::Array(result)
+            }
+        });
+    }
+    if name == "at" {
+        let n = integer(&args[0]).context("at index must be an integer")?;
+        return Ok(match &receiver {
+            Value::String(s) => {
+                let len = s.chars().count() as i128;
+                let index = if n < 0 { len + n } else { n };
+                if index < 0 || index >= len {
+                    Value::Null
+                } else {
+                    json!(s.chars().nth(index as usize).unwrap().to_string())
+                }
+            }
+            Value::Array(a) => {
+                let len = a.len() as i128;
+                let index = if n < 0 { len + n } else { n };
+                if index < 0 || index >= len {
+                    Value::Null
+                } else {
+                    a[index as usize].clone()
+                }
+            }
+            _ => bail!("at needs a string or array"),
+        });
+    }
     if name == "slice" {
         let len = match &receiver {
             Value::String(s) => s.chars().count(),
@@ -243,13 +401,56 @@ pub(super) fn method(receiver: Value, name: &str, args: Vec<Value>) -> Result<Va
                         .map(|byte| s[..byte].chars().count() as i64)
                         .unwrap_or(-1)
                 ),
+                "lastIndexOf" => json!(
+                    s.rfind(arg)
+                        .map(|byte| s[..byte].chars().count() as i64)
+                        .unwrap_or(-1)
+                ),
                 "startsWith" => json!(s.starts_with(arg)),
                 "endsWith" => json!(s.ends_with(arg)),
+                "concat" => json!(format!("{s}{arg}")),
                 "split" => {
                     if arg.is_empty() {
                         json!(s.chars().map(|c| c.to_string()).collect::<Vec<_>>())
                     } else {
                         json!(s.split(arg).collect::<Vec<_>>())
+                    }
+                }
+                "replace" | "replaceAll" => {
+                    let replacement = args[1].as_str().context("replacement must be a string")?;
+                    let count = if name == "replaceAll" {
+                        if arg.is_empty() {
+                            s.chars().count().saturating_add(1)
+                        } else {
+                            s.match_indices(arg).count()
+                        }
+                    } else if s.contains(arg) {
+                        1
+                    } else {
+                        0
+                    };
+                    let size = s
+                        .len()
+                        .saturating_sub(count.saturating_mul(arg.len()))
+                        .saturating_add(count.saturating_mul(replacement.len()));
+                    ensure!(
+                        size <= TEXT_RESULT_LIMIT,
+                        "string replacement result exceeds 4 MiB"
+                    );
+                    if name == "replaceAll" {
+                        if arg.is_empty() {
+                            let mut result = String::new();
+                            result.push_str(replacement);
+                            for c in s.chars() {
+                                result.push(c);
+                                result.push_str(replacement);
+                            }
+                            json!(result)
+                        } else {
+                            json!(s.replace(arg, replacement))
+                        }
+                    } else {
+                        json!(s.replacen(arg, replacement, 1))
                     }
                 }
                 _ => bail!("method {name} is not supported on strings"),
@@ -282,6 +483,14 @@ pub(super) fn method(receiver: Value, name: &str, args: Vec<Value>) -> Result<Va
                         .collect::<Result<Vec<_>>>()?
                         .join(separator)
                 ))
+            }
+            "concat" => {
+                let mut result = a;
+                match &args[0] {
+                    Value::Array(items) => result.extend(items.iter().cloned()),
+                    value => result.push(value.clone()),
+                }
+                Ok(json!(result))
             }
             _ => bail!("method {name} is not supported on arrays"),
         },

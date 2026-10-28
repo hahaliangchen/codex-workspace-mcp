@@ -31,20 +31,177 @@ fn returned(mut r: Runtime) -> Value {
 }
 
 #[test]
+fn regular_expressions_validate_limits_and_resume_with_saved_state() {
+    for source in [
+        r"function main(){return /(?=x)/.test('x');}",
+        r"function main(){return /(a)\1/.test('aa');}",
+        r"function main(){return /x/y.test('x');}",
+        r"function main(){return /x/gg.test('x');}",
+    ] {
+        assert!(compile(source).is_err(), "should reject {source}");
+    }
+    assert_eq!(
+        returned(runtime(r"function main(){return 'b'.match(/(a)?b/);}")),
+        json!(["b", null])
+    );
+    assert_eq!(
+        returned(runtime(
+            r"function main(){const r=/a/g;return [r.test('a'),r.test('a')];}"
+        )),
+        json!([true, true])
+    );
+    let input = "a".repeat(2 * 1024 * 1024 + 1);
+    assert!(
+        values::method(
+            json!({"$flow_regex":{"pattern":"a","flags":""}}),
+            "test",
+            vec![json!(input)]
+        )
+        .is_err()
+    );
+    assert!(
+        values::method(
+            json!("a".repeat(10001)),
+            "match",
+            vec![json!({"$flow_regex":{"pattern":"a","flags":"g"}})]
+        )
+        .is_err()
+    );
+    let mut run = runtime(
+        r"function main(){const pattern=/(\d+)/;const data=io.read({path:'a'});return data.content.match(pattern);}",
+    );
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut restored: Runtime =
+        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    restored.resume(json!({"content":"page42"}), false).unwrap();
+    assert_eq!(returned(restored), json!(["42", "42"]));
+}
+
+#[test]
+fn text_checks_can_pass_real_read_content_to_ai_review() {
+    let mut run = runtime(
+        r#"
+function main() {
+  const file = io.read({path:"page.html"});
+  const links = file.content.match(/href="[^"]+"/g);
+  const summary = {hasTitle: /<title>[^<]+<\/title>/i.test(file.content), links: links};
+  return inspect(file.content, summary);
+}
+
+/** @virtual */
+function inspect(content, summary) { // Judge the page using the actual content and deterministic checks.
+}
+"#,
+    );
+    assert!(
+        matches!(run.next(), State::Action(action) if matches!(action.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
+    );
+    run.resume(
+        json!({"content":"<title>Test</title><a href=\"one.html\">One</a>"}),
+        false,
+    )
+    .unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("missing AI review")
+    };
+    assert!(
+        matches!(action.kind, ActionKind::Task { ref name, ref input, .. } if name == "inspect" && input["summary"] == json!({"hasTitle":true,"links":["href=\"one.html\""]})),
+        "unexpected action: {:?}",
+        action.kind
+    );
+    run.resume(json!({"passed":true}), false).unwrap();
+    assert_eq!(returned(run), json!({"passed":true}));
+}
+
+#[test]
+fn rust_path_and_url_builtins_run_inside_flow_and_survive_resume() {
+    let mut run = runtime(
+        r#"
+function main() {
+  const target = path.join("docs", "pages", "..", "index.html");
+  const link = url.parse("../asset.css?x=1#part", "https://example.com/docs/pages/");
+  const input = io.read({path:"proof.txt"});
+  return {target:target, link:link, data:input.content};
+}
+"#,
+    );
+    assert!(
+        matches!(run.next(), State::Action(action) if matches!(action.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
+    );
+    let mut restored: Runtime =
+        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    restored.resume(json!({"content":"ok"}), false).unwrap();
+    let result = returned(restored);
+    assert_eq!(
+        result["target"],
+        std::path::Path::new("docs")
+            .join("index.html")
+            .to_string_lossy()
+            .as_ref()
+    );
+    assert_eq!(
+        result["link"]["href"],
+        "https://example.com/docs/asset.css?x=1#part"
+    );
+    assert_eq!(result["data"], "ok");
+    assert_eq!(
+        returned(runtime(
+            "function main(){return path.basename('a/b.txt','.txt');}"
+        )),
+        json!("b")
+    );
+    assert_eq!(
+        returned(runtime(
+            "function main(){return path.join('a', '$(echo nope)');}"
+        )),
+        json!(
+            std::path::Path::new("a")
+                .join("$(echo nope)")
+                .to_string_lossy()
+                .to_string()
+        )
+    );
+    assert!(compile("function main(){return path.nonexistent('x');}").is_err());
+    assert_eq!(
+        returned(runtime(
+            "function main(){try{return path.resolve('relative');}catch(error){return error.message;}}"
+        )),
+        json!("path.resolve requires an absolute path argument")
+    );
+    let invalid = returned(runtime(
+        "function main(){try{return url.parse('not a URL');}catch(error){return error.message;}}",
+    ));
+    assert!(invalid.as_str().unwrap().starts_with("URL parse error:"));
+}
+
+#[test]
 fn serial_page_review_reads_in_order_then_uses_one_ai_scope() {
     let source = include_str!("../../skills/task-program/examples/serial-page-review.js");
     let program = compile(source).unwrap();
-    let mut runtime = Runtime::task_program(program, "main", vec![json!({
-        "paths":["1.html","2.html","3.html","4.html","5.html"],
-        "requirements":"检查正文"
-    })]).unwrap();
+    let mut runtime = Runtime::task_program(
+        program,
+        "main",
+        vec![json!({
+            "paths":["1.html","2.html","3.html","4.html","5.html"],
+            "requirements":"检查正文"
+        })],
+    )
+    .unwrap();
     for n in 1..=5 {
-        let State::Action(action) = runtime.next() else { panic!("missing page read") };
-        assert!(matches!(action.kind, ActionKind::Tool { ref name, ref args }
-            if name == "read_file" && args["path"] == format!("{n}.html")));
-        runtime.resume(json!({"content":format!("page {n}")}), false).unwrap();
+        let State::Action(action) = runtime.next() else {
+            panic!("missing page read")
+        };
+        assert!(
+            matches!(action.kind, ActionKind::Tool { ref name, ref args }
+            if name == "read_file" && args["path"] == format!("{n}.html"))
+        );
+        runtime
+            .resume(json!({"content":format!("page {n}")}), false)
+            .unwrap();
     }
-    let State::Action(action) = runtime.next() else { panic!("missing AI inspection") };
+    let State::Action(action) = runtime.next() else {
+        panic!("missing AI inspection")
+    };
     match action.kind {
         ActionKind::Call { name, args } => {
             assert_eq!(name, "inspectPages");
@@ -61,7 +218,8 @@ fn serial_page_review_reads_in_order_then_uses_one_ai_scope() {
 
 #[test]
 fn await_promise_all_suspends_once_and_returns_ordered_read_results() {
-    let mut run = runtime(r#"
+    let mut run = runtime(
+        r#"
 async function main() {
   const paths = ["first.txt", "second.txt"];
   return await Promise.all([
@@ -69,8 +227,11 @@ async function main() {
     io.read({path:paths[1]}),
     io.search({path:".",query:"needle"})
   ]);
-}"#);
-    let State::Action(action) = run.next() else { panic!("missing parallel reads") };
+}"#,
+    );
+    let State::Action(action) = run.next() else {
+        panic!("missing parallel reads")
+    };
     match action.kind {
         ActionKind::ParallelReads { operations } => {
             assert_eq!(operations.len(), 3);
@@ -81,28 +242,48 @@ async function main() {
         }
         other => panic!("unexpected action {other:?}"),
     }
-    let mut recovered: Runtime = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
-    let State::Action(again) = recovered.next() else { panic!("missing saved action") };
+    let mut recovered: Runtime =
+        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    let State::Action(again) = recovered.next() else {
+        panic!("missing saved action")
+    };
     assert_eq!(again.id, action.id);
-    recovered.resume(json!([{"content":"first"},{"content":"second"},{"matches":[]}]), false).unwrap();
-    assert_eq!(returned(recovered), json!([{"content":"first"},{"content":"second"},{"matches":[]}]));
+    recovered
+        .resume(
+            json!([{"content":"first"},{"content":"second"},{"matches":[]}]),
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        returned(recovered),
+        json!([{"content":"first"},{"content":"second"},{"matches":[]}])
+    );
 }
 
 #[test]
 fn promise_all_rejects_writes_and_ai_calls() {
-    assert!(compile("async function main(){return await Promise.all([io.write({path:'a',content:'b'})]);}").is_err());
+    assert!(
+        compile(
+            "async function main(){return await Promise.all([io.write({path:'a',content:'b'})]);}"
+        )
+        .is_err()
+    );
     assert!(compile("async function main(){return await Promise.all([judge()]);} /** @virtual */ function judge(){}").is_err());
     assert!(compile("async function main(){return await Promise.all([fork(worker)]);} function worker(){return 1;}").is_err());
 }
 
 #[test]
 fn failed_parallel_reads_follow_catch_without_repeating_the_batch() {
-    let mut run = runtime(r#"
+    let mut run = runtime(
+        r#"
 async function main() {
   try { return await Promise.all([io.read({path:"a"}),io.read({path:"b"})]); }
   catch(error) { return error.message; }
-}"#);
-    assert!(matches!(run.next(), State::Action(action) if matches!(action.kind, ActionKind::ParallelReads { .. })));
+}"#,
+    );
+    assert!(
+        matches!(run.next(), State::Action(action) if matches!(action.kind, ActionKind::ParallelReads { .. }))
+    );
     run.resume(json!({"message":"read failed"}), true).unwrap();
     assert_eq!(returned(run), json!("read failed"));
 }
@@ -112,25 +293,48 @@ fn promise_all_maps_dynamic_page_list_without_agents() {
     let source = include_str!("../../skills/task-program/examples/async-page-review.js");
     let program = compile(source).unwrap();
     let mut run = Runtime::task_program(program, "main", vec![json!({"paths":["a.html","b.html","c.html","d.html","e.html"],"requirements":"检查正文"})]).unwrap();
-    let State::Action(action) = run.next() else { panic!("missing batch") };
-    let ActionKind::ParallelReads { operations } = action.kind else { panic!("expected read batch") };
+    let State::Action(action) = run.next() else {
+        panic!("missing batch")
+    };
+    let ActionKind::ParallelReads { operations } = action.kind else {
+        panic!("expected read batch")
+    };
     assert_eq!(operations.len(), 5);
-    assert_eq!(operations.iter().map(|(_, args)|args["path"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a.html","b.html","c.html","d.html","e.html"]);
+    assert_eq!(
+        operations
+            .iter()
+            .map(|(_, args)| args["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["a.html", "b.html", "c.html", "d.html", "e.html"]
+    );
     run.resume(json!([{ "content":"a" },{ "content":"b" },{ "content":"c" },{ "content":"d" },{ "content":"e" }]), false).unwrap();
-    let State::Action(action) = run.next() else { panic!("missing AI inspection") };
-    assert!(matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspectPages" && args[0][4]["initial"]["content"] == "e" && args[1] == "检查正文"));
+    let State::Action(action) = run.next() else {
+        panic!("missing AI inspection")
+    };
+    assert!(
+        matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspectPages" && args[0][4]["initial"]["content"] == "e" && args[1] == "检查正文")
+    );
 }
 
 #[test]
 fn virtual_function_body_can_be_refined_to_an_async_entry() {
-    let program = compile_body(r#"
+    let program = compile_body(
+        r#"
 async function review(paths) {
   return await Promise.all(paths.map(path => io.read({path:path})));
-}"#, "review").unwrap();
-    let mut run = Runtime::task_program(program, "review", vec![json!(["a","b"])]).unwrap();
-    let State::Action(action) = run.next() else { panic!("missing read batch") };
-    assert!(matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len() == 2));
-    run.resume(json!([{ "content":"a" },{ "content":"b" }]), false).unwrap();
+}"#,
+        "review",
+    )
+    .unwrap();
+    let mut run = Runtime::task_program(program, "review", vec![json!(["a", "b"])]).unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("missing read batch")
+    };
+    assert!(
+        matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len() == 2)
+    );
+    run.resume(json!([{ "content":"a" },{ "content":"b" }]), false)
+        .unwrap();
     assert_eq!(returned(run), json!([{ "content":"a" },{ "content":"b" }]));
     assert!(compile_body("async function review(){return review();}", "review").is_err());
 }
@@ -244,6 +448,13 @@ fn deterministic_expressions_return_without_model_actions() {
         ("1 !== '1'", json!(true)),
         ("[1,{x:2}]===[1,{x:2}]", json!(true)),
         ("!false", json!(true)),
+        ("typeof 'abc'", json!("string")),
+        ("typeof null", json!("object")),
+        ("typeof [1]", json!("object")),
+        ("Array.isArray([1])", json!(true)),
+        ("Array.isArray({})", json!(false)),
+        ("Object.keys({b:2,a:1})", json!(["a", "b"])),
+        ("Object.values({b:2,a:1})", json!([1, 2])),
         ("+3", json!(3)),
         ("false && true", json!(false)),
         ("true || false", json!(true)),
@@ -256,8 +467,21 @@ fn deterministic_expressions_return_without_model_actions() {
         ("'中文😀'.indexOf('😀')", json!(2)),
         ("'abcd'.slice(1,-1)", json!("bc")),
         ("[1,2,3].slice(1)", json!([2, 3])),
+        ("[1,2,3].at(-1)", json!(3)),
+        ("'中文'.at(-1)", json!("文")),
+        ("[1].at(2)", Value::Null),
+        ("[1].concat([2,3])", json!([1, 2, 3])),
+        ("'a'.concat('b')", json!("ab")),
         ("' a '.trim().toUpperCase()", json!("A")),
         ("'a,b'.split(',')", json!(["a", "b"])),
+        ("'中a中'.lastIndexOf('中')", json!(2)),
+        ("'aaa'.replace('a','x')", json!("xaa")),
+        ("'aba'.replaceAll('a','x')", json!("xbx")),
+        ("'中a'.replaceAll('','-')", json!("-中-a-")),
+        ("/abc/i.test('ABC')", json!(true)),
+        (r"'x12'.match(/(\d+)/)", json!(["12", "12"])),
+        (r"'a1b2'.match(/\d/g)", json!(["1", "2"])),
+        ("'abc'.match(/z/)", Value::Null),
         ("[1,true,null].join('-')", json!("1-true-null")),
         ("[1,2].includes(2)", json!(true)),
         ("JSON.parse(JSON.stringify({ok:true}))", json!({"ok":true})),
@@ -464,7 +688,7 @@ fn integer_literals_and_task_parameters_remain_json_integers() {
 
 #[test]
 fn programs_have_one_main_and_helpers_use_normal_returns() {
-    assert!(compile("function prepare(){return 'ready';}").is_err());
+    assert!(compile("function prepare(){return 'ready';}").is_ok());
     assert!(compile("function main(){} function main(){}").is_err());
     let mut r = runtime(
         "function prepare(){return {ready:true};} function execute(input){io.write({path:'done.txt',content:'done'});return input;} function main(){const prepared=prepare();const result=execute(prepared);return result;}",
@@ -699,11 +923,9 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "const bits = value | 1;",
         "const bits = ~value;",
         "const power = value ** 2;",
-        "const kind = typeof value;",
         "void value;",
         "delete data.value;",
         "data.value = 2;",
-        "const regex = /x/;",
         "const bigint = 1n;",
         "const infinity = 1e999;",
         "const infinity = value + 1e999;",
@@ -753,7 +975,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
     for source in [
         "function* main(){return 1;}",
         "function main(){return 1;} function* unused(){return 1;}",
-        "function main(){return 1;} async function unused(){return 1;}",
         "import {tools} from '@agent/runtime'; function main(){return 1;}",
         "export function main(){return 1;}",
         "type Result = string; function main(){return 1;}",
@@ -825,13 +1046,7 @@ fn all_older_program_versions_reject_pending_effects_without_replaying() {
 
 #[test]
 fn embedded_skill_and_tool_contracts_advertise_the_same_source_whitelist() {
-    for text in [
-        SKILL.to_owned(),
-        tool()["function"]["description"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    ] {
+    for text in [SKILL.to_owned(), CAPABILITIES.to_owned()] {
         for required in [
             "function*",
             "yield",
@@ -861,11 +1076,12 @@ fn published_flow_examples_compile_with_the_fixed_whitelist() {
         let text = text.replace("\r\n", "\n");
         for block in text.split("```js\n").skip(1) {
             let source = block.split("```").next().unwrap();
-            let result = if source.contains("function main(") {
-                compile(source)
-            } else {
-                compile_body(source, "process")
-            };
+            let result =
+                if source.contains("function process(") && !source.contains("function main(") {
+                    compile_body(source, "process")
+                } else {
+                    compile(source)
+                };
             result.unwrap_or_else(|error| panic!("published example failed: {error}\n{source}"));
             examples += 1;
         }
@@ -998,8 +1214,8 @@ fn documented_serial_example_writes_reads_and_checks_without_fork() {
             include_str!("../../skills/task-program/examples/serial.input.json"),
         ))
         .unwrap();
-    assert_eq!(output["path"], "agent-overview.html");
-    assert_eq!(output["review"]["passed"], true);
+    assert_eq!(output, Value::Null);
+    assert!(harness.files.contains_key("agent-overview.html"));
     assert_eq!(
         harness.events,
         vec![
@@ -1033,8 +1249,7 @@ fn documented_parallel_example_forks_disjoint_parts_then_checks_all_five() {
             "join"
         ]
     );
-    assert_eq!(output["files"].as_array().unwrap().len(), 5);
-    assert_eq!(output["reviews"].as_array().unwrap().len(), 5);
+    assert_eq!(output, Value::Null);
     assert_eq!(harness.files.len(), 6); // one source plus five distinct outputs
     assert_eq!(
         harness.events.iter().filter(|e| *e == "designPage").count(),
@@ -1048,8 +1263,8 @@ fn documented_parallel_example_forks_disjoint_parts_then_checks_all_five() {
             .count(),
         5
     );
-    for file in output["files"].as_array().unwrap() {
-        let path = file["path"].as_str().unwrap();
+    for path in harness.files.keys().filter(|path| path.ends_with(".html")) {
+        let path = path.as_str();
         for operation in ["write_file", "read_file"] {
             assert_eq!(
                 harness
@@ -1574,4 +1789,205 @@ fn source_variables_remain_visible_until_their_function_returns() {
     let mut restored: Runtime = serde_json::from_str(&saved).unwrap();
     restored.resume(json!({"saved":true}), false).unwrap();
     assert!(matches!(restored.next(),State::Returned(value) if value==payload.chars().count()));
+}
+
+#[test]
+fn top_level_imports_run_in_order_and_capture_visible_variables() {
+    let source = r#"
+import { read as load, write } from "host:io";
+const file = load({path: input.source});
+const value = prepare(file.content);
+write({path: input.output, content: value});
+function prepare(content) { return content + input.suffix; }
+"#;
+    let mut r = Runtime::new(
+        compile(source).unwrap(),
+        "main",
+        vec![json!({"source":"in", "output":"out", "suffix":"!"})],
+    )
+    .unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
+    );
+    r.resume(json!({"content":"hello"}), false).unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "write_file" && args["content"] == "hello!" && args["path"] == "out"))
+    );
+    r.resume(json!({"ok":true}), false).unwrap();
+    assert_eq!(returned(r), Value::Null);
+}
+
+#[test]
+fn imports_use_only_published_tools_and_reject_invalid_bindings() {
+    for source in [
+        "import {missing} from 'host:io'; missing({});",
+        "import {read} from 'host:missing'; read({});",
+        "import x from 'host:io'; x({});",
+        "import {read} from 'host:io'; const read = 1;",
+        "import {read} from 'host:io'; io.write({path:'x',content:'x'});",
+    ] {
+        assert!(compile(source).is_err(), "unexpectedly accepted {source}");
+    }
+    let mut r = Runtime::new(
+        compile("import * as files from 'host:io'; files.read({path:'x'});").unwrap(),
+        "main",
+        vec![Value::Null],
+    )
+    .unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
+    );
+}
+
+#[test]
+fn await_single_effects_and_async_helpers_preserve_sequential_execution() {
+    let source = r#"
+import {read, write} from "host:io";
+const content = await load(input.path);
+await write({path: "out.txt", content: content});
+async function load(path) {
+    const result = await read({path});
+    return result.content;
+}
+"#;
+    let mut r = Runtime::new(
+        compile(source).unwrap(),
+        "main",
+        vec![json!({"path":"in.txt"})],
+    )
+    .unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "read_file" && args["path"] == "in.txt"))
+    );
+    let mut resumed: Runtime = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+    resumed.resume(json!({"content":"hello"}), false).unwrap();
+    assert!(
+        matches!(resumed.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "write_file" && args["content"] == "hello"))
+    );
+    resumed.resume(json!({"ok":true}), false).unwrap();
+    assert_eq!(returned(resumed), Value::Null);
+}
+
+#[test]
+fn await_preserves_values_and_catchable_tool_failures() {
+    assert_eq!(
+        returned(runtime(
+            "async function main(){const n=await 3; return n+1;}"
+        )),
+        json!(4)
+    );
+    let mut r = runtime(
+        "async function main(){try {await io.read({path:'missing'}); return 'unexpected';} catch(e) {return e.message;}} ",
+    );
+    assert!(matches!(r.next(), State::Action(_)));
+    r.resume(json!({"message":"read failed"}), true).unwrap();
+    assert_eq!(returned(r), json!("read failed"));
+}
+
+#[test]
+fn await_virtual_function_returns_its_actual_task_value() {
+    let source = r#"
+const value = await classify(input);
+await io.write({path:"result.txt",content:value.text});
+/** @virtual */
+async function classify(data) { // Classify data; return {text:string}.
+}
+"#;
+    let mut r = Runtime::new(compile(source).unwrap(), "main", vec![json!("input")]).unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Task { ref name, ref input, .. } if name == "classify" && input["data"] == "input"))
+    );
+    r.resume(json!({"text":"actual"}), false).unwrap();
+    assert!(
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref args, .. } if args["content"] == "actual"))
+    );
+    r.resume(json!({"ok":true}), false).unwrap();
+    assert_eq!(returned(r), Value::Null);
+}
+
+#[test]
+fn virtual_literal_throw_is_a_placeholder_but_other_effects_are_rejected() {
+    let source = r#"
+import { write } from "host:io";
+const result = await inspect("data");
+await write({path:"result.txt",content:result.text});
+/** @virtual Review the provided data and return {text:string}. */
+async function inspect(data) { throw new Error("Host must provide inspect"); }
+"#;
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![Value::Null]).unwrap();
+    assert!(
+        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Task { ref name, ref input, .. } if name == "inspect" && input["data"] == "data"))
+    );
+    run.resume(json!({"text":"reviewed"}), false).unwrap();
+    assert!(
+        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "write_file" && args["content"] == "reviewed"))
+    );
+    run.resume(json!({"ok":true}), false).unwrap();
+    assert_eq!(returned(run), Value::Null);
+    for body in [
+        "throw new Error(io.read({path:'x'}));",
+        "io.write({path:'x'}); throw new Error('x');",
+        "throw 'oops';",
+        "throw new Other('x');",
+    ] {
+        assert!(
+            compile(&format!(
+                "/** @virtual Review and return result. */ function inspect(){{{body}}} inspect();"
+            ))
+            .is_err(),
+            "must reject {body}"
+        );
+    }
+}
+
+#[test]
+fn promise_all_async_map_read_calls_remain_parallel_and_ordered() {
+    let source = r#"
+import {read} from "host:io";
+const files = await Promise.all(input.map(async file => await read({path:file})));
+"#;
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!(["a", "b"])]).unwrap();
+    let State::Action(action) = run.next() else {
+        panic!("expected parallel read")
+    };
+    assert!(
+        matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len()==2 && operations[0].1["path"]=="a" && operations[1].1["path"]=="b")
+    );
+    let mut restored: Runtime =
+        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    restored
+        .resume(json!([{"content":"A"},{"content":"B"}]), false)
+        .unwrap();
+    assert_eq!(returned(restored), Value::Null);
+}
+
+#[test]
+fn awaited_promise_chains_preserve_callback_values_and_tool_continuations() {
+    assert_eq!(
+        returned(runtime(
+            "async function main(){let x=10; const obj=await Promise.resolve(3).then(x=>({x})); return [x,obj.x];}"
+        )),
+        json!([10, 3])
+    );
+    assert_eq!(
+        returned(runtime(
+            "async function main(){return await Promise.reject({message:'bad'}).catch(e=>e.message);}"
+        )),
+        json!("bad")
+    );
+    let mut run = runtime(
+        "async function main(){return await Promise.resolve('in').then(async p=>await io.read({path:p})).then(r=>r.content).catch(e=>e.message);}",
+    );
+    assert!(
+        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
+    );
+    let snapshot = serde_json::to_value(&run).unwrap();
+    let mut restored: Runtime = serde_json::from_value(snapshot.clone()).unwrap();
+    restored.resume(json!({"content":"hello"}), false).unwrap();
+    assert_eq!(returned(restored), json!("hello"));
+    let mut failed: Runtime = serde_json::from_value(snapshot).unwrap();
+    failed
+        .resume(json!({"message":"read failed"}), true)
+        .unwrap();
+    assert_eq!(returned(failed), json!("read failed"));
 }

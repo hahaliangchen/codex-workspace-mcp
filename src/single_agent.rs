@@ -229,6 +229,8 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         tools.push(function_scope::tool());
         tools.push(crate::agent_program::tool());
         tools.push(crate::agent_program::check_tool());
+        tools.push(crate::agent_program::declarations::contract_tool());
+        tools.push(function("read_program_guide", "Read supported flow language capabilities and differences from JavaScript on demand.", json!({}), json!([])));
         if w.program_task.is_some() {
             tools.push(crate::agent_program::body_tool());
         }
@@ -300,7 +302,9 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
     };
     matches!(
         name,
-        "read_task_board"
+        "read_tool_contracts"
+            | "read_program_guide"
+            | "read_task_board"
             | "execute_program"
             | "define_task_body"
             | "check_program"
@@ -523,9 +527,11 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     }
     let comment_task = messages.iter().find(|m| m["name"] == "program_task_input");
     {
-        wire.insert(1.min(wire.len()),json!({"role":"system","name":"task_program_skill","content":crate::agent_program::SKILL}));
+        if comment_task.is_none() {
+            wire.insert(1.min(wire.len()),json!({"role":"system","name":"program_environment","content":crate::agent_program::ENVIRONMENT}));
+        }
         let libraries = program_flow::library_catalog(s, definitions);
-        let headers = crate::agent_program::declarations::headers(&libraries, definitions);
+        let headers = crate::agent_program::declarations::index(&libraries, definitions);
         wire.insert(
             2.min(wire.len()),
             json!({"role":"system","name":"program_tool_headers","content":headers}),
@@ -678,7 +684,7 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     }
     wire.extend(host_messages);
     if let Some(task) = comment_task {
-        wire.push(json!({"role":"system","name":"program_task_execution","content":"You are executing the current @virtual task function described in program_task_input, with its exact signature and actual local parameter bindings. Comments explain the work; they do not make this a leaf task. Calls to AI-defined functions are child tasks; calls to advertised tools are execution steps. Work step by step in this same function: inspect actual results, address problems within your responsibility and verify the result as required. Follow the function contract for side effects: use write or modify operations only when the function is assigned that action. If it only produces content for its caller to persist, return the content without writing it; a caller may already be responsible for persistence. You may use tools directly, or call define_task_body to implement this same function with tool calls and helper tasks using task_program_skill. Keep its function name and return contract. A concrete define_task_body implementation removes @virtual from this current function; newly declared AI helper stubs use @virtual plus comments and no executable statements or placeholder return. program_task_input shows the exact function signature and bindings: each binding is already the local parameter value, not an input envelope. Keep the same parameter count; actual arguments bind by position only. Do not add a wrapper such as input.input unless that property exists in the actual bound value. Use explicit parameters and retrieve other visible values from the inherited scope as needed; declare new helpers. Do not create another main, recreate the root task or reschedule the caller. After tools complete, return one JSON value matching the caller contract, without Markdown fences; text is a JSON string. Failure is {\"$task_error\":{\"message\":\"concrete cause\"}} and propagates to the caller. Preserve permissions, plugin scope and required actual evidence; never automatically replay completed or uncertain external effects."}));
+        wire.push(json!({"role":"system","name":"program_task_execution","content":"You are executing the current @virtual task function described in program_task_input, with its exact signature and actual local parameter bindings. Comments explain the work; they do not make this a leaf task. Calls to AI-defined functions are child tasks; calls to advertised tools are execution steps. Work step by step in this same function: inspect actual results, address problems within your responsibility and verify the result as required. Follow the function contract for side effects: use write or modify operations only when the function is assigned that action. If it only produces content for its caller to persist, return the content without writing it; a caller may already be responsible for persistence. You may use tools directly, or call define_task_body to implement this same function with tool calls and helper tasks. If needed, read_program_guide describes supported flow language features on demand. Keep its function name and return contract. A concrete define_task_body implementation removes @virtual from this current function; newly declared AI helper stubs use @virtual plus comments and no executable statements or placeholder return. program_task_input shows the exact function signature and bindings: each binding is already the local parameter value, not an input envelope. Keep the same parameter count; actual arguments bind by position only. Do not add a wrapper such as input.input unless that property exists in the actual bound value. Use explicit parameters and retrieve other visible values from the inherited scope as needed; declare new helpers. Do not create another main, recreate the root task or reschedule the caller. After tools complete, return one JSON value matching the caller contract, without Markdown fences; text is a JSON string. Failure is {\"$task_error\":{\"message\":\"concrete cause\"}} and propagates to the caller. Preserve permissions, plugin scope and required actual evidence; never automatically replay completed or uncertain external effects."}));
         // Keep the exact current call available after folded working history.
         if !wire.iter().any(|m| m["name"] == "program_task_input") {
             wire.push(task.clone());
@@ -728,7 +734,7 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             {
                 published.push(native);
             }
-            wire.push(json!({"role":"system","name":"library_transport","content":"For direct native steps use invoke_library({method: 'namespace.method', args: {...}}), with the same method names and JSON contract as program_tool_headers. In define_task_body source call namespace.method({...}) directly. invoke_library is a transport only, not a source function."}));
+            wire.push(json!({"role":"system","name":"library_transport","content":"For direct native steps use invoke_library({method: 'namespace.method', args: {...}}). The program_tool_headers is only an index; call read_tool_contracts to obtain exact signatures as needed. In define_task_body import and call the library methods directly. invoke_library is a transport only, not a source function."}));
         }
         if awaiting_task {
             published.retain(|d| d["function"]["name"] == "create_task");
@@ -1867,6 +1873,13 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     let catalog = program_flow::library_catalog(s, &definitions);
                     let target = crate::agent_program::libraries::target(&catalog, method)
                         .context("unknown or unavailable library method")?;
+                    let definition = definitions.iter().find(|d| d["function"]["name"] == target)
+                        .context("tool contract unavailable")?;
+                    let schema = &definition["function"]["parameters"];
+                    let validator = jsonschema::validator_for(schema)
+                        .map_err(|e| anyhow::anyhow!("invalid tool schema: {e}"))?;
+                    validator.validate(&payload["args"])
+                        .map_err(|e| anyhow::anyhow!("invalid arguments for {method}: {e}"))?;
                     Ok((target.to_owned(), payload["args"].to_string()))
                 })();
                 match resolve {
@@ -1931,6 +1944,12 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         Ok(json!(results))
                     },
                     "read_scope" => { material_source=Some(("read_scope".into(),args.clone())); function_scope::read(w,&args) },
+                    "read_program_guide" => { Ok(json!({"guide":crate::agent_program::CAPABILITIES})) },
+                    "read_tool_contracts" => {
+                        let catalog = program_flow::library_catalog(s, &definitions);
+                        let selected = crate::agent_program::declarations::selected(&catalog, &args)?;
+                        Ok(json!({"declarations":crate::agent_program::declarations::headers(&selected, &definitions)}))
+                    },
                     "check_program" => { validating_source = true; program_flow::check_scoped(s,w,&args) },
                     "execute_program" => { validating_source = true; program_flow::install_scoped(s,w,&args,false) },
                     "define_task_body" => { validating_source = true; program_flow::install_scoped(s,w,&args,true) },

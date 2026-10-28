@@ -1,12 +1,13 @@
 // 最小串行流程：设计 → 保存 → 读回 → 验收 → 交付。不启动子 Agent。
-function main(request) {
-  const draft = compose(request);
-  const receipt = io.write({path: request.output, content: draft.content});
-  const actual = io.read({path: request.output});
-  const review = inspect(request, actual.content);
-  assert(review.passed, "验收未通过，不能交付");
-  return {path: request.output, receipt, review};
-}
+import * as io from "host:io";
+const request = input;
+
+const draft = compose(request);
+const receipt = io.write({path: request.output, content: draft.content});
+const actual = io.read({path: request.output});
+const review = inspect(request, actual.content);
+assert(review.passed, "验收未通过，不能交付");
+// 读写和验收完成后，流程自然结束。
 
 /** @virtual */
 function compose(request) {

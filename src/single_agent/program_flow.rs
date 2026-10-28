@@ -407,7 +407,9 @@ async fn exchange(
 async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value) -> Result<Round> {
     w.program_value = Some(value.clone());
     w.program = None;
-    let text = if w.program_task.is_some() {
+    let text = if w.program_task.is_none() && value.is_null() {
+        "程序执行完成。".to_owned()
+    } else if w.program_task.is_some() {
         serde_json::to_string(&value)?
     } else {
         value
@@ -1028,7 +1030,8 @@ function produce(part,state,marker) {
             async move {
                 let messages=body["messages"].as_array().unwrap();
                 let message=if let Some(task)=messages.iter().find(|m|m["name"]=="program_task_input") {
-                    assert!(messages.iter().any(|m|m["name"]=="task_program_skill"),"the executing AI needs the generic representation skill to refine this function");
+                    assert!(!messages.iter().any(|m|m["name"]=="task_program_skill"));
+                    assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_program_guide"));
                     assert!(messages.iter().any(|m|m["name"]=="program_task_execution"));
                     let names=body["tools"].as_array().unwrap().iter().map(|t|t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
                     assert!(names.contains(&"invoke_library"));
@@ -1048,7 +1051,9 @@ function produce(part,state,marker) {
                         json!({"role":"assistant","tool_calls":[{"id":format!("write{n}"),"type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.write","args":{"path":part["path"],"content":part["text"]}}).to_string()}}]})
                     }
                 } else {
-                    assert!(messages.iter().any(|m|m["name"]=="task_program_skill"));
+                    assert!(messages.iter().any(|m|m["name"]=="program_environment"));
+                    assert!(!messages.iter().any(|m|m["name"]=="task_program_skill"));
+                    if n > 0 { assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_program_guide")); }
                     let (name,args)=match n {0=>("create_task",json!({"goal":"Two forked helpers with comment tasks"})),1=>("execute_program",json!({"source":source})),_=>panic!("unexpected planner request {n}")};
                     json!({"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
                 };
@@ -1211,7 +1216,10 @@ function produce(part,state,marker) {
                     match task["name"].as_str().unwrap() {
                         "phase" => {
                             assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="define_task_body"));
-                            assert!(messages.iter().any(|m|m["name"]=="task_program_skill"));
+                            if !messages.iter().any(|m|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|calls|calls.iter().any(|c|c["function"]["name"]=="read_program_guide"))) {
+                                return Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":"guide","type":"function","function":{"name":"read_program_guide","arguments":"{}"}}]}}]}));
+                            }
+                            assert!(messages.iter().any(|m|m["role"]=="tool" && m.to_string().contains("Flow runtime capabilities")));
                             ("define_task_body",json!({"source":r#"
 function phase(request) {
   // Refine this same task, not another main.
@@ -1270,7 +1278,7 @@ function evaluate(request,content) {
         .unwrap()
         .unwrap();
         server.abort();
-        assert_eq!(count.load(Ordering::SeqCst), 5);
+        assert_eq!(count.load(Ordering::SeqCst), 6);
         let status: String = conn
             .query_row("SELECT status FROM agent_tasks", [], |r| r.get(0))
             .unwrap();
@@ -1388,7 +1396,6 @@ function evaluate(request,content) {
     fn source_adapters_reject_extensions_without_installing_a_program() {
         for source in [
             "function* work(){return 1;}",
-            "async function work(){return await helper();} function helper(){return 1;}",
             "function work(input: string){return input;}",
             "function work(){return ai({instruction:'value'});}",
             "function work(){return io.read({});} export function unused(){return 1;}",
@@ -1529,7 +1536,11 @@ function evaluate(request,content) {
                 assert!(headers.contains("function read("));assert!(headers.contains("function write("));
                 assert!(!body["tools"].as_array().unwrap().iter().any(|t|matches!(t["function"]["name"].as_str(),Some("read_file"|"write_file"|"invoke_library"))));
             }
-            let (name,args)=match n {0=>("create_task",json!({"goal":"Use file library and C truth values"})),1=>("execute_program",json!({"source":source})),_=>panic!("no condition should request a model: {n}")};
+            if n==2 {
+                assert!(messages.iter().any(|m|m["role"]=="tool" && m["content"].as_str().is_some_and(|c| c.contains("function read(args:") && c.contains("path:"))), "exact selected contract must reach the planner");
+            }
+            if n==3 { assert!(messages.iter().any(|m|m["role"]=="tool" && m.to_string().contains("Flow runtime capabilities"))); }
+            let (name,args)=match n {0=>("create_task",json!({"goal":"Use file library and C truth values"})),1=>("read_tool_contracts",json!({"methods":["io.read","io.write"]})),2=>("read_program_guide",json!({})),3=>("execute_program",json!({"source":source})),_=>panic!("no condition should request a model: {n}")};
             async move {Json(json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]}}]}))}
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1554,7 +1565,7 @@ function evaluate(request,content) {
             .query_row("SELECT status FROM agent_tasks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "completed");
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert_eq!(count.load(Ordering::SeqCst), 4);
         assert_eq!(
             std::fs::read_to_string(root.path().join("one.txt")).unwrap(),
             "one"
@@ -1789,8 +1800,16 @@ function 修正(产物, request) {
                     assert_eq!(task["name"], "检查");
                     let input = &task["bindings"];
                     assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "invoke_library"));
-                    let read = messages.iter().any(|m| m["role"] == "assistant" && m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "invoke_library")));
-                    if !read {
+                    assert!(!messages.iter().any(|m| m["name"] == "task_program_skill"), "virtual work should not receive the full programming guide");
+                    assert!(body["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "read_program_guide"));
+                    let has_call = |id: &str| messages.iter().any(|m| m["tool_calls"].as_array().is_some_and(|calls| calls.iter().any(|c| c["id"] == id)));
+                    if !has_call("contract") {
+                        json!({"role":"assistant","tool_calls":[{"id":"contract","type":"function","function":{"name":"read_tool_contracts","arguments":json!({"methods":["io.read"]}).to_string()}}]})
+                    } else if !has_call("invalid-read") {
+                        assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("function read(args:")));
+                        json!({"role":"assistant","tool_calls":[{"id":"invalid-read","type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.read","args":{}}).to_string()}}]})
+                    } else if !has_call("inspect-actual") {
+                        assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("invalid arguments")), "invalid input must be rejected before dispatch");
                         json!({"role":"assistant","tool_calls":[{"id":"inspect-actual","type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.read","args":{"path":input["产物"]["path"]}}).to_string()}}]})
                     } else {
                         assert!(messages.iter().any(|m| m["role"] == "tool" && m.to_string().contains("DRAFT")));
@@ -1845,7 +1864,7 @@ function 修正(产物, request) {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(status, "completed", "{terminal:?}");
-        assert_eq!(requests.load(Ordering::SeqCst), 5);
+        assert_eq!(requests.load(Ordering::SeqCst), 7);
         assert_eq!(
             std::fs::read_to_string(root.path().join("artifact.txt")).unwrap(),
             "APPROVED"

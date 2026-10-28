@@ -4,34 +4,44 @@
 
 这是面向 Agent 工作流的领域语言。可以借用 JS 的写法，但执行语义以本手册为准。业务 skill 提供需求和流程，语言负责表达函数、数据依赖和控制流，宿主负责执行；学习语言不替代加载当前业务的 skill。
 
+## 顶层入口与工具导入
+
+完整流程直接写在源码顶层，按顺序运行；不必声明 main，也不要求返回值。execute_program 的 input 在顶层以 input 访问，普通函数的返回值仍用于后续计算。通过 `import * as io from "host:io"` 或 `import {read as load} from "host:io"` 引入当前权限目录中公布的工具；支持命名导入和命名空间导入，别名仅为本地绑定，不扩大权限。工具仍以一个 JSON 对象传参并经过原权限检查。其他模块、默认导入和动态导入不支持。顶层运行完毕表示流程结束，不代表业务验收自动通过。
+
+下面保留部分旧式函数入口示例作为历史参考；新流程应采用顶层入口。program_tool_headers 是精简的库和方法目录；完整契约由 read_tool_contracts 按需获取，不随每次请求重复注入。
+
 ## 阅读路线
 
 1. 从下面两个完整示例理解一次工作如何开始、执行和交付。
 2. 查阅“固定语言范围”“确定性的值规则”，避免照搬完整 JS／TS 的能力。
-3. 需要调用业务工具时读本轮 `program_tool_headers`，需要细分当前 AI 任务时读“当前函数的补写”。
+3. 需要调用业务工具时先看本轮 `program_tool_headers` 目录，再用 `read_tool_contracts` 获取相关签名，需要细分当前 AI 任务时读“当前函数的补写”。
 4. 材料和并发问题查“函数作用域与工作空间预算”“已知循环与授权并发”，错误查“失败与恢复”。
 
-宿主每轮自动提供的 [task-program Skill](../skills/task-program/SKILL.md) 包含关键规则和下面两份完整示例，执行 AI 也能看到。详细手册用于解释与查阅，不要求每个函数重新读取文档。示例源码和 JSON 输入分开保存，支持直接校验；它们是教学案例，不固定其他业务的页数、任务数量或步骤。
+宿主只提供简短的流程运行环境说明，不自动注入本手册、Skill 或完整示例。需要了解语言能力和差异时，可用 read_program_guide 按需查询；[task-program Skill](../skills/task-program/SKILL.md) 与详细手册保留供人查阅。示例源码和 JSON 输入分开保存，支持直接校验；它们是教学案例，不固定其他业务的页数、任务数量或步骤。
 
 ## 从最简单的串行执行开始
 
 源码：[serial.js](../skills/task-program/examples/serial.js)；输入：[serial.input.json](../skills/task-program/examples/serial.input.json)。
 
-这份程序只有一个 `main`，不创建并发 Agent：
+这份程序在顶层顺序执行，不创建并发 Agent：
 
 ```text
-main(request)
-  → compose(request)           AI 设计，返回正文
+顶层流程（input）
+  → compose(input)           AI 设计，返回正文
   → io.write(...)             工具保存
   → io.read(...)              工具读回实际文件
   → inspect(request, content) AI 检查，返回 passed 和证据
   → assert(review.passed)     宿主消费检查结论，失败则停止
-  → return {path,receipt,review}
+  → 流程结束
 ```
 
 `compose` 和 `inspect` 带 `@virtual`，需要 AI 理解与处理；写文件、读文件及布尔判断有确定规则，直接由宿主执行。普通函数调用使用局部 Runtime 函数帧，不创建 AI 任务节点，也不启动另一个 Agent。此例用 HTML 说明串行数据流，只检查实际执行过的内容／结构，不声称已经完成浏览器视觉验收。
 
 已有的真实结果通过参数交给需要它的函数，不因为进入虚函数就重读原材料。虚函数可在同一上下文连续观察、调用工具和处理；其职责是只检查还是包含修复，由任务确定。调用方对函数契约中可以确定的输入与输出关系做代码核对，不能把不匹配的返回结果当作有效验收。处理实际状态后需要复检时才重新读回；复杂处理可以按需补写当前函数体。
+
+虚函数是流程中的一次 AI 能力调用，有明确输入、职责和返回值；不要把它当作省略整段流程实现的默认容器。能具体表达的读取、遍历、判断分支、写入和复查等步骤尽量由普通函数编排；需要 AI 理解、判断或生成的部分才交给职责明确的虚函数，调用方再用其返回值继续推进。划分应符合当前任务，虚函数内仍可按职责和授权逐步使用工具、处理与复查，无需为了形式强制拆分。
+
+验收要覆盖当前任务的实际要求，禁止用表面特征冒充完整验收。基础文本、数量或存在性检查只能证明其实际检查到的事项，不能单独证明内容正确或资源可用。可确定的步骤尽量写成普通代码，需要理解与判断时调用职责明确的 AI 函数或适用工具；未检查或无法确认的事项如实报告。遇到语言限制或工具缺失时，不得删减必要检查后将结果当作全面通过，应该改用其他可行能力或说明未完成的原因。
 
 开始时在已有主任务中，把文件原文作为 `execute_program.source`，把 JSON 作为 `execute_program.input`。没有主任务时先用当前工具契约创建一次；不为每条库调用再创建主任务。`check_program` 可以预检，提交本身也会先编译。
 
@@ -39,7 +49,7 @@ main(request)
 {"source":"这里放 serial.js 的完整源码文本","input":{"topic":"通用 Agent 的职责边界","output":"agent-overview.html","requirements":"独立中文 HTML、内嵌 CSS、说明各角色职责"}}
 ```
 
-这里的 `source` 是源码字符串，不能填文件路径让宿主猜。此 JSON 说明提交格式；实际使用文件原文。宿主将 `input` 直接绑定为 `main(request)` 的 `request`，不是 `request.input`。
+这里的 `source` 是源码字符串，不能填文件路径让宿主猜。此 JSON 说明提交格式；实际使用文件原文。宿主将输入直接绑定到顶层变量 `input`；示例用 `const request = input`。
 
 ## 一个 AI 与并发只读操作
 
@@ -47,7 +57,7 @@ main(request)
 
 [串行页检查](../skills/task-program/examples/serial-page-review.js)使用普通函数依次读取页面，再把结果交给同一个 AI 上下文判断。[并发只读页检查](../skills/task-program/examples/async-page-review.js)改用 `await Promise.all(request.paths.map(path => io.read({path: path})))`：独立文件读取并发执行，结果仍按输入顺序交给同一个 AI 逐页判断，不启动子 Agent。
 
-受限异步只允许入口函数（`main` 或 `define_task_body` 补写的当前函数）声明 `async`，并允许 `await Promise.all` 接收只读调用的数组字面量，或接收数组的 `map`，其中箭头只有一个简单参数和一个只读调用。允许的调用为 `io.read`、`io.read_lines`、`io.list`、`io.search`，每批最多 32 项；不允许并发写入、AI 调用或其他副作用。输入表达式不能有副作用。所有读取完成后返回按输入排列的真实结果；任一失败进入原有异常路径，宿主不自动重放。一般异步函数、任意 Promise 和 Promise 链不在支持范围内。
+支持在顶层或 async 函数中对单个函数、工具调用或 JSON 值使用 `await`；宿主按已有的串行暂停与恢复机制等待结果，不产生 JavaScript Promise 对象。`await Promise.all` 接收只读调用的数组字面量，或接收数组的 `map`，其中箭头只有一个简单参数和一个只读调用，允许在箭头和调用上使用 async / await。允许的调用为 `io.read`、`io.read_lines`、`io.list`、`io.search`，每批最多 32 项；不允许并发写入、AI 调用或其他副作用。输入表达式不能有副作用。所有读取完成后返回按输入排列的真实结果；任一失败进入原有异常路径，宿主不自动重放。直接 await 的 Promise.resolve/reject 链以简单值为初始参数，不支持有副作用的表达式或属性访问；它支持 then/catch 的零或一个简单参数的表达式箭头，按顺序执行；一般 Promise 对象和其他 Promise 链仍不支持。
 
 宿主为这些任务的模型请求共用一个并发队列，默认同时执行 3 个；启动进程时可用 `CODEX_AGENT_MODEL_CONCURRENCY` 设置正整数上限。等待名额的时间不算模型请求超时，取消任务会退出等待。此限制本身不会让虚函数并发执行：目前 `Promise.all` 尚不能接收 AI 虚函数调用。
 
@@ -111,18 +121,19 @@ main(request)
 
 | 部分 | 允许范围与含义 |
 | --- | --- |
-| 文件 | 顶层普通 function；唯一 main 接受零或一个输入。辅助函数显式传参。补写源码只有当前函数及所需 helper，没有第二个 main |
+| 文件 | 顶层顺序执行，无需 main 或返回值；input 为输入。普通 function 定义辅助函数。补写源码只有当前函数及所需 helper，没有第二个 main |
 | 数据 | JSON 字符串、有限数字、布尔、null、数组、静态键对象；成员／下标读取、对象简写、简单数组解构 |
 | 局部值 | const/let/var、局部赋值、赋值表达式、局部 ++/-- 与 += -= *= /= %=。const 不重绑定。变量不共享可变别名 |
 | 调用 | helper(args)、已发布的 library.method(args)（如 io.read）；编译时核对 helper 实参数量，不允许调用或 fork main |
 | 控制流 | if/else、for(init;test;update)、while、do/while、数组 for...of、无标签 break/continue、三元表达式、return、assert、try/catch/throw |
-| 表达式 | + - * / %、一元 + - !、== != === !== < <= > >=、&& || ??、模板字符串；宿主直接计算，不创建模型任务 |
-| 收集及数据方法 | 本地数组 push；确定性的 includes/indexOf/slice、字符串 startsWith/endsWith/trim/toLowerCase/toUpperCase/split、数组 join，以及 JSON.stringify/JSON.parse |
+| 表达式 | + - * / %、一元 + - ! typeof、== != === !== < <= > >=、&& || ??、模板字符串；宿主直接计算，不创建模型任务 |
+| 收集及数据方法 | 本地数组 push；确定性的 includes/indexOf/slice/at/concat、字符串 lastIndexOf/startsWith/endsWith/trim/toLowerCase/toUpperCase/split/replace/replaceAll/match、正则 test、数组 join，以及 JSON.stringify/JSON.parse、Array.isArray、Object.keys/values |
+| 路径和 URL 计算 | `path.join/resolve/relative/normalize/dirname/basename/extname`、`url.parse`；由 Rust 直接计算，不访问文件系统 |
 | 授权并发 | fork(helper,args) 启动获授权的子 Agent，join(handles) 等待并按顺序返回；子 Agent 不再 fork |
 
 常见语法归约为已有赋值、分支、跳转、调用和返回结构，不为每种写法新增调度协议。for 的 continue 进入 update 再检查条件；while 的 continue 进入条件；do/while 的 continue 进入末尾条件。break/continue 只退出其跨越的异常处理现场，保留外围 catch。
 
-入口函数可以使用受限的 `async` 和 `await Promise.all` 并发执行只读文件操作；不支持一般 Promise、异步 helper 或完整 JS。其余仍禁止 function*/yield、call()/ai() 包装、import/export、TS 类型／断言、一般箭头／匿名／嵌套函数、闭包、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入，以及未公布的数据方法和 JS 全局环境。源码字符串里的这些词语只是数据，不按词语拦截。需要智能处理时声明注释任务；没有“计算失败后自动交给 AI”的路径。
+顶层和 async 函数可以 await 单个调用；`await Promise.all` 可以并发执行受限的只读文件操作。不支持一般 Promise 对象或完整 JS。其余仍禁止 function*/yield、call()/ai() 包装、非工具模块导入/export、TS 类型／断言、一般箭头／匿名／嵌套函数、闭包、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、BigInt、位运算、void/delete、对象成员写入，以及未公布的数据方法和 JS 全局环境。源码字符串里的这些词语只是数据，不按词语拦截。需要智能处理时声明注释任务；没有“计算失败后自动交给 AI”的路径。
 
 ## 确定性的值规则
 
@@ -136,9 +147,19 @@ main(request)
 
 数据方法只有文首列出的白名单：includes/indexOf 接受一个查找值（字符串接收者要求字符串实参；数组使用 JSON 值相等），slice 接受一个或两个整数下标；startsWith/endsWith/split 接受一个字符串；trim/toLowerCase/toUpperCase 无实参；join 接受零或一个字符串分隔符（默认逗号）；JSON.stringify/parse 恰好一个实参。类型或实参数量不匹配明确报错，不猜测方法含义。
 
+`at` 接受一个整数，支持负索引，越界返回 null；字符串按 Unicode 标量索引。`concat` 接受一个参数：数组追加值或数组元素，字符串只接受字符串。
+
+`typeof` 支持已声明的 JSON 值，null 和数组返回 `"object"`；未声明的名字仍在编译期拒绝。`Array.isArray` 判断 JSON 数组；`Object.keys/values` 接受 JSON 对象，按宿主稳定键序返回数组，不模拟 JS 整数键的特殊枚举顺序。
+
+路径和 URL 由宿主 Rust 直接计算：如 `path.join("docs", "page.html")`、`path.resolve("/project", "docs", "page.html")` 和 `url.parse("../a.html", "https://example.com/docs/")`。`url.parse` 返回 `{href,origin,protocol,hostname,port,pathname,search,hash}`；`path.resolve` 至少要求一个绝对路径，`path.relative` 的两个参数必须均为绝对路径，避免隐式依赖服务进程目录。路径按运行平台的规则进行词法处理，不访问文件系统或解析符号链接；输入最多 64 KiB，输出最多 256 KiB。常见 POSIX 路径和 URL 行为与 Node 对照测试，Windows 复杂路径尚未做真实环境兼容性验证，不承诺完整 Node 行为。调用不启动外部进程或 AI 任务；文件读取与修改仍使用 `io` 工具。
+
+`lastIndexOf` 接受一个字符串，返回 Unicode 标量下标或 -1。`replace` 和 `replaceAll` 接受两个字符串，分别替换首次或全部匹配；替换内容按字面文本处理，不展开 `$&` 或 `$1`，暂不接受正则或函数作为参数，结果最多 4 MiB。
+
+支持正则字面量，例如 `/a(\\d+)/i.test(text)` 和 `text.match(/a(\\d+)/g)`。可用标志为 `g`、`i`、`m`、`s`、`u`；底层采用 Rust regex 的 Unicode 语义及语法，不支持回溯引用、环视或 JS 特有语法，非法模式和标志在编译时拒绝。`test` 无状态，即使有 `g` 也不维护 JS 的 `lastIndex`；`match` 不匹配返回 null，非 `g` 返回完整匹配与捕获组组成的 JSON 数组（未匹配组为 null，不含 JS 的 index/groups 属性），`g` 返回全部完整匹配的数组。正则以内部 JSON 描述保存，不能使用 `new RegExp` 或其他正则方法。模式最多 8192 字节，输入最多 2 MiB，结果最多 10000 项及 4 MiB 捕获文本；超出时报错。正则不替代结构化 HTML 解析。
+
 ## 工具声明与固定名字
 
-模型请求发布 program_tool_headers：每个库一份自动生成的 TS 风格声明，包含固定方法名、JSON 参数类型、可选字段、返回类型及完整工具说明。程序仍使用不带类型的 JS 子集，声明不是可执行源码。只接收 namespace.method(args)，拒绝 tools.*、动态方法下标与 execute_program/define_task_body 的 libraries 别名参数。
+模型请求发布 TS 风格的 program_tool_headers 索引，只列当前允许的库和方法，不是参数契约。使用 read_tool_contracts({methods:["io.read"]}) 或 read_tool_contracts({libraries:["io"]}) 按需取得真实参数、约束、返回类型和完整说明。虚函数可在同一上下文中调用 read_tool_contracts 和 invoke_library，宿主校验原始 schema 与权限；无需先编写流程。程序源码使用 import 引入工具，声明资料不是可执行源码。
 
 内置文件库为 io.read/read_lines/write/list/search/edit/replace。其他宿主操作在 host 库中按原方法名声明。插件在 plugin.json 或远程握手的 plugin 中声明 library，例如 {"id":"ppt-master","library":"ppt"}；已登记的 ppt_master__get_design 对外只发布 ppt.get_design。未声明 library 的旧插件按 ID 将连字符替换为下划线，作为固定兼容名字。库名必须是有效、非保留的标识符，不能占用 io/host；不同插件不能占用同一个库名。方法来自实际注册工具，不按业务含义猜测。
 
@@ -162,9 +183,9 @@ function main(request) {
 
 ## 任务函数与工具步骤
 
-业务 skill 和用户决定范围、依赖、确认点、验收与交付；通用 task-program skill 负责表达这些关系。无主任务时先 create_task，准备缺失的技能／工具契约，再 execute_program({source,input})。main 覆盖完整工作、检查与交付。
+业务 skill 和用户决定范围、依赖、确认点、验收与交付；通用 task-program skill 负责表达这些关系。无主任务时先 create_task，准备缺失的技能／工具契约，再 execute_program({source,input})。顶层流程覆盖完整工作、检查与交付。
 
-普通 helper 在宿主的局部函数帧中执行，不创建 AI 任务节点；工具调用是实际操作步骤。显式 @virtual helper 创建独立 AI 任务上下文，把职责注释与命名实参交给执行 AI。虚函数标记放在紧邻函数的前置 JSDoc 或函数体注释中，体内只允许注释，不允许占位 return 或其他可执行语句；未标记的空函数拒绝编译。返回结构写入注释契约，实际返回来自执行 AI。普通代码中的注释没有执行效果。后者可以直接调用真实工具，也可 define_task_body 去掉当前函数的 @virtual 标记并补写实际实现，继续细分任务；不重新创建 main。注释应说明职责、输入与返回字段。所有调用一律按位置绑定实参，补写函数保持参数个数；不按名字猜测，也不把多参自动打包成单对象。bindings 中的值就是局部参数值，没有额外 input 包装；scope_variables 是其余可见上层变量的索引。
+普通 helper 在宿主的局部函数帧中执行，不创建 AI 任务节点；工具调用是实际操作步骤。显式 @virtual helper 创建独立 AI 任务上下文，把职责注释与命名实参交给执行 AI。虚函数标记放在紧邻函数的前置 JSDoc 或函数体注释中，体内可为空，或仅写 throw new Error("固定说明") 作为占位；不允许占位 return 或其他可执行语句；未标记的空函数拒绝编译。返回结构写入注释契约，实际返回来自执行 AI。普通代码中的注释没有执行效果。后者可以直接调用真实工具，也可 define_task_body 去掉当前函数的 @virtual 标记并补写实际实现，继续细分任务；不重新创建 main。注释应说明职责、输入与返回字段。所有调用一律按位置绑定实参，补写函数保持参数个数；不按名字猜测，也不把多参自动打包成单对象。bindings 中的值就是局部参数值，没有额外 input 包装；scope_variables 是其余可见上层变量的索引。
 
 ```js
 function main(request) {
@@ -242,11 +263,11 @@ function integrate(handle) {
 
 共同材料、真实稳定资产引用和各分支职责显式传参；不以“沿用前文”替代数据。任务函数按 JSON 值交接，局部对话不复制给父／兄弟。主任务验收真实产物。工具受理、函数返回、语法编译通过都不等于业务通过；按技能处理异步结果和必要确认。
 
-main 返回结束整项任务，helper 返回恢复原调用方；finish 只交接并推进，不额外请求模型确认完成。工具只能使用公布的确切名称及参数；工具返回原始 JSON，例如 result.content，没有 original_result 包装。工具仍经过原权限、插件隔离和取消机制，不能递归调用 execute_program/create_task/spawn_agent 等替代函数关系。
+顶层执行完毕结束整项任务，helper 返回恢复原调用方；finish 只交接并推进，不额外请求模型确认完成。工具只能使用公布的确切名称及参数；工具返回原始 JSON，例如 result.content，没有 original_result 包装。工具仍经过原权限、插件隔离和取消机制，不能递归调用 execute_program/create_task/spawn_agent 等替代函数关系。
 
 ## 规划与执行的职责边界
 
-规划阶段将用户目标与业务 skill 编排成 main 和辅助函数；进入虚函数后，当前 AI 负责实现该函数的职责，可以直接理解、生成、转换、验收或使用工具并返回实际结果。当前调用已经满足“智能工作显式交给虚函数”的表达要求，执行者不必再次包装同一职责。
+规划阶段将用户目标与业务 skill 编排成顶层流程和辅助函数；进入虚函数后，当前 AI 负责实现该函数的职责，可以直接理解、生成、转换、验收或使用工具并返回实际结果。当前调用已经满足“智能工作显式交给虚函数”的表达要求，执行者不必再次包装同一职责。
 
 define_task_body 用于需要具体编排时补写实现，并非执行前置条件。进一步拆分应产生职责明确、实际推进处理的子步骤；仅换函数名、传递相同输入并转交同一未完成工作，属于重复规划。保留合理的嵌套函数和动态子任务。
 

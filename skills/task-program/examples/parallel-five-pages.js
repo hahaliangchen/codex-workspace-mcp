@@ -1,37 +1,39 @@
 // 教学案例：用户已授权两个执行 Agent 并行制作五个独立 HTML。
-function main(request) {
-  assert(request.pages.length === 5, "此教学示例接收五页清单");
-  const source = io.read({path: request.source});
-  const shared = {
-    source_path: request.source,
-    source_content: source.content,
-    requirements: request.requirements
-  };
+import * as io from "host:io";
+import * as host from "host:host";
+const request = input;
 
-  // 先启动两路再等待；传相同公共材料与不同的独占页面清单。
-  const a = fork(makePages, shared, request.pages.slice(0, 3));
-  const b = fork(makePages, shared, request.pages.slice(3));
-  const outcomes = join(a, b);
+assert(request.pages.length === 5, "此教学示例接收五页清单");
+const source = io.read({path: request.source});
+const shared = {
+  source_path: request.source,
+  source_content: source.content,
+  requirements: request.requirements
+};
 
-  // Git 分支的文件在独立工作树中；合并后才能从主工作区读回。
-  integrate(a);
-  integrate(b);
+// 先启动两路再等待；传相同公共材料与不同的独占页面清单。
+const a = fork(makePages, shared, request.pages.slice(0, 3));
+const b = fork(makePages, shared, request.pages.slice(3));
+const outcomes = join(a, b);
 
-  // join 只收齐结果。主 Agent 仍要逐页读回并验收。
-  const files = [];
-  const reviews = [];
-  for (const outcome of outcomes) {
-    for (const file of outcome.files) {
-      const actual = io.read({path: file.path});
-      const review = inspectPage(shared, file, actual.content);
-      assert(review.passed, "验收失败：" + file.path);
-      files.push(file);
-      reviews.push(review);
-    }
+// Git 分支的文件在独立工作树中；合并后才能从主工作区读回。
+integrate(a);
+integrate(b);
+
+// join 只收齐结果。主 Agent 仍要逐页读回并验收。
+const files = [];
+const reviews = [];
+for (const outcome of outcomes) {
+  for (const file of outcome.files) {
+    const actual = io.read({path: file.path});
+    const review = inspectPage(shared, file, actual.content);
+    assert(review.passed, "验收失败：" + file.path);
+    files.push(file);
+    reviews.push(review);
   }
-  assert(files.length === request.pages.length, "交付数量不符");
-  return {files, reviews};
 }
+assert(files.length === request.pages.length, "交付数量不符");
+// 已检查所有页面；流程自然结束。
 
 function makePages(shared, pages) {
   // 一个分支是一个 Agent；其中逐页串行执行，不再 fork。

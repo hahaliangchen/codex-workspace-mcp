@@ -182,7 +182,9 @@ pub fn valid_namespace(name: &str) -> bool {
 pub fn control(name: &str) -> bool {
     matches!(
         name,
-        "execute_program"
+        "read_program_guide"
+            | "read_tool_contracts"
+            | "execute_program"
             | "check_program"
             | "define_task_body"
             | "create_task"

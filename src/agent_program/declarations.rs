@@ -274,76 +274,102 @@ pub fn headers(libraries: &Libraries, definitions: &[Value]) -> String {
     result
 }
 
+/// Compact, discoverable names; signatures are fetched only when needed.
+pub fn index(libraries: &Libraries, definitions: &[Value]) -> String {
+    let descriptions = definitions
+        .iter()
+        .filter_map(|d| {
+            Some((
+                d["function"]["name"].as_str()?,
+                d["function"]["description"].as_str().unwrap_or(""),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut result = String::from(
+        "// Tool index only, not signatures. Use read_tool_contracts for exact inputs and returns.\n",
+    );
+    for (library, methods) in libraries {
+        let object = methods.keys().any(|name| libraries::reserved(name));
+        result.push_str(&if object {
+            format!("declare const {library}: {{\n")
+        } else {
+            format!("declare namespace {library} {{\n")
+        });
+        for (method, target) in methods {
+            let description = descriptions.get(target.as_str()).copied().unwrap_or("");
+            let summary = description.split(['.', '。', '\n']).next().unwrap_or("");
+            let summary = text(&summary.chars().take(140).collect::<String>());
+            if !summary.is_empty() {
+                result.push_str(&format!("  /** {summary} */\n"));
+            }
+            let prefix = if object { "" } else { "function " };
+            result.push_str(&format!(
+                "  {prefix}{method}(...args: unknown[]): unknown;\n"
+            ));
+        }
+        result.push_str(if object { "};\n" } else { "}\n" });
+    }
+    result
+}
+
+pub fn selected(libraries: &Libraries, args: &Value) -> anyhow::Result<Libraries> {
+    use anyhow::{Context, ensure};
+    let mut result = Libraries::new();
+    ensure!(
+        args.as_object()
+            .is_some_and(|o| o.keys().all(|k| k == "libraries" || k == "methods")),
+        "expected libraries and/or methods"
+    );
+    ensure!(
+        args.get("libraries").is_none_or(Value::is_array)
+            && args.get("methods").is_none_or(Value::is_array),
+        "libraries and methods must be arrays"
+    );
+    let groups = args.get("libraries").and_then(Value::as_array);
+    let methods = args.get("methods").and_then(Value::as_array);
+    ensure!(
+        groups.is_some_and(|x| !x.is_empty()) || methods.is_some_and(|x| !x.is_empty()),
+        "select at least one library or qualified method"
+    );
+    for group in groups.into_iter().flatten() {
+        let name = group.as_str().context("library name must be a string")?;
+        let items = libraries
+            .get(name)
+            .with_context(|| format!("unknown or unavailable library {name}"))?;
+        result
+            .entry(name.into())
+            .or_insert_with(BTreeMap::new)
+            .extend(items.clone());
+    }
+    for method in methods.into_iter().flatten() {
+        let name = method.as_str().context("method name must be a string")?;
+        let (group, item) = name
+            .split_once('.')
+            .context("use a qualified method such as io.read")?;
+        let target = libraries::target(libraries, name)
+            .with_context(|| format!("unknown or unavailable method {name}"))?;
+        result
+            .entry(group.into())
+            .or_insert_with(BTreeMap::new)
+            .insert(item.into(), target.into());
+    }
+    Ok(result)
+}
+
+pub fn contract_tool() -> Value {
+    json!({"type":"function","function":{"name":"read_tool_contracts","description":"Read exact TypeScript-like tool declarations for selected available libraries or qualified methods before coding or invoking them. Does not execute tools or expand permissions.","parameters":{"type":"object","properties":{"libraries":{"type":"array","items":{"type":"string"}},"methods":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}})
+}
+
 /// Provider-safe transport name. The only method names in this schema are the
 /// same qualified names used in source; original dispatcher names stay private.
 pub const CALL: &str = "invoke_library";
-fn rebase_refs(schema: &mut Value, prefix: &str) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-    // An explicit resource ID establishes its own reference scope.
-    if object.contains_key("$id") {
-        return;
+pub fn native_tool(libraries: &Libraries, _definitions: &[Value]) -> Option<Value> {
+    if libraries.is_empty() {
+        return None;
     }
-    if let Some(Value::String(reference)) = object.get_mut("$ref") {
-        if reference == "#" || reference.starts_with("#/") {
-            *reference = format!("{prefix}{}", &reference[1..]);
-        }
-    }
-    for name in [
-        "properties",
-        "patternProperties",
-        "$defs",
-        "definitions",
-        "dependentSchemas",
-    ] {
-        if let Some(Value::Object(map)) = object.get_mut(name) {
-            for value in map.values_mut() {
-                rebase_refs(value, prefix);
-            }
-        }
-    }
-    for name in [
-        "items",
-        "additionalItems",
-        "additionalProperties",
-        "contains",
-        "not",
-        "if",
-        "then",
-        "else",
-        "propertyNames",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-    ] {
-        if let Some(value) = object.get_mut(name) {
-            if let Some(items) = value.as_array_mut() {
-                for item in items {
-                    rebase_refs(item, prefix);
-                }
-            } else {
-                rebase_refs(value, prefix);
-            }
-        }
-    }
-    for name in ["allOf", "anyOf", "oneOf", "prefixItems"] {
-        if let Some(Value::Array(items)) = object.get_mut(name) {
-            for item in items {
-                rebase_refs(item, prefix);
-            }
-        }
-    }
-}
-pub fn native_tool(libraries: &Libraries, definitions: &[Value]) -> Option<Value> {
-    let options = definitions.iter().filter_map(|definition| {
-        let function=&definition["function"];
-        let name=libraries::public_name(libraries,function["name"].as_str()?)?;
-        Some(json!({"type":"object","description":function["description"],"properties":{"method":{"type":"string","const":name},"args":function["parameters"]},"required":["method","args"],"additionalProperties":false}))
-    }).enumerate().map(|(index,mut option)| {
-        rebase_refs(&mut option["properties"]["args"],&format!("#/oneOf/{index}/properties/args"));
-        option
-    }).collect::<Vec<_>>();
-    (!options.is_empty()).then(||json!({"type":"function","function":{"name":CALL,"description":"Execute a declared library method as a native tool step. Use the exact qualified method name in program_tool_headers and its JSON arguments. This transport wrapper does not rename methods or expand permissions.","parameters":{"type":"object","oneOf":options}}}))
+    Some(
+        json!({"type":"function","function":{"name":CALL,"description":"Execute an available qualified library method in the current virtual task. Read its contract with read_tool_contracts when needed. The host validates arguments and permissions before dispatch.","parameters":{"type":"object","properties":{"method":{"type":"string"},"args":{"type":"object"}},"required":["method","args"],"additionalProperties":false}}}),
+    )
 }
 
 #[cfg(test)]
@@ -430,38 +456,37 @@ mod tests {
         ));
     }
     #[test]
-    fn native_transport_exposes_only_the_same_qualified_names_and_schemas() {
+    fn compact_index_and_selected_contracts_expose_only_available_tools() {
         let defs = [
-            json!({"function":{"name":"write_file","parameters":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}}}),
+            json!({"function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}}}),
+            json!({"function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","required":["content"],"properties":{"content":{"type":"string"}}}}}),
         ];
         let libs = libraries::catalog(&defs, &json!([]));
+        let directory = index(&libs, &defs);
+        parse(&directory);
+        assert!(directory.contains("function read("));
+        assert!(directory.contains("function write("));
+        assert!(!directory.contains("path:"));
+        let chosen = selected(&libs, &json!({"methods":["io.read"]})).unwrap();
+        let signature = headers(&chosen, &defs);
+        assert!(signature.contains("path:"));
+        assert!(!signature.contains("function write("));
+        assert!(selected(&libs, &json!({"methods":["io.missing"]})).is_err());
+        assert!(selected(&libs, &json!({"libraries":["missing"]})).is_err());
+        assert!(selected(&libs, &json!({})).is_err());
         let native = native_tool(&libs, &defs).unwrap();
         assert_eq!(native["function"]["name"], CALL);
-        assert_eq!(
-            native["function"]["parameters"]["oneOf"][0]["properties"]["method"]["const"],
-            "io.write"
-        );
-        assert_eq!(
-            native["function"]["parameters"]["oneOf"][0]["properties"]["args"],
-            defs[0]["function"]["parameters"]
-        );
         assert!(!native.to_string().contains("write_file"));
+        assert!(!native.to_string().contains("oneOf"));
     }
     #[test]
-    fn native_wrapper_preserves_local_reference_scope_and_literal_data() {
-        let schema = json!({"type":"object","$defs":{"Text":{"type":"string"}},"properties":{"path":{"$ref":"#/$defs/Text"},"data":{"const":{"$ref":"literal data"}}}});
-        let defs = [json!({"function":{"name":"read_file","parameters":schema}})];
-        let libs = libraries::catalog(&defs, &json!([]));
-        let parameters = &native_tool(&libs, &defs).unwrap()["function"]["parameters"];
-        let args = &parameters["oneOf"][0]["properties"]["args"];
-        let reference = args["properties"]["path"]["$ref"].as_str().unwrap();
-        assert_eq!(
-            parameters
-                .pointer(reference.strip_prefix('#').unwrap())
-                .unwrap(),
-            &json!({"type":"string"})
-        );
-        assert_eq!(args["properties"]["data"]["const"]["$ref"], "literal data");
+    fn original_contract_validator_preserves_local_references_and_constraints() {
+        let schema = json!({"type":"object","$defs":{"Text":{"type":"string","minLength":1}},"properties":{"path":{"$ref":"#/$defs/Text"}},"required":["path"],"additionalProperties":false});
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"path":"ok"})));
+        assert!(!validator.is_valid(&json!({"path":""})));
+        assert!(!validator.is_valid(&json!({"path":"ok","extra":1})));
+        assert!(!validator.is_valid(&json!({})));
     }
     #[test]
     fn all_available_host_headers_are_valid_declarations_including_keyword_methods() {
@@ -477,11 +502,16 @@ mod tests {
             BTreeMap::from([("delete".into(), "plugin__delete".into())]),
         );
         let declarations = headers(&libs, &definitions);
+        let compact = index(&libs, &definitions);
+        let native = native_tool(&libs, &definitions).unwrap().to_string();
         eprintln!(
-            "host catalog sizes: declarations={} bytes, native schemas={} bytes",
+            "host catalog sizes: full_declarations={} compact_index={} native_wrapper={} bytes",
             declarations.len(),
-            serde_json::to_string(&definitions).unwrap().len()
+            compact.len(),
+            native.len()
         );
+        assert!(compact.len() < declarations.len());
+        parse(&compact);
         parse(&declarations);
     }
 }

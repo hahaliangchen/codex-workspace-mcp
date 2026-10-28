@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use swc_common::{FileName, SourceMap, Span, Spanned, comments::SingleThreadedComments, sync::Lrc};
 use swc_ecma_ast as ast;
 use swc_ecma_parser::{EsSyntax, Parser, StringInput, Syntax, lexer::Lexer};
-use swc_ecma_visit::{Visit, VisitWith};
+use swc_ecma_visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 struct Compiler {
     map: Lrc<SourceMap>,
@@ -12,6 +12,7 @@ struct Compiler {
     arities: BTreeMap<String, usize>,
     async_entry: Option<String>,
     libraries: super::libraries::Libraries,
+    imports: BTreeMap<String, String>,
     vars: BTreeMap<String, bool>,
     available_names: BTreeSet<String>,
     captures: std::cell::RefCell<BTreeSet<String>>,
@@ -162,6 +163,7 @@ impl Compiler {
         ) || name.starts_with("$temp")
             || self.vars.contains_key(name)
             || self.libraries.contains_key(name)
+            || self.imports.contains_key(name)
         {
             return self.error(span, "duplicate or reserved local binding");
         }
@@ -179,6 +181,19 @@ impl Compiler {
         use ast::Expr as E;
         Ok(match e {
             E::Lit(ast::Lit::Str(s)) => Expr::Value(json!(s.value.to_string_lossy())),
+            E::Lit(ast::Lit::Regex(r)) => {
+                let pattern = r.exp.to_string();
+                let flags = r.flags.to_string();
+                super::values::compile_regex(&pattern, &flags).map_err(|e| {
+                    let p = self.at(r.span);
+                    anyhow::anyhow!(
+                        "TS_PROGRAM {}:{}: invalid regular expression: {e}",
+                        p.line,
+                        p.column
+                    )
+                })?;
+                Expr::Value(json!({"$flow_regex": {"pattern": pattern, "flags": flags}}))
+            }
             E::Lit(ast::Lit::Num(n)) => {
                 if !n.value.is_finite() {
                     return self.error(n.span, "numbers must be finite JSON values");
@@ -317,9 +332,15 @@ impl Compiler {
             .map(|a| self.expr(&a.expr))
             .collect::<Result<Vec<_>>>()?;
         let target = match target {
+            ast::Expr::Ident(i) if self.imports.contains_key(i.sym.as_ref()) => {
+                self.imports[i.sym.as_ref()].clone()
+            }
             ast::Expr::Ident(i) if self.names.contains(i.sym.as_ref()) => {
                 if self.async_entry.as_deref() == Some(i.sym.as_ref()) {
-                    return self.error(call.span, "the async entry is awaited by the host and cannot be called as a helper");
+                    return self.error(
+                        call.span,
+                        "the async entry is awaited by the host and cannot be called as a helper",
+                    );
                 }
                 if i.sym == *"main" {
                     return self.error(call.span, "main is the sole entry, not a callable helper");
@@ -389,68 +410,353 @@ impl Compiler {
         }
         Ok(Effect::Tool(target, args))
     }
+    // Only chains rooted in Promise.resolve/reject are lowered here. They are
+    // consumed by await immediately; no Promise handle is represented as JSON.
+    fn is_awaited_promise_chain(e: &ast::Expr) -> bool {
+        let ast::Expr::Call(call) = e else {
+            return false;
+        };
+        let ast::Callee::Expr(target) = &call.callee else {
+            return false;
+        };
+        let ast::Expr::Member(member) = &**target else {
+            return false;
+        };
+        let ast::MemberProp::Ident(method) = &member.prop else {
+            return false;
+        };
+        if matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise") {
+            return matches!(method.sym.as_ref(), "resolve" | "reject");
+        }
+        matches!(method.sym.as_ref(), "then" | "catch")
+            && Self::is_awaited_promise_chain(&member.obj)
+    }
+    // Keep initial argument evaluation outside the subset with catchable effects:
+    // JavaScript evaluates it before Promise.resolve/reject creates a promise.
+    fn safe_promise_root_argument(e: &ast::Expr) -> bool {
+        match e {
+            ast::Expr::Lit(_) | ast::Expr::Ident(_) => true,
+            ast::Expr::Array(a) => a.elems.iter().all(|item| {
+                item.as_ref().is_none_or(|item| {
+                    item.spread.is_none() && Self::safe_promise_root_argument(&item.expr)
+                })
+            }),
+            ast::Expr::Object(o) => o.props.iter().all(|prop| match prop {
+                ast::PropOrSpread::Prop(p) => match &**p {
+                    ast::Prop::Shorthand(_) => true,
+                    ast::Prop::KeyValue(kv) => {
+                        matches!(
+                            kv.key,
+                            ast::PropName::Ident(_) | ast::PropName::Str(_) | ast::PropName::Num(_)
+                        ) && Self::safe_promise_root_argument(&kv.value)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+    fn promise_callback(&mut self, callback: &ast::Expr, argument: Expr) -> Result<Expr> {
+        let ast::Expr::Arrow(arrow) = callback else {
+            return self.error(
+                callback.span(),
+                "awaited Promise callbacks must be expression arrows",
+            );
+        };
+        if arrow.is_generator || arrow.params.len() > 1 {
+            return self.error(
+                arrow.span,
+                "awaited Promise callbacks take zero or one simple parameter",
+            );
+        }
+        let ast::BlockStmtOrExpr::Expr(expression) = &*arrow.body else {
+            return self.error(
+                arrow.span,
+                "awaited Promise callbacks require an expression body",
+            );
+        };
+        let mut body = (**expression).clone();
+        if let Some(parameter) = arrow.params.first() {
+            let ast::Pat::Ident(binding) = parameter else {
+                return self.error(
+                    parameter.span(),
+                    "awaited Promise callbacks require a simple parameter",
+                );
+            };
+            let name = binding.id.sym.to_string();
+            let temporary = self.temp();
+            self.vars.insert(temporary.clone(), true);
+            self.emit(arrow.span, Op::Set(temporary.clone(), argument));
+            struct RenameCallback {
+                from: String,
+                to: String,
+            }
+            impl VisitMut for RenameCallback {
+                fn visit_mut_expr(&mut self, node: &mut ast::Expr) {
+                    if let ast::Expr::Ident(i) = node
+                        && i.sym.as_ref() == self.from
+                    {
+                        i.sym = self.to.clone().into();
+                    } else {
+                        node.visit_mut_children_with(self);
+                    }
+                }
+                fn visit_mut_prop(&mut self, node: &mut ast::Prop) {
+                    if let ast::Prop::Shorthand(i) = node
+                        && i.sym.as_ref() == self.from
+                    {
+                        let key = ast::PropName::Ident(i.clone().into());
+                        let value = ast::Expr::Ident(ast::Ident::new_no_ctxt(
+                            self.to.clone().into(),
+                            i.span,
+                        ));
+                        *node = ast::Prop::KeyValue(ast::KeyValueProp {
+                            key,
+                            value: Box::new(value),
+                        });
+                    } else {
+                        node.visit_mut_children_with(self);
+                    }
+                }
+            }
+            body.visit_mut_with(&mut RenameCallback {
+                from: name,
+                to: temporary,
+            });
+        } else {
+            // The previous result must still be evaluated if the callback ignores it.
+            let temporary = self.temp();
+            self.emit(arrow.span, Op::Set(temporary, argument));
+        }
+        if Self::is_awaited_promise_chain(&body) {
+            self.awaited_promise_chain(&body)
+        } else {
+            self.lower(&body)
+        }
+    }
+    fn awaited_promise_chain(&mut self, e: &ast::Expr) -> Result<Expr> {
+        let ast::Expr::Call(call) = e else {
+            return self.error(e.span(), "invalid awaited Promise chain");
+        };
+        let ast::Callee::Expr(target) = &call.callee else {
+            return self.error(call.span, "invalid awaited Promise chain");
+        };
+        let ast::Expr::Member(member) = &**target else {
+            return self.error(call.span, "invalid awaited Promise chain");
+        };
+        let ast::MemberProp::Ident(method) = &member.prop else {
+            return self.error(call.span, "invalid awaited Promise method");
+        };
+        if call.args.iter().any(|arg| arg.spread.is_some()) {
+            return self.error(call.span, "Promise argument spreads are unsupported");
+        }
+        if matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise") {
+            if call.args.len() > 1 {
+                return self.error(
+                    call.span,
+                    "Promise.resolve/reject accepts at most one argument",
+                );
+            }
+            if call
+                .args
+                .first()
+                .is_some_and(|arg| !Self::safe_promise_root_argument(&arg.expr))
+            {
+                return self.error(call.span, "Promise.resolve/reject arguments must be simple values without effects or property access");
+            }
+            let value = if let Some(arg) = call.args.first() {
+                self.lower(&arg.expr)?
+            } else {
+                Expr::Value(Value::Null)
+            };
+            if method.sym == *"reject" {
+                self.emit(call.span, Op::Throw(value));
+                return Ok(Expr::Value(Value::Null));
+            }
+            return Ok(value);
+        }
+        if call.args.len() != 1 {
+            return self.error(call.span, "awaited then/catch requires one callback");
+        }
+        if method.sym == *"then" {
+            let value = self.awaited_promise_chain(&member.obj)?;
+            return self.promise_callback(&call.args[0].expr, value);
+        }
+        let error = self.temp();
+        let result = self.temp();
+        self.vars.insert(error.clone(), false);
+        self.vars.insert(result.clone(), false);
+        let start = self.emit(
+            call.span,
+            Op::Catch {
+                target: 0,
+                name: error.clone(),
+            },
+        );
+        self.handlers += 1;
+        let value = self.awaited_promise_chain(&member.obj)?;
+        self.handlers -= 1;
+        self.emit(call.span, Op::Set(result.clone(), value));
+        self.emit(call.span, Op::EndCatch);
+        let jump = self.emit(call.span, Op::Jump(0));
+        let handler = self.code.len();
+        let value = self.promise_callback(&call.args[0].expr, Expr::Variable(error))?;
+        self.emit(call.span, Op::Set(result.clone(), value));
+        let end = self.code.len();
+        if let Op::Catch { target, .. } = &mut self.code[start].op {
+            *target = handler;
+        }
+        self.code[jump].op = Op::Jump(end);
+        Ok(Expr::Variable(result))
+    }
     fn lower(&mut self, e: &ast::Expr) -> Result<Expr> {
         match e {
             ast::Expr::Await(awaited) => {
+                if Self::is_awaited_promise_chain(&awaited.arg) {
+                    return self.awaited_promise_chain(&awaited.arg);
+                }
                 let ast::Expr::Call(all) = &*awaited.arg else {
-                    return self.error(awaited.span, "only await Promise.all([read-only tool calls]) is supported");
+                    return self.lower(&awaited.arg);
                 };
                 let is_all = matches!(&all.callee, ast::Callee::Expr(e)
                     if matches!(&**e, ast::Expr::Member(m)
                         if matches!(&*m.obj, ast::Expr::Ident(i) if i.sym == *"Promise")
                         && matches!(&m.prop, ast::MemberProp::Ident(i) if i.sym == *"all")));
-                if !is_all || all.args.len() != 1 || all.args[0].spread.is_some() {
-                    return self.error(awaited.span, "use await Promise.all([read-only tool calls])");
+                // Ordinary flow effects already suspend until their result is available.
+                // Awaiting one effect or JSON value preserves that sequencing without
+                // creating a Promise or another task.
+                if !is_all {
+                    return self.lower(&awaited.arg);
+                }
+                if all.args.len() != 1 || all.args[0].spread.is_some() {
+                    return self.error(
+                        awaited.span,
+                        "use await Promise.all([read-only tool calls])",
+                    );
                 }
                 if let ast::Expr::Call(map) = &*all.args[0].expr {
-                    let ast::Callee::Expr(target) = &map.callee else { return self.error(map.span, "use array.map(item => io.read(...))") };
-                    let ast::Expr::Member(member) = &**target else { return self.error(map.span, "use array.map(item => io.read(...))") };
-                    if !matches!(&member.prop, ast::MemberProp::Ident(i) if i.sym == *"map") || map.args.len() != 1 || map.args[0].spread.is_some() {
+                    let ast::Callee::Expr(target) = &map.callee else {
+                        return self.error(map.span, "use array.map(item => io.read(...))");
+                    };
+                    let ast::Expr::Member(member) = &**target else {
+                        return self.error(map.span, "use array.map(item => io.read(...))");
+                    };
+                    if !matches!(&member.prop, ast::MemberProp::Ident(i) if i.sym == *"map")
+                        || map.args.len() != 1
+                        || map.args[0].spread.is_some()
+                    {
                         return self.error(map.span, "use array.map(item => io.read(...))");
                     }
                     let items = self.expr(&member.obj)?;
-                    let ast::Expr::Arrow(arrow) = &*map.args[0].expr else { return self.error(map.span, "map needs an arrow with one parameter") };
-                    if arrow.is_async || arrow.is_generator || arrow.params.len() != 1 {
-                        return self.error(arrow.span, "map needs one ordinary arrow parameter");
+                    let ast::Expr::Arrow(arrow) = &*map.args[0].expr else {
+                        return self.error(map.span, "map needs an arrow with one parameter");
+                    };
+                    if arrow.is_generator || arrow.params.len() != 1 {
+                        return self.error(arrow.span, "map needs one arrow parameter");
                     }
-                    let ast::Pat::Ident(parameter) = &arrow.params[0] else { return self.error(arrow.span, "map needs a simple parameter") };
+                    let ast::Pat::Ident(parameter) = &arrow.params[0] else {
+                        return self.error(arrow.span, "map needs a simple parameter");
+                    };
                     let name = parameter.id.sym.to_string();
                     if self.vars.contains_key(&name) {
-                        return self.error(arrow.span, "map parameter must not shadow an existing binding");
+                        return self.error(
+                            arrow.span,
+                            "map parameter must not shadow an existing binding",
+                        );
                     }
-                    let ast::BlockStmtOrExpr::Expr(body) = &*arrow.body else { return self.error(arrow.span, "map body must be one read-only tool call") };
-                    let ast::Expr::Call(call) = &**body else { return self.error(arrow.span, "map body must be one read-only tool call") };
+                    let ast::BlockStmtOrExpr::Expr(body) = &*arrow.body else {
+                        return self.error(arrow.span, "map body must be one read-only tool call");
+                    };
+                    let body_expr = match &**body {
+                        ast::Expr::Await(awaited) if arrow.is_async => &*awaited.arg,
+                        expr => expr,
+                    };
+                    let ast::Expr::Call(call) = body_expr else {
+                        return self.error(arrow.span, "map body must be one read-only tool call");
+                    };
                     self.declare(&name, false, arrow.span)?;
                     let effect = self.effect(call);
                     self.vars.remove(&name);
                     let (tool, args) = match effect? {
-                        Effect::Tool(tool, args) if matches!(tool.as_str(), "read_file" | "read_file_lines" | "search_text" | "list_dir") => (tool, args),
-                        _ => return self.error(call.span, "Promise.all accepts only file reads, listings and searches"),
+                        Effect::Tool(tool, args)
+                            if matches!(
+                                tool.as_str(),
+                                "read_file" | "read_file_lines" | "search_text" | "list_dir"
+                            ) =>
+                        {
+                            (tool, args)
+                        }
+                        _ => {
+                            return self.error(
+                                call.span,
+                                "Promise.all accepts only file reads, listings and searches",
+                            );
+                        }
                     };
                     let dest = self.temp();
-                    self.emit(awaited.span, Op::Effect(Some(dest.clone()), Effect::ParallelReadMap { name: tool, items, parameter: name, args }));
+                    self.emit(
+                        awaited.span,
+                        Op::Effect(
+                            Some(dest.clone()),
+                            Effect::ParallelReadMap {
+                                name: tool,
+                                items,
+                                parameter: name,
+                                args,
+                            },
+                        ),
+                    );
                     return Ok(Expr::Variable(dest));
                 }
                 let ast::Expr::Array(array) = &*all.args[0].expr else {
-                    return self.error(awaited.span, "Promise.all needs an array of calls or array.map(item => read-only call)");
+                    return self.error(
+                        awaited.span,
+                        "Promise.all needs an array of calls or array.map(item => read-only call)",
+                    );
                 };
                 if array.elems.len() > 32 {
-                    return self.error(awaited.span, "Promise.all supports at most 32 read-only calls");
+                    return self.error(
+                        awaited.span,
+                        "Promise.all supports at most 32 read-only calls",
+                    );
                 }
                 let mut operations = Vec::new();
                 for item in &array.elems {
-                    let Some(item) = item else { return self.error(array.span, "array holes are unsupported") };
-                    if item.spread.is_some() { return self.error(item.span(), "array spreads are unsupported"); }
+                    let Some(item) = item else {
+                        return self.error(array.span, "array holes are unsupported");
+                    };
+                    if item.spread.is_some() {
+                        return self.error(item.span(), "array spreads are unsupported");
+                    }
                     let ast::Expr::Call(call) = &*item.expr else {
-                        return self.error(item.span(), "Promise.all accepts only read-only library calls");
+                        return self.error(
+                            item.span(),
+                            "Promise.all accepts only read-only library calls",
+                        );
                     };
                     match self.effect(call)? {
-                        Effect::Tool(name, args) if matches!(name.as_str(), "read_file" | "read_file_lines" | "search_text" | "list_dir") => operations.push((name, args)),
-                        _ => return self.error(call.span, "Promise.all accepts only file reads, listings and searches"),
+                        Effect::Tool(name, args)
+                            if matches!(
+                                name.as_str(),
+                                "read_file" | "read_file_lines" | "search_text" | "list_dir"
+                            ) =>
+                        {
+                            operations.push((name, args))
+                        }
+                        _ => {
+                            return self.error(
+                                call.span,
+                                "Promise.all accepts only file reads, listings and searches",
+                            );
+                        }
                     }
                 }
                 let dest = self.temp();
-                self.emit(awaited.span, Op::Effect(Some(dest.clone()), Effect::ParallelReads(operations)));
+                self.emit(
+                    awaited.span,
+                    Op::Effect(Some(dest.clone()), Effect::ParallelReads(operations)),
+                );
                 Ok(Expr::Variable(dest))
             }
             ast::Expr::Bin(b) => {
@@ -487,6 +793,7 @@ impl Compiler {
                     ast::UnaryOp::Bang => "!",
                     ast::UnaryOp::Plus => "+",
                     ast::UnaryOp::Minus => "-",
+                    ast::UnaryOp::TypeOf => "typeof",
                     _ => return self.error(u.span, "unsupported unary operator"),
                 };
                 let value = self.lower(&u.arg)?;
@@ -612,8 +919,30 @@ impl Compiler {
                     self.code[success].op = Op::Jump(end);
                     return Ok(Expr::Value(json!(true)));
                 }
-                // Local result collection is a deterministic language operation,
-                // like for...of, not arbitrary JavaScript method execution.
+                if let ast::Callee::Expr(target) = &call.callee
+                    && let ast::Expr::Member(member) = &**target
+                    && let ast::Expr::Ident(namespace) = &*member.obj
+                    && matches!(namespace.sym.as_ref(), "Array" | "Object")
+                    && !self.vars.contains_key(namespace.sym.as_ref())
+                    && !self.available_names.contains(namespace.sym.as_ref())
+                    && !self.libraries.contains_key(namespace.sym.as_ref())
+                {
+                    let ast::MemberProp::Ident(method) = &member.prop else {
+                        return self.error(call.span, "data built-in method must be a static name");
+                    };
+                    let operation = match (namespace.sym.as_ref(), method.sym.as_ref()) {
+                        ("Array", "isArray") => "isArray",
+                        ("Object", "keys") => "objectKeys",
+                        ("Object", "values") => "objectValues",
+                        _ => return self.error(call.span, "unsupported data built-in"),
+                    };
+                    if call.args.len() != 1 || call.args[0].spread.is_some() {
+                        return self.error(call.span, "data built-in needs one argument");
+                    }
+                    let value = self.lower(&call.args[0].expr)?;
+                    return Ok(Expr::Unary(operation.into(), Box::new(value)));
+                }
+                // Local result collection is deterministic, like for...of.
                 if let ast::Callee::Expr(target) = &call.callee
                     && let ast::Expr::Member(m) = &**target
                     && let ast::Expr::Ident(array) = &*m.obj
@@ -639,6 +968,38 @@ impl Compiler {
                         },
                     );
                     return Ok(Expr::Variable(destination));
+                }
+                if let ast::Callee::Expr(target) = &call.callee
+                    && let ast::Expr::Member(member) = &**target
+                    && let ast::Expr::Ident(namespace) = &*member.obj
+                    && matches!(namespace.sym.as_ref(), "path" | "url")
+                    && !self.vars.contains_key(namespace.sym.as_ref())
+                    && !self.available_names.contains(namespace.sym.as_ref())
+                    && !self.libraries.contains_key(namespace.sym.as_ref())
+                {
+                    let ast::MemberProp::Ident(method) = &member.prop else {
+                        return self.error(call.span, "built-in method must be a static name");
+                    };
+                    let name = format!("{}.{}", namespace.sym, method.sym);
+                    let (min, max) = super::builtins::arity(&name).ok_or_else(|| {
+                        let p = self.at(call.span);
+                        anyhow::anyhow!(
+                            "TS_PROGRAM {}:{}: unsupported built-in {name}",
+                            p.line,
+                            p.column
+                        )
+                    })?;
+                    if !(min..=max).contains(&call.args.len())
+                        || call.args.iter().any(|arg| arg.spread.is_some())
+                    {
+                        return self.error(call.span, "invalid built-in arguments");
+                    }
+                    let mut args = Vec::new();
+                    for arg in &call.args {
+                        let value = self.lower(&arg.expr)?;
+                        args.push(self.snapshot(arg.span(), value));
+                    }
+                    return Ok(Expr::NodeBuiltin(name, args));
                 }
                 if matches!(&call.callee,ast::Callee::Expr(e) if matches!(&**e,ast::Expr::Member(m) if !matches!(&*m.obj,ast::Expr::Ident(i) if self.libraries.contains_key(i.sym.as_ref()))))
                 {
@@ -666,7 +1027,7 @@ impl Compiler {
                         }
                         (1, 1)
                     } else {
-                        super::values::method_arity(name).ok_or_else(|| {let at=self.at(call.span);anyhow::anyhow!("TS_PROGRAM {}:{}: unsupported data method; use an explicit helper task",at.line,at.column)})?
+                        super::values::method_arity(name).ok_or_else(|| {let at=self.at(call.span);anyhow::anyhow!("TS_PROGRAM {}:{}: unsupported data method; check the task-program method list",at.line,at.column)})?
                     };
                     if !(min..=max).contains(&call.args.len()) {
                         return self.error(call.span, "invalid data method argument count");
@@ -1132,25 +1493,97 @@ fn compile_inner(
     module.visit_with(&mut bindings);
     bindings.0.extend(external_names);
     let mut declarations = Vec::new();
+    let mut top_level = Vec::new();
+    let mut imports = BTreeMap::new();
+    let mut imported_libraries = super::libraries::Libraries::new();
+    let mut imported_names = BTreeSet::new();
+    let mut has_import = false;
     for item in module.body {
         match item {
+            ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(import)) => {
+                has_import = true;
+                let module_name = import.src.value.to_string_lossy();
+                let Some(namespace) = module_name.strip_prefix("host:") else {
+                    bail!("TS_PROGRAM 1:1: tool imports must use host:<library>");
+                };
+                let Some(methods) = libraries.get(namespace) else {
+                    bail!("TS_PROGRAM 1:1: unknown or unavailable tool library {namespace}");
+                };
+                ensure!(
+                    !import.type_only && !import.specifiers.is_empty(),
+                    "TS_PROGRAM 1:1: import tool methods or a namespace"
+                );
+                for spec in import.specifiers {
+                    let (local, method) = match spec {
+                        ast::ImportSpecifier::Named(named) => {
+                            ensure!(
+                                !named.is_type_only,
+                                "TS_PROGRAM 1:1: type imports are unsupported"
+                            );
+                            let method = match named.imported {
+                                Some(ast::ModuleExportName::Ident(i)) => i.sym.to_string(),
+                                Some(ast::ModuleExportName::Str(s)) => {
+                                    s.value.to_string_lossy().into_owned()
+                                }
+                                None => named.local.sym.to_string(),
+                            };
+                            (named.local.sym.to_string(), Some(method))
+                        }
+                        ast::ImportSpecifier::Namespace(ns) => (ns.local.sym.to_string(), None),
+                        ast::ImportSpecifier::Default(_) => {
+                            bail!("TS_PROGRAM 1:1: default tool imports are unsupported")
+                        }
+                    };
+                    ensure!(
+                        !super::libraries::reserved(&local) && imported_names.insert(local.clone()),
+                        "TS_PROGRAM 1:1: duplicate or reserved import {local}"
+                    );
+                    if let Some(method) = method {
+                        let tool = methods.get(&method).with_context(|| {
+                            format!("TS_PROGRAM 1:1: unknown tool {namespace}.{method}")
+                        })?;
+                        imports.insert(local, tool.clone());
+                    } else {
+                        imported_libraries.insert(local, methods.clone());
+                    }
+                }
+            }
             ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(f))) => declarations.push(f),
+            ast::ModuleItem::Stmt(stmt) if !refinement && entry == "main" => top_level.push(stmt),
             other => {
                 let p = map.lookup_char_pos(other.span().lo);
                 bail!(
-                    "TS_PROGRAM {}:{}: top level only supports ordinary function declarations; no imports, exports or type declarations",
+                    "TS_PROGRAM {}:{}: unsupported module declaration or statement in function refinement",
                     p.line,
                     p.col.0 + 1
                 );
             }
         }
     }
+    // Existing function-only programs remain executable without affecting the new top-level form.
+    let implicit_entry = !refinement
+        && entry == "main"
+        && (!top_level.is_empty() || !declarations.iter().any(|f| f.ident.sym == *"main"));
+    let libraries = if has_import {
+        imported_libraries
+    } else {
+        libraries
+    };
     ensure!(
-        !declarations.is_empty() && declarations.len() <= 64,
-        "TS_PROGRAM needs 1..=64 functions"
+        declarations.len() <= 64,
+        "TS_PROGRAM supports at most 64 functions"
     );
     let mut names = BTreeSet::new();
+    if implicit_entry {
+        names.insert("main".into());
+        bindings.0.insert("input".into());
+    }
     for f in &declarations {
+        ensure!(
+            !imported_names.contains(f.ident.sym.as_ref()),
+            "function name conflicts with import {}",
+            f.ident.sym
+        );
         ensure!(
             !libraries.contains_key(f.ident.sym.as_ref()),
             "function name conflicts with library namespace {}",
@@ -1179,18 +1612,25 @@ fn compile_inner(
         "task refinement implements the current function, never another main"
     );
     let mut functions = BTreeMap::new();
-    let arities = declarations
+    let mut arities = declarations
         .iter()
         .map(|f| (f.ident.sym.to_string(), f.function.params.len()))
         .collect::<BTreeMap<_, _>>();
-    let async_entry = declarations.iter().find(|f|f.ident.sym.as_ref() == entry && f.function.is_async).map(|f|f.ident.sym.to_string());
-    for f in declarations {
+    if implicit_entry {
+        arities.insert("main".into(), 1);
+    }
+    let async_entry = declarations
+        .iter()
+        .find(|f| f.ident.sym.as_ref() == entry && f.function.is_async)
+        .map(|f| f.ident.sym.to_string());
+    if implicit_entry {
         let mut c = Compiler {
             map: map.clone(),
             names: names.clone(),
             arities: arities.clone(),
-            async_entry: async_entry.clone(),
+            async_entry: None,
             libraries: libraries.clone(),
+            imports: imports.clone(),
             vars: BTreeMap::new(),
             available_names: bindings.0.clone(),
             captures: std::cell::RefCell::new(BTreeSet::new()),
@@ -1199,11 +1639,40 @@ fn compile_inner(
             loops: Vec::new(),
             handlers: 0,
         };
-        if f.function.is_generator || (f.function.is_async && f.ident.sym.as_ref() != entry) {
-            return c.error(
-                f.function.span,
-                "async is currently supported only on the entry function; generator functions are unsupported",
-            );
+        c.declare("input", false, module.span)?;
+        for stmt in &top_level {
+            c.stmt(stmt)?;
+        }
+        c.emit(module.span, Op::Return(Expr::Value(Value::Null)));
+        functions.insert(
+            "main".into(),
+            Function {
+                description: String::new(),
+                virtual_task: false,
+                captures: c.captures.into_inner(),
+                params: vec!["input".into()],
+                code: c.code,
+            },
+        );
+    }
+    for f in declarations {
+        let mut c = Compiler {
+            map: map.clone(),
+            names: names.clone(),
+            arities: arities.clone(),
+            async_entry: async_entry.clone(),
+            libraries: libraries.clone(),
+            imports: imports.clone(),
+            vars: BTreeMap::new(),
+            available_names: bindings.0.clone(),
+            captures: std::cell::RefCell::new(BTreeSet::new()),
+            code: Vec::new(),
+            temp: 0,
+            loops: Vec::new(),
+            handlers: 0,
+        };
+        if f.function.is_generator {
+            return c.error(f.function.span, "generator functions are unsupported");
         }
         if f.ident.sym == *"main" && f.function.params.len() > 1 {
             return c.error(f.function.span, "main accepts zero or one input parameter");
@@ -1264,10 +1733,23 @@ fn compile_inner(
             .collect::<Vec<_>>()
             .join("\n");
         let empty = body.stmts.iter().all(|s| matches!(s, ast::Stmt::Empty(_)));
+        // A sole `throw new Error("literal")` is a conventional unavailable-implementation
+        // sentinel. Do not ignore arbitrary throws, expressions or side effects.
+        let executable = body
+            .stmts
+            .iter()
+            .filter(|s| !matches!(s, ast::Stmt::Empty(_)))
+            .collect::<Vec<_>>();
+        let error_placeholder = matches!(executable.as_slice(), [ast::Stmt::Throw(t)]
+            if matches!(&*t.arg, ast::Expr::New(n)
+                if matches!(&*n.callee, ast::Expr::Ident(i) if i.sym == *"Error")
+                    && n.args.as_ref().is_some_and(|args| args.len() == 1
+                        && args[0].spread.is_none()
+                        && matches!(&*args[0].expr, ast::Expr::Lit(ast::Lit::Str(_))))));
         if virtual_task {
-            if !empty {
+            if !empty && !error_placeholder {
                 return c.error(body.span,
-                    "@virtual declares AI work: leave its body empty; put the return contract in comments, not a placeholder return. Use define_task_body without @virtual for a concrete implementation");
+                    "@virtual declares AI work: use an empty body or a sole throw new Error with a literal message; executable work and placeholder returns are unsupported");
             }
             if description.is_empty() {
                 return c.error(
