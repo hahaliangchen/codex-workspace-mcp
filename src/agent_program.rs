@@ -2,8 +2,13 @@
 //! SWC compiles it to serializable control flow; effects use the normal host tools.
 mod builtins;
 mod compiler;
+mod heap;
+mod js_methods;
+mod js_value;
+mod vm_eval;
 pub(crate) mod declarations;
 pub(crate) mod libraries;
+mod promise;
 pub(crate) mod runtime;
 #[cfg(test)]
 mod tests;
@@ -17,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub const VERSION: u32 = 12;
+pub const VERSION: u32 = 14;
 // JavaScript has one number type; JSON tool schemas often require integer
 // representations. Preserve integral values at the deterministic boundary.
 fn number_value(value: f64) -> Value {
@@ -47,9 +52,21 @@ pub struct Function {
     pub description: String,
     #[serde(default)]
     pub virtual_task: bool,
-    #[serde(default)]
-    pub captures: std::collections::BTreeSet<String>,
     pub params: Vec<String>,
+    /// Hoisted `var` names, undefined on entry.
+    #[serde(default)]
+    pub vars: Vec<String>,
+    /// let/const names of the body's top level, in their dead zone on entry.
+    #[serde(default)]
+    pub lexical: Vec<String>,
+    /// The top-level flow: its frame runs in the module environment itself.
+    #[serde(default)]
+    pub module: bool,
+    #[serde(default)]
+    pub is_async: bool,
+    /// A named function expression sees its own name inside its body.
+    #[serde(default)]
+    pub self_name: Option<String>,
     pub code: Vec<Instruction>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,7 +76,16 @@ pub struct Instruction {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Op {
+    /// Assign a compiler temporary, or an existing variable through the scope chain.
     Set(String, Expr),
+    /// Initialize a let/const/var binding and end its dead zone.
+    Declare(String, Expr),
+    /// Enter a block scope whose let/const names start in their dead zone.
+    EnterScope(Vec<String>),
+    LeaveScope,
+    /// Fresh per-iteration copy of the current scope for `for (let …)`.
+    CopyScope,
+    SetMember { object: Expr, key: Expr, value: Expr },
     Effect(Option<String>, Effect),
     Append {
         target: String,
@@ -84,6 +110,7 @@ pub enum Op {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Expr {
+    Undefined,
     Value(Value),
     Variable(String),
     Array(Vec<Expr>),
@@ -100,6 +127,11 @@ pub enum Expr {
     NodeBuiltin(String, Vec<Expr>),
     Template(Vec<Expr>),
     ParseJson(Box<Expr>),
+    RegExp(Vec<Expr>),
+    /// A closure over the current scope for the function with this id.
+    Function(String),
+    /// A built-in function or tool as a value: "String", "Math.max", "tool:read_file".
+    Native(String),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Effect {
@@ -118,6 +150,14 @@ pub enum Effect {
         name: String,
         description: String,
         input: Expr,
+    },
+    /// Call a function value: a closure, a built-in or a tool.
+    Dynamic { callee: Expr, args: Vec<Expr> },
+    /// `receiver.name(args)`: a function-valued property, else a built-in method.
+    Method {
+        receiver: Expr,
+        name: String,
+        args: Vec<Expr>,
     },
 }
 

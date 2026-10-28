@@ -1006,16 +1006,16 @@ function main() {
 function main() {
   const spec=io.read({path:"spec.txt"});
   let parentState="before";
-  const unusedParent="visible without an explicit parameter";
-  const a=fork(worker,{path:"a.txt",text:"A",source:spec.content});
+  const unusedParent="passed at fork time";
+  const a=fork(worker,{path:"a.txt",text:"A",source:spec.content},parentState,unusedParent);
   parentState="between";
-  const b=fork(worker,{path:"b.txt",text:"B",source:spec.content});
+  const b=fork(worker,{path:"b.txt",text:"B",source:spec.content},parentState,unusedParent);
   parentState="after";
   const [x,y]=join(a,b);
   return {x,y};
 }
-function worker(part) {
-  const saved=produce(part,parentState,unusedParent);
+function worker(part,state,marker) {
+  const saved=produce(part,state,marker);
   const checked=io.read({path:saved.path});
   return {path:saved.path,content:checked.content};
 }
@@ -1042,7 +1042,7 @@ function produce(part,state,marker) {
                     assert!(names.contains(&"define_task_body"));
                     let part=&task["bindings"]["part"];
                     assert_eq!(part["source"],"SHARED_SOURCE");
-                    assert_eq!(task["bindings"]["marker"],"visible without an explicit parameter");
+                    assert_eq!(task["bindings"]["marker"],"passed at fork time");
                     assert_eq!(task["bindings"]["state"],if part["text"]=="A"{"before"}else{"between"});
                     assert!(messages.iter().any(|m|m["name"]=="scope_variables"),"other visible values remain discoverable");
                     if messages.iter().any(|m|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|a|a.iter().any(|c|c["function"]["name"]=="invoke_library"))) {
@@ -1769,7 +1769,7 @@ function evaluate(request,content) {
         let seen = requests.clone();
         let source = r#"
 function main(request) {
-  产物 = 制作(request);
+  let 产物 = 制作(request);
   const check = 检查(产物, request);
   if (!check.passed) { 产物 = 修正(产物, request); }
   const actual = io.read({path:产物.path});
@@ -2159,11 +2159,8 @@ function 修正(产物, request) {
             &json!({"source":"function work(item){return rules.prefix + ':' + item;}"}),
         )
         .unwrap();
+        // Inherited names form the body's outermost scope.
         let runtime = window.program.as_mut().unwrap();
-        assert_eq!(
-            runtime.program.functions["work"].captures,
-            ["rules".to_owned()].into_iter().collect()
-        );
         assert!(matches!(runtime.next(), State::Returned(value) if value == "from parent:value"));
     }
 

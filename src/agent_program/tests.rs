@@ -50,23 +50,17 @@ fn regular_expressions_validate_limits_and_resume_with_saved_state() {
         )),
         json!([true, true])
     );
-    let input = "a".repeat(2 * 1024 * 1024 + 1);
-    assert!(
-        values::method(
-            json!({"$flow_regex":{"pattern":"a","flags":""}}),
-            "test",
-            vec![json!(input)]
-        )
-        .is_err()
-    );
-    assert!(
-        values::method(
-            json!("a".repeat(10001)),
-            "match",
-            vec![json!({"$flow_regex":{"pattern":"a","flags":"g"}})]
-        )
-        .is_err()
-    );
+    let mut heap = heap::Heap::default();
+    let plain = heap
+        .from_json(&json!({"$flow_regex":{"pattern":"a","flags":""}}))
+        .unwrap();
+    let global = heap
+        .from_json(&json!({"$flow_regex":{"pattern":"a","flags":"g"}}))
+        .unwrap();
+    let input = heap::VmValue::String("a".repeat(2 * 1024 * 1024 + 1));
+    assert!(js_methods::call_method(&mut heap, plain, "test", &[input]).is_err());
+    let many = heap::VmValue::String("a".repeat(10001));
+    assert!(js_methods::call_method(&mut heap, many, "match", &[global]).is_err());
     let mut run = runtime(
         r"function main(){const pattern=/(\d+)/;const data=io.read({path:'a'});return data.content.match(pattern);}",
     );
@@ -446,15 +440,15 @@ fn deterministic_expressions_return_without_model_actions() {
         ("-5%2", json!(-1)),
         ("1===1", json!(true)),
         ("1 !== '1'", json!(true)),
-        ("[1,{x:2}]===[1,{x:2}]", json!(true)),
+        ("[1,{x:2}]===[1,{x:2}]", json!(false)),
         ("!false", json!(true)),
         ("typeof 'abc'", json!("string")),
         ("typeof null", json!("object")),
         ("typeof [1]", json!("object")),
         ("Array.isArray([1])", json!(true)),
         ("Array.isArray({})", json!(false)),
-        ("Object.keys({b:2,a:1})", json!(["a", "b"])),
-        ("Object.values({b:2,a:1})", json!([1, 2])),
+        ("Object.keys({b:2,a:1})", json!(["b", "a"])),
+        ("Object.values({b:2,a:1})", json!([2, 1])),
         ("+3", json!(3)),
         ("false && true", json!(false)),
         ("true || false", json!(true)),
@@ -482,10 +476,10 @@ fn deterministic_expressions_return_without_model_actions() {
         (r"'x12'.match(/(\d+)/)", json!(["12", "12"])),
         (r"'a1b2'.match(/\d/g)", json!(["1", "2"])),
         ("'abc'.match(/z/)", Value::Null),
-        ("[1,true,null].join('-')", json!("1-true-null")),
+        ("[1,true,null].join('-')", json!("1-true-")),
         ("[1,2].includes(2)", json!(true)),
         ("JSON.parse(JSON.stringify({ok:true}))", json!({"ok":true})),
-        ("9007199254740993 + 2", json!(9007199254740995u64)),
+        ("9007199254740993 + 2", json!(9007199254740994u64)),
     ] {
         for _ in 0..3 {
             assert_eq!(
@@ -505,18 +499,65 @@ fn deterministic_expressions_return_without_model_actions() {
 }
 
 #[test]
+fn older_runtime_snapshots_without_promise_state_remain_readable() {
+    let mut r = runtime("function main(){io.read({path:'input'});return 42;}");
+    assert!(matches!(r.next(), State::Action(_)));
+    let mut snapshot = serde_json::to_value(&r).unwrap();
+    snapshot.as_object_mut().unwrap().remove("promises");
+    snapshot.as_object_mut().unwrap().remove("heap");
+    let mut restored: Runtime = serde_json::from_value(snapshot).unwrap();
+    restored.resume(json!({}), false).unwrap();
+    assert_eq!(returned(restored), json!(42));
+}
+
+#[test]
+fn vm_object_aliases_survive_calls_and_host_suspension() {
+    let mut r = runtime("function main(){const a={inner:{x:1}};const b=a;io.read({path:'input'});b.inner.x=2;return a.inner.x;}");
+    assert!(matches!(r.next(), State::Action(_)));
+    let snapshot = serde_json::to_vec(&r).unwrap();
+    let mut restored: Runtime = serde_json::from_slice(&snapshot).unwrap();
+    restored.resume(json!({}), false).unwrap();
+    assert_eq!(returned(restored), json!(2));
+    assert_eq!(returned(runtime("function set(o){o.x=9;} function main(){const a={x:1};set(a);return a.x;}")), json!(9));
+    assert_eq!(returned(runtime("function main(){const a=[1];const b=a;b[0]=3;return [a===b,a===[3],a[0]];}")), json!([true,false,3]));
+    assert_eq!(returned(runtime("function main(){const a={b:1,a:2};return Object.keys(a);}")), json!(["b","a"]));
+    assert_eq!(returned(runtime("function main(){const item={x:1};const rows=[item];const copy=rows.slice(0);copy[0].x=7;return [rows[0].x,rows.includes({x:7}),rows.includes(item)];}")), json!([7,false,true]));
+    assert_eq!(returned(runtime("function empty(){return;} function main(){let x;return [typeof x,typeof undefined,typeof empty(),x===undefined];}")), json!(["undefined","undefined","undefined",true]));
+    assert_eq!(returned(runtime("function main(){const a={};a.self=a;for(var i=0;i<1000;i++){}return a.self===a;}")), json!(true));
+    assert_eq!(returned(runtime("function main(){const a=[2,3];let i=0;const old=a[i++]++;a[0]+=a[1];return [i,old,a[0],a[1]];}")), json!([1,2,6,3]));
+    assert_eq!(returned(runtime("function main(){const a=[1,2,3];a.length=1;return a;}")), json!([1]));
+}
+
+#[test]
+fn dynamic_regexp_constructor_evaluates_arguments_and_survives_suspension() {
+    assert_eq!(returned(runtime(r#"function main(){
+        const pattern = "a+"; const flags = "i";
+        return new RegExp(pattern, flags).test("AAA");
+    }"#)), json!(true));
+    assert_eq!(returned(runtime(r#"function main(){
+        const original = /abc/i; const copy = new RegExp(original);
+        return copy.test("ABC");
+    }"#)), json!(true));
+    assert_eq!(returned(runtime(r#"function main(){ return new RegExp().test(""); }"#)), json!(true));
+    let mut r = runtime(r#"function main(){
+        const pattern = "a+"; io.read({path:"input"});
+        return new RegExp(pattern, "i").test("AAA");
+    }"#);
+    assert!(matches!(r.next(), State::Action(_)));
+    let snapshot = serde_json::to_string(&r).unwrap();
+    let mut restored: Runtime = serde_json::from_str(&snapshot).unwrap();
+    restored.resume(json!({}), false).unwrap();
+    assert_eq!(returned(restored), json!(true));
+    let mut invalid = runtime(r#"function main(){ return new RegExp("x", "ii").test("x"); }"#);
+    assert!(matches!(invalid.next(), State::Failed(_)));
+}
+
+#[test]
 fn executable_extensions_and_unknown_data_methods_are_rejected_before_effects() {
     for expression in [
-        "delete x.a",
-        "x &&= true",
-        "x ??= 1",
         "x!",
         "(1,2)",
-        "(()=>1)()",
         "new Date()",
-        "x.map(item=>item)",
-        "x.check({run(){return 1;}})",
-        "x.unknown()",
     ] {
         let error = compile(&format!(
             "function main(){{let x=1;io.write({{path:'never'}});\nreturn {expression};}}"
@@ -526,7 +567,48 @@ fn executable_extensions_and_unknown_data_methods_are_rejected_before_effects() 
         assert!(error.starts_with("TS_PROGRAM 2:"), "{error}");
     }
     assert!(compile("function main(){const x=1;x=2;}").is_err());
-    assert!(compile("function main(){let x={};x.a=2;}").is_err());
+    assert_eq!(returned(runtime("function main(){const x={};x.a=2;return x.a;}")), json!(2));
+    // delete and logical assignment are JavaScript, not extensions.
+    assert_eq!(
+        returned(runtime("function main(){const x={a:1};const removed=delete x.a;let y=1;y&&=true;let z=null;z??=1;return [removed,x,y,z];}")),
+        json!([true, {}, true, 1])
+    );
+    // A call of something that is not a function compiles and throws when it runs.
+    assert_eq!(
+        returned(runtime("function main(){let x=1;const run=(()=>1)();try{x.unknown();}catch(error){return [run,error.name];}}")),
+        json!([1, "TypeError"])
+    );
+}
+
+#[test]
+fn array_map_filter_callbacks_capture_inputs_and_survive_tool_suspension() {
+    let r = runtime("function main(){const factor=2;const rows=[2,3,4];const result=rows.map((v,i,a)=>v*factor+i+a.length);return result.filter(function(v){return v>8;});}");
+    assert_eq!(returned(r), json!([10,13]));
+    assert_eq!(returned(runtime("function main(){let sum=0;const a=[1,2];const b=a.map(v=>v+=1);a.map(v=>sum+=v);return [b,sum,a];}")), json!([[2,3],3,[1,2]]));
+    assert_eq!(returned(runtime("function main(){const a=[1,2];const b=a.map((v,i,arr)=>arr.push(99));return [a,b];}")), json!([[1,2,99,99],[3,4]]));
+    assert_eq!(returned(runtime("function main(){const a=[];a[2]=3;let calls=0;const mapped=a.map(v=>calls+=v);return [mapped,a.filter(v=>true),a.slice(0),a.concat([4]),calls,a.indexOf(undefined),a.includes(undefined)];}")), json!([[null,null,3],[3],[null,null,3],[null,null,3,4],3,-1,true]));
+    assert_eq!(returned(runtime("function main(){const a=[1,2];return [a.slice(),'abc'.slice()];}")), json!([[1,2],"abc"]));
+    let mut r = runtime("function main(){const paths=['a','b'];return paths.map(path=>io.read({path:path}));}");
+    let State::Action(first) = r.next() else { panic!("expected first read") };
+    assert!(matches!(first.kind, ActionKind::Tool { ref args, .. } if args["path"] == "a"));
+    let mut restored: Runtime = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+    restored.resume(json!({"content":"A"}), false).unwrap();
+    let State::Action(second) = restored.next() else { panic!("expected second read") };
+    assert!(matches!(second.kind, ActionKind::Tool { ref args, .. } if args["path"] == "b"));
+    let mut restored: Runtime = serde_json::from_slice(&serde_json::to_vec(&restored).unwrap()).unwrap();
+    restored.resume(json!({"content":"B"}), false).unwrap();
+    assert_eq!(returned(restored), json!([{"content":"A"},{"content":"B"}]));
+    let mut sparse = runtime("function main(){const a=[];a[1]='b';a[3]='d';return a.map(path=>io.read({path:path}));}");
+    let State::Action(first) = sparse.next() else { panic!("expected sparse first read") };
+    assert!(matches!(first.kind, ActionKind::Tool { ref args, .. } if args["path"] == "b"));
+    sparse.resume(json!({"content":"B"}), false).unwrap();
+    let State::Action(second) = sparse.next() else { panic!("expected sparse second read") };
+    assert!(matches!(second.kind, ActionKind::Tool { ref args, .. } if args["path"] == "d"));
+    let mut sparse: Runtime = serde_json::from_slice(&serde_json::to_vec(&sparse).unwrap()).unwrap();
+    sparse.resume(json!({"content":"D"}), false).unwrap();
+    assert_eq!(returned(sparse), json!([null,{"content":"B"},null,{"content":"D"}]));
+    assert!(matches!(runtime("function main(){return (1).map(v=>v);}").next(), State::Failed(_)));
+    assert!(compile("function main(){return [1].map(async v=>v);}").is_err());
 }
 
 #[test]
@@ -558,10 +640,7 @@ fn business_judgment_is_an_explicit_task_with_named_inputs_and_evidence() {
 #[test]
 fn type_errors_and_assertions_use_the_existing_exception_path() {
     for statement in [
-        "1/0;",
         "JSON.parse('bad');",
-        "for(1/0;false;){}",
-        "for(var i=0;i<1;1/0){i++;}",
     ] {
         assert_eq!(
             returned(runtime(&format!(
@@ -572,22 +651,20 @@ fn type_errors_and_assertions_use_the_existing_exception_path() {
         );
     }
     for expression in [
-        "1/0",
-        "1%0",
-        "true+1",
-        "1<false",
-        "18446744073709551615+1",
-        "1e308*1e308",
         "JSON.parse('bad')",
-        "`${{x:1}}`",
-        "'x'.slice(0.5)",
-        "9007199254740993/2",
+        "null.x",
+        "[].reduce((a,b)=>a)",
     ] {
         let r = runtime(&format!(
             "function main(){{try{{return {expression};}}catch(error){{return {{caught:true,message:error.message}};}}}}"
         ));
         assert_eq!(returned(r)["caught"], true, "{expression}");
     }
+    // These convert as in JavaScript instead of throwing.
+    assert_eq!(
+        returned(runtime("function main(){return [`${{x:1}}`,'x'.slice(0.5)];}")),
+        json!(["[object Object]", "x"])
+    );
     assert!(
         matches!(runtime("function main(){assert(false,'failed');io.write({path:'never'});}").next(),State::Failed(e) if e["message"]=="failed")
     );
@@ -619,7 +696,7 @@ fn if_else_uses_returned_boolean_or_field_directly() {
 }
 
 #[test]
-fn c_style_truth_values_are_deterministic_for_all_json_types() {
+fn javascript_truth_values_and_short_circuit_results_are_deterministic() {
     for (value, truth) in [
         (json!(null), false),
         (json!(false), false),
@@ -630,7 +707,7 @@ fn c_style_truth_values_are_deterministic_for_all_json_types() {
         (json!(1), true),
         (json!(-1), true),
         (json!(0.25), true),
-        (json!(""), true),
+        (json!(""), false),
         (json!("false"), true),
         (json!([]), true),
         (json!({}), true),
@@ -638,13 +715,18 @@ fn c_style_truth_values_are_deterministic_for_all_json_types() {
         for expression in [
             "input ? true : false",
             "!!input",
-            "input && true",
-            "input || false",
         ] {
             let source = format!("function main(input){{return {expression};}}");
             let r = Runtime::new(compile(&source).unwrap(), "main", vec![value.clone()]).unwrap();
             assert_eq!(returned(r), json!(truth), "{expression}: {value}");
         }
+        let source = "function main(input){return input && true;}";
+        let r = Runtime::new(compile(source).unwrap(), "main", vec![value.clone()]).unwrap();
+        let normalized = if value.as_f64() == Some(0.0) { json!(0) } else { value.clone() };
+        assert_eq!(returned(r), if truth { json!(true) } else { normalized.clone() });
+        let source = "function main(input){return input || false;}";
+        let r = Runtime::new(compile(source).unwrap(), "main", vec![value.clone()]).unwrap();
+        assert_eq!(returned(r), if truth { normalized } else { json!(false) });
     }
     assert_eq!(
         returned(runtime(
@@ -762,7 +844,8 @@ fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
         })
     ));
     r.resume(json!({"passed":false}), false).unwrap();
-    assert_eq!(returned(r)["error"]["message"], json!("bad"));
+    // A thrown string is caught as that string.
+    assert_eq!(returned(r)["error"], json!("bad"));
     let mut r = runtime(
         "function work(){/* @virtual */ // Complete the assigned work.\n} function main(){try{return work();}catch(error){return error;}}",
     );
@@ -899,10 +982,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
     // the entire source, including unused functions, before any effects run.
     for fragment in [
         "function* hidden(){return 1;}",
-        "async function hidden(){return 1;}",
-        "function hidden(){return 1;}", // nested functions
-        "const fn = function(){return 1;};",
-        "const fn = () => 1;",
         "yield io.read({});",
         "yield* rows;",
         "await io.read({});",
@@ -919,28 +998,18 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "const copy = {...data};",
         "const copy = [...rows];",
         "helper(...rows);",
-        "const missing = data?.value;",
-        "const bits = value | 1;",
-        "const bits = ~value;",
-        "const power = value ** 2;",
-        "void value;",
-        "delete data.value;",
-        "data.value = 2;",
         "const bigint = 1n;",
         "const infinity = 1e999;",
         "const infinity = value + 1e999;",
-        "const hidden = data.check(/x/);",
         "const hidden = data.check(1n);",
         "const value2 = new Date();",
         "const value2 = this.value;",
         "class Thing{}",
         "const runtime = Promise.resolve(value);",
         "const runtime = process.exit();",
-        "const runtime = data.check({run(){return 1;}});",
         "const runtime = data.check([,]);",
         "const runtime = data.check({[value]:1});",
         "const runtime = value instanceof data;",
-        "const runtime = 'value' in data;",
         "return import('module');",
     ] {
         let body = format!(
@@ -972,6 +1041,28 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
             );
         }
     }
+    // Ordinary JavaScript operators and function values are accepted at every entry.
+    for fragment in [
+        "async function hidden(){return 1;}",
+        "function hidden(){return 1;}",
+        "const fn = function(){return 1;};",
+        "const fn = () => 1;",
+        "const hidden = data.check(/x/);",
+        "const runtime = data.check({run(){return 1;}});",
+        "const missing = data?.value;",
+        "const bits = value | 1;",
+        "const bits = ~value;",
+        "const power = value ** 2;",
+        "void value;",
+        "delete data.value;",
+        "const runtime = 'value' in data;",
+    ] {
+        let body = format!("const data={{value:1}}; let value=1;\n{fragment}");
+        let source = format!("function work(){{{body}}}");
+        compile(&format!("function main(){{{body}}}")).unwrap_or_else(|e| panic!("{fragment}: {e}"));
+        compile_body(&source, "work").unwrap_or_else(|e| panic!("{fragment}: {e}"));
+        compile_entry(&source, "work").unwrap_or_else(|e| panic!("{fragment}: {e}"));
+    }
     for source in [
         "function* main(){return 1;}",
         "function main(){return 1;} function* unused(){return 1;}",
@@ -992,9 +1083,7 @@ fn static_call_contracts_are_checked_before_execution() {
     for source in [
         "function main(){return JSON.trim();}",
         "function main(){return JSON.includes('x');}",
-        "function main(){return JSON.stringify(1,2);}",
         "function main(){return 0xffffffffffffffff;}",
-        "function main(){io.write({path:'never'}); return helper();} function helper(input){return input;}",
         "function main(){io.write({path:'never'}); return fork(helper,1,2);} function helper(input){return input;}",
         "function main(){return main();}",
         "function main(a,b){return a;}",
@@ -1005,6 +1094,11 @@ fn static_call_contracts_are_checked_before_execution() {
         let error = compile(source).unwrap_err().to_string();
         assert!(error.starts_with("TS_PROGRAM "), "{error}");
     }
+    // JSON.stringify takes a replacer and an indent, as in JavaScript.
+    assert_eq!(
+        returned(runtime("function main(){return [JSON.stringify(1,2),JSON.stringify({a:1},null,1)];}")),
+        json!(["1", "{\n \"a\": 1\n}"])
+    );
 }
 
 #[test]
@@ -1012,15 +1106,15 @@ fn json_fields_and_elements_capture_values_before_later_array_mutation() {
     for (source, expected) in [
         (
             "function main(){const rows=[];return {before:rows,length:rows.push('item'),after:rows};}",
-            json!({"before":[],"length":1,"after":["item"]}),
+            json!({"before":["item"],"length":1,"after":["item"]}),
         ),
         (
             "function main(){const rows=[];return [rows,rows.push('item'),rows];}",
-            json!([[], 1, ["item"]]),
+            json!([["item"], 1, ["item"]]),
         ),
         (
             "function main(){const rows=['old'];return rows[choose(rows.push('new'))];} function choose(length){return 1;}",
-            json!(null),
+            json!("new"),
         ),
         (
             "function main(){let result='before';result='after';return result;}",
@@ -1391,20 +1485,17 @@ fn lazy_expressions_execute_only_selected_effects_once() {
         restored.resume(json!(true), false).unwrap();
         assert_eq!(returned(restored), json!(true));
     }
-    // Earlier arithmetic failures must precede later effects.
-    assert!(matches!(
-        runtime("function main(){return (1/0)+test.never({});}").next(),
-        State::Failed(_)
-    ));
+    // Division by zero is not an exception in JavaScript; the later call runs.
+    assert!(matches!(runtime("function main(){return (1/0)+test.never({});}").next(), State::Action(_)));
 }
 
 #[test]
 fn loop_jumps_unwind_only_the_handlers_they_leave() {
     for source in [
-        "function main(){try{for(var i=0;i<2;i++){try{if(i===0)continue;break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer.message;}}",
-        "function main(){try{while(true){try{break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer.message;}}",
-        "function main(){try{for(var item of [1,2]){try{if(item===1)continue;break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer.message;}}",
-        "function main(){try{do{try{break;}catch(inner){return 'wrong';}}while(true);throw 'outer';}catch(outer){return outer.message;}}",
+        "function main(){try{for(var i=0;i<2;i++){try{if(i===0)continue;break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer;}}",
+        "function main(){try{while(true){try{break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer;}}",
+        "function main(){try{for(var item of [1,2]){try{if(item===1)continue;break;}catch(inner){return 'wrong';}}throw 'outer';}catch(outer){return outer;}}",
+        "function main(){try{do{try{break;}catch(inner){return 'wrong';}}while(true);throw 'outer';}catch(outer){return outer;}}",
     ] {
         assert_eq!(returned(runtime(source)), json!("outer"), "{source}");
     }
@@ -1517,16 +1608,16 @@ fn library_catalog_uses_real_ownership_and_omits_unavailable_or_ambiguous_names(
 }
 
 #[test]
-fn numeric_and_null_short_circuits_preserve_c_boolean_results_and_skip_effects() {
+fn numeric_and_null_short_circuits_return_operands_and_skip_effects() {
     for (expression, expected) in [
-        ("0 && test.never({})", json!(false)),
-        ("null && test.never({})", json!(false)),
-        ("{} || test.never({})", json!(true)),
-        ("1 || test.never({})", json!(true)),
+        ("0 && test.never({})", json!(0)),
+        ("null && test.never({})", json!(null)),
+        ("{} || test.never({})", json!({})),
+        ("1 || test.never({})", json!(1)),
         ("0 ?? test.never({})", json!(0)),
         ("!({}).error", json!(true)),
-        ("0 || 7", json!(true)),
-        ("1 && {}", json!(true)),
+        ("0 || 7", json!(7)),
+        ("1 && {}", json!({})),
     ] {
         assert_eq!(
             returned(runtime(&format!("function main(){{return {expression};}}"))),
@@ -1539,7 +1630,7 @@ fn numeric_and_null_short_circuits_preserve_c_boolean_results_and_skip_effects()
         matches!(r.next(),State::Action(Action{kind:ActionKind::Tool{name,..},..}) if name=="read_file")
     );
     r.resume(json!({}), false).unwrap();
-    assert_eq!(returned(r), json!(true));
+    assert_eq!(returned(r), json!({}));
 }
 
 #[test]
@@ -1666,11 +1757,11 @@ fn string_concatenation_accepts_primitives_and_preserves_numeric_addition_order(
         ("'项' + 1 + 2", json!("项12")),
         (
             "'大整数=' + 9007199254740993",
-            json!("大整数=9007199254740993"),
+            json!("大整数=9007199254740992"),
         ),
         (
             "18446744073709551615 + '字'",
-            json!("18446744073709551615字"),
+            json!("18446744073709552000字"),
         ),
     ] {
         assert_eq!(
@@ -1684,15 +1775,12 @@ fn string_concatenation_accepts_primitives_and_preserves_numeric_addition_order(
         )),
         json!({"label":"数量=2","total":5})
     );
-    for expression in ["'x'+{}", "[]+'x'", "true+1", "'3'-1", "'3'<4"] {
-        assert!(
-            matches!(
-                runtime(&format!("function main(){{return {expression};}}")).next(),
-                State::Failed(_)
-            ),
-            "{expression}"
-        );
-    }
+    // Objects and arrays convert to their string forms, as in JavaScript.
+    assert_eq!(
+        returned(runtime("function main(){return ['x'+{},[]+'x',[1,[2,3]]+''];}")),
+        json!(["x[object Object]", "x", "1,2,3"])
+    );
+    assert_eq!(returned(runtime("function main(){return [true+1,'3'-1,'3'<4];}")), json!([2,2,true]));
 }
 
 #[test]
@@ -1750,22 +1838,238 @@ fn caller_can_reject_an_inspection_result_for_a_different_input() {
 }
 
 #[test]
-fn caller_visible_variables_are_captured_only_when_the_function_uses_them() {
-    let source = "function main(){const wanted='YES';const unused='NO';return helper();} function helper(){return wanted;}";
+fn functions_share_module_variables_and_cannot_see_their_callers_locals() {
+    // A top-level function and the top-level flow share one module binding.
+    let source = "let count = 0; function bump(){ count++; return count; } bump(); bump(); test.record({count});";
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!(null)]).unwrap();
+    assert!(matches!(
+        run.next(),
+        State::Action(Action { kind: ActionKind::Tool { name, args }, .. })
+            if name == "record" && args == json!({"count": 2})
+    ));
+    // A caller's local variable is not in the called function's scope.
+    for source in [
+        "function main(){const wanted='YES';return helper();} function helper(){return wanted;}",
+        "function main(){return helper();} function other(){const wanted='wrong scope';return wanted;} function helper(){return wanted;}",
+    ] {
+        let error = compile(source).unwrap_err().to_string();
+        assert!(error.contains("unknown variable"), "{error}");
+    }
+}
+
+#[test]
+fn block_scopes_allow_repeated_names_and_shadowing() {
+    let source = r#"
+function main(){
+  const rows = [];
+  for (let i = 0; i < 2; i++) { rows.push(i); }
+  for (let i = 10; i < 12; i++) { rows.push(i); }
+  let x = 'outer';
+  { let x = 'inner'; rows.push(x); }
+  rows.push(x);
+  try { throw new Error('a'); } catch (error) { rows.push(error.message); }
+  try { throw new Error('b'); } catch (error) { rows.push(error.message); }
+  for (const item of ['p', 'q']) { const label = item + '!'; rows.push(label); }
+  return rows;
+}"#;
+    assert_eq!(
+        returned(runtime(source)),
+        json!([0, 1, 10, 11, "inner", "outer", "a", "b", "p!", "q!"])
+    );
+    for source in [
+        "function main(){let a=1;let a=2;return a;}",
+        "function main(){const a=1;var a=2;return a;}",
+        "function main(p){let p=1;return p;}",
+        "function main(){try{}catch(e){let e=1;}return 1;}",
+        "function main(){undeclared=1;return 1;}",
+    ] {
+        assert!(compile(source).is_err(), "should reject {source}");
+    }
+}
+
+#[test]
+fn let_and_const_have_a_dead_zone_and_var_is_hoisted() {
+    let source = r#"
+function main(){
+  const result = {};
+  try { result.before = value; let value = 1; } catch (error) { result.tdz = error.name; }
+  result.hoisted = typeof later;
+  var later = 5;
+  result.after = later;
+  if (true) { var inner = 'block'; }
+  result.inner = inner;
+  var later;
+  result.kept = later;
+  return result;
+}"#;
+    assert_eq!(
+        returned(runtime(source)),
+        json!({"tdz": "ReferenceError", "hoisted": "undefined", "after": 5, "inner": "block", "kept": 5})
+    );
+}
+
+#[test]
+fn jumps_and_throws_leave_exactly_the_scopes_they_cross() {
+    // At the final effect only `total` and `rows` are in scope: nothing from
+    // the loop bodies or try blocks remains after break, continue or throw.
+    let source = r#"
+function main(){
+  let total = 0;
+  const rows = [];
+  for (let i = 0; i < 5; i++) {
+    const double = i * 2;
+    if (i === 1) { const skip = true; continue; }
+    if (i === 3) { const stop = true; break; }
+    total += double;
+  }
+  for (const item of [1, 2]) { const seen = item; if (item === 1) continue; break; }
+  while (true) { const once = 1; break; }
+  try { const a = 1; { const b = 2; throw new Error('x'); } } catch (error) { rows.push(error.message); }
+  test.record({total, rows});
+  return total;
+}"#;
+    let mut run = runtime(source);
+    assert!(matches!(
+        run.next(),
+        State::Action(Action { kind: ActionKind::Tool { args, .. }, .. })
+            if args == json!({"total": 4, "rows": ["x"]})
+    ));
+    assert_eq!(
+        run.named_bindings().keys().cloned().collect::<Vec<_>>(),
+        ["rows", "total"]
+    );
+}
+
+#[test]
+fn block_scopes_survive_suspension_and_restore() {
+    let source = r#"
+function main(){
+  const rows = [];
+  for (let i = 0; i < 2; i++) {
+    const label = 'item' + i;
+    { const doc = io.read({path: label}); rows.push(label + ':' + doc.content); }
+  }
+  return rows;
+}"#;
+    let mut run = runtime(source);
+    for content in ["A", "B"] {
+        assert!(matches!(run.next(), State::Action(_)));
+        assert!(run.named_bindings().contains_key("label"));
+        run = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        run.resume(json!({"content": content}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!(["item0:A", "item1:B"]));
+}
+
+#[test]
+fn closures_keep_their_own_state_and_share_updates() {
+    let source = r#"
+function makeCounter(){ let count = 0; return () => { count++; return count; }; }
+function main(){
+  const a = makeCounter();
+  const b = makeCounter();
+  a(); a(); b();
+  let shared = 1;
+  const read = () => shared;
+  shared = 2;
+  return [a(), b(), read(), typeof a, a.name, makeCounter.name];
+}"#;
+    assert_eq!(returned(runtime(source)), json!([3, 2, 2, "function", "", "makeCounter"]));
+}
+
+#[test]
+fn loop_closures_capture_each_let_iteration_and_one_var() {
+    let source = r#"
+function main(){
+  const fns = [];
+  for (let i = 0; i < 3; i++) { fns.push(() => i); }
+  const vars = [];
+  for (var j = 0; j < 3; j++) { vars.push(() => j); }
+  const items = [];
+  for (const item of ['a', 'b']) { items.push(() => item); }
+  return [fns[0](), fns[1](), fns[2](), vars[0](), vars[2](), items[0](), items[1]()];
+}"#;
+    assert_eq!(returned(runtime(source)), json!([0, 1, 2, 3, 3, "a", "b"]));
+}
+
+#[test]
+fn functions_are_values_in_arrays_objects_and_expressions() {
+    let source = r#"
+function main(){
+  const ops = { double(x) { return x * 2; }, inc: x => x + 1 };
+  const list = [ops.double, ops.inc, helper];
+  const fact = function f(n) { return n <= 1 ? 1 : n * f(n - 1); };
+  { function local(){ return 'block'; } var fromBlock = local(); }
+  const toText = String;
+  return [ops.double(4), ops.inc(4), list[0](5), list[2](1), (x => x * 10)(3), fact(5),
+          fromBlock, hoisted(), toText(12), [[1, 2], [3]].map(row => row.map(x => x * 10)),
+          [1, 2].map(x => () => x).map(f => f())];
+  function hoisted(){ return 'hoisted'; }
+}
+function helper(x){ return x + 100; }
+"#;
+    assert_eq!(
+        returned(runtime(source)),
+        json!([8, 5, 10, 101, 30, 120, "block", "hoisted", "12", [[10, 20], [30]], [1, 2]])
+    );
+    // Functions are not data: they leave objects and become null in arrays.
+    assert_eq!(
+        returned(runtime("function main(){return {f: () => 1, x: 1, list: [() => 2, 3]};}")),
+        json!({"x": 1, "list": [null, 3]})
+    );
+    // Calling something that is not a function is a TypeError the flow can catch.
+    assert_eq!(
+        returned(runtime("function main(){const x = {}; try { x.missing(); } catch (error) { return error.name; }}")),
+        json!("TypeError")
+    );
+}
+
+#[test]
+fn ordinary_functions_take_javascript_arity_and_ai_functions_stay_exact() {
+    assert_eq!(
+        returned(runtime("function pair(a, b){ return [a, b]; } function main(){ return [pair(1), pair(1, 2, 3)]; }")),
+        json!([[1, null], [1, 2]])
+    );
+    let error = compile("function main(){ return review(1, 2); } /** @virtual Review one item; return {passed}. */ function review(item){}")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("expects 1 arguments, got 2"), "{error}");
+}
+
+#[test]
+fn closures_and_tool_values_survive_suspension() {
+    let source = r#"
+function main(){
+  let total = 0;
+  const add = n => { total += n; return total; };
+  const load = path => io.read({path});
+  const read = io.read;
+  add(1);
+  const first = load('a');
+  add(first.content.length);
+  const second = read({path: 'b'});
+  return [total, add(second.content.length)];
+}"#;
+    let mut run = runtime(source);
+    for (path, content) in [("a", "abc"), ("b", "xy")] {
+        assert!(matches!(
+            run.next(),
+            State::Action(Action { kind: ActionKind::Tool { ref name, ref args }, .. })
+                if name == "read_file" && args["path"] == path
+        ));
+        run = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+        run.resume(json!({"content": content}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!([4, 6]));
+}
+
+#[test]
+fn model_written_five_page_acceptance_flow_compiles() {
+    // Written by a model without guidance on the subset (2026-10-28). It
+    // repeats `let i` and `catch (error)` within functions.
+    let source = include_str!("fixtures/model-five-page-acceptance.js");
     let program = compile(source).unwrap();
-    assert_eq!(
-        program.functions["helper"].captures,
-        ["wanted".to_owned()].into_iter().collect()
-    );
-    assert_eq!(
-        returned(Runtime::new(program, "main", vec![]).unwrap()),
-        json!("YES")
-    );
-    let missing = "function main(){return helper();} function other(){const wanted='wrong scope';return wanted;} function helper(){return wanted;}";
-    let mut run = Runtime::new(compile(missing).unwrap(), "main", vec![]).unwrap();
-    assert!(
-        matches!(run.next(), State::Failed(e) if e["message"].as_str().unwrap().contains("not visible"))
-    );
+    assert!(program.functions["proposeMinimalEdits"].virtual_task);
 }
 
 #[test]
@@ -1963,6 +2267,9 @@ const files = await Promise.all(input.map(async file => await read({path:file}))
 
 #[test]
 fn awaited_promise_chains_preserve_callback_values_and_tool_continuations() {
+    assert_eq!(returned(runtime("async function main(){return await Promise.resolve(2).then(v=>v+=2);}")), json!(4));
+    assert_eq!(returned(runtime("async function main(){return await Promise.resolve(1).then(x=>Promise.resolve(2).then(x=>x+1));}")), json!(3));
+    assert_eq!(returned(runtime("async function main(){return await Promise.resolve(1).then(x=>Promise.resolve(2).then(y=>x+y));}")), json!(3));
     assert_eq!(
         returned(runtime(
             "async function main(){let x=10; const obj=await Promise.resolve(3).then(x=>({x})); return [x,obj.x];}"

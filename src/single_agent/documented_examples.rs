@@ -70,7 +70,8 @@ fn examples() -> Vec<Example> {
         ("manual", include_str!("../../docs/agent-program.md")),
         ("skill", crate::agent_program::SKILL),
     ] {
-        for (n, block) in text.split("```js\n").skip(1).enumerate() {
+        let normalized = text.replace("\r\n", "\n");
+        for (n, block) in normalized.split("```js\n").skip(1).enumerate() {
             let original = block.split("```").next().unwrap().to_owned();
             let (source, input, fragment) = if original.contains("function compose(") {
                 (

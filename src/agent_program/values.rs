@@ -1,44 +1,7 @@
 //! Deterministic JSON operations. No model fallback and no JavaScript runtime.
 use super::*;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 
-fn integer(v: &Value) -> Option<i128> {
-    v.as_i64()
-        .map(i128::from)
-        .or_else(|| v.as_u64().map(i128::from))
-}
-fn number(v: &Value) -> Result<f64> {
-    if let Some(i) = integer(v) {
-        ensure!(
-            i.abs() <= 9_007_199_254_740_991,
-            "integer cannot be converted to float without loss"
-        );
-    }
-    let n = v.as_f64().context("numeric operand required")?;
-    ensure!(n.is_finite(), "finite numeric operand required");
-    Ok(n)
-}
-fn int_value(n: i128) -> Result<Value> {
-    if let Ok(n) = i64::try_from(n) {
-        return Ok(json!(n));
-    }
-    if let Ok(n) = u64::try_from(n) {
-        return Ok(json!(n));
-    }
-    bail!("integer overflow")
-}
-fn float_value(n: f64) -> Result<Value> {
-    ensure!(n.is_finite(), "non-finite arithmetic result");
-    Ok(number_value(n))
-}
-pub(super) fn boolean(v: &Value) -> Result<bool> {
-    Ok(match v {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().context("invalid JSON number")? != 0.0,
-        Value::String(_) | Value::Array(_) | Value::Object(_) => true,
-    })
-}
 pub(super) fn text(v: &Value) -> Result<String> {
     Ok(match v {
         Value::String(s) => s.clone(),
@@ -50,164 +13,7 @@ pub(super) fn text(v: &Value) -> Result<String> {
         }
     })
 }
-fn equal(a: &Value, b: &Value) -> Result<bool> {
-    Ok(match (a, b) {
-        (Value::Number(_), Value::Number(_)) => match (integer(a), integer(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => number(a)? == number(b)?,
-        },
-        (Value::Array(a), Value::Array(b)) => {
-            if a.len() != b.len() {
-                false
-            } else {
-                let mut same = true;
-                for (a, b) in a.iter().zip(b) {
-                    if !equal(a, b)? {
-                        same = false;
-                        break;
-                    }
-                }
-                same
-            }
-        }
-        (Value::Object(a), Value::Object(b)) => {
-            if a.len() != b.len() {
-                false
-            } else {
-                let mut same = true;
-                for (k, a) in a {
-                    if let Some(b) = b.get(k) {
-                        if !equal(a, b)? {
-                            same = false;
-                            break;
-                        }
-                    } else {
-                        same = false;
-                        break;
-                    }
-                }
-                same
-            }
-        }
-        _ => a == b,
-    })
-}
-pub(super) fn binary(op: &str, a: Value, b: Value) -> Result<Value> {
-    if matches!(op, "==" | "===" | "!=" | "!==") {
-        let same = equal(&a, &b)?;
-        return Ok(json!(if matches!(op, "!=" | "!==") {
-            !same
-        } else {
-            same
-        }));
-    }
-    if matches!(op, "<" | "<=" | ">" | ">=") {
-        let ordering = match (&a, &b) {
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            (Value::Number(_), Value::Number(_)) => match (integer(&a), integer(&b)) {
-                (Some(a), Some(b)) => a.cmp(&b),
-                _ => number(&a)?
-                    .partial_cmp(&number(&b)?)
-                    .context("invalid numeric comparison")?,
-            },
-            _ => bail!("comparison needs two numbers or two strings"),
-        };
-        return Ok(json!(match op {
-            "<" => ordering.is_lt(),
-            "<=" => !ordering.is_gt(),
-            ">" => ordering.is_gt(),
-            _ => !ordering.is_lt(),
-        }));
-    }
-    // A string operand selects concatenation, as in ordinary flow source.
-    // Convert JSON primitives directly, preserving 64-bit integer text rather
-    // than passing through f64. Containers still require JSON.stringify.
-    if op == "+" && (a.is_string() || b.is_string()) {
-        return Ok(json!(format!("{}{}", text(&a)?, text(&b)?)));
-    }
-    if op != "/"
-        && let (Some(a), Some(b)) = (integer(&a), integer(&b))
-    {
-        let n = match op {
-            "+" => a.checked_add(b),
-            "-" => a.checked_sub(b),
-            "*" => a.checked_mul(b),
-            "%" => {
-                ensure!(b != 0, "remainder by zero");
-                a.checked_rem(b)
-            }
-            _ => bail!("unsupported binary operator {op}"),
-        }
-        .context("integer overflow")?;
-        return int_value(n);
-    }
-    let (a, b) = (number(&a)?, number(&b)?);
-    float_value(match op {
-        "+" => a + b,
-        "-" => a - b,
-        "*" => a * b,
-        "/" => {
-            ensure!(b != 0.0, "division by zero");
-            a / b
-        }
-        "%" => {
-            ensure!(b != 0.0, "remainder by zero");
-            a % b
-        }
-        _ => bail!("unsupported binary operator {op}"),
-    })
-}
-pub(super) fn unary(op: &str, v: Value) -> Result<Value> {
-    match op {
-        "!" => Ok(json!(!boolean(&v)?)),
-        "bool" => Ok(json!(boolean(&v)?)),
-        "typeof" => Ok(json!(match v {
-            Value::Null | Value::Array(_) | Value::Object(_) => "object",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::String(_) => "string",
-        })),
-        "isArray" => Ok(json!(v.is_array())),
-        "objectKeys" | "objectValues" => {
-            let object = v
-                .as_object()
-                .context("Object.keys/values requires a JSON object")?;
-            Ok(if op == "objectKeys" {
-                json!(object.keys().collect::<Vec<_>>())
-            } else {
-                json!(object.values().collect::<Vec<_>>())
-            })
-        }
-        "+" => {
-            ensure!(v.is_number(), "numeric operand required");
-            Ok(v)
-        }
-        "-" => {
-            if let Some(i) = integer(&v) {
-                int_value(-i)
-            } else {
-                float_value(-number(&v)?)
-            }
-        }
-        _ => bail!("unsupported unary operator {op}"),
-    }
-}
-pub(super) fn method_arity(name: &str) -> Option<(usize, usize)> {
-    Some(match name {
-        "includes" | "indexOf" | "lastIndexOf" | "startsWith" | "endsWith" | "split" | "match"
-        | "test" => (1, 1),
-        "replace" | "replaceAll" => (2, 2),
-        "slice" => (1, 2),
-        "at" | "concat" => (1, 1),
-        "trim" | "toLowerCase" | "toUpperCase" => (0, 0),
-        "join" => (0, 1),
-        _ => return None,
-    })
-}
 const REGEX_PATTERN_LIMIT: usize = 8 * 1024;
-const REGEX_INPUT_LIMIT: usize = 2 * 1024 * 1024;
-const REGEX_RESULT_LIMIT: usize = 10_000;
-const TEXT_RESULT_LIMIT: usize = 4 * 1024 * 1024;
 
 pub(super) fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
     ensure!(
@@ -223,25 +29,7 @@ pub(super) fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> 
         ensure!(!seen.contains(flag), "duplicate regex flag: {flag}");
         seen.push(flag);
     }
-    // In a JavaScript regex literal, the delimiter must be escaped. Rust regex
-    // does not recognize `\/` as an escape, so remove only that delimiter
-    // escape while preserving escaped backslashes and other regex escapes.
-    let mut normalized = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('/') => normalized.push('/'),
-                Some(next) => {
-                    normalized.push('\\');
-                    normalized.push(next);
-                }
-                None => normalized.push('\\'),
-            }
-        } else {
-            normalized.push(ch);
-        }
-    }
+    let normalized = translate_js_pattern(pattern, flags.contains('s'));
     let mut builder = regex::RegexBuilder::new(&normalized);
     builder
         .case_insensitive(flags.contains('i'))
@@ -249,6 +37,111 @@ pub(super) fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> 
         .dot_matches_new_line(flags.contains('s'))
         .size_limit(1024 * 1024);
     Ok(builder.build()?)
+}
+
+/// JavaScript character classes, written as Rust regex syntax.
+const JS_SPACE: &str = r"\t\n\x0B\x0C\r \x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}";
+const JS_WORD: &str = "0-9A-Za-z_";
+
+/// Translate a JavaScript pattern to Rust regex syntax with JavaScript's
+/// meaning: \d, \w and \b are ASCII; \s is the ECMAScript WhiteSpace and
+/// LineTerminator set; `.` excludes all line terminators unless the s flag is
+/// set. Inside a class, `[`, `&` and `~` are literal in JavaScript but are
+/// nesting and set operators in Rust, so they are escaped.
+pub(super) fn translate_js_pattern(pattern: &str, dot_all: bool) -> String {
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' => {
+                let Some(&next) = chars.get(i + 1) else {
+                    out.push_str(r"\\");
+                    break;
+                };
+                i += 1;
+                match (next, in_class) {
+                    ('/', _) => out.push('/'),
+                    ('d', false) => out.push_str("[0-9]"),
+                    ('d', true) => out.push_str("0-9"),
+                    ('D', _) => out.push_str("[^0-9]"),
+                    ('w', false) => out.push_str(&format!("[{JS_WORD}]")),
+                    ('w', true) => out.push_str(JS_WORD),
+                    ('W', _) => out.push_str(&format!("[^{JS_WORD}]")),
+                    ('s', false) => out.push_str(&format!("[{JS_SPACE}]")),
+                    ('s', true) => out.push_str(JS_SPACE),
+                    ('S', _) => out.push_str(&format!("[^{JS_SPACE}]")),
+                    ('b', false) => out.push_str(r"(?-u:\b)"),
+                    ('B', false) => out.push_str(r"(?-u:\B)"),
+                    ('b', true) => out.push_str(r"\x08"),
+                    ('0', _) if !chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                        out.push_str(r"\x00")
+                    }
+                    ('c', _) if chars.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) => {
+                        i += 1;
+                        out.push_str(&format!(r"\x{:02X}", (chars[i] as u32) % 32));
+                    }
+                    (other, _) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            }
+            '[' if !in_class => {
+                // `[]` matches nothing and `[^]` matches anything in JavaScript.
+                if chars.get(i + 1) == Some(&']') {
+                    out.push_str(r"[^\x{0}-\x{10FFFF}]");
+                    i += 1;
+                } else if chars.get(i + 1) == Some(&'^') && chars.get(i + 2) == Some(&']') {
+                    out.push_str(r"[\x{0}-\x{10FFFF}]");
+                    i += 2;
+                } else {
+                    in_class = true;
+                    out.push('[');
+                    if chars.get(i + 1) == Some(&'^') {
+                        out.push('^');
+                        i += 1;
+                    }
+                    // A leading `]` is literal in neither language; JavaScript
+                    // closed the class above, so nothing else is needed here.
+                }
+            }
+            ']' if in_class => {
+                in_class = false;
+                out.push(']');
+            }
+            '[' | '&' | '~' if in_class => {
+                out.push('\\');
+                out.push(c);
+            }
+            '.' if !in_class && !dot_all => out.push_str(r"[^\n\r\x{2028}\x{2029}]"),
+            '{' if !in_class && !is_quantifier(&chars[i..]) => out.push_str(r"\{"),
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `{n}`, `{n,}` or `{n,m}` at the start of `rest`.
+fn is_quantifier(rest: &[char]) -> bool {
+    let mut i = 1;
+    let start = i;
+    while rest.get(i).is_some_and(char::is_ascii_digit) {
+        i += 1;
+    }
+    if i == start {
+        return false;
+    }
+    if rest.get(i) == Some(&',') {
+        i += 1;
+        while rest.get(i).is_some_and(char::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    rest.get(i) == Some(&'}')
 }
 
 fn regex_parts(value: &Value) -> Option<(&str, &str)> {
@@ -263,237 +156,18 @@ fn regex_parts(value: &Value) -> Option<(&str, &str)> {
     ))
 }
 
-fn checked_regex_input(s: &str) -> Result<()> {
-    ensure!(s.len() <= REGEX_INPUT_LIMIT, "regex input exceeds 2 MiB");
-    Ok(())
+pub(super) fn regexp(args: Vec<Value>) -> Result<Value> {
+    let original = args.first().and_then(regex_parts);
+    let pattern = match args.first() {
+        None => String::new(),
+        Some(_) if original.is_some() => original.unwrap().0.to_owned(),
+        Some(value) => text(value)?,
+    };
+    let flags = match args.get(1) {
+        Some(value) => text(value)?,
+        None => original.map(|(_, flags)| flags.to_owned()).unwrap_or_default(),
+    };
+    compile_regex(&pattern, &flags)?;
+    Ok(json!({"$flow_regex": {"pattern": pattern, "flags": flags}}))
 }
-fn index(v: &Value, len: usize) -> Result<usize> {
-    let n = integer(v).context("slice index must be an integer")?;
-    let len = len as i128;
-    Ok(if n < 0 { (len + n).max(0) } else { n.min(len) } as usize)
-}
-pub(super) fn method(receiver: Value, name: &str, args: Vec<Value>) -> Result<Value> {
-    let (min, max) = method_arity(name).context("unsupported data method")?;
-    ensure!(
-        (min..=max).contains(&args.len()),
-        "invalid method argument count"
-    );
-    if name == "test" {
-        let (pattern, flags) = regex_parts(&receiver).context("test requires a regex receiver")?;
-        let input = args[0].as_str().context("regex test needs a string")?;
-        checked_regex_input(input)?;
-        return Ok(json!(compile_regex(pattern, flags)?.is_match(input)));
-    }
-    if name == "match" {
-        let input = receiver.as_str().context("match needs a string receiver")?;
-        let (pattern, flags) = regex_parts(&args[0]).context("match needs a regex argument")?;
-        checked_regex_input(input)?;
-        let re = compile_regex(pattern, flags)?;
-        if flags.contains('g') {
-            let mut matches = Vec::new();
-            for m in re.find_iter(input) {
-                ensure!(
-                    matches.len() < REGEX_RESULT_LIMIT,
-                    "regex match result exceeds 10000 items"
-                );
-                matches.push(m.as_str());
-            }
-            return Ok(if matches.is_empty() {
-                Value::Null
-            } else {
-                json!(matches)
-            });
-        }
-        return Ok(match re.captures(input) {
-            None => Value::Null,
-            Some(captures) => {
-                ensure!(
-                    captures.len() <= REGEX_RESULT_LIMIT,
-                    "regex capture result exceeds 10000 items"
-                );
-                let mut bytes = 0usize;
-                let mut result = Vec::with_capacity(captures.len());
-                for m in captures.iter() {
-                    if let Some(m) = m {
-                        bytes = bytes.saturating_add(m.as_str().len());
-                        ensure!(
-                            bytes <= TEXT_RESULT_LIMIT,
-                            "regex capture result exceeds 4 MiB"
-                        );
-                        result.push(json!(m.as_str()));
-                    } else {
-                        result.push(Value::Null);
-                    }
-                }
-                Value::Array(result)
-            }
-        });
-    }
-    if name == "at" {
-        let n = integer(&args[0]).context("at index must be an integer")?;
-        return Ok(match &receiver {
-            Value::String(s) => {
-                let len = s.chars().count() as i128;
-                let index = if n < 0 { len + n } else { n };
-                if index < 0 || index >= len {
-                    Value::Null
-                } else {
-                    json!(s.chars().nth(index as usize).unwrap().to_string())
-                }
-            }
-            Value::Array(a) => {
-                let len = a.len() as i128;
-                let index = if n < 0 { len + n } else { n };
-                if index < 0 || index >= len {
-                    Value::Null
-                } else {
-                    a[index as usize].clone()
-                }
-            }
-            _ => bail!("at needs a string or array"),
-        });
-    }
-    if name == "slice" {
-        let len = match &receiver {
-            Value::String(s) => s.chars().count(),
-            Value::Array(a) => a.len(),
-            _ => bail!("slice needs a string or array"),
-        };
-        let start = index(&args[0], len)?;
-        let end = if args.len() == 2 {
-            index(&args[1], len)?
-        } else {
-            len
-        };
-        return Ok(match receiver {
-            Value::String(s) => json!(
-                s.chars()
-                    .skip(start)
-                    .take(end.saturating_sub(start))
-                    .collect::<String>()
-            ),
-            Value::Array(a) => json!(
-                a.into_iter()
-                    .skip(start)
-                    .take(end.saturating_sub(start))
-                    .collect::<Vec<_>>()
-            ),
-            _ => unreachable!(),
-        });
-    }
-    match receiver {
-        Value::String(s) => {
-            if matches!(name, "trim" | "toLowerCase" | "toUpperCase") {
-                return Ok(json!(match name {
-                    "trim" => s.trim().to_owned(),
-                    "toLowerCase" => s.to_lowercase(),
-                    _ => s.to_uppercase(),
-                }));
-            }
-            let arg = args
-                .first()
-                .and_then(Value::as_str)
-                .context("string method needs a string argument")?;
-            Ok(match name {
-                "includes" => json!(s.contains(arg)),
-                "indexOf" => json!(
-                    s.find(arg)
-                        .map(|byte| s[..byte].chars().count() as i64)
-                        .unwrap_or(-1)
-                ),
-                "lastIndexOf" => json!(
-                    s.rfind(arg)
-                        .map(|byte| s[..byte].chars().count() as i64)
-                        .unwrap_or(-1)
-                ),
-                "startsWith" => json!(s.starts_with(arg)),
-                "endsWith" => json!(s.ends_with(arg)),
-                "concat" => json!(format!("{s}{arg}")),
-                "split" => {
-                    if arg.is_empty() {
-                        json!(s.chars().map(|c| c.to_string()).collect::<Vec<_>>())
-                    } else {
-                        json!(s.split(arg).collect::<Vec<_>>())
-                    }
-                }
-                "replace" | "replaceAll" => {
-                    let replacement = args[1].as_str().context("replacement must be a string")?;
-                    let count = if name == "replaceAll" {
-                        if arg.is_empty() {
-                            s.chars().count().saturating_add(1)
-                        } else {
-                            s.match_indices(arg).count()
-                        }
-                    } else if s.contains(arg) {
-                        1
-                    } else {
-                        0
-                    };
-                    let size = s
-                        .len()
-                        .saturating_sub(count.saturating_mul(arg.len()))
-                        .saturating_add(count.saturating_mul(replacement.len()));
-                    ensure!(
-                        size <= TEXT_RESULT_LIMIT,
-                        "string replacement result exceeds 4 MiB"
-                    );
-                    if name == "replaceAll" {
-                        if arg.is_empty() {
-                            let mut result = String::new();
-                            result.push_str(replacement);
-                            for c in s.chars() {
-                                result.push(c);
-                                result.push_str(replacement);
-                            }
-                            json!(result)
-                        } else {
-                            json!(s.replace(arg, replacement))
-                        }
-                    } else {
-                        json!(s.replacen(arg, replacement, 1))
-                    }
-                }
-                _ => bail!("method {name} is not supported on strings"),
-            })
-        }
-        Value::Array(a) => match name {
-            "includes" | "indexOf" => {
-                let mut found = None;
-                for (i, v) in a.iter().enumerate() {
-                    if equal(v, &args[0])? {
-                        found = Some(i);
-                        break;
-                    }
-                }
-                Ok(if name == "includes" {
-                    json!(found.is_some())
-                } else {
-                    json!(found.map(|i| i as i64).unwrap_or(-1))
-                })
-            }
-            "join" => {
-                let separator = if let Some(v) = args.first() {
-                    v.as_str().context("join separator must be a string")?
-                } else {
-                    ","
-                };
-                Ok(json!(
-                    a.iter()
-                        .map(text)
-                        .collect::<Result<Vec<_>>>()?
-                        .join(separator)
-                ))
-            }
-            "concat" => {
-                let mut result = a;
-                match &args[0] {
-                    Value::Array(items) => result.extend(items.iter().cloned()),
-                    value => result.push(value.clone()),
-                }
-                Ok(json!(result))
-            }
-            _ => bail!("method {name} is not supported on arrays"),
-        },
-        _ => bail!("data methods need a string or array receiver"),
-    }
-}
+

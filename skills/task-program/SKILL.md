@@ -5,7 +5,7 @@ description: 将用户目标与业务 skill 表达为可执行的流程伪代码
 
 # 用程序表达任务
 
-语言版本 12。用普通 JS 基础语法表达完整流程；Rust 宿主执行普通计算，AI 只处理显式任务函数。业务要求、确认点、验收标准来自用户和业务 skill，不写进通用宿主。
+语言版本 14。用普通 JS 基础语法表达完整流程；Rust 宿主执行普通计算，AI 只处理显式任务函数。业务要求、确认点、验收标准来自用户和业务 skill，不写进通用宿主。
 
 ## 从完整示例学习
 
@@ -130,18 +130,19 @@ function integrate(handle) {
 ## 固定写法
 
 - 顶层语句按顺序覆盖用户要求的工作、验证和交付；源码无需 main，也无需返回值。execute_program 的 input 在源码中直接作为 input 使用。顶层普通 function 定义辅助任务，helper(args) 调用。
-- 数据为 JSON；支持 const/let/var、局部赋值及赋值表达式、++/--、+= -= *= /= %=、对象简写、简单数组解构、成员／下标读取、模板字符串。
+- 内部值保存在 VM 堆中，对象和数组在普通函数调用间保留引用；宿主工具和 AI 参数／结果使用 JSON。支持 const/let/var、局部赋值及赋值表达式、对象／下标赋值及复合赋值、更新、++/--、+= -= *= /= %=、对象简写、简单数组解构、成员／下标读取、模板字符串。
 - 控制流支持 if/else、传统 for、while、do/while、数组 for...of、无标签 break/continue、三元、assert、return、try/catch/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
-- + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件采用 C 风格真值：false、null 和数值 0 为假，其余 JSON 值为真（空字符串、数组、对象也为真）。if(items.length)、if(!result.error)、if(obj) 都合法。除字符串拼接外，算术和比较不做字符串／数字强制转换。短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。
-- 数字运算类型明确：整数加减乘余数精确保留 JSON 64 位整数，溢出报错；除法为有限小数除法，除零报错。超过 2^53-1 的整数不能隐式转换成小数。+ / += 任一侧为字符串时，将另一侧 JSON 原始值（数字、布尔、null）转为文本后拼接；两个数字仍相加，数组／对象显式用 JSON.stringify。==/=== 都比较 JSON 值内容，不表示业务质量。
+- + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件中空字符串、false、null、undefined、0 和 NaN 为假，数组和对象为真。&& 和 || 返回所选操作数；短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。基本数字、布尔与字符串支持部分转换，对象到原始值的转换仍有限制。
+- 数字采用 IEEE-754 双精度，超过安全整数范围会像 JS Number 一样舍入；除零产生非有限数，但非有限数不能直接越过宿主 JSON 边界。=== 对对象比较引用身份；基本原始值的 == 支持部分类型转换。复杂对象转换和完整 JS 数值语义仍未覆盖。
 - 通过 import * as io from "host:io" 或 import {read, write as save} from "host:io" 引入已发布工具，使用 io.read({path}) 或 read({path})。program_tool_headers 仅列出名称；用 read_tool_contracts({methods:["io.read"]}) 或按 libraries 获取完整参数与返回契约；导入不扩大权限。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
-- 本地数组 push 收集结果；支持确定性方法 includes/indexOf/slice/at/concat、字符串 lastIndexOf/startsWith/endsWith/trim/toLowerCase/toUpperCase/split/replace/replaceAll/match、正则 test、数组 join、JSON.stringify/parse、Array.isArray、Object.keys/values、typeof。Object.keys/values 仅接受 JSON 对象，使用宿主稳定键序。replace/replaceAll 仅接受字符串查找和字面替换文本，不展开捕获组；未知方法编译失败，不能假定会让 AI 解释。
+- 本地数组 push 收集结果；支持确定性方法 includes/indexOf/slice/at/concat、字符串 lastIndexOf/startsWith/endsWith/trim/toLowerCase/toUpperCase/split/replace/replaceAll/match、正则 test、数组 join、JSON.stringify/parse、Array.isArray、Object.keys/values、typeof。Object.keys/values 仅接受对象，整数键按索引排序，其余键按插入顺序；宿主 JSON 输入的键顺序可能已经变化。replace/replaceAll 仅接受字符串查找和字面替换文本，不展开捕获组；未知方法编译失败，不能假定会让 AI 解释。
+- 函数是值：嵌套函数声明、函数表达式、箭头函数和对象方法简写都创建闭包，可以保存、传递和调用。数组 map/filter 等方法的回调仍需直接写在调用处：同步表达式箭头，或函数体仅有单条 return 表达式的匿名函数；可使用 value、index、array 三个简单参数，以及可见变量、普通函数或工具，回调内可以再嵌套回调。多语句回调、异步回调和把函数变量作为回调传入暂不支持。普通函数按 JS 处理实参数量；@virtual 函数和 fork 目标的实参数量必须与参数一致。支持通过索引和 length 产生稀疏数组；数组字面量空位和一般非索引数组属性尚不支持。
 - 路径与 URL 可直接计算：`path.join/resolve/relative/normalize/dirname/basename/extname` 和 `url.parse(value, base)`；结果用于普通流程，不调用 AI。resolve 至少一个绝对路径、relative 的两个参数必须绝对；url.parse 返回 href/origin/protocol/hostname/port/pathname/search/hash。它们由宿主 Rust 实现，处理路径不访问文件系统；文件访问仍使用 io。
-- 支持正则字面量及 `/pattern/i.test(text)`、`text.match(/pattern/g)`；只有 g/i/m/s/u 标志，Rust regex 语法不支持环视和回溯引用。test 无状态；match 未命中返回 null，非 g 返回完整匹配和捕获组数组，g 返回完整匹配数组。模式最多 8192 字节，输入最多 2 MiB，结果最多 10000 项、捕获文本最多 4 MiB；超出时报错。不是完整 JavaScript RegExp，不支持 new RegExp、正则替换或 lastIndex。
+- 支持正则字面量及 `/pattern/i.test(text)`、`text.match(/pattern/g)`；只有 g/i/m/s/u 标志，Rust regex 语法不支持环视和回溯引用。test 无状态；match 未命中返回 null，非 g 返回完整匹配和捕获组数组，g 返回完整匹配数组。模式最多 8192 字节，输入最多 2 MiB，结果最多 10000 项、捕获文本最多 4 MiB；超出时报错。不是完整 JavaScript RegExp，支持 new RegExp；不支持正则替换或 lastIndex。
 - 顶层流程或 async 函数可对单个函数、AI 能力或工具调用使用 await，按宿主原有串行机制等待结果；也可使用 await Promise.all([只读调用...])，或 await Promise.all(paths.map(path => io.read({path}))) 并发读取、列目录或搜索；最多 32 项，结果按输入顺序返回。仅允许 io.read、io.read_lines、io.list、io.search；AI 判断、写入和修复仍串行，不由此启动子 Agent。失败经既有异常路径处理，不自动重放。示例见 examples/async-page-review.js；串行基线见 examples/serial-page-review.js。
-- 以上是受限异步语法，不是完整 Promise 或 JS 环境。async 函数与单个 await 通过宿主暂停与恢复执行，不产生 Promise 对象；Promise.all 的 map 箭头仅允许一个简单参数和一个只读调用，允许 async / await，参数不能遮蔽已有局部变量。直接 await 的 Promise.resolve/reject 链以简单值为初始参数，不支持有副作用的表达式或属性访问；它支持 then/catch 的零或一个简单参数的表达式箭头，按顺序执行；不提供一般 Promise 对象和其他 Promise 链。禁止function*/yield、call()/ai() 包装、非工具模块导入和导出、TS 类型、闭包、其他箭头／匿名／嵌套函数、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、BigInt、位运算、void/delete、对象成员写入和 JS 全局环境。
+- 以上是受限异步语法，不是完整 Promise 或 JS 环境。async 函数与单个 await 通过宿主暂停与恢复执行，不产生 Promise 对象；Promise.all 的 map 箭头仅允许一个简单参数和一个只读调用，允许 async / await，参数不能遮蔽已有局部变量。直接 await 的 Promise.resolve/reject 链以简单值为初始参数，不支持有副作用的表达式或属性访问；它支持 then/catch 的零或一个简单参数的表达式箭头，按顺序执行；不提供一般 Promise 对象和其他 Promise 链。禁止function*/yield、call()/ai() 包装、非工具模块导入和导出、TS 类型、class/this/自定义 new、for-in、switch、finally、标签跳转、展开／剩余／默认参数、BigInt 和 JS 全局环境。
 
-let/const 在函数内不做块级遮蔽，使用不同名字；var 可以重复声明，不做提升，首次无初值为 null。数据按 JSON 快照交接，不共享可变别名。字符串 length、索引、slice 和 indexOf 使用 Unicode 标量。模板只插入原始值，对象和数组使用 JSON.stringify。完整规范在 docs/agent-program.md。
+let/const 属于所在的块，内层块可以重复声明同名变量并遮蔽外层，声明前读取会抛出 ReferenceError；var 属于所在函数并提升，首次无初值为 undefined。函数只看自己的变量和顶层变量，调用方的局部变量作为参数传入。普通函数中的对象别名共享修改；AI 作用域和宿主工具以 JSON 交接。字符串 length、索引、slice 和 indexOf 使用 Unicode 标量。模板只插入原始值，对象和数组使用 JSON.stringify。完整规范在 docs/agent-program.md。
 
 ## 工具库
 
@@ -219,7 +220,7 @@ define_task_body 是按需补写具体实现的方式，不是执行前的必经
 
 ## 作用域与生命周期
 
-当前函数的真实参数由 program_task_input.bindings 自动提供。普通函数代码引用调用位置可见的上层变量时，宿主取得该变量的进入时快照；当前参数遮蔽同名上层值，不能通过子函数赋值改写父变量。子 Agent 使用 fork 时的快照，之后父作用域变化不自动同步。未引用的上层变量不自动发送正文，scope_variables 提供名称、类型与大小，AI 可用 host.read_scope({name,path}) 按需读取；虚函数只有自然语言注释，不会从注释猜测代码变量引用。源码变量保留到函数返回，编译器临时量可回收。历史工具调用、回执不是自动重放的变量。
+当前函数的真实参数由 program_task_input.bindings 自动提供。普通函数代码按词法作用域只能引用自己的变量和顶层变量，调用方的局部变量需要作为参数传入。子 Agent 使用 fork 时的快照，之后父作用域变化不自动同步。AI 函数可以看到调用链上各层可见变量的索引：未引用的变量不自动发送正文，scope_variables 提供名称、类型与大小，AI 可用 host.read_scope({name,path}) 按需读取；虚函数只有自然语言注释，不会从注释猜测代码变量引用。源码变量保留到函数返回，编译器临时量可回收。历史工具调用、回执不是自动重放的变量。
 
 容量折叠先扣除固定指令和当前函数输入的开销，再按剩余工作空间的80%触发、向60%回落。自然增长的旧步骤可以折叠为可恢复引用；当前输入及最新交换保留。完整活跃输入超出硬上限时需分页或缩小单次处理范围，不把引用冒充已读取正文。
 

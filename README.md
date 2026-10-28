@@ -1,13 +1,13 @@
 # codex-workspace-mcp
 
 > 当前执行、作用域、语言和插件边界，以[语言手册](docs/agent-program.md)及[通用 Agent 设计](docs/generic-agent-design.md)为准。旧设计执行路径已经移除；设计文档中的有日期测试记录只代表当时版本。
-> 当前版本 12 的执行主线已统一；旧步骤链、工具组、自然语言委派、Observer 及模型选材压缩执行器已移除。完整 Rust 回归 294 项通过，前端 38 项通过，前后端构建通过。见[统一清理记录](docs/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。本轮 Terra 真实复测 4/5 文件，在虚函数返回无效 JSON 时停止，完整交付未通过；历史 Luna 五文件结果见第 22 节。
+> 当前执行语言为版本 14：对象引用、块级作用域、词法作用域、函数值与闭包已按 JS 语义执行；可挂起的回调方法、完整 Promise 与事件循环尚未实现，计划见 [JS 运行时设计](docs/js-runtime-design.md)。版本 12 的运行记录及历史测试见[统一清理记录](docs/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。
 
 由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。当前执行采用固定 JS 基础语法子集的流程调用与返回、父作用域继承、按容量折叠上下文；支持按需串行子任务和受约束的并发委派。模型直接连接提供商的 Chat Completions 接口。
 
 ## 核心能力
 
-- 版本 12 流程伪代码：普通函数、常见基础循环／表达式与 C 风格真值由 Rust 确定性执行，工具使用固定库名和自动生成的声明表达；智能生成和业务判断通过显式 @virtual 虚函数调用，支持授权 fork/join、异常与回执恢复。拒绝生成器、异步、TS 扩展和完整 JS 环境，详见[语言手册与串行／并发教程](docs/agent-program.md)。全部七段文档示例有真实宿主执行回归；两份完整示例已用 Terra 原样跑通，见[示例验证](docs/agent-program.md#示例的可执行回归)。可执行示例：[最小串行](skills/task-program/examples/serial.js)、[两 Agent 并发五页](skills/task-program/examples/parallel-five-pages.js)，配套 JSON 输入与源码同目录；两份示例也随 Skill 自动提供给模型。
+- 版本 14 流程语言：普通函数、常见基础循环／表达式、块级作用域与对象引用由 Rust 确定性执行，工具使用固定库名和自动生成的声明表达；智能生成和业务判断通过显式 @virtual 虚函数调用，支持授权 fork/join、异常与回执恢复。异步目前仍是受限的宿主等待，并非完整 Promise 或 Node 环境，详见[语言手册与串行／并发教程](docs/agent-program.md)。可执行示例：[最小串行](skills/task-program/examples/serial.js)、[两 Agent 并发五页](skills/task-program/examples/parallel-five-pages.js)，配套 JSON 输入与源码同目录。
 - 文件读取、文本搜索、版本校验写入与编辑。
 - Go、Rust、Python、TypeScript/JavaScript 符号索引和职责记忆。
 - 受限原生程序执行、项目依赖与脚本、进程日志、HTTP 探测及浏览器操作。
