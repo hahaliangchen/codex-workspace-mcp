@@ -40,6 +40,9 @@ pub enum ActionKind {
         name: String,
         args: Value,
     },
+    ParallelReads {
+        operations: Vec<(String, Value)>,
+    },
     Fork {
         entry: String,
         args: Vec<Value>,
@@ -262,6 +265,15 @@ impl Runtime {
                         }
                     }
                     Op::Effect(_, effect) => match effect {
+                        Effect::ParallelReads(operations) => {
+                            for (_, args) in operations {
+                                for arg in args { expression(arg, &mut live); }
+                            }
+                        }
+                        Effect::ParallelReadMap { items, args, .. } => {
+                            expression(items, &mut live);
+                            for arg in args { expression(arg, &mut live); }
+                        }
                         Effect::Tool(name, args) => {
                             dynamic_scope |= name == "read_scope";
                             for arg in args {
@@ -592,6 +604,31 @@ impl Runtime {
                                 };
                                 ensure!(args.is_object(), "tool arguments must be an object");
                                 ActionKind::Tool { name, args }
+                            }
+                            Effect::ParallelReads(operations) => {
+                                let mut resolved = Vec::with_capacity(operations.len());
+                                for (name, args) in operations {
+                                    let mut args = values(&args)?;
+                                    let args = if args.is_empty() { json!({}) } else { args.remove(0) };
+                                    ensure!(args.is_object(), "tool arguments must be an object");
+                                    resolved.push((name, args));
+                                }
+                                ActionKind::ParallelReads { operations: resolved }
+                            }
+                            Effect::ParallelReadMap { name, items, parameter, args } => {
+                                let list = eval(&items, locals)?;
+                                let items = list.as_array().context("Promise.all map needs an array")?;
+                                ensure!(items.len() <= 32, "Promise.all supports at most 32 reads");
+                                let mut resolved = Vec::with_capacity(items.len());
+                                for item in items {
+                                    let mut scope = locals.clone();
+                                    scope.insert(parameter.clone(), item.clone());
+                                    let mut values = args.iter().map(|arg| eval(arg, &scope)).collect::<Result<Vec<_>>>()?;
+                                    let args = if values.is_empty() { json!({}) } else { values.remove(0) };
+                                    ensure!(args.is_object(), "tool arguments must be an object");
+                                    resolved.push((name.clone(), args));
+                                }
+                                ActionKind::ParallelReads { operations: resolved }
                             }
                             Effect::Fork(entry, args) => ActionKind::Fork {
                                 entry,

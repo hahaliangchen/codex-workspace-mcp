@@ -133,7 +133,8 @@ function integrate(handle) {
 - 数字运算类型明确：整数加减乘余数精确保留 JSON 64 位整数，溢出报错；除法为有限小数除法，除零报错。超过 2^53-1 的整数不能隐式转换成小数。+ / += 任一侧为字符串时，将另一侧 JSON 原始值（数字、布尔、null）转为文本后拼接；两个数字仍相加，数组／对象显式用 JSON.stringify。==/=== 都比较 JSON 值内容，不表示业务质量。
 - 只使用 program_tool_headers 声明的固定 library.method(args)，如 io.read({path})、io.write({path,content})。参数、可选字段和返回信息直接看声明；不写 tools.*，不提供 libraries 别名。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
 - 本地数组 push 收集结果；只支持确定性方法 includes/indexOf/slice、字符串 startsWith/endsWith/trim/toLowerCase/toUpperCase/split、数组 join、JSON.stringify/parse。未知方法编译失败，不能假定会让 AI 解释。
-- 禁止 function*/yield、async/await/Promise、call()/ai() 包装、模块导入导出、TS 类型、闭包、箭头／匿名／嵌套函数、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入和 JS 全局环境。
+- 入口函数（main 或当前补写函数）可声明 async，使用 await Promise.all([只读调用...])，或 await Promise.all(paths.map(path => io.read({path}))) 并发读取、列目录或搜索；最多 32 项，结果按输入顺序返回。仅允许 io.read、io.read_lines、io.list、io.search；AI 判断、写入和修复仍串行，不由此启动子 Agent。失败经既有异常路径处理，不自动重放。示例见 examples/async-page-review.js；串行基线见 examples/serial-page-review.js。
+- 以上是受限异步语法，不是完整 Promise 或 JS 环境。async 只允许入口函数；await 只允许上述 Promise.all；map 箭头仅允许一个简单参数和一个只读调用，参数不能遮蔽已有局部变量。禁止一般 async helper、Promise 链、function*/yield、call()/ai() 包装、模块导入导出、TS 类型、闭包、其他箭头／匿名／嵌套函数、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入和 JS 全局环境。
 
 let/const 在函数内不做块级遮蔽，使用不同名字；var 可以重复声明，不做提升，首次无初值为 null。数据按 JSON 快照交接，不共享可变别名。字符串 length、索引、slice 和 indexOf 使用 Unicode 标量。模板只插入原始值，对象和数组使用 JSON.stringify。完整规范在 docs/agent-program.md。
 

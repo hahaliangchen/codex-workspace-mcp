@@ -221,7 +221,7 @@ pub async fn post(
     Path(task): Path<String>,
     Json(input): Json<RewindInput>,
 ) -> Response {
-    let _guard = crate::workspace_changes::MUTATIONS.lock().await;
+    let _guard = crate::workspace_changes::MUTATIONS.write().await;
     let root = state.workspace.root().to_path_buf();
     let result = tokio::task::spawn_blocking(move || rewind(&root, &task, input.turn)).await;
     match result {

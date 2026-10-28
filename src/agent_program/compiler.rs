@@ -10,6 +10,7 @@ struct Compiler {
     map: Lrc<SourceMap>,
     names: BTreeSet<String>,
     arities: BTreeMap<String, usize>,
+    async_entry: Option<String>,
     libraries: super::libraries::Libraries,
     vars: BTreeMap<String, bool>,
     available_names: BTreeSet<String>,
@@ -157,7 +158,7 @@ impl Compiler {
     fn declare(&mut self, name: &str, mutable: bool, span: Span) -> Result<()> {
         if matches!(
             name,
-            "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON"
+            "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON" | "Promise"
         ) || name.starts_with("$temp")
             || self.vars.contains_key(name)
             || self.libraries.contains_key(name)
@@ -317,6 +318,9 @@ impl Compiler {
             .collect::<Result<Vec<_>>>()?;
         let target = match target {
             ast::Expr::Ident(i) if self.names.contains(i.sym.as_ref()) => {
+                if self.async_entry.as_deref() == Some(i.sym.as_ref()) {
+                    return self.error(call.span, "the async entry is awaited by the host and cannot be called as a helper");
+                }
                 if i.sym == *"main" {
                     return self.error(call.span, "main is the sole entry, not a callable helper");
                 }
@@ -387,6 +391,68 @@ impl Compiler {
     }
     fn lower(&mut self, e: &ast::Expr) -> Result<Expr> {
         match e {
+            ast::Expr::Await(awaited) => {
+                let ast::Expr::Call(all) = &*awaited.arg else {
+                    return self.error(awaited.span, "only await Promise.all([read-only tool calls]) is supported");
+                };
+                let is_all = matches!(&all.callee, ast::Callee::Expr(e)
+                    if matches!(&**e, ast::Expr::Member(m)
+                        if matches!(&*m.obj, ast::Expr::Ident(i) if i.sym == *"Promise")
+                        && matches!(&m.prop, ast::MemberProp::Ident(i) if i.sym == *"all")));
+                if !is_all || all.args.len() != 1 || all.args[0].spread.is_some() {
+                    return self.error(awaited.span, "use await Promise.all([read-only tool calls])");
+                }
+                if let ast::Expr::Call(map) = &*all.args[0].expr {
+                    let ast::Callee::Expr(target) = &map.callee else { return self.error(map.span, "use array.map(item => io.read(...))") };
+                    let ast::Expr::Member(member) = &**target else { return self.error(map.span, "use array.map(item => io.read(...))") };
+                    if !matches!(&member.prop, ast::MemberProp::Ident(i) if i.sym == *"map") || map.args.len() != 1 || map.args[0].spread.is_some() {
+                        return self.error(map.span, "use array.map(item => io.read(...))");
+                    }
+                    let items = self.expr(&member.obj)?;
+                    let ast::Expr::Arrow(arrow) = &*map.args[0].expr else { return self.error(map.span, "map needs an arrow with one parameter") };
+                    if arrow.is_async || arrow.is_generator || arrow.params.len() != 1 {
+                        return self.error(arrow.span, "map needs one ordinary arrow parameter");
+                    }
+                    let ast::Pat::Ident(parameter) = &arrow.params[0] else { return self.error(arrow.span, "map needs a simple parameter") };
+                    let name = parameter.id.sym.to_string();
+                    if self.vars.contains_key(&name) {
+                        return self.error(arrow.span, "map parameter must not shadow an existing binding");
+                    }
+                    let ast::BlockStmtOrExpr::Expr(body) = &*arrow.body else { return self.error(arrow.span, "map body must be one read-only tool call") };
+                    let ast::Expr::Call(call) = &**body else { return self.error(arrow.span, "map body must be one read-only tool call") };
+                    self.declare(&name, false, arrow.span)?;
+                    let effect = self.effect(call);
+                    self.vars.remove(&name);
+                    let (tool, args) = match effect? {
+                        Effect::Tool(tool, args) if matches!(tool.as_str(), "read_file" | "read_file_lines" | "search_text" | "list_dir") => (tool, args),
+                        _ => return self.error(call.span, "Promise.all accepts only file reads, listings and searches"),
+                    };
+                    let dest = self.temp();
+                    self.emit(awaited.span, Op::Effect(Some(dest.clone()), Effect::ParallelReadMap { name: tool, items, parameter: name, args }));
+                    return Ok(Expr::Variable(dest));
+                }
+                let ast::Expr::Array(array) = &*all.args[0].expr else {
+                    return self.error(awaited.span, "Promise.all needs an array of calls or array.map(item => read-only call)");
+                };
+                if array.elems.len() > 32 {
+                    return self.error(awaited.span, "Promise.all supports at most 32 read-only calls");
+                }
+                let mut operations = Vec::new();
+                for item in &array.elems {
+                    let Some(item) = item else { return self.error(array.span, "array holes are unsupported") };
+                    if item.spread.is_some() { return self.error(item.span(), "array spreads are unsupported"); }
+                    let ast::Expr::Call(call) = &*item.expr else {
+                        return self.error(item.span(), "Promise.all accepts only read-only library calls");
+                    };
+                    match self.effect(call)? {
+                        Effect::Tool(name, args) if matches!(name.as_str(), "read_file" | "read_file_lines" | "search_text" | "list_dir") => operations.push((name, args)),
+                        _ => return self.error(call.span, "Promise.all accepts only file reads, listings and searches"),
+                    }
+                }
+                let dest = self.temp();
+                self.emit(awaited.span, Op::Effect(Some(dest.clone()), Effect::ParallelReads(operations)));
+                Ok(Expr::Variable(dest))
+            }
             ast::Expr::Bin(b) => {
                 let op = match b.op {
                     ast::BinaryOp::EqEq => "==",
@@ -1093,7 +1159,7 @@ fn compile_inner(
         ensure!(
             !matches!(
                 f.ident.sym.as_ref(),
-                "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON"
+                "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON" | "Promise"
             ),
             "reserved function name {}",
             f.ident.sym
@@ -1117,11 +1183,13 @@ fn compile_inner(
         .iter()
         .map(|f| (f.ident.sym.to_string(), f.function.params.len()))
         .collect::<BTreeMap<_, _>>();
+    let async_entry = declarations.iter().find(|f|f.ident.sym.as_ref() == entry && f.function.is_async).map(|f|f.ident.sym.to_string());
     for f in declarations {
         let mut c = Compiler {
             map: map.clone(),
             names: names.clone(),
             arities: arities.clone(),
+            async_entry: async_entry.clone(),
             libraries: libraries.clone(),
             vars: BTreeMap::new(),
             available_names: bindings.0.clone(),
@@ -1131,10 +1199,10 @@ fn compile_inner(
             loops: Vec::new(),
             handlers: 0,
         };
-        if f.function.is_async || f.function.is_generator {
+        if f.function.is_generator || (f.function.is_async && f.ident.sym.as_ref() != entry) {
             return c.error(
                 f.function.span,
-                "only ordinary functions are allowed; function*, yield and async/await are unsupported",
+                "async is currently supported only on the entry function; generator functions are unsupported",
             );
         }
         if f.ident.sym == *"main" && f.function.params.len() > 1 {

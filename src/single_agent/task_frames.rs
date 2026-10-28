@@ -360,7 +360,7 @@ async fn create_main_task(
             node.status = "running".into();
             tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
             Ok((json!({"task":{"node_id":node.node_id,"goal":node.goal},
-                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete program with one main covering the user goal and helpers for its steps. Use ordinary helper(args) for serial tasks and fork/join for authorized parallel helpers; generator/yield and async syntax are rejected. Normal returns resume the caller or finish main; the host records execution without another model completion verdict."}),
+                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete program with one main covering the user goal and helpers for its steps. Use ordinary helper(args) for serial tasks; the async entry supports await Promise.all for the documented read-only operations. Use fork/join only when multi-agent work is explicitly authorized; generator/yield is rejected. Normal returns resume the caller or finish main; the host records execution without another model completion verdict."}),
                 node.node_id))
         })();
         if created.is_err() {

@@ -625,10 +625,12 @@ impl Workspace {
     pub fn write_file(&self, request: WriteFileRequest) -> Result<WriteFileResponse> {
         check_write_size(request.content.len())?;
         let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let _guard = crate::file_edit::WRITES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let path = crate::file_edit::workspace_path(&workspace.root, &request.path)?;
+        let lock = crate::file_edit::file_lock(&path);
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if crate::file_edit::workspace_path(&workspace.root, &request.path)? != path {
+            return Err(ToolError::WriteConflict("file location changed while waiting".into()));
+        }
         let original = crate::file_edit::snapshot(&path)?;
         if original.is_some() && request.expected_code_hash.is_none() {
             return Err(ToolError::WritePreconditionRequired("overwriting an existing file requires expected_code_hash from a source read; use edit_file for focused edits".into()));
@@ -663,10 +665,12 @@ impl Workspace {
             return Err(ToolError::WritePreconditionRequired("replace_range requires expected_old_text or expected_code_hash from current source".into()));
         }
         let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let _guard = crate::file_edit::WRITES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let path = crate::file_edit::workspace_path(&workspace.root, &request.path)?;
+        let lock = crate::file_edit::file_lock(&path);
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if crate::file_edit::workspace_path(&workspace.root, &request.path)? != path {
+            return Err(ToolError::WriteConflict("file location changed while waiting".into()));
+        }
         let original = fs::read(&path)?;
         crate::file_edit::check_hash(Some(&original), request.expected_code_hash.as_deref())?;
         let content = String::from_utf8(original.clone())?;
@@ -707,10 +711,12 @@ impl Workspace {
             })?;
         check_write_size(edit_size)?;
         let workspace = self.with_root(request.workspace_root.as_deref())?;
-        let _guard = crate::file_edit::WRITES
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
         let path = crate::file_edit::workspace_path(&workspace.root, &request.path)?;
+        let lock = crate::file_edit::file_lock(&path);
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if crate::file_edit::workspace_path(&workspace.root, &request.path)? != path {
+            return Err(ToolError::WriteConflict("file location changed while waiting".into()));
+        }
         let original = fs::read(&path)?;
         crate::file_edit::check_hash(Some(&original), request.expected_code_hash.as_deref())?;
         let content = String::from_utf8(original.clone())?;

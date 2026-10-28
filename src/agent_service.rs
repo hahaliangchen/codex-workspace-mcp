@@ -30,6 +30,14 @@ use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_STEPS: usize = 100;
 const MAX_STEP_LIMIT: usize = 100;
+pub(crate) fn model_request_slots() -> Arc<tokio::sync::Semaphore> {
+    let limit = std::env::var("CODEX_AGENT_MODEL_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0 && value <= tokio::sync::Semaphore::MAX_PERMITS)
+        .unwrap_or(3);
+    Arc::new(tokio::sync::Semaphore::new(limit))
+}
 // Acceptance may include history, code and image reads before its return.
 // Use the same production window as an Organizer decision, not the former
 // short summary-only window. A deadline never implies a business defect.
@@ -84,6 +92,8 @@ pub struct AgentProviderRoute {
 pub struct AgentServiceState {
     pub workspace: Arc<crate::tools::Workspace>,
     pub model_client: Client,
+    /// Shared by all task sessions created by this host.
+    pub model_request_slots: Arc<tokio::sync::Semaphore>,
     pub provider_url: String,
     pub api_key: String,
     pub provider_name: String,
@@ -1741,6 +1751,7 @@ pub(crate) mod tests {
         AgentServiceState {
             workspace: Arc::new(crate::tools::Workspace::new(root.to_path_buf()).unwrap()),
             model_client: crate::model_transport::client().unwrap(),
+            model_request_slots: Arc::new(tokio::sync::Semaphore::new(3)),
             provider_url: format!("http://{address}/v1"),
             api_key: "fake".into(),
             provider_name: String::new(),

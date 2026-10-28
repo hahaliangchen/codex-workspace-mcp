@@ -37,6 +37,7 @@ pub fn reserved(name: &str) -> bool {
             | "case"
             | "tools"
             | "JSON"
+            | "Promise"
             | "call"
             | "fork"
             | "join"

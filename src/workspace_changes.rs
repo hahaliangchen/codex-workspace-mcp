@@ -16,10 +16,43 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) static MUTATIONS: Mutex<()> = Mutex::const_new(());
+pub(crate) static MUTATIONS: RwLock<()> = RwLock::const_new(());
+static FILE_MUTATIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>> = std::sync::OnceLock::new();
+
+pub(crate) enum MutationGuard {
+    File { _workspace: tokio::sync::RwLockReadGuard<'static, ()>, _file: tokio::sync::OwnedMutexGuard<()> },
+    Workspace { _workspace: tokio::sync::RwLockWriteGuard<'static, ()> },
+}
+
+pub(crate) async fn mutation_guard(workspace: &Path, name: &str, args: &Value, cancel: &CancellationToken) -> Result<MutationGuard> {
+    if !matches!(name, "write_file" | "edit_file" | "replace_range") {
+        let guard = tokio::select! { _ = cancel.cancelled() => bail!("Tool execution cancelled"), guard = MUTATIONS.write() => guard };
+        return Ok(MutationGuard::Workspace { _workspace: guard });
+    }
+    let raw = args["path"].as_str().context("missing file path")?;
+    let path = safe_path(workspace, raw)?;
+    #[cfg(windows)]
+    let path = PathBuf::from(path.to_string_lossy().to_lowercase());
+    let file = {
+        let mut locks = FILE_MUTATIONS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&path).and_then(std::sync::Weak::upgrade) { lock } else {
+            let lock = std::sync::Arc::new(Mutex::new(()));
+            locks.insert(path.clone(), std::sync::Arc::downgrade(&lock));
+            lock
+        }
+    };
+    let workspace_guard = tokio::select! { _ = cancel.cancelled() => bail!("Tool execution cancelled"), guard = MUTATIONS.read() => guard };
+    let file = tokio::select! { _ = cancel.cancelled() => bail!("Tool execution cancelled"), guard = file.lock_owned() => guard };
+    let resolved = safe_path(workspace, raw)?;
+    #[cfg(windows)]
+    let resolved = PathBuf::from(resolved.to_string_lossy().to_lowercase());
+    ensure!(resolved == path, "file location changed while waiting");
+    Ok(MutationGuard::File { _workspace: workspace_guard, _file: file })
+}
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 const FILE_LIMIT: u64 = 2 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 32 * 1024 * 1024;
@@ -320,7 +353,6 @@ pub async fn execute_tracked(
     args: Value,
     cancel: CancellationToken,
 ) -> Result<Value> {
-    let _guard = tokio::select! { _=cancel.cancelled()=>return Err(anyhow::anyhow!("Tool execution cancelled")), guard=MUTATIONS.lock()=>guard };
     let root = state.workspace.root().to_path_buf();
     let files = workspace.root().to_path_buf();
     if !crate::project_process::may_change_files(&name) {
@@ -587,7 +619,7 @@ pub async fn undo_turn(
     State(state): State<AgentServiceState>,
     RoutePath((task, turn)): RoutePath<(String, usize)>,
 ) -> Response {
-    let _guard = MUTATIONS.lock().await;
+    let _guard = MUTATIONS.write().await;
     let root = state.workspace.root().to_path_buf();
     let saved_root = root.clone();
     let saved_task = task.clone();
@@ -624,6 +656,30 @@ fn response(result: std::result::Result<Result<Value>, tokio::task::JoinError>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn broad_mutations_wait_for_file_writes_and_cancel_cleanly() {
+        let root = std::env::temp_dir().join(format!("changes-lock-{}", crate::agent_service::uuid_like()));
+        fs::create_dir_all(&root).unwrap();
+        let cancel = CancellationToken::new();
+        let file = mutation_guard(&root, "write_file", &json!({"path":"a.txt"}), &cancel).await.unwrap();
+        let broad_args = json!({});
+        let pending = mutation_guard(&root, "run_project_script", &broad_args, &cancel);
+        tokio::pin!(pending);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending).await.is_err());
+        cancel.cancel();
+        assert!(pending.await.is_err());
+        drop(file);
+        let fresh = CancellationToken::new();
+        let broad = mutation_guard(&root, "run_project_script", &json!({}), &fresh).await.unwrap();
+        let file_args = json!({"path":"b.txt"});
+        let pending_file = mutation_guard(&root, "write_file", &file_args, &fresh);
+        tokio::pin!(pending_file);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending_file).await.is_err());
+        drop(broad);
+        drop(pending_file.await.unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn undo_restores_files_in_the_tasks_own_project() {

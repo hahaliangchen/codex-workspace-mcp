@@ -938,19 +938,19 @@ pub async fn call_tool(workspace: &Workspace, params: Value) -> anyhow::Result<V
         "workspace_info" => serde_json::to_value(
             workspace.workspace_info(serde_json::from_value::<WorkspaceInfoRequest>(arguments)?)?,
         )?,
-        "list_dir" => serde_json::to_value(
-            workspace.list_dir(serde_json::from_value::<ListDirRequest>(arguments)?)?,
-        )?,
-        "read_file" => serde_json::to_value(
-            workspace.read_file(serde_json::from_value::<ReadFileRequest>(arguments)?)?,
-        )?,
-        "read_file_lines" => serde_json::to_value(
-            workspace
-                .read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(arguments)?)?,
-        )?,
-        "search_text" => serde_json::to_value(
-            workspace.search_text(serde_json::from_value::<SearchTextRequest>(arguments)?)?,
-        )?,
+        "list_dir" | "read_file" | "read_file_lines" | "search_text" => {
+            let workspace = Workspace::new(workspace.root())?;
+            let name = name.to_owned();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                Ok(match name.as_str() {
+                    "list_dir" => serde_json::to_value(workspace.list_dir(serde_json::from_value::<ListDirRequest>(arguments)?)?)?,
+                    "read_file" => serde_json::to_value(workspace.read_file(serde_json::from_value::<ReadFileRequest>(arguments)?)?)?,
+                    "read_file_lines" => serde_json::to_value(workspace.read_file_lines(serde_json::from_value::<ReadFileLinesRequest>(arguments)?)?)?,
+                    "search_text" => serde_json::to_value(workspace.search_text(serde_json::from_value::<SearchTextRequest>(arguments)?)?)?,
+                    _ => unreachable!(),
+                })
+            }).await??
+        },
         "write_file" => {
             let workspace = Workspace::new(workspace.root())?;
             tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {

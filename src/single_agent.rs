@@ -951,6 +951,11 @@ async fn model_round(
         &s.state.provider_url,
         &body,
     );
+    // Queue before starting request timeouts; a permit covers the whole stream.
+    let _model_slot = tokio::select! {
+        _ = s.cancel.cancelled() => anyhow::bail!("model request cancelled while waiting for a slot"),
+        permit = s.state.model_request_slots.acquire() => permit.context("model request queue closed")?,
+    };
     diagnostics.sending();
     let response = {
         let pending = async {
@@ -1029,6 +1034,7 @@ async fn model_round(
             )
             .await
     };
+    drop(_model_slot);
     let status = if s.cancel.is_cancelled() {
         "cancelled"
     } else if response.is_ok() {
@@ -1175,6 +1181,11 @@ async fn business_tool(
             "GIT_DELEGATE_BACKGROUND_WRITE_DENIED: finish foreground processes before the branch is snapshotted"
         );
     }
+    // Hold the guard before claiming ownership and reading a file baseline.
+    let _mutation_guard = if crate::workspace_changes::is_mutation(name)
+        && s.delegate_id().is_none() && s.plugin.is_none() {
+        Some(crate::workspace_changes::mutation_guard(tool_workspace.root(), name, &args, s.cancel).await?)
+    } else { None };
     let _claim = if let Some(resource) =
         crate::collaboration_jobs::resource_key(tool_workspace.root(), name, &args)?
     {
@@ -1884,6 +1895,41 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
+                    "parallel_read_batch" => {
+                        ensure!(program_flow::internal_call(w, &call), "parallel reads require a pending compiled program");
+                        let operations = args["operations"].as_array().context("operations must be an array")?;
+                        ensure!(operations.len() <= 32, "parallel read limit exceeded");
+                        for operation in operations {
+                            let name = operation["name"].as_str().context("read tool name required")?;
+                            ensure!(matches!(name,"read_file"|"read_file_lines"|"search_text"|"list_dir"), "only read-only file operations may run in parallel");
+                            ensure!(operation["args"].is_object(), "read arguments must be an object");
+                            validate_tool(s,w,&definitions,name)?;
+                        }
+                        let node_ref = &node;
+                        let futures = operations.iter().enumerate().map(|(index, operation)| {
+                            let name = operation["name"].as_str().unwrap().to_owned();
+                            let input = operation["args"].clone();
+                            let subcall = format!("{}-{}", call.call_id, index);
+                            async move { business_tool(s, node_ref, &name, input, &subcall).await }
+                        });
+                        let settled = futures::future::join_all(futures).await;
+                        for (index, result) in settled.iter().enumerate() {
+                            let (failed, value) = match result {
+                                Ok(value) => (value["error_code"] == "ASSET_CONFLICT", value.clone()),
+                                Err(error) => (true, json!({"error":format!("{error:#}")})),
+                            };
+                            append(s, "parallel_read/item", json!({"turn":s.turn,"batch_call_id":call.call_id,"index":index,
+                                "name":operations[index]["name"],"arguments":operations[index]["args"],"is_error":failed,"result":value}), false).await?;
+                        }
+                        let mut results = Vec::with_capacity(operations.len());
+                        for result in settled {
+                            let value = result?;
+                            if value["error_code"] == "ASSET_CONFLICT" { return Ok(value); }
+                            results.push(value);
+                        }
+                        material_source = Some((call.name.clone(), args.clone()));
+                        Ok(json!(results))
+                    },
                     "read_scope" => { material_source=Some(("read_scope".into(),args.clone())); function_scope::read(w,&args) },
                     "check_program" => { validating_source = true; program_flow::check_scoped(s,w,&args) },
                     "execute_program" => { validating_source = true; program_flow::install_scoped(s,w,&args,false) },
@@ -2611,6 +2657,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_file_writes_overlap_while_same_file_writes_queue() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let root = TestRoot::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let catalog = Arc::new(crate::builtin_plugins::ToolCatalog::default());
+        catalog.register(&["write_file"], Arc::new({
+            let (active, peak) = (active.clone(), peak.clone());
+            move |workspace, _, args| {
+                let (active, peak) = (active.clone(), peak.clone());
+                Box::pin(async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let content = args["content"].as_str().unwrap();
+                    std::fs::write(workspace.root().join(args["path"].as_str().unwrap()), content)?;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(json!({"code_hash":crate::symbol_description::content_hash(content.as_bytes())}))
+                })
+            }
+        })).unwrap();
+        let mut state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
+        state.tool_catalog = Some(catalog);
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)", []).unwrap();
+        let cancel = CancellationToken::new();
+        let session = Session { agent_id:None, task_node_id:None, step_node_id:None, plugin:None, state:&state, task:"task", model:"fake", turn:1, cancel:&cancel, ban_execution:false, scope:"main".into(), parent:None, input_budget:INPUT_BUDGET };
+        let (a,b) = tokio::join!(
+            business_tool(&session,"node","write_file",json!({"path":"a.txt","content":"a"}),"a"),
+            business_tool(&session,"node","write_file",json!({"path":"b.txt","content":"b"}),"b")
+        );
+        a.unwrap(); b.unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "different file writes should overlap");
+        peak.store(0, Ordering::SeqCst);
+        let (a,b) = tokio::join!(
+            business_tool(&session,"node","write_file",json!({"path":"a.txt","content":"first"}),"c"),
+            business_tool(&session,"node","write_file",json!({"path":"a.txt","content":"second"}),"d")
+        );
+        a.unwrap(); b.unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "same file writes must queue");
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "second");
+        let changes = crate::workspace_changes::summary(root.path(), "task", 1).unwrap();
+        assert_eq!(changes["total"], 2);
+        assert_eq!(changes["complete"], true);
+        assert!(changes["files"].as_array().unwrap().iter().all(|f|f["conflicted"] == false));
+    }
+
+    #[tokio::test]
     async fn git_delegate_file_tool_writes_only_its_worktree() {
         let root = TestRoot::new();
         let git = |args: &[&str]| {
@@ -2839,6 +2933,39 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn model_requests_share_three_slots_and_queue_the_rest() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = TestRoot::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let received = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/v1/chat/completions", post({
+            let (active, peak, received) = (active.clone(), peak.clone(), received.clone());
+            move |Json(_): Json<Value>| {
+                let (active, peak, received) = (active.clone(), peak.clone(), received.clone());
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    received.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    ([("content-type", "text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('transport-test','test','fake','running',0,0)", []).unwrap();
+        let results = futures::future::join_all((0..6).map(|step| diagnostic_round(&state, "fake", step))).await;
+        server.abort();
+        for result in results { result.unwrap(); }
+        assert_eq!(received.load(Ordering::SeqCst), 6);
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

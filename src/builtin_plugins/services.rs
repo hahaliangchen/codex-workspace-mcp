@@ -323,6 +323,7 @@ impl Plugin for AgentTasksPlugin {
         let mut state = AgentServiceState {
             workspace,
             model_client: crate::model_transport::client()?,
+            model_request_slots: crate::agent_service::model_request_slots(),
             provider_url: String::new(),
             api_key: String::new(),
             provider_name: String::new(),

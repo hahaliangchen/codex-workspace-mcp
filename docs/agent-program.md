@@ -41,6 +41,16 @@ main(request)
 
 这里的 `source` 是源码字符串，不能填文件路径让宿主猜。此 JSON 说明提交格式；实际使用文件原文。宿主将 `input` 直接绑定为 `main(request)` 的 `request`，不是 `request.input`。
 
+## 一个 AI 与并发只读操作
+
+[文件读写普通函数](../skills/task-program/examples/file-functions.js)展示如何把已提供的内容写入文件并读回：`writeFile`、`readFile` 都是有实际函数体的普通函数，由宿主直接执行工具调用，不为读写单独请求 AI。每次写入后的读取按顺序进行。此示例串行处理各文件；宿主对单文件写入按路径协调，不同文件的独立写入可以并发。不过当前程序的 `Promise.all` 仍不支持写入或 AI 虚函数调用。
+
+[串行页检查](../skills/task-program/examples/serial-page-review.js)使用普通函数依次读取页面，再把结果交给同一个 AI 上下文判断。[并发只读页检查](../skills/task-program/examples/async-page-review.js)改用 `await Promise.all(request.paths.map(path => io.read({path: path})))`：独立文件读取并发执行，结果仍按输入顺序交给同一个 AI 逐页判断，不启动子 Agent。
+
+受限异步只允许入口函数（`main` 或 `define_task_body` 补写的当前函数）声明 `async`，并允许 `await Promise.all` 接收只读调用的数组字面量，或接收数组的 `map`，其中箭头只有一个简单参数和一个只读调用。允许的调用为 `io.read`、`io.read_lines`、`io.list`、`io.search`，每批最多 32 项；不允许并发写入、AI 调用或其他副作用。输入表达式不能有副作用。所有读取完成后返回按输入排列的真实结果；任一失败进入原有异常路径，宿主不自动重放。一般异步函数、任意 Promise 和 Promise 链不在支持范围内。
+
+宿主为这些任务的模型请求共用一个并发队列，默认同时执行 3 个；启动进程时可用 `CODEX_AGENT_MODEL_CONCURRENCY` 设置正整数上限。等待名额的时间不算模型请求超时，取消任务会退出等待。此限制本身不会让虚函数并发执行：目前 `Promise.all` 尚不能接收 AI 虚函数调用。
+
 ## 完整示例：两个 Agent 并发制作五页
 
 源码：[parallel-five-pages.js](../skills/task-program/examples/parallel-five-pages.js)；输入：[parallel-five-pages.input.json](../skills/task-program/examples/parallel-five-pages.input.json)。此例基于已跑通的两 Agent／五 HTML 流程整理，不复制测试中临时补写的长 HTML 正文。
@@ -112,7 +122,7 @@ main(request)
 
 常见语法归约为已有赋值、分支、跳转、调用和返回结构，不为每种写法新增调度协议。for 的 continue 进入 update 再检查条件；while 的 continue 进入条件；do/while 的 continue 进入末尾条件。break/continue 只退出其跨越的异常处理现场，保留外围 catch。
 
-仍禁止 function*/yield、async/await/Promise、call()/ai() 包装、import/export、TS 类型／断言、箭头／匿名／嵌套函数、闭包、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入，以及未公布的数据方法和 JS 全局环境。源码字符串里的这些词语只是数据，不按词语拦截。需要智能处理时声明注释任务；没有“计算失败后自动交给 AI”的路径。
+入口函数可以使用受限的 `async` 和 `await Promise.all` 并发执行只读文件操作；不支持一般 Promise、异步 helper 或完整 JS。其余仍禁止 function*/yield、call()/ai() 包装、import/export、TS 类型／断言、一般箭头／匿名／嵌套函数、闭包、class/new/this、for-in、switch、finally、标签跳转、展开／剩余／默认参数、可选链、正则／BigInt、位运算、typeof/void/delete、对象成员写入，以及未公布的数据方法和 JS 全局环境。源码字符串里的这些词语只是数据，不按词语拦截。需要智能处理时声明注释任务；没有“计算失败后自动交给 AI”的路径。
 
 ## 确定性的值规则
 

@@ -5,12 +5,25 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-pub static WRITES: Mutex<()> = Mutex::new(());
+static WRITES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
+pub fn file_lock(path: &Path) -> Arc<Mutex<()>> {
+    #[cfg(windows)]
+    let key = PathBuf::from(path.to_string_lossy().to_lowercase());
+    #[cfg(not(windows))]
+    let key = path.to_path_buf();
+    let mut locks = WRITES.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) { return lock; }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub fn workspace_path(root: &Path, raw: &str) -> Result<PathBuf> {
@@ -118,7 +131,7 @@ pub fn commit(path: &Path, original: Option<&[u8]>, content: &[u8]) -> Result<bo
         if let Some(permissions) = permissions {
             fs::set_permissions(&tmp, permissions)?;
         }
-        // The process-wide write lock covers direct MCP and Agent writes. Also
+        // The per-file write lock covers direct MCP and Agent writes. Also
         // reject external changes observed before replacing the destination.
         if snapshot(path)?.as_deref() != original {
             return Err(ToolError::WriteConflict(

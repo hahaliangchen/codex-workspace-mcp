@@ -58,6 +58,7 @@ pub fn is_material_tool(name: &str) -> bool {
         name,
         "read_attachment"
             | "read_file"
+            | "parallel_read_batch"
             | "read_file_lines"
             | "search_text"
             | "search_code_map"

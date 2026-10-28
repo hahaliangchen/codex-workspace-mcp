@@ -29,6 +29,111 @@ fn returned(mut r: Runtime) -> Value {
         other => panic!("expected return, got {other:?}"),
     }
 }
+
+#[test]
+fn serial_page_review_reads_in_order_then_uses_one_ai_scope() {
+    let source = include_str!("../../skills/task-program/examples/serial-page-review.js");
+    let program = compile(source).unwrap();
+    let mut runtime = Runtime::task_program(program, "main", vec![json!({
+        "paths":["1.html","2.html","3.html","4.html","5.html"],
+        "requirements":"检查正文"
+    })]).unwrap();
+    for n in 1..=5 {
+        let State::Action(action) = runtime.next() else { panic!("missing page read") };
+        assert!(matches!(action.kind, ActionKind::Tool { ref name, ref args }
+            if name == "read_file" && args["path"] == format!("{n}.html")));
+        runtime.resume(json!({"content":format!("page {n}")}), false).unwrap();
+    }
+    let State::Action(action) = runtime.next() else { panic!("missing AI inspection") };
+    match action.kind {
+        ActionKind::Call { name, args } => {
+            assert_eq!(name, "inspectPages");
+            assert_eq!(args[0].as_array().unwrap().len(), 5);
+            assert_eq!(args[0][0]["initial"]["content"], "page 1");
+            assert_eq!(args[0][4]["path"], "5.html");
+            assert_eq!(args[1], "检查正文");
+        }
+        other => panic!("expected one AI task, got {other:?}"),
+    }
+    runtime.resume(json!({"reviewed":5}), false).unwrap();
+    assert_eq!(returned(runtime), json!({"reviewed":5}));
+}
+
+#[test]
+fn await_promise_all_suspends_once_and_returns_ordered_read_results() {
+    let mut run = runtime(r#"
+async function main() {
+  const paths = ["first.txt", "second.txt"];
+  return await Promise.all([
+    io.read({path:paths[0]}),
+    io.read({path:paths[1]}),
+    io.search({path:".",query:"needle"})
+  ]);
+}"#);
+    let State::Action(action) = run.next() else { panic!("missing parallel reads") };
+    match action.kind {
+        ActionKind::ParallelReads { operations } => {
+            assert_eq!(operations.len(), 3);
+            assert_eq!(operations[0].0, "read_file");
+            assert_eq!(operations[0].1["path"], "first.txt");
+            assert_eq!(operations[1].1["path"], "second.txt");
+            assert_eq!(operations[2].0, "search_text");
+        }
+        other => panic!("unexpected action {other:?}"),
+    }
+    let mut recovered: Runtime = serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
+    let State::Action(again) = recovered.next() else { panic!("missing saved action") };
+    assert_eq!(again.id, action.id);
+    recovered.resume(json!([{"content":"first"},{"content":"second"},{"matches":[]}]), false).unwrap();
+    assert_eq!(returned(recovered), json!([{"content":"first"},{"content":"second"},{"matches":[]}]));
+}
+
+#[test]
+fn promise_all_rejects_writes_and_ai_calls() {
+    assert!(compile("async function main(){return await Promise.all([io.write({path:'a',content:'b'})]);}").is_err());
+    assert!(compile("async function main(){return await Promise.all([judge()]);} /** @virtual */ function judge(){}").is_err());
+    assert!(compile("async function main(){return await Promise.all([fork(worker)]);} function worker(){return 1;}").is_err());
+}
+
+#[test]
+fn failed_parallel_reads_follow_catch_without_repeating_the_batch() {
+    let mut run = runtime(r#"
+async function main() {
+  try { return await Promise.all([io.read({path:"a"}),io.read({path:"b"})]); }
+  catch(error) { return error.message; }
+}"#);
+    assert!(matches!(run.next(), State::Action(action) if matches!(action.kind, ActionKind::ParallelReads { .. })));
+    run.resume(json!({"message":"read failed"}), true).unwrap();
+    assert_eq!(returned(run), json!("read failed"));
+}
+
+#[test]
+fn promise_all_maps_dynamic_page_list_without_agents() {
+    let source = include_str!("../../skills/task-program/examples/async-page-review.js");
+    let program = compile(source).unwrap();
+    let mut run = Runtime::task_program(program, "main", vec![json!({"paths":["a.html","b.html","c.html","d.html","e.html"],"requirements":"检查正文"})]).unwrap();
+    let State::Action(action) = run.next() else { panic!("missing batch") };
+    let ActionKind::ParallelReads { operations } = action.kind else { panic!("expected read batch") };
+    assert_eq!(operations.len(), 5);
+    assert_eq!(operations.iter().map(|(_, args)|args["path"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a.html","b.html","c.html","d.html","e.html"]);
+    run.resume(json!([{ "content":"a" },{ "content":"b" },{ "content":"c" },{ "content":"d" },{ "content":"e" }]), false).unwrap();
+    let State::Action(action) = run.next() else { panic!("missing AI inspection") };
+    assert!(matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspectPages" && args[0][4]["initial"]["content"] == "e" && args[1] == "检查正文"));
+}
+
+#[test]
+fn virtual_function_body_can_be_refined_to_an_async_entry() {
+    let program = compile_body(r#"
+async function review(paths) {
+  return await Promise.all(paths.map(path => io.read({path:path})));
+}"#, "review").unwrap();
+    let mut run = Runtime::task_program(program, "review", vec![json!(["a","b"])]).unwrap();
+    let State::Action(action) = run.next() else { panic!("missing read batch") };
+    assert!(matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len() == 2));
+    run.resume(json!([{ "content":"a" },{ "content":"b" }]), false).unwrap();
+    assert_eq!(returned(run), json!([{ "content":"a" },{ "content":"b" }]));
+    assert!(compile_body("async function review(){return review();}", "review").is_err());
+}
 #[test]
 fn data_loops_local_calls_and_destructuring_need_no_operators() {
     let mut r = runtime(
@@ -648,7 +753,7 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
     for source in [
         "function* main(){return 1;}",
         "function main(){return 1;} function* unused(){return 1;}",
-        "async function main(){return 1;}",
+        "function main(){return 1;} async function unused(){return 1;}",
         "import {tools} from '@agent/runtime'; function main(){return 1;}",
         "export function main(){return 1;}",
         "type Result = string; function main(){return 1;}",
@@ -730,7 +835,7 @@ fn embedded_skill_and_tool_contracts_advertise_the_same_source_whitelist() {
         for required in [
             "function*",
             "yield",
-            "async/await",
+            "Promise.all",
             "call()/ai()",
             "if/else",
         ] {
@@ -787,6 +892,7 @@ impl TutorialRun {
                 State::Action(action) => action,
             };
             let result = match action.kind {
+                ActionKind::ParallelReads { .. } => panic!("tutorial does not use parallel reads"),
                 ActionKind::Call { name, args } => {
                     self.run(Runtime::task_program(run.program.clone(), &name, args).unwrap())
                 }
