@@ -219,7 +219,6 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         json!({"asset_ids":{"type":"array","minItems":1,"items":{"type":"string"}},"reason":{"type":"string"}}),json!(["asset_ids","reason"])));
     tools.push(function("list_context_assets", "Inspect the asset references and loaded/reference-only states in your current context. Does not read asset files or alter context.",json!({}),json!([])));
     {
-        tools.push(function_scope::tool());
         tools.push(crate::agent_program::declarations::contract_tool());
         tools.push(function("read_program_guide", "Read supported flow language capabilities and differences from JavaScript on demand.", json!({}), json!([])));
         if w.program_task.is_some() {
@@ -261,6 +260,18 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         tools.push(function("refresh_asset", "Explicitly re-read the current local file/range behind an existing file asset. Returns its current version as an asset; keeps the old snapshot and reference. Never replays commands or captures screenshots.",json!({"asset_id":{"type":"string"}}),json!(["asset_id"])));
     }
     tools.retain(|tool| page_allows(s, tool["function"]["name"].as_str().unwrap_or("")));
+    // These serve the main conversation itself: its saved materials, task
+    // board, history and project notes. A virtual function has only its
+    // arguments, so they are no part of its libraries.
+    if program_flow::role(w) != program_flow::Role::Main {
+        tools.retain(|tool| {
+            !matches!(
+                tool["function"]["name"].as_str(),
+                Some("read_asset" | "release_assets" | "list_context_assets" | "refresh_asset"
+                    | "read_task_board" | "read_session_history" | "propose_project_note")
+            )
+        });
+    }
     tools
 }
 fn page_allows(s: &Session<'_>, name: &str) -> bool {
@@ -553,27 +564,15 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             .clone()
             .or(frame_id.clone())
             .unwrap_or_else(|| crate::task_tree::ROOT.to_owned());
-        if role == "main" && let Ok(conn) = agent_service::open_db(s.state.workspace.root()) {
-            let status = if s.task_node_id.is_some() || frame_id.is_some() {
-                crate::task_tree::path_status(&conn, s.task, &frame_node).ok()
-            } else if s.delegate_id().is_none()
-                && let Ok(Some(active)) = crate::task_tree::active(&conn, s.task)
-            {
-                frame_node = active.node_id;
-                crate::task_tree::path_status(&conn, s.task, &frame_node).ok()
-            } else {
-                None
-            };
-            if let Some(mut status) = status {
-                // Step descriptions already travel in the working view.
-                if let Some(object) = status.as_object_mut() {
-                    object.remove("steps");
-                    object.remove("earlier_steps_omitted");
-                }
-                host_messages.push(host_message(
-                    json!({"name":"task_status","content":status.to_string()}),
-                ));
-            }
+        // The main window's active task decides whose saved materials are indexed.
+        if role == "main"
+            && s.task_node_id.is_none()
+            && frame_id.is_none()
+            && s.delegate_id().is_none()
+            && let Ok(conn) = agent_service::open_db(s.state.workspace.root())
+            && let Ok(Some(active)) = crate::task_tree::active(&conn, s.task)
+        {
+            frame_node = active.node_id;
         }
         match crate::context_assets::frame_index(
             s.state.workspace.root(),
@@ -1324,7 +1323,7 @@ fn material_over_capacity(
         "delivered":false,"loaded_assets_unchanged":true,
         "next_read":reference["asset_id"].as_str().map(|id|json!({"tool":"read_asset","arguments":{"asset_id":id,"char_offset":0,"max_chars":PAGE_CHARS}})),
         "history_reference":{"tool":"read_session_history","arguments":{"task_id":s.task,"event_seq":event_seq}},
-        "instruction":"The original body was saved but not delivered. With an asset_reference, read only needed pages using the advertised snapshot reader (char_offset, max_chars up to 24000), or create a child task with this asset_id and a precise goal/briefing to process it in pages and return only the needed result. You decide which route is useful; the host does not create tasks automatically. Without an asset_reference, recover the saved result through history_reference in pages."})
+        "instruction":"The original body was saved but not delivered. Read only the pages you need with host.read_asset (char_offset, max_chars up to 24000); the host does not load it automatically."})
 }
 
 /// New jobs persist their step at submission. Only legacy jobs consult history.
@@ -1858,7 +1857,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                         Ok(json!(results))
                     },
                     name if name == program_flow::FIND => program_flow::find(s, w, &args),
-                    "read_scope" => { material_source=Some(("read_scope".into(),args.clone())); function_scope::read(w,&args) },
                     "read_program_guide" => { Ok(json!({"guide":crate::agent_program::CAPABILITIES})) },
                     "read_tool_contracts" => {
                         let catalog = program_flow::library_catalog(s, &definitions);

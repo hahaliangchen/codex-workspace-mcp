@@ -529,13 +529,12 @@ fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node) -> Result<Wind
         let mut messages = vec![json!({"role":"system","content":s.prompt()})];
         inherit_material(parent, &mut messages);
         child.messages = messages;
+        child.scope_values.clear();
     }
     child.messages.push(json!({"role":"user","name":"program_task_input","content":input.to_string(),"_frame_input":true}));
     child.program = super::program_flow::task_runtime(&task)?;
     child.program_task = Some(task);
-    if !virtual_function && let Some(index) = super::function_scope::index(&child) {
-        child.messages.push(index);
-    }
+
     let mut session = s.clone();
     session.scope = tree::frame_scope(node);
     fit_input_bodies(&session, &mut child)?;
@@ -552,7 +551,6 @@ fn inherited_frame(s: &Session<'_>, parent: &Window, node: &Node) -> Window {
             .filter(|m| is_user_original(m))
             .cloned(),
     );
-    messages.push(scope_environment(parent, &frame_task(s, parent)));
     Window {
         scope_values: super::function_scope::values(parent),
         messages,
@@ -936,13 +934,6 @@ fn fit_input_bodies(s: &Session<'_>, child: &mut Window) -> Result<()> {
     Ok(())
 }
 
-fn scope_environment(parent: &Window, owner: &str) -> Value {
-    json!({"role":"user","name":"scope_environment","_frame_input":true,
-        "content":json!({"host_status":true,"not_a_user_request":true,
-            "parent_task":owner,
-            "active_skills":parent.active_skills,
-            "instruction":"Prepared capabilities remain available within their permissions. Compiled functions receive actual arguments in program_task_input.bindings; scope_variables indexes inherited names, and host.read_scope retrieves values as needed. The entry snapshot is read-only; later parent updates are not included. Local work stays here and only explicit results return."}).to_string()})
-}
 
 /// Point a frame at the node it now executes: refresh its path and node card.
 fn inherit_material(parent: &Window, messages: &mut Vec<Value>) {
@@ -994,34 +985,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    #[tokio::test]
-    async fn large_unused_inherited_value_is_indexed_and_available_on_demand() {
-        let original = "unique-context-value-".repeat(3_000);
-        let mut child = Window {
-            scope_values: BTreeMap::from([("inherited".into(), json!(original))]),
-            messages: vec![json!({"role":"system","content":MAIN_PROMPT})],
-            ..Default::default()
-        };
-        child
-            .messages
-            .push(super::super::function_scope::index(&child).unwrap());
-        let snapshot: Value =
-            serde_json::from_str(child.messages.last().unwrap()["content"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(snapshot["variables"][0]["name"], "inherited");
-        assert!(
-            !child
-                .messages
-                .last()
-                .unwrap()
-                .to_string()
-                .contains("unique-context-value")
-        );
-        assert_eq!(
-            super::super::function_scope::read(&child, &json!({"name":"inherited"})).unwrap()["value"],
-            original
-        );
-    }
 
     struct Harness {
         root: std::path::PathBuf,

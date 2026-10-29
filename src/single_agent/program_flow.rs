@@ -951,7 +951,13 @@ mod tests {
             let role = role_of(&body);
             let tools = tool_names(&body);
             let prompt = body["messages"][0]["content"].as_str().unwrap_or("").to_owned();
+            let text = body.to_string();
+            assert!(!text.contains("\"task_status\"") && !text.contains("read_scope"), "no task-tree status or scope reads reach the model");
             if role == "implement" {
+                let headers = body["messages"].as_array().unwrap().iter().find(|m| m["name"] == "program_tool_headers").unwrap()["content"].as_str().unwrap().to_owned();
+                for main_only in ["read_asset(", "read_task_board(", "list_context_assets(", "read_session_history("] {
+                    assert!(!headers.contains(main_only), "an implementation's libraries hold no {main_only}");
+                }
                 let input = body["messages"].as_array().unwrap().iter().find(|m| m["name"] == "program_task_input").unwrap();
                 let input: Value = serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
                 assert_eq!(input["signature"], "async function summarize(paths)", "the declared async is shown");

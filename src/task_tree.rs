@@ -247,51 +247,7 @@ fn text(args: &Value, field: &str) -> Result<String> {
 /// Every task ends at its finish node; steps are ordered before it.
 pub const FINISH_ORDINAL: usize = 1_000_000;
 
-fn clip(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_owned();
-    }
-    format!("{}…", text.chars().take(limit).collect::<String>())
-}
 
-/// Where execution stands in the task graph, rebuilt from durable nodes for
-/// every request so compression can never drop the goals above the current step.
-pub fn path_status(conn: &Connection, task: &str, id: &str) -> Result<Value> {
-    let node = get(conn, task, id)?;
-    if !is_task(&node) {
-        return Ok(
-            json!({"task":null,"instruction":"No task is running. To answer without tools, reply directly. Before using tools for any business execution, write a short execution program sketch in create_task briefing and call create_task alone with goal. A materialized step list is not required."}),
-        );
-    }
-    let mut tasks = Vec::new();
-    for ancestor in path(conn, task, id)?.into_iter().filter(is_task) {
-        let waiting = if ancestor.node_id == id {
-            None
-        } else {
-            current_step(conn, task, &ancestor.node_id)?.map(|step| clip(&step.title, 160))
-        };
-        tasks.push(json!({"node_id":ancestor.node_id,"role":if is_temp(&ancestor) {"temporary"} else {"main"},
-            "goal":clip(&ancestor.goal,400),"reason":ancestor.spawned_from,"suspended_at_step":waiting}));
-    }
-    let steps = children(conn, task, id)?
-        .into_iter()
-        .filter(|n| n.kind == "step")
-        .collect::<Vec<_>>();
-    let omitted = steps.len().saturating_sub(30);
-    let listed = steps[omitted..]
-        .iter()
-        .map(|step| json!({"node_id":step.node_id,"title":clip(&step.title,160),"status":step.status,
-            "result":step.result.as_ref().and_then(|r|r["result"].as_str()).map(|text|clip(text,200))}))
-        .collect::<Vec<_>>();
-    let current = steps
-        .iter()
-        .find(|n| n.status == "current")
-        .map(|step| json!({"node_id":step.node_id,"title":step.title}));
-    let instruction = "Execute the current user goal using the supplied materials: reply with its complete program as one ```js block, or answer directly when no program is needed. The host records actual calls and results.";
-    Ok(
-        json!({"task_path":tasks,"steps":listed,"earlier_steps_omitted":omitted,"current_step":current,"instruction":instruction}),
-    )
-}
 
 pub fn planned(parent: &Node, args: &Value, ordinal: usize, kind: &str) -> Result<Node> {
     let executor = args["executor"].as_str().unwrap_or("inline");
