@@ -171,6 +171,10 @@ node --test tests/*.test.mjs
 
 浏览器与实际模型验收中的忽略测试需要对应环境，普通测试不要求配置真实模型。
 
+## 项目贡献
+
+本项目的开发得到 Claude 和 OpenAI Codex 的协助。具体贡献可在 Git 提交记录中查看。
+
 ## 按功能查看代码 Flow
 
 会话顶部 **技能页面 → 代码 Flow** 按功能分级展示当前方法调用关系。根目录 [code-flow.json](code-flow.json) 声明职责、公共入口、方法绑定和测试入口；宿主只提取源码证据，不自动判断耦合或重复实现。人和 AI 的 `read_code_flow` 工具使用同一个图读取器。首版支持 Rust，并明确保留边界、歧义和未解析调用。详见 [代码 Flow 首版说明](docs/code_flow_v1.md)。
