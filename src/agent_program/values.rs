@@ -35,7 +35,9 @@ pub(super) fn compile_regex(pattern: &str, flags: &str) -> Result<regex::Regex> 
         .case_insensitive(flags.contains('i'))
         .multi_line(flags.contains('m'))
         .dot_matches_new_line(flags.contains('s'))
-        .size_limit(1024 * 1024);
+        // Counted repetition such as [\s\S]{0,1800} is ordinary JS; an
+        // automaton unrolls it, so the budget is sized for that, not 1 MB.
+        .size_limit(64 * 1024 * 1024);
     Ok(builder.build()?)
 }
 

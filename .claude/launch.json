@@ -15,6 +15,17 @@
         "--strictPort"
       ],
       "port": 5174
+    },
+    {
+      "name": "agent-design-slides",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "WORKSPACE_ROOT=runs/agent-design-5-slides",
+        "AGENT_BIND=127.0.0.1:3101",
+        "MCP_BIND=127.0.0.1:3100",
+        "target/debug/codex-workspace-mcp"
+      ],
+      "port": 3101
     }
   ]
 }

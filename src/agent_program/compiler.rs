@@ -39,6 +39,11 @@ struct Compiler {
     chain_exits: Option<Vec<usize>>,
     /// The next lowered expression is the object of the current chain link.
     chain_object: bool,
+    /// Header contracts of every function declaration, nested ones included,
+    /// keyed by the position of the function.
+    contracts: std::sync::Arc<BTreeMap<u32, (bool, String)>>,
+    /// The tools a virtual declared here may use, when this is an implementation.
+    leaf_tools: Option<Vec<String>>,
 }
 
 /// Global built-in functions that can be used as values, as in `.filter(Boolean)`.
@@ -690,6 +695,8 @@ impl Compiler {
             finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
+            contracts: self.contracts.clone(),
+            leaf_tools: self.leaf_tools.clone(),
         };
         let mut params = Vec::new();
         let mut parameter_lexical = Vec::new();
@@ -736,7 +743,25 @@ impl Compiler {
             }
             _ => (Vec::new(), Vec::new()),
         };
+        // A nested declaration marked @virtual is AI work, as at the top level.
+        let contract = source.name.as_ref().and_then(|_| self.contracts.get(&source.span.lo.0)).filter(|(v, _)| *v).cloned();
         match source.body {
+            FunctionBody::Block(body) if contract.is_some() => {
+                let (_, description) = contract.clone().unwrap();
+                if patterned {
+                    return c.error(source.span, "@virtual functions require simple parameters");
+                }
+                if !body.stmts.iter().all(|s| matches!(s, ast::Stmt::Empty(_))) {
+                    return c.error(body.span, "@virtual declares AI work: its body holds only comments describing it");
+                }
+                if description.is_empty() {
+                    return c.error(body.span, "@virtual needs a task description and return contract");
+                }
+                let input = Expr::Object(params.iter().map(|p| (p.clone(), Expr::Variable(p.clone()))).collect());
+                let dest = c.temp();
+                c.emit(body.span, Op::Effect(Some(dest.clone()), Effect::Task { name: id.clone(), description, input }));
+                c.emit(body.span, Op::Return(Expr::Variable(dest)));
+            }
             FunctionBody::Block(body) => {
                 c.hoist_functions(&body.stmts)?;
                 for s in &body.stmts {
@@ -751,11 +776,13 @@ impl Compiler {
             FunctionBody::Missing => return c.error(source.span, "function body is required"),
         }
         self.nested.extend(c.nested);
+        let virtual_task = contract.is_some();
         self.nested.push((
             id.clone(),
             Function {
-                description: String::new(),
-                virtual_task: false,
+                description: contract.map(|(_, description)| description).unwrap_or_default(),
+                virtual_task,
+                leaf_tools: if virtual_task { self.leaf_tools.clone() } else { None },
                 params,
                 rest_parameter,
                 parameter_scope: patterned,
@@ -857,9 +884,6 @@ impl Compiler {
                         "the async entry is awaited by the host and cannot be called as a helper",
                     );
                 }
-                if i.sym == *"main" {
-                    return self.error(call.span, "main is the sole entry, not a callable helper");
-                }
                 // Virtual calls bind arguments exactly; ordinary functions use JS arity.
                 let exact = self.virtuals.contains(i.sym.as_ref());
                 if exact && self.arities[i.sym.as_ref()] != args.len() {
@@ -904,17 +928,6 @@ impl Compiler {
                 );
             }
         };
-        if matches!(
-            target.as_str(),
-            "execute_program"
-                | "check_program"
-                | "define_task_body"
-                | "create_task"
-                | "spawn_agent"
-                | "join_agents"
-        ) {
-            return self.error(call.span,"use local and async virtual functions rather than recursively controlling program/task execution");
-        }
         if args.len() > 1 {
             return self.error(call.span, "a tool call takes one JSON argument object");
         }
@@ -2328,7 +2341,7 @@ pub fn compile_with_libraries(
     source: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    link_prelude(compile_inner(source, "main", false, libraries, BTreeSet::new(), false)?)
+    link_prelude(compile_inner(source, super::ENTRY, false, libraries, BTreeSet::new(), false)?)
 }
 #[cfg(test)]
 pub fn compile_body_with_libraries(
@@ -2347,7 +2360,7 @@ pub fn compile_body_with_scope(
     let program = link_prelude(compile_inner(source, entry, true, libraries, external_names, false)?)?;
     ensure!(
         !program.functions[entry].virtual_task,
-        "define_task_body must implement the current function, not return another empty stub"
+        "the implementation of {entry} needs a real body; do not mark it @virtual again"
     );
     Ok(program)
 }
@@ -2423,6 +2436,16 @@ fn compile_inner(
     let mut imported_libraries = super::libraries::Libraries::new();
     let mut imported_names = BTreeSet::new();
     let mut has_import = false;
+    // Every function declaration, nested ones included, for their contracts.
+    struct Declarations(Vec<ast::FnDecl>);
+    impl Visit for Declarations {
+        fn visit_fn_decl(&mut self, node: &ast::FnDecl) {
+            self.0.push(node.clone());
+            node.visit_children_with(self);
+        }
+    }
+    let mut all_declarations = Declarations(Vec::new());
+    module.visit_with(&mut all_declarations);
     for item in module.body {
         match item {
             ast::ModuleItem::ModuleDecl(ast::ModuleDecl::Import(import)) => {
@@ -2476,7 +2499,7 @@ fn compile_inner(
                 }
             }
             ast::ModuleItem::Stmt(ast::Stmt::Decl(ast::Decl::Fn(f))) => declarations.push(f),
-            ast::ModuleItem::Stmt(stmt) if !refinement && entry == "main" => top_level.push(stmt),
+            ast::ModuleItem::Stmt(stmt) if !refinement && entry == super::ENTRY => top_level.push(stmt),
             other => {
                 let p = map.lookup_char_pos(other.span().lo);
                 bail!(
@@ -2487,10 +2510,15 @@ fn compile_inner(
             }
         }
     }
-    // Existing function-only programs remain executable without affecting the new top-level form.
-    let implicit_entry = !refinement
-        && entry == "main"
-        && (!top_level.is_empty() || !declarations.iter().any(|f| f.ident.sym == *"main"));
+    let imported_tools = imports
+        .values()
+        .chain(imported_libraries.values().flat_map(|methods| methods.values()))
+        .map(|tool| tool.trim_start_matches("async-tool:").to_owned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // The top-level statements are the program, as in a JavaScript module.
+    let implicit_entry = !refinement && entry == super::ENTRY;
     let libraries = if has_import {
         imported_libraries
     } else {
@@ -2502,7 +2530,7 @@ fn compile_inner(
     );
     let mut names = BTreeSet::new();
     if implicit_entry {
-        names.insert("main".into());
+        names.insert(super::ENTRY.into());
     }
     for f in &declarations {
         ensure!(
@@ -2533,17 +2561,13 @@ fn compile_inner(
         names.contains(entry),
         "TS_PROGRAM 1:1: declare the required entry function {entry}"
     );
-    ensure!(
-        !refinement || !names.contains("main"),
-        "task refinement implements the current function, never another main"
-    );
     let mut functions = BTreeMap::new();
     let mut arities = declarations
         .iter()
         .map(|f| (f.ident.sym.to_string(), f.function.params.len()))
         .collect::<BTreeMap<_, _>>();
     if implicit_entry {
-        arities.insert("main".into(), 1);
+        arities.insert(super::ENTRY.into(), 0);
     }
     let async_entry = declarations
         .iter()
@@ -2562,23 +2586,29 @@ fn compile_inner(
         for note in notes.iter().rev().filter(|n| n.span.hi <= f.function.span.lo) {
             let lo = (note.span.hi.0 - file.start_pos.0) as usize;
             let hi = (header_start.0 - file.start_pos.0) as usize;
-            if !source.get(lo..hi).is_some_and(|gap| gap.trim().is_empty()) {
+            // A blank line ends the header: a comment above it belongs to the code before.
+            if !source.get(lo..hi).is_some_and(|gap| gap.trim().is_empty() && gap.matches('\n').count() <= 1) {
                 break;
             }
             header.push(note.text.to_string());
             header_start = note.span.lo;
         }
         header.reverse();
-        header.extend(
-            notes
-                .iter()
-                .filter(|n| n.span.lo >= body.span.lo && n.span.hi <= body.span.hi)
-                .map(|n| n.text.to_string()),
-        );
+        let marked = |text: &str| {
+            text.split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '@' | '_')))
+                .any(|word| word == "@virtual")
+        };
+        let inner = notes
+            .iter()
+            .filter(|n| n.span.lo >= body.span.lo && n.span.hi <= body.span.hi)
+            .map(|n| n.text.to_string())
+            .collect::<Vec<_>>();
+        // The header marks a function virtual, and so does a marker in a body
+        // that holds only comments. A nested helper's marker belongs to it.
+        let comment_only = body.stmts.iter().all(|s| matches!(s, ast::Stmt::Empty(_)));
+        let virtual_task = marked(&header.join("\n")) || (comment_only && marked(&inner.join("\n")));
+        header.extend(inner);
         let contract = header.join("\n");
-        let virtual_task = contract
-            .split(|ch: char| !(ch.is_alphanumeric() || matches!(ch, '@' | '_')))
-            .any(|word| word == "@virtual");
         let description = contract
             .lines()
             .map(|line| line.trim().trim_start_matches('*').trim())
@@ -2598,6 +2628,10 @@ fn compile_inner(
         .iter()
         .map(|f| (f.ident.sym.to_string(), contract_of(f)))
         .collect::<BTreeMap<_, _>>();
+    let contracts_by_position = std::sync::Arc::new(
+        all_declarations.0.iter().map(|f| (f.function.span.lo.0, contract_of(f))).collect::<BTreeMap<_, _>>(),
+    );
+    let leaf_tools = refinement.then(|| imported_tools.clone());
     let virtuals = contracts
         .iter()
         .filter(|(_, (virtual_task, _))| *virtual_task)
@@ -2630,7 +2664,7 @@ fn compile_inner(
             external: external.clone(),
             temp_names: BTreeSet::new(),
             runtime_scopes: 0,
-            function_id: "main".into(),
+            function_id: super::ENTRY.into(),
             nested: Vec::new(),
             virtuals: virtuals.clone(),
             async_functions: async_functions.clone(),
@@ -2641,8 +2675,9 @@ fn compile_inner(
             finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
+            contracts: contracts_by_position.clone(),
+            leaf_tools: leaf_tools.clone(),
         };
-        c.declare("input", false, module.span)?;
         for name in &module_vars {
             c.declare(name, true, module.span)?;
         }
@@ -2663,11 +2698,12 @@ fn compile_inner(
         c.emit(module.span, Op::Return(Expr::Undefined));
         functions.extend(std::mem::take(&mut c.nested));
         functions.insert(
-            "main".into(),
+            super::ENTRY.into(),
             Function {
                 description: String::new(),
                 virtual_task: false,
-                params: vec!["input".into()],
+                leaf_tools: None,
+                params: Vec::new(),
                 rest_parameter: None,
                 parameter_scope: false,
                 parameter_lexical: Vec::new(),
@@ -2703,12 +2739,11 @@ fn compile_inner(
             finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
+            contracts: contracts_by_position.clone(),
+            leaf_tools: leaf_tools.clone(),
         };
         if f.function.is_generator {
             return c.error(f.function.span, "generator functions are unsupported");
-        }
-        if f.ident.sym == *"main" && f.function.params.len() > 1 {
-            return c.error(f.function.span, "main accepts zero or one input parameter");
         }
         let mut params = Vec::new();
         let mut parameter_names = Vec::new();
@@ -2778,12 +2813,6 @@ fn compile_inner(
                     "@virtual needs a task description and return contract",
                 );
             }
-            if f.ident.sym == *"main" {
-                return c.error(
-                    body.span,
-                    "main must orchestrate the complete task and cannot be @virtual",
-                );
-            }
             let input = Expr::Object(
                 params
                     .iter()
@@ -2822,6 +2851,7 @@ fn compile_inner(
             Function {
                 description,
                 virtual_task,
+                leaf_tools: if virtual_task { leaf_tools.clone() } else { None },
                 params,
                 rest_parameter,
                 parameter_scope: patterned,

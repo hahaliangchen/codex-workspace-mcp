@@ -287,11 +287,7 @@ pub fn path_status(conn: &Connection, task: &str, id: &str) -> Result<Value> {
         .iter()
         .find(|n| n.status == "current")
         .map(|step| json!({"node_id":step.node_id,"title":step.title}));
-    let instruction = if node.inputs["program_task"].is_object() {
-        "Execute this helper body using its description, named arguments and supplied materials. Use tools as steps or define_task_body to implement this same function with child task calls; return its contracted JSON value to the waiting caller. Do not create another main. The host records actual calls and results."
-    } else {
-        "Execute the current user goal using the supplied materials. After required skill/tool preparation, submit its complete program through execute_program: one main for the full task, helper call for serial work, fork/join for authorized parallel work. Main returns when its requested work, checks and delivery are complete; helper returns resume their caller. The host records actual calls and results; do not recreate step nodes."
-    };
+    let instruction = "Execute the current user goal using the supplied materials: reply with its complete program as one ```js block, or answer directly when no program is needed. The host records actual calls and results.";
     Ok(
         json!({"task_path":tasks,"steps":listed,"earlier_steps_omitted":omitted,"current_step":current,"instruction":instruction}),
     )

@@ -1,8 +1,12 @@
-// 一个普通函数按输入顺序读取页面，再交给同一个 AI 上下文逐页判断。
-// 这是串行基线，不启动子 Agent，也不要求视觉检查。
-function main(request) {
-  return reviewPages(request.paths, request.requirements);
-}
+import * as io from "host:io";
+// 一个普通函数按顺序读取页面，再交给同一个 AI 上下文逐页判断。
+// 这是串行基线，不要求视觉检查。
+const request = {
+  paths: ["a.html", "b.html", "c.html", "d.html", "e.html"],
+  requirements: "检查正文"
+};
+
+const review = reviewPages(request.paths, request.requirements);
 
 function reviewPages(paths, requirements) {
   const pages = [];

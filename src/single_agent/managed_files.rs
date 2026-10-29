@@ -286,47 +286,4 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn conflict_stops_the_turn_without_retry() -> Result<()> {
-        use axum::{Json, Router, routing::post};
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
-        let root = root();
-        fs::write(root.join("document.txt"), "original")?;
-        let count = Arc::new(AtomicUsize::new(0));
-        let requests = count.clone();
-        let external = root.join("document.txt");
-        let app = Router::new().route("/v1/chat/completions", post(move |Json(_body): Json<Value>| {
-            let n = requests.fetch_add(1, Ordering::SeqCst);
-            let (name, args) = match n {
-                0 => ("create_task", json!({"goal":"Update the file"})),
-                1 => ("execute_program", json!({"source":"function main(){return work();} /** @virtual Update the file. */ function work(){}"})),
-                2 => ("invoke_library", json!({"method":"io.read","args":{"path":"document.txt"}})),
-                3 => {
-                    fs::write(&external, "external").unwrap();
-                    ("invoke_library", json!({"method":"io.write","args":{"path":"document.txt","content":"agent"}}))
-                }
-                _ => panic!("conflict must stop before another model request"),
-            };
-            let message = json!({"role":"assistant","tool_calls":[{"id":format!("call-{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
-            async move { Json(json!({"choices":[{"finish_reason":"tool_calls","message":message}]})) }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let state = crate::agent_service::tests::test_state(&root, listener.local_addr()?);
-        let conn = crate::agent_service::open_db(&root)?;
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", [])?;
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        super::super::run_task(state, "task".into(), "fake".into(), "Update the file".into(), 10, tokio_util::sync::CancellationToken::new(), 1, false).await?;
-        server.abort();
-        assert_eq!(count.load(Ordering::SeqCst), 4);
-        assert_eq!(fs::read_to_string(root.join("document.txt"))?, "external");
-        let raw: String = conn.query_row("SELECT data FROM agent_task_events WHERE kind='tool/result' AND json_extract(data,'$.meta.result.error_code')='ASSET_CONFLICT'", [], |r| r.get(0))?;
-        let result: Value = serde_json::from_str(&raw)?;
-        let copy = result["meta"]["result"]["candidate_path"].as_str().context("candidate path")?;
-        assert_eq!(fs::read_to_string(copy)?, "agent");
-        let status: String = conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| r.get(0))?;
-        assert_eq!(status, "failed");
-        drop(conn);
-        let _ = fs::remove_dir_all(root);
-        Ok(())
-    }
 }

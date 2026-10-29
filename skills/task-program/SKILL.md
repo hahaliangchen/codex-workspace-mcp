@@ -9,16 +9,20 @@ description: 将用户目标与业务 skill 表达为可执行的流程伪代码
 
 ## 从完整示例学习
 
-这是一门面向 Agent 工作流的领域语言，借用 JS 的表面语法；执行规则以本 Skill 为准。下面两份完整程序供查阅；宿主不会在每次规划时自动注入本 Skill 或示例。完整说明见 [语言手册](../../docs/agent-program.md)，包括提交方式、输入绑定、逐阶段数据流、当前函数补写、失败处理和语法差异。示例只是教学，不把 HTML、五页或两个 Agent 规定为其他业务的流程。
+流程就是普通的 JavaScript：宿主实现其中的一个子集，工具是从 `host:<library>` 导入的库方法，AI 工作是 `@virtual` 函数。下面两份完整程序供查阅；宿主不会在每次规划时自动注入本 Skill 或示例。完整说明见 [语言手册](../../docs/agent-program.md)，包括运行方式、逐阶段数据流、当前函数补写、失败处理和尚未支持的 JS 功能。示例只是教学，不把 HTML、五页或两个 Agent 规定为其他业务的流程。
 
 ### 最小串行程序
 
-源码：[serial.js](examples/serial.js)；输入：[serial.input.json](examples/serial.input.json)。execute_program 的 source 取源码全文，input 取 JSON 对象。普通函数调用顺序执行，不启动另一个 Agent。compose 返回正文，工具保存并读回，inspect 对实际正文检查，断言通过才交付。
+源码：[serial.js](examples/serial.js)。把程序放在回复的一个 ```js 代码块里，宿主收到后直接运行；用户请求中的数据直接写进代码。普通函数调用顺序执行。compose 返回正文，工具保存并读回，inspect 对实际正文检查，断言通过才交付。
 
 ```js
-// 最小串行流程：设计 → 保存 → 读回 → 验收 → 交付。不启动子 Agent。
 import * as io from "host:io";
-const request = input;
+// 最小串行流程：设计 → 保存 → 读回 → 验收 → 交付。
+const request = {
+  topic: "通用 Agent 的职责边界",
+  output: "agent-overview.html",
+  requirements: "制作一个独立中文 HTML，说明用户、AI、通用宿主、插件和工具的职责。内嵌 CSS，可在桌面与手机阅读；准确区分流程结束与业务验收。"
+};
 
 const draft = compose(request);
 const receipt = io.write({path: request.output, content: draft.content});
@@ -43,14 +47,23 @@ function inspect(request, content) {
 
 ### 并发制作并验收五页
 
-源码：[parallel-five-pages.js](examples/parallel-five-pages.js)；输入：[parallel-five-pages.input.json](examples/parallel-five-pages.input.json)。读取真实源材料后，每页通过 async 虚函数并发设计；父流程统一写入，再对实际读回的内容并发验收。失败进入 `await` 的异常路径。
+源码：[parallel-five-pages.js](examples/parallel-five-pages.js)。读取真实源材料后，每页通过 async 虚函数并发设计；父流程统一写入，再对实际读回的内容并发验收。失败进入 `await` 的异常路径。
 
 ```js
-// 五页并发设计、统一写入，再并发检查实际读回的内容。
+// 五页并发设计、统一写入，再并发检查实际读回的内容；未通过的页修正一轮后复检。
 import * as io from "host:io";
-const request = input;
+const request = {
+  source: "docs/agent-design-guide.md",
+  requirements: "制作五个内容不同、风格协调的独立中文 HTML。忠实于源材料的当前设计，准确区分已废弃的机制和现行设计；内嵌 CSS、无外部资源依赖，兼顾桌面与手机阅读。完成后对实际读回的各页进行验收。",
+  pages: [
+    {path: "agent-01-overview.html", title: "设计出发点", focus: "朴素循环为何最稳、上下文有限带来的问题，以及用函数作用域代替压缩"},
+    {path: "agent-02-program.html", title: "流程与虚函数", focus: "流程代码就是 JavaScript、虚函数是唯一的 AI 入口、第一层与叶子的两层边界"},
+    {path: "agent-03-scope.html", title: "作用域与上下文", focus: "参数显式传入、返回值是跨作用域的唯一通道、上下文超限时抛错而不压缩"},
+    {path: "agent-04-libraries.html", title: "工具库与并发", focus: "工具即库并通过 import 引入、叶子的工具范围与运行时查找、Promise 取代子 Agent"},
+    {path: "agent-05-acceptance.html", title: "错误与交付", focus: "错误统一走异常、副作用边界、已废弃机制，以及真实证据与完成条件"}
+  ]
+};
 
-assert(request.pages.length === 5, "此教学示例接收五页清单");
 const source = io.read({path: request.source});
 const shared = {
   source_path: request.source,
@@ -62,12 +75,21 @@ const designs = await Promise.all(request.pages.map(page => designPage(shared, p
 for (let i = 0; i < request.pages.length; i++) {
   io.write({path: request.pages[i].path, content: designs[i].content});
 }
-const reviews = await Promise.all(request.pages.map(async page => {
+const review = async page => {
   const actual = io.read({path: page.path});
   return await inspectPage(shared, page, actual.content);
+};
+const reviews = await Promise.all(request.pages.map(review));
+// 未通过的页按验收意见修正一轮，写入后重新读回复检。
+const revised = await Promise.all(request.pages.map(async (page, i) => {
+  if (reviews[i].passed) return reviews[i];
+  const current = io.read({path: page.path});
+  const fixed = await revisePage(shared, page, current.content, reviews[i].issues);
+  io.write({path: page.path, content: fixed.content});
+  return await review(page);
 }));
-for (const review of reviews) {
-  assert(review.passed, "验收失败：" + review.path);
+for (let i = 0; i < request.pages.length; i++) {
+  assert(revised[i].passed, "修正后验收仍未通过：" + request.pages[i].path);
 }
 
 /** @virtual */
@@ -82,8 +104,17 @@ async function designPage(shared, page) {
 /** @virtual */
 async function inspectPage(shared, page, content) {
   // 对照实际源材料和本页要求检查真实读回正文。
+  // 只验收本页；五页之间是否不同、是否协调不在本函数职责内，不因此判为不通过。
+  // 只有与源材料不符、遗漏本页要求等实质问题判为不通过；措辞上的建议可写进 issues，但不影响 passed。
   // 返回 {passed:boolean, path:string, issues:[string], evidence:[string]}。
   // 不虚构未执行的浏览器或视觉检查。
+}
+
+/** @virtual */
+async function revisePage(shared, page, content, issues) {
+  // content 是本页已保存的真实正文，issues 是验收指出的问题。
+  // 依据 shared 中的源材料逐条修正这些问题，保留本页其余正确内容和风格。
+  // 返回 {content:string}；不写文件。
 }
 ```
 
@@ -91,7 +122,7 @@ async function inspectPage(shared, page, content) {
 
 ## 固定写法
 
-- 顶层语句按顺序覆盖用户要求的工作、验证和交付；源码无需 main，也无需返回值。execute_program 的 input 在源码中直接作为 input 使用。顶层普通 function 定义辅助任务，helper(args) 调用。
+- 顶层语句按顺序覆盖用户要求的工作、验证和交付，像 JS 模块一样从上到下执行，没有入口函数，也不需要返回值。程序需要的数据写在代码里，或用导入的工具读取。function 定义辅助任务，helper(args) 调用。
 - 内部值保存在 VM 堆中，对象和数组在普通函数调用间保留引用；宿主工具和 AI 参数／结果使用 JSON。支持 const/let/var、局部赋值及赋值表达式、对象／下标赋值及复合赋值、更新、++/--、+= -= *= /= %=、对象简写、简单数组解构、成员／下标读取、模板字符串。
 - 控制流支持 if/else、传统 for、while、do/while、数组 for...of、简单绑定的 for...in、switch、带标签 break/continue、三元、assert、return、try/catch/finally/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
 - + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件中空字符串、false、null、undefined、0 和 NaN 为假，数组和对象为真。&& 和 || 返回所选操作数；短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。基本数字、布尔与字符串支持部分转换，对象到原始值的转换仍有限制。
@@ -121,7 +152,7 @@ program_tool_headers 按库列出可用方法，是 TS 风格的发现目录，�
 **禁止用表面特征冒充完整验收。** 按当前任务的实际要求设计检查：普通函数明确编排可确定的读取、计算、循环、分支、工具调用和必要的复查；内容理解、无法由现有代码可靠判断的问题交给职责清楚的虚函数和适用工具。基础字符串、数量或存在性检查可以作为有用的局部证据，但不能据此声称内容正确、资源可用或整个任务通过。每项结论必须与实际检查及其证据相匹配；未检查或无法可靠确认的要求应如实报告，不能计入完整通过。编译限制或缺少工具时，不得通过删掉必要检查、降低标准或虚构结果使流程看起来成功；应使用其他可行能力，或明确返回未完成及原因。不要为此把某一种业务的检查规则写死为通用标准。
 
 ```js
-const request = input;
+const request = {output: "report.html", requirements: "按用户要求制作并验收报告"};
 let output = produce(request);
 let check = inspect(output, request);
 if (!check.passed) {
@@ -158,7 +189,7 @@ function deliver(output, request) {
 
 函数契约若约定了返回值与输入之间可由代码确定的关系，调用方在使用返回值之前应直接核对该关系；不匹配不能当成当前对象的有效证据，应安排核实或返回明确失败。具体字段和关系由该任务的契约决定，通用运行时不要求统一字段，也不把文字检查误称为实际资源验证。
 
-虚函数任务在当前 Agent 的局部作用域执行，可直接使用已公布工具；也可 define_task_body 补写当前函数及新 helper，继续分解工作；当前函数提供真实实现时去掉 @virtual，其内部尚需 AI 工作的新函数保留 @virtual，不新建第二个 main、不重复创建当前任务。形参与实参按位置绑定；例如 work(shared,part) 的异步调用是 work(shared,part)，每个形参分别接收一个实参，不隐式打包对象；补写保持原参数个数，不会自动把多个参数打包成一个对象。program_task_input 给出函数签名和 bindings（各形参的实际局部值），bindings 不是参数内部的一层数据。若签名是 make(input)，bindings.input 为 {pages,...}，函数内直接用 input.pages；不能再套 input.input。有代码的普通 helper 在 Runtime 函数帧内执行，不创建 AI 任务节点；虚函数调用创建 AI 任务，其工具调用是步骤。顶层运行完毕结束，helper 返回恢复调用方。
+虚函数任务在当前 Agent 的局部作用域执行，可直接使用已公布工具；也可 define_task_body 补写当前函数及新 helper，继续分解工作；当前函数提供真实实现时去掉 @virtual，其内部尚需 AI 工作的新函数保留 @virtual，不重复安排当前任务。形参与实参按位置绑定；例如 work(shared,part) 的异步调用是 work(shared,part)，每个形参分别接收一个实参，不隐式打包对象；补写保持原参数个数，不会自动把多个参数打包成一个对象。program_task_input 给出函数签名和 bindings（各形参的实际局部值），bindings 不是参数内部的一层数据。若签名是 make(input)，bindings.input 为 {pages,...}，函数内直接用 input.pages；不能再套 input.input。有代码的普通 helper 在 Runtime 函数帧内执行，不创建 AI 任务节点；虚函数调用创建 AI 任务，其工具调用是步骤。顶层运行完毕结束，helper 返回恢复调用方。
 
 当前调用为 process(shared, part) 时，可补写：
 
@@ -199,7 +230,7 @@ define_task_body 是按需补写具体实现的方式，不是执行前的必经
 
 ## 源码检查和错误修正
 
-execute_program 和 define_task_body 都在任何实际操作前编译整份源码；失败会带行列、附近源码和错误原因返回当前 AI，当前任务及原有结果保留。根据诊断重写完整源码并在原作用域重新提交，不重建任务、不重放已完成操作、不把编译失败当作完成。需要先检查时可用 check_program；它复用同一编译与作用域规则，不安装、不执行、不调用业务工具，并非每次都必须增加的前置步骤。反复无法修正时如实报告阻碍。此修正机制只处理源码，不自动重试未知写入或改写业务目标。
+回复中的程序和 define_task_body 的源码都在任何实际操作前整份编译；失败时什么都不执行，诊断带行列、附近源码和错误原因自动返回当前 AI，当前任务及原有结果保留。根据诊断重写完整源码，用同样方式在原作用域重新提交，不重建任务、不重放已完成操作、不把编译失败当作完成。反复无法修正时如实报告阻碍。此修正机制只处理源码，不自动重试未知写入或改写业务目标。
 
 库方法在源码和 invoke_library 中都返回工具原始 JSON，直接按声明读取字段；资产交付的 original_result 包装不属于库返回契约。host.read_asset 的快照结构是该方法自身的数据契约。使用 async 虚函数和 Promise 编排并发；不维护工具组加载状态。
 

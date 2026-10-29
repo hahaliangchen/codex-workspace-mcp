@@ -1,10 +1,13 @@
 import * as io from "host:io/promises";
-// 文件读取并发；AI 在一个上下文中按顺序判断，不启动子 Agent。
-async function main(request) {
-  const actuals = await Promise.all(request.paths.map(path => io.read({path: path})));
-  const pages = pairPages(request.paths, actuals);
-  return inspectPages(pages, request.requirements);
-}
+// 文件读取并发；AI 在一个上下文中按顺序判断。
+const request = {
+  paths: ["a.html", "b.html", "c.html", "d.html", "e.html"],
+  requirements: "检查正文"
+};
+
+const actuals = await Promise.all(request.paths.map(path => io.read({path: path})));
+const pages = pairPages(request.paths, actuals);
+const review = inspectPages(pages, request.requirements);
 
 function pairPages(paths, actuals) {
   const pages = [];

@@ -142,15 +142,7 @@ export function ConversationPage({
           >
             对话
           </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === 'flow'}
-            className={clsx(headerCss.tabPill, tab === 'flow' && headerCss.tabPillActive)}
-            onClick={() => setTab('flow')}
-          >
-            任务流
-          </button>
+          {/* 任务流节点展示暂时隐藏：新的虚函数执行路径跑通后再按新设计恢复。 */}
           <button type="button" role="tab" aria-selected={tab === 'skill-pages'} className={clsx(headerCss.tabPill, tab === 'skill-pages' && headerCss.tabPillActive)} onClick={() => setTab('skill-pages')}>技能页面</button>
           <button
             type="button"

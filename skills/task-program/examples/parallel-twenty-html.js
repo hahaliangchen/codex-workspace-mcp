@@ -188,7 +188,7 @@ function reviewDocumentation(shared, manifest, css, actualPages) {
   // 返回 {passed:boolean, evidence:[string], issues:[string]}。
 }
 
-async function main() {
+async function buildSite() {
   const sourcePaths = [
     "README.md",
     "docs/agent-program.md",
@@ -251,3 +251,5 @@ async function main() {
     stylesheet:"shared.css",structure_checks:structureChecks,semantic_review:semanticReview,
     limitations:["材料读取以五个指定文件为范围；不推断未读材料","未进行浏览器渲染、视觉或交互验收"]};
 }
+
+await buildSite();

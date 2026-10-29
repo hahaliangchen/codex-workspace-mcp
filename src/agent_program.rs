@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 pub const VERSION: u32 = 14;
+/// Id of the function formed by a program's top-level statements. It is not
+/// a JavaScript identifier, so no declared function can take it.
+pub const ENTRY: &str = "<module>";
 // JavaScript has one number type; JSON tool schemas often require integer
 // representations. Preserve integral values at the deterministic boundary.
 fn number_value(value: f64) -> Value {
@@ -55,6 +58,10 @@ pub struct Function {
     pub description: String,
     #[serde(default)]
     pub virtual_task: bool,
+    /// A virtual declared inside a function implementation is a leaf: a plain
+    /// tool loop limited to the tools that implementation imported.
+    #[serde(default)]
+    pub leaf_tools: Option<Vec<String>>,
     pub params: Vec<String>,
     /// Index of the final rest parameter, if present.
     #[serde(default)]
@@ -187,19 +194,6 @@ pub enum Effect {
 pub const SKILL: &str = include_str!("../skills/task-program/SKILL.md");
 pub const ENVIRONMENT: &str = include_str!("../prompts/flow_environment.md");
 pub const CAPABILITIES: &str = include_str!("../prompts/flow_capabilities.md");
-
-pub fn tool() -> Value {
-    json!({"type":"function","function":{"name":"execute_program",
-        "description":"Compile and execute the complete top-level flow for the current task. Pass JS source and optional input; the flow ends when its statements finish. Ordinary functions and tools execute in the host; @virtual functions invoke AI. Import tools from host:<library>. Compilation errors return diagnostics before effects; correct and resubmit in the same task. Call alone. Successful execution does not imply business acceptance.",
-        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000},"input":{}},"required":["source"],"additionalProperties":false}}})
-}
-
-/// Optional preflight using exactly the install compiler and current scope.
-pub fn check_tool() -> Value {
-    json!({"type":"function","function":{"name":"check_program",
-        "description":"Check complete flow source without executing tools or changing the current task/program. Uses the same compiler, fixed libraries, permissions, input binding and @virtual rules as execute_program or define_task_body. In a virtual task, check the concrete current function implementation (no main); otherwise check the complete top-level program. Optional preflight, not a mandatory extra step: submission always compiles too. On a compile error, use its diagnostics to rewrite the complete source and resubmit in this same scope; do not recreate tasks, repeat earlier operations or claim completion. Passing a check does not execute or prove business acceptance.",
-        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000},"input":{}},"required":["source"],"additionalProperties":false}}})
-}
 
 pub fn body_tool() -> Value {
     json!({"type":"function","function":{"name":"define_task_body",

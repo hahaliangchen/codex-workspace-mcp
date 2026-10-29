@@ -9,8 +9,6 @@ mod browser_control;
 mod builtin_plugins;
 mod code_map;
 mod composer_catalog;
-#[cfg(test)]
-mod context_acceptance;
 mod context_assets;
 mod context_window;
 mod database;

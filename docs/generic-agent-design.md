@@ -1,6 +1,8 @@
 # 通用 Agent 设计：流程伪代码、函数作用域与插件边界
 
-更新日期：2026-10-27。本文记录通用 Agent 的设计边界、当前实现及验证结果。第 1.1 节是设计原则；版本 12 使用基础 JS 流程写法与确定性表达式，智能判断通过显式 AI 函数调用；当前结构语法及边界见第 3.5、3.6 节与执行语言规范。不代表常驻服务已经重启或代码已经提交、部署。
+> 阅读前先看 [设计与实现入口](agent-design-guide.md)。本文混有不同阶段的方案；旧工具调用方式和语言版本不代表最新设计。
+
+更新日期：2026-10-29。本文记录通用 Agent 的设计边界、当前实现及验证结果。第 1.1 节是设计原则；第 1–8 节描述当前设计（流程语言版本 14：JS VM、词法作用域与闭包、Promise 与 async 虚函数并发，见 [js-runtime-design.md](js-runtime-design.md) 与 [agent-program.md](agent-program.md)）。第 9 节起是按日期保存的历史记录，其中的 fork/join、子 Agent、Git 工作树整合及当时的版本限制均已退役或被替代，不代表当前实现。
 
 本文作为后续维护通用执行层的设计依据。早期文档中的规划闸门、步骤必须返回专门协议、宿主替业务创建节点、每轮强制折叠、两次无工具回复才结束等方案，不能直接作为当前实现要求。修改前应对照本文和实际代码；有意改变这里的执行语义时，同步说明原因、更新文档及回归测试。
 
@@ -27,7 +29,7 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 
 ### 1.1 流程和普通计算由宿主执行，智能判断显式调用
 
-最新原则：普通函数、JSON 数据、常见循环和运算符表达流程；宿主确定性计算普通表达式，不把 i+1 或条件比较交给 AI。for/while、break/continue、三元和模板字符串降低到已有执行结构，不因模型采用常见写法就拒绝编译。具体范围与值规则以[版本 12 执行语言](agent-program.md)为准，不开放完整 JS 运行时。
+最新原则：普通函数、JSON 数据、常见循环和运算符表达流程；宿主确定性计算普通表达式，不把 i+1 或条件比较交给 AI。for/while、break/continue、三元和模板字符串降低到已有执行结构，不因模型采用常见写法就拒绝编译。当前范围与值规则见[执行语言手册](agent-program.md)；目标是让 AI 写真实 JavaScript，采用 Node 等技术路线仍需验证。
 
 需要内容理解、生成或业务验收时，声明具有注释职责和返回契约的任务函数。例如 const check = inspect(artifact, requirements)，AI 使用真实工具证据返回 {passed,evidence,issues}，宿主执行 if (!check.passed)。artifact !== expected 只比较 JSON 数据，不能同时解释为“业务质量不合格”。计算类型错误明确抛出，不自动请求 AI 解释。
 
@@ -51,19 +53,19 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 ### 3.1 唯一执行主线
 
 ```text
-用户请求 → create_task(主目标) → execute_program(唯一 main)
+用户请求 → 宿主建立主任务 → AI 输出顶层 JS → 宿主编译执行
 运行 Runtime：
     普通计算／分支／循环 → 宿主确定性推进 PC
     工具效果 → 原权限分发，保存原始回执，再恢复同一 Runtime
     函数调用 → 以真实实参进入局部作用域
         普通函数 → 执行代码
         @virtual → 当前 AI 完成职责，或补写同名函数
-    fork → 启动获授权的编译函数分支；join → 收齐函数返回
+    async 虚函数 → 立即得到 Promise，各自在独立 AI 窗口并发运行；await／Promise.all 收齐返回
     helper 返回 → 释放局部窗口，把 JSON 值交回原调用位置
-    main 返回 → 保存最终结果，结束主任务
+    顶层代码结束 → 保存结果，结束主任务
 ```
 
-`create_task` 只创建一次主任务，字段为 goal、reason、briefing。子函数、步骤与返回由程序运行时记录，不再通过模型手动创建任务列表、步骤节点或完成状态。无需工具的普通问答可以直接回复。
+主任务由宿主建立，AI 无须手动调用 `create_task` 或 `execute_program`。子函数、步骤与返回由程序运行时记录；内部保留任务创建机制并不表示 AI 需要调用该工具。无需工具的普通问答可以直接回复。
 
 ### 3.2 串行顺序只有一个来源
 
@@ -87,15 +89,15 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 
 ### 3.5 当前实现：常见基础语法与持久化指令
 
-主任务准备缺失技能／工具契约后，通过 execute_program 提交覆盖完整工作、验证和交付的唯一 main。SWC 使用 JS 解析模式；编译器整体检查源码，再将普通函数、局部值、for/while/do-while/for-of、break/continue、三元、模板及表达式降低成可持久化结构。生成器、异步、闭包、类与模块等额外执行机制仍拒绝。
+主任务准备缺失技能／工具契约后，AI 输出覆盖完整工作、验证和交付的顶层 JS，宿主提取并执行。SWC 使用 JS 解析模式；编译器整体检查源码，再降低成可持久化指令，在可序列化堆上的 JS VM 中执行：块级作用域、闭包与函数值、解构、展开、switch/finally/标签跳转、async/await 和 Promise 均已支持，数组回调由 JS 预置库以可恢复帧执行。生成器、类／this 与非工具模块仍拒绝。
 
-普通函数调用在 Runtime 局部函数帧内执行，不创建 AI 任务节点；工具调用是步骤。显式标记 @virtual 的空函数创建独立 AI 任务上下文并交给执行 AI，普通注释不自动执行；虚函数不允许占位 return。后者可 define_task_body 去掉当前标记、补写实际函数和更细的 helper，不重建 main。公共材料及各分支职责显式传参，已知循环由代码推进，授权并发使用 fork/join。main 返回结束，helper 返回恢复调用方，finish 不额外询问模型。工具只使用固定库方法：内置 io 绑定文件工具，插件在清单声明库名，参数与返回契约生成 TS 风格头文件。发布与编译共用权限过滤目录；规划请求不重复发送业务 JSON schema，注释任务用 invoke_library 传输相同方法名。模型不能起别名或使用 tools.*；宿主编译结果持久化，实际调用仍受原权限和插件边界约束。
+普通函数调用在 Runtime 局部函数帧内执行，不创建 AI 任务节点；工具调用是步骤。显式标记 @virtual 的空函数创建独立 AI 任务上下文并交给执行 AI，普通注释不自动执行；虚函数不允许占位 return。后者可 define_task_body 去掉当前标记、补写实际函数和更细的 helper，不重建 main。公共材料及各分支职责显式传参，已知循环由代码推进；需要并发时把虚函数声明为 async，用 `await Promise.all` 收齐结果。fork/join 已退役，新源码中会被编译拒绝。顶层代码结束即结束流程，helper 返回恢复调用方，finish 不额外询问模型。工具只使用固定库方法：内置 io 绑定文件工具，插件在清单声明库名，参数与返回契约生成 TS 风格头文件。发布与编译共用权限过滤目录；规划请求不重复发送业务 JSON schema，注释任务用 invoke_library 传输相同方法名。工具可通过 import 使用命名别名；宿主编译结果持久化，实际调用仍受原权限和插件边界约束。
 
-### 3.6 表达式与智能任务的边界（版本 12）
+### 3.6 表达式与智能任务的边界
 
 普通算术、比较、布尔逻辑、模板转换和公布的数据方法在 Rust 中直接求值，无模型任务。短路／三元只执行选中分支，操作数、实参和字段按顺序冻结值。循环 continue 正确经过更新或条件，跳转离开 try 时清理跨越的 catch 栈；位置和局部值随挂起效果持久化，恢复消费已有回执不重复更新。
 
-智能判断必须通过有说明和输入的任务函数返回 JSON；证据随该任务回执和实际工具历史保存。没有运算符专用 value/evidence 协议，没有未知名字／数据方法的 AI 兜底。条件按 C 风格真值转换：false/null/数值零为假，其余 JSON 值为真；不存在字段是 null。算术类型错误和除零等沿已有异常路径传播。旧 Semantic/Ai 类型和相关执行／恢复分支已删除；旧语言现场不能续跑，原始记录仍可查询。
+智能判断必须通过有说明和输入的任务函数返回 JSON；证据随该任务回执和实际工具历史保存。没有运算符专用 value/evidence 协议，没有未知名字／数据方法的 AI 兜底。当前值和条件语义以版本 14 的实现与执行语言手册为准。算术类型错误和除零等沿已有异常路径传播。旧 Semantic/Ai 类型和相关执行／恢复分支已删除；旧语言现场不能续跑，原始记录仍可查询。
 
 ## 4. 共享环境与局部上下文
 
@@ -204,7 +206,7 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 
 模型仍需按技能检查真实产物。工具契约可以确定地验证必要条件；视觉、美观度、内容覆盖等判断需要相应实际证据。执行图返回不能替代这些检查。
 
-串行子任务不等于多 Agent。默认使用串行执行；只有用户或适用技能明确需要多 Agent 时，再将子函数 fork 到独立执行 Agent，继承父环境并使用 join、所有权、合并和验收机制，不因为存在待办清单就启动并行 Agent。
+串行子任务不等于并发。默认使用串行执行；需要几份 AI 工作同时进行时，把相应虚函数声明为 async 并用 `Promise.all` 等待，每个调用是独立 AI 窗口，同时运行的数量受模型并发槽位限制。不因为存在待办清单就并发；并发调用各写各的文件，共享文件在收齐结果后由父流程统一写入。
 
 ## 8. 持久化与代码位置
 
@@ -216,17 +218,19 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 | 活动工作帧 | `agent_runtime_windows`；调用方挂起时保留，返回的子任务窗口释放 |
 | 原始用户、模型、工具与图事件 | `agent_task_events`；请求内容另有 `agent_request_contexts` 等记录 |
 | 不可变材料快照、来源及投递索引 | [context_assets.rs](../src/context_assets.rs)；`agent_context_assets`、`agent_context_asset_deliveries` 及资产文件 |
-| 并行 fork／join、句柄、租约、归属和验收 | [collaboration_jobs.rs](../src/collaboration_jobs.rs)；`agent_delegates` 和原生工具调用记录 |
+| async 虚函数的并发窗口、按调用 ID 的回执与恢复 | [program_flow.rs](../src/single_agent/program_flow.rs)、[task_frames.rs](../src/single_agent/task_frames.rs)；并发写同一文件的冲突记录在 [managed_files.rs](../src/single_agent/managed_files.rs)，写入租约在 [workspace_changes.rs](../src/workspace_changes.rs) |
 | 确定性容量折叠 | [step_context.rs](../src/single_agent/step_context.rs) |
 | 通用任务定义、计划及明确确认 | [main_task_anchor.rs](../src/main_task_anchor.rs) |
 | 插件后台任务及步骤归属 | [plugin_jobs.rs](../src/plugin_jobs.rs)；`agent_plugin_jobs` |
-| 通用执行提示及工具契约 | [single_agent.md](../prompts/single_agent.md)、[delegate_agent.md](../prompts/delegate_agent.md)、[task_tree.rs](../src/task_tree.rs) |
+| 通用执行提示及工具契约 | [single_agent.md](../prompts/single_agent.md)、[flow_capabilities.md](../prompts/flow_capabilities.md)、[task_tree.rs](../src/task_tree.rs) |
 
 执行图上已有的 pending、running、suspended、done 等字段用于保存和展示运行现场，不要求模型逐项调用工具维护，也不应演变成一套必须反复请求批准才能推进的业务状态协议。
 
 当前容量边界包括：源码最多 64 个函数，临时任务最多嵌套 64 层；共享资产视图有条目和索引预算限制，不能保证任意数量材料同时全文可见。截断索引和放不下的材料要通过已有资产、来源活动或历史入口恢复。这些是资源限制，不是推荐固定拆分数量。
 
 ## 9. 本轮验证与适用范围
+
+> 以下各节是按日期保存的历史记录，描述当时的实现与测试。其中的 fork/join、子 Agent、Git 工作树整合、版本 5–13 的语法限制等均已退役或被版本 14 替代；当前设计以第 1–8 节和 [js-runtime-design.md](js-runtime-design.md) 为准。
 
 ### 9.1 本地回归
 

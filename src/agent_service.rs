@@ -1619,6 +1619,54 @@ pub(crate) async fn consume_model_stream_observed(
     Ok((completed.message, stats))
 }
 
+/// Return contracts of the file tools as programs receive them. They are kept
+/// off the MCP list, where an outputSchema obliges structured content.
+fn local_output_schema(name: &str) -> Option<Value> {
+    let page = json!({
+        "path":{"type":"string"},
+        "content":{"type":"string","description":"This page only; read the next page while complete is false."},
+        "complete":{"type":"boolean","description":"false when the requested range continues beyond this page"},
+        "start_line":{"type":"integer"},
+        "end_line":{"type":"integer"},
+        "total_lines":{"type":"integer"},
+        "next_start_line":{"type":["integer","null"],"description":"Pass as start_line to read the next page; null when nothing remains"},
+        "next_column":{"type":["integer","null"],"description":"Pass as start_column with the same start_line to continue a partial long line"},
+        "returned_chars":{"type":"integer"},
+        "code_hash":{"type":"string"}
+    });
+    let required = json!(["path","content","complete","start_line","end_line","total_lines","next_start_line","next_column","code_hash"]);
+    let written = |extra: Value| {
+        let mut properties = json!({"path":{"type":"string"},"bytes_written":{"type":"integer"},"changed":{"type":"boolean"},"code_hash":{"type":"string"}});
+        properties.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let required: Vec<_> = properties.as_object().unwrap().keys().cloned().collect();
+        json!({"type":"object","required":required,"properties":properties})
+    };
+    Some(match name {
+        "read_file" => json!({"type":"object","required":required,"properties":page}),
+        "read_file_lines" => {
+            let mut properties = page;
+            properties["lines"] = json!({"type":"array","items":{"type":"object","required":["line","text"],"properties":{"line":{"type":"integer"},"text":{"type":"string"}}}});
+            let mut required = required;
+            required.as_array_mut().unwrap().push(json!("lines"));
+            json!({"type":"object","required":required,"properties":properties})
+        }
+        "list_dir" => json!({"type":"object","required":["root","entries"],"properties":{
+            "root":{"type":"string"},
+            "entries":{"type":"array","items":{"type":"object","required":["path","kind","size_bytes"],"properties":{
+                "path":{"type":"string","description":"Workspace-relative path, usable as a read path"},
+                "kind":{"enum":["file","directory","symlink","other"]},
+                "size_bytes":{"type":["integer","null"]}}}}}}),
+        "search_text" => json!({"type":"object","required":["query","matches","truncated"],"properties":{
+            "query":{"type":"string"},
+            "matches":{"type":"array","items":{"type":"object","required":["path","line","column","text"],"properties":{
+                "path":{"type":"string"},"line":{"type":"integer"},"column":{"type":"integer"},"text":{"type":"string"}}}},
+            "truncated":{"type":"boolean","description":"true when more matches exist than were returned"}}}),
+        "write_file" | "edit_file" => written(json!({"created":{"type":"boolean"}})),
+        "replace_range" => written(json!({"start_line":{"type":"integer"},"end_line":{"type":"integer"}})),
+        _ => return None,
+    })
+}
+
 pub(crate) fn local_tools(
     _workspace: &crate::tools::Workspace,
     catalog: Option<&crate::builtin_plugins::ToolCatalog>,
@@ -1696,7 +1744,9 @@ pub(crate) fn local_tools(
             }.to_owned();
             if let Some(prop)=schema.pointer_mut("/properties/expected_old_text") { prop["description"]=json!("Optional exact selected text, used to validate the requested edit."); }
         }
-        json!({"type":"function","function":{"name":name,"description":description,"parameters":schema}})
+        let mut function = json!({"name":name,"description":description,"parameters":schema});
+        if let Some(output) = local_output_schema(name) { function["outputSchema"] = output; }
+        json!({"type":"function","function":function})
     }).collect()
 }
 
@@ -1939,5 +1989,53 @@ pub(crate) mod tests {
         assert_eq!(status, "interrupted");
         assert_eq!(&kinds[2..], ["step/end", "turn/end"]);
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod output_contract_tests {
+    use super::*;
+
+    /// The declared return contracts must describe what the tools return.
+    #[tokio::test]
+    async fn file_tool_results_match_their_declared_contracts() {
+        let root = std::env::temp_dir().join(format!("output-contracts-{}", uuid_like()));
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        // Longer than one default page, so pagination fields are exercised.
+        std::fs::write(root.join("docs/long.md"), "设计文档的一行内容。\n".repeat(4000)).unwrap();
+        let workspace = crate::tools::Workspace::new(root.clone()).unwrap();
+        let tools = local_tools(&workspace, None, false);
+        let schema = |name: &str| tools.iter().find(|t| t["function"]["name"] == name).unwrap()["function"]["outputSchema"].clone();
+        let calls = [
+            ("list_dir", json!({"path":"docs"})),
+            ("read_file", json!({"path":"docs/long.md"})),
+            ("read_file_lines", json!({"path":"docs/long.md","start_line":1,"end_line":3})),
+            ("search_text", json!({"query":"设计","path":"docs","max_matches":2})),
+            ("write_file", json!({"path":"docs/new.md","content":"x"})),
+            ("edit_file", json!({"path":"docs/new.md","edits":[{"old_text":"x","new_text":"y"}]})),
+            ("replace_range", json!({"path":"docs/new.md","start_line":1,"end_line":1,"replacement":"z"})),
+        ];
+        let mut first_page = Value::Null;
+        for (name, arguments) in calls {
+            let mut arguments = arguments;
+            if name != "write_file" && arguments["path"] == "docs/new.md" {
+                let hash = crate::mcp::call_tool(&workspace, json!({"name":"read_file","arguments":{"path":"docs/new.md"}})).await.unwrap();
+                let hash: Value = serde_json::from_str(hash["content"][0]["text"].as_str().unwrap()).unwrap();
+                arguments["expected_code_hash"] = hash["code_hash"].clone();
+            }
+            let response = crate::mcp::call_tool(&workspace, json!({"name":name,"arguments":arguments})).await.unwrap();
+            let result: Value = serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+            let validator = jsonschema::validator_for(&schema(name)).unwrap();
+            let errors: Vec<_> = validator.iter_errors(&result).map(|e| e.to_string()).collect();
+            assert!(errors.is_empty(), "{name}: {errors:?}\n{result}");
+            if name == "read_file" { first_page = result; }
+        }
+        assert_eq!(first_page["complete"], false);
+        assert!(first_page["next_start_line"].is_u64());
+        let libraries = crate::agent_program::libraries::catalog(&tools, &json!([]));
+        let declarations = crate::agent_program::declarations::headers(&libraries, &tools);
+        let read = declarations.lines().find(|line| line.contains("function read(")).unwrap();
+        assert!(read.contains("next_start_line") && !read.ends_with("): unknown;"), "{read}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

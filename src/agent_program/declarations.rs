@@ -360,17 +360,8 @@ pub fn contract_tool() -> Value {
     json!({"type":"function","function":{"name":"read_tool_contracts","description":"Read exact TypeScript-like tool declarations for selected available libraries or qualified methods before coding or invoking them. Does not execute tools or expand permissions.","parameters":{"type":"object","properties":{"libraries":{"type":"array","items":{"type":"string"}},"methods":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}}})
 }
 
-/// Provider-safe transport name. The only method names in this schema are the
-/// same qualified names used in source; original dispatcher names stay private.
+/// Retired transport name, still recognized in saved histories.
 pub const CALL: &str = "invoke_library";
-pub fn native_tool(libraries: &Libraries, _definitions: &[Value]) -> Option<Value> {
-    if libraries.is_empty() {
-        return None;
-    }
-    Some(
-        json!({"type":"function","function":{"name":CALL,"description":"Execute an available qualified library method in the current virtual task. Read its contract with read_tool_contracts when needed. The host validates arguments and permissions before dispatch.","parameters":{"type":"object","properties":{"method":{"type":"string"},"args":{"type":"object"}},"required":["method","args"],"additionalProperties":false}}}),
-    )
-}
 
 #[cfg(test)]
 mod tests {
@@ -474,10 +465,6 @@ mod tests {
         assert!(selected(&libs, &json!({"methods":["io.missing"]})).is_err());
         assert!(selected(&libs, &json!({"libraries":["missing"]})).is_err());
         assert!(selected(&libs, &json!({})).is_err());
-        let native = native_tool(&libs, &defs).unwrap();
-        assert_eq!(native["function"]["name"], CALL);
-        assert!(!native.to_string().contains("write_file"));
-        assert!(!native.to_string().contains("oneOf"));
     }
     #[test]
     fn original_contract_validator_preserves_local_references_and_constraints() {
@@ -503,12 +490,10 @@ mod tests {
         );
         let declarations = headers(&libs, &definitions);
         let compact = index(&libs, &definitions);
-        let native = native_tool(&libs, &definitions).unwrap().to_string();
         eprintln!(
-            "host catalog sizes: full_declarations={} compact_index={} native_wrapper={} bytes",
+            "host catalog sizes: full_declarations={} compact_index={} bytes",
             declarations.len(),
-            compact.len(),
-            native.len()
+            compact.len()
         );
         assert!(compact.len() < declarations.len());
         parse(&compact);

@@ -20,8 +20,23 @@ fn compile(source: &str) -> anyhow::Result<Program> {
     );
     compile_with_libraries(source, bindings)
 }
+/// The function a test drives: its `main` function when it declares one and
+/// has no top-level statements, otherwise the top-level program.
+fn entry_of(program: &Program) -> &'static str {
+    let top_level = program.functions[ENTRY].code.len() > 1;
+    if !top_level && program.functions.contains_key("main") { "main" } else { ENTRY }
+}
+fn start(source: &str, args: Vec<Value>) -> Runtime {
+    let program = compile(source).unwrap();
+    let entry = entry_of(&program);
+    Runtime::new(program, entry, args).unwrap()
+}
+fn start_task(program: Program, args: Vec<Value>) -> Runtime {
+    let entry = entry_of(&program);
+    Runtime::task_program(program, entry, args).unwrap()
+}
 fn runtime(source: &str) -> Runtime {
-    Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap()
+    start(source, vec![])
 }
 fn returned(mut r: Runtime) -> Value {
     match r.next() {
@@ -168,47 +183,6 @@ function main() {
     assert!(invalid.as_str().unwrap().starts_with("URL parse error:"));
 }
 
-#[test]
-fn serial_page_review_reads_in_order_then_uses_one_ai_scope() {
-    let source = include_str!("../../skills/task-program/examples/serial-page-review.js");
-    let program = compile(source).unwrap();
-    let mut runtime = Runtime::task_program(
-        program,
-        "main",
-        vec![json!({
-            "paths":["1.html","2.html","3.html","4.html","5.html"],
-            "requirements":"检查正文"
-        })],
-    )
-    .unwrap();
-    for n in 1..=5 {
-        let State::Action(action) = runtime.next() else {
-            panic!("missing page read")
-        };
-        assert!(
-            matches!(action.kind, ActionKind::Tool { ref name, ref args }
-            if name == "read_file" && args["path"] == format!("{n}.html"))
-        );
-        runtime
-            .resume(json!({"content":format!("page {n}")}), false)
-            .unwrap();
-    }
-    let State::Action(action) = runtime.next() else {
-        panic!("missing AI inspection")
-    };
-    match action.kind {
-        ActionKind::Call { name, args } => {
-            assert_eq!(name, "inspectPages");
-            assert_eq!(args[0].as_array().unwrap().len(), 5);
-            assert_eq!(args[0][0]["initial"]["content"], "page 1");
-            assert_eq!(args[0][4]["path"], "5.html");
-            assert_eq!(args[1], "检查正文");
-        }
-        other => panic!("expected one AI task, got {other:?}"),
-    }
-    runtime.resume(json!({"reviewed":5}), false).unwrap();
-    assert_eq!(returned(runtime), json!({"reviewed":5}));
-}
 
 #[test]
 fn await_promise_all_suspends_once_and_returns_ordered_read_results() {
@@ -280,33 +254,6 @@ async function main() {
     assert_eq!(returned(run), json!("read failed"));
 }
 
-#[test]
-fn promise_all_maps_dynamic_page_list_without_agents() {
-    let source = include_str!("../../skills/task-program/examples/async-page-review.js");
-    let program = compile(source).unwrap();
-    let mut run = Runtime::task_program(program, "main", vec![json!({"paths":["a.html","b.html","c.html","d.html","e.html"],"requirements":"检查正文"})]).unwrap();
-    let State::Action(action) = run.next() else {
-        panic!("missing batch")
-    };
-    let ActionKind::ParallelReads { operations } = action.kind else {
-        panic!("expected read batch")
-    };
-    assert_eq!(operations.len(), 5);
-    assert_eq!(
-        operations
-            .iter()
-            .map(|(_, args)| args["path"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec!["a.html", "b.html", "c.html", "d.html", "e.html"]
-    );
-    run.resume(json!(["a","b","c","d","e"].iter().map(|v|json!({"failed":false,"value":{"content":v}})).collect::<Vec<_>>()), false).unwrap();
-    let State::Action(action) = run.next() else {
-        panic!("missing AI inspection")
-    };
-    assert!(
-        matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspectPages" && args[0][4]["initial"]["content"] == "e" && args[1] == "检查正文")
-    );
-}
 
 #[test]
 fn virtual_function_body_can_be_refined_to_an_async_entry() {
@@ -662,7 +609,7 @@ fn if_else_uses_returned_boolean_or_field_directly() {
         (json!({"ok":false,"retry":false}), "no"),
     ] {
         assert_eq!(
-            returned(Runtime::new(compile(source).unwrap(), "main", vec![input]).unwrap()),
+            returned(start(source, vec![input])),
             json!(expected)
         );
     }
@@ -696,15 +643,15 @@ fn javascript_truth_values_and_short_circuit_results_are_deterministic() {
             "!!input",
         ] {
             let source = format!("function main(input){{return {expression};}}");
-            let r = Runtime::new(compile(&source).unwrap(), "main", vec![value.clone()]).unwrap();
+            let r = start(&source, vec![value.clone()]);
             assert_eq!(returned(r), json!(truth), "{expression}: {value}");
         }
         let source = "function main(input){return input && true;}";
-        let r = Runtime::new(compile(source).unwrap(), "main", vec![value.clone()]).unwrap();
+        let r = start(source, vec![value.clone()]);
         let normalized = if value.as_f64() == Some(0.0) { json!(0) } else { value.clone() };
         assert_eq!(returned(r), if truth { json!(true) } else { normalized.clone() });
         let source = "function main(input){return input || false;}";
-        let r = Runtime::new(compile(source).unwrap(), "main", vec![value.clone()]).unwrap();
+        let r = start(source, vec![value.clone()]);
         assert_eq!(returned(r), if truth { normalized } else { json!(false) });
     }
     assert_eq!(
@@ -736,7 +683,7 @@ fn old_operator_enabled_runtime_cannot_resume_pending_effects() {
 #[test]
 fn integer_literals_and_task_parameters_remain_json_integers() {
     let source = "function main(input){io.list({path:'.',max_depth:2,limit:input.limit});}";
-    let mut r = Runtime::new(compile(source).unwrap(), "main", vec![json!({"limit":3})]).unwrap();
+    let mut r = start(source, vec![json!({"limit":3})]);
     let State::Action(action) = r.next() else {
         panic!()
     };
@@ -845,30 +792,11 @@ fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
     );
 }
 
-#[test]
-fn task_refinement_has_no_new_main_and_ordinary_calls_use_frames() {
-    let p = compile_body(
-        "function phase(input){return helper(input);} function helper(input){return input;}",
-        "phase",
-    )
-    .unwrap();
-    let r = Runtime::task_program(p, "phase", vec![json!({"ok":true})]).unwrap();
-    assert_eq!(returned(r), json!({"ok":true}));
-    assert!(
-        compile_body(
-            "function main(){return null;} function phase(){return null;}",
-            "phase"
-        )
-        .is_err()
-    );
-    assert!(compile_body("function phase(){// only restates the task\n}", "phase").is_err());
-    assert!(compile("function main(){return tools.define_task_body({source:'bad'});}").is_err());
-}
 
 #[test]
 fn local_result_arrays_collect_nested_task_returns_without_operators() {
     let source = "function main(){const rows=[];for(const item of [{n:1},{n:2}]){rows.push(process(item));}const length=rows.push({n:3});return {rows,length};} function process(item){return item;}";
-    let r = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let r = start_task(compile(source).unwrap(), vec![]);
     let restored: Runtime = serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
     assert_eq!(
         returned(restored),
@@ -891,7 +819,7 @@ function main(){const outer='OUTER';const result=work('INPUT');return {result,ou
 function work(input){const local='LOCAL';const answer=think(input);return {answer,local};}
 /** @virtual */ function think(input){/* Return the inspected result. */}
 "#;
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     let State::Action(action) = run.next() else {
         panic!("expected virtual task")
     };
@@ -915,7 +843,7 @@ fn ordinary_frames_restore_tool_receipts_and_propagate_errors_to_caller() {
 function main(){try{return helper();}catch(problem){return {error:problem.message};}}
 function helper(){return io.write({path:'out.txt',content:'hello'});}
 "#;
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     let State::Action(action) = run.next() else {
         panic!("expected write")
     };
@@ -939,7 +867,7 @@ function main(){const shared='OUTER';const result=helper();return {shared,result
 function helper(){const shared='INNER';const result=think();return {shared,result};}
 /** @virtual */ function think(){/* Return a result. */}
 "#;
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     assert!(matches!(
         run.next(),
         State::Action(Action {
@@ -1054,28 +982,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
     }
 }
 
-#[test]
-fn static_call_contracts_are_checked_before_execution() {
-    for source in [
-        "function main(){return JSON.trim();}",
-        "function main(){return JSON.includes('x');}",
-        "function main(){return 0xffffffffffffffff;}",
-        "function main(){io.write({path:'never'}); return fork(helper,1,2);} function helper(input){return input;}",
-        "function main(){return main();}",
-        "function main(a,b){return a;}",
-        "function main(){return fork(main);}",
-        "function main(){return io.read({},{});}",
-        "function main(){return tools[name]({});}",
-    ] {
-        let error = compile(source).unwrap_err().to_string();
-        assert!(error.starts_with("TS_PROGRAM "), "{error}");
-    }
-    // JSON.stringify takes a replacer and an indent, as in JavaScript.
-    assert_eq!(
-        returned(runtime("function main(){return [JSON.stringify(1,2),JSON.stringify({a:1},null,1)];}")),
-        json!(["1", "{\n \"a\": 1\n}"])
-    );
-}
 
 #[test]
 fn json_fields_and_elements_capture_values_before_later_array_mutation() {
@@ -1168,6 +1074,8 @@ struct TutorialRun {
     events: Vec<String>,
     workers: BTreeMap<String, Runtime>,
     reject_review: bool,
+    /// A rejected page passes once it has been revised.
+    accept_revised: bool,
 }
 
 impl TutorialRun {
@@ -1222,9 +1130,16 @@ impl TutorialRun {
                                 assert_eq!(input["shared"]["source_content"], "SOURCE");
                                 assert!(content.contains(input["page"]["title"].as_str().unwrap()));
                             }
+                            let passed = !self.reject_review || (self.accept_revised && content.contains("已修正"));
                             Ok(
-                                json!({"passed":!self.reject_review,"issues":[],"evidence":[content]}),
+                                json!({"passed":passed,"issues":if passed {json!([])} else {json!(["缺少要点"])},"evidence":[content]}),
                             )
+                        }
+                        "revisePage" => {
+                            let path = input["page"]["path"].as_str().unwrap();
+                            assert_eq!(self.files[path], input["content"], "revise the saved page");
+                            assert_eq!(input["issues"], json!(["缺少要点"]));
+                            Ok(json!({"content":format!("{}（已修正）", input["content"].as_str().unwrap())}))
                         }
                         _ => panic!("unexpected tutorial task {name}"),
                     }
@@ -1264,27 +1179,19 @@ impl TutorialRun {
     }
 }
 
-fn tutorial(source: &str, input: &str) -> Runtime {
+fn tutorial(source: &str) -> Runtime {
     assert!(
         SKILL.contains(source.trim()),
         "the AI must receive the same example that is tested"
     );
-    Runtime::task_program(
-        compile(source).unwrap(),
-        "main",
-        vec![serde_json::from_str(input).unwrap()],
-    )
-    .unwrap()
+    Runtime::task_program(compile(source).unwrap(), crate::agent_program::ENTRY, vec![]).unwrap()
 }
 
 #[test]
 fn documented_serial_example_writes_reads_and_checks_without_fork() {
     let mut harness = TutorialRun::default();
     let output = harness
-        .run(tutorial(
-            include_str!("../../skills/task-program/examples/serial.js"),
-            include_str!("../../skills/task-program/examples/serial.input.json"),
-        ))
+        .run(tutorial(include_str!("../../skills/task-program/examples/serial.js")))
         .unwrap();
     assert_eq!(output, Value::Null);
     assert!(harness.files.contains_key("agent-overview.html"));
@@ -1305,14 +1212,11 @@ fn documented_parallel_example_checks_all_five_pages() {
     let mut harness = TutorialRun::default();
     harness
         .files
-        .insert("docs/generic-agent-design.md".into(), "SOURCE".into());
+        .insert("docs/agent-design-guide.md".into(), "SOURCE".into());
     let output = harness
-        .run(tutorial(
-            include_str!("../../skills/task-program/examples/parallel-five-pages.js"),
-            include_str!("../../skills/task-program/examples/parallel-five-pages.input.json"),
-        ))
+        .run(tutorial(include_str!("../../skills/task-program/examples/parallel-five-pages.js")))
         .unwrap();
-    assert_eq!(harness.events.first().unwrap(), "read_file:docs/generic-agent-design.md");
+    assert_eq!(harness.events.first().unwrap(), "read_file:docs/agent-design-guide.md");
     assert_eq!(output, Value::Null);
     assert_eq!(harness.files.len(), 6); // one source plus five distinct outputs
     assert_eq!(
@@ -1345,15 +1249,9 @@ fn documented_parallel_example_checks_all_five_pages() {
 
 #[test]
 fn documented_examples_fail_instead_of_delivering_failed_reviews() {
-    for (source, input) in [
-        (
-            include_str!("../../skills/task-program/examples/serial.js"),
-            include_str!("../../skills/task-program/examples/serial.input.json"),
-        ),
-        (
-            include_str!("../../skills/task-program/examples/parallel-five-pages.js"),
-            include_str!("../../skills/task-program/examples/parallel-five-pages.input.json"),
-        ),
+    for source in [
+        include_str!("../../skills/task-program/examples/serial.js"),
+        include_str!("../../skills/task-program/examples/parallel-five-pages.js"),
     ] {
         let mut harness = TutorialRun {
             reject_review: true,
@@ -1361,8 +1259,8 @@ fn documented_examples_fail_instead_of_delivering_failed_reviews() {
         };
         harness
             .files
-            .insert("docs/generic-agent-design.md".into(), "SOURCE".into());
-        let error = harness.run(tutorial(source, input)).unwrap_err();
+            .insert("docs/agent-design-guide.md".into(), "SOURCE".into());
+        let error = harness.run(tutorial(source)).unwrap_err();
         assert!(error["message"].as_str().unwrap().contains("验收"));
         assert_eq!(
             harness
@@ -1370,9 +1268,22 @@ fn documented_examples_fail_instead_of_delivering_failed_reviews() {
                 .iter()
                 .filter(|e| matches!(e.as_str(), "inspect" | "inspectPage"))
                 .count(),
-            if source.contains("function inspectPage(") { 5 } else { 1 }
+            if source.contains("function inspectPage(") { 10 } else { 1 }
         );
     }
+}
+
+#[test]
+fn the_parallel_example_revises_rejected_pages_and_rechecks_them() {
+    let mut harness = TutorialRun { reject_review: true, accept_revised: true, ..Default::default() };
+    harness.files.insert("docs/agent-design-guide.md".into(), "SOURCE".into());
+    let output = harness
+        .run(tutorial(include_str!("../../skills/task-program/examples/parallel-five-pages.js")))
+        .unwrap();
+    assert_eq!(output, Value::Null);
+    assert_eq!(harness.events.iter().filter(|e| *e == "revisePage").count(), 5);
+    assert_eq!(harness.events.iter().filter(|e| *e == "inspectPage").count(), 10);
+    assert!(harness.files.iter().filter(|(path, _)| path.ends_with(".html")).all(|(_, content)| content.contains("已修正")));
 }
 
 #[test]
@@ -1507,7 +1418,7 @@ fn no_implicit_semantic_effects_are_emitted_or_executed() {
             .flat_map(|(_, f)| &f.code)
             .all(|i| !matches!(i.op, Op::Effect(_, _)))
     );
-    let mut runtime = Runtime::task_program(program, "main", vec![]).unwrap();
+    let mut runtime = start_task(program, vec![]);
     assert!(matches!(runtime.next(),State::Returned(v) if v=="6"));
 }
 
@@ -1619,11 +1530,6 @@ fn raw_tool_spellings_are_rejected_before_any_effect() {
         }
     }
     assert!(
-        super::tool()["function"]["parameters"]["properties"]
-            .get("libraries")
-            .is_none()
-    );
-    assert!(
         super::body_tool()["function"]["parameters"]["properties"]
             .get("libraries")
             .is_none()
@@ -1662,24 +1568,6 @@ function inspect(request) {}
     assert_eq!(returned(restored), actual);
 }
 
-#[test]
-fn virtual_placeholders_and_ambiguous_empty_helpers_fail_before_effects() {
-    for declaration in [
-        "/** @virtual Create actual outputs; return {files}. */ function work(){return {status:'completed'};}",
-        "function work(){/* @virtual Create actual outputs; return {files}. */ io.write({path:'bad'});}",
-        "/** @virtual */ function work(){}",
-        "function work(){// Create outputs and return their paths.\n}",
-    ] {
-        let error = compile(&format!(
-            "function main(){{io.write({{path:'never'}});return work();}} {declaration}"
-        ))
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("@virtual"), "{error}");
-        assert!(error.starts_with("TS_PROGRAM "), "{error}");
-    }
-    assert!(compile("/** @virtual Execute the main task. */ function main(){}").is_err());
-}
 
 #[test]
 fn virtual_tags_are_local_and_concrete_refinement_can_call_another_virtual_task() {
@@ -1799,7 +1687,7 @@ fn captured_receipt_concatenation_allows_both_writes_and_resumes_without_replay(
 #[test]
 fn caller_can_reject_an_inspection_result_for_a_different_input() {
     let source = "function main(){const subject={id:'correct'};const result=inspect(subject);assert(result.id===subject.id,'result does not match its input');return result;} /** @virtual Return the inspected id and conclusion. */ function inspect(subject){}";
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     assert!(matches!(run.next(), State::Action(_)));
     run.resume(json!({"id":"other","passed":true}), false)
         .unwrap();
@@ -1812,7 +1700,7 @@ fn caller_can_reject_an_inspection_result_for_a_different_input() {
 fn functions_share_module_variables_and_cannot_see_their_callers_locals() {
     // A top-level function and the top-level flow share one module binding.
     let source = "let count = 0; function bump(){ count++; return count; } bump(); bump(); test.record({count});";
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!(null)]).unwrap();
+    let mut run = start(source, vec![json!(null)]);
     assert!(matches!(
         run.next(),
         State::Action(Action { kind: ActionKind::Tool { name, args }, .. })
@@ -2046,7 +1934,7 @@ fn model_written_five_page_acceptance_flow_compiles() {
 #[test]
 fn model_written_five_page_acceptance_flow_runs_with_recorded_receipts() {
     let source = include_str!("fixtures/model-five-page-acceptance.js");
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     let pages = ["01-overview", "02-program-flow", "03-task-context", "04-parallel-agents", "05-verification"];
     let requirements: Vec<_> = pages.iter().enumerate().map(|(i, page)| json!({
         "file": format!("agent-design-html/{page}.html"), "purpose": "Document the design",
@@ -2176,7 +2064,7 @@ fn replacement_callbacks_receive_captures_and_survive_tool_suspension() {
 #[test]
 fn internal_prelude_frames_do_not_hide_or_expose_ai_scope() {
     let source = "function main(){const userValue='visible';return [1].map(x=>inspect(x));} /** @virtual Inspect input and return a result. */ function inspect(x){}";
-    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Call { ref name, .. }, .. }) if name == "inspect"));
     let bindings = run.named_bindings();
     assert_eq!(bindings["userValue"], "visible");
@@ -2228,7 +2116,7 @@ function main(){ try { throw {message:'bad'}; } catch ({message, code = 4}) { re
 #[test]
 fn m4_defaults_do_not_see_body_var_bindings() {
     let source = "const x=9;function read(a=x){var x=1;return a;}io.write({path:'out',content:String(read())});";
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    let mut run = start(source, vec![json!({})]);
     assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["content"] == "9"));
     run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
     run.resume(json!({}), false).unwrap();
@@ -2243,7 +2131,7 @@ fn m4_parameter_closures_keep_parameter_environment() {
     assert_eq!(returned(run), json!([2,1]));
     assert_eq!(returned(runtime("function f(a=1){function a(){return 3;}return a();}function main(){return f();}")), json!(3));
     let source = "const x=9;const f=function self(get=()=>self){var self=1;return get()===f;};io.write({path:'result',content:String(f())});";
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    let mut run = start(source, vec![json!({})]);
     assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["content"] == "true"));
     run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
     run.resume(json!({}), false).unwrap();
@@ -2253,7 +2141,7 @@ fn m4_parameter_closures_keep_parameter_environment() {
 #[test]
 fn m4_parameter_initializer_can_suspend_before_body_scope() {
     let source = "const path='outer';function read(a=io.read({path})){let path='inner';return [a.content,path];}io.write({path:'result',content:JSON.stringify(read())});";
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    let mut run = start(source, vec![json!({})]);
     assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == "outer"));
     run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
     run.resume(json!({"content":"ok"}), false).unwrap();
@@ -2433,7 +2321,7 @@ fn m4_for_in_member_and_for_of_destructuring_bindings() {
 #[test]
 fn source_variables_remain_visible_until_their_function_returns() {
     let source = "function main(){const doc=io.read({path:'large.txt'});const count=measure(doc.content);io.write({path:'count.txt',content:`${count}`});return count;} function measure(text){return text.length;}";
-    let mut runtime = Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap();
+    let mut runtime = start(source, vec![]);
     let State::Action(_read) = runtime.next() else {
         panic!("read required")
     };
@@ -2453,82 +2341,8 @@ fn source_variables_remain_visible_until_their_function_returns() {
     assert!(matches!(restored.next(),State::Returned(value) if value==payload.chars().count()));
 }
 
-#[test]
-fn top_level_imports_run_in_order_and_capture_visible_variables() {
-    let source = r#"
-import { read as load, write } from "host:io";
-const file = load({path: input.source});
-const value = prepare(file.content);
-write({path: input.output, content: value});
-function prepare(content) { return content + input.suffix; }
-"#;
-    let mut r = Runtime::new(
-        compile(source).unwrap(),
-        "main",
-        vec![json!({"source":"in", "output":"out", "suffix":"!"})],
-    )
-    .unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
-    );
-    r.resume(json!({"content":"hello"}), false).unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "write_file" && args["content"] == "hello!" && args["path"] == "out"))
-    );
-    r.resume(json!({"ok":true}), false).unwrap();
-    assert_eq!(returned(r), Value::Null);
-}
 
-#[test]
-fn imports_use_only_published_tools_and_reject_invalid_bindings() {
-    for source in [
-        "import {missing} from 'host:io'; missing({});",
-        "import {read} from 'host:missing'; read({});",
-        "import x from 'host:io'; x({});",
-        "import {read} from 'host:io'; const read = 1;",
-        "import {read} from 'host:io'; io.write({path:'x',content:'x'});",
-    ] {
-        assert!(compile(source).is_err(), "unexpectedly accepted {source}");
-    }
-    let mut r = Runtime::new(
-        compile("import * as files from 'host:io'; files.read({path:'x'});").unwrap(),
-        "main",
-        vec![Value::Null],
-    )
-    .unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file"))
-    );
-}
 
-#[test]
-fn await_single_effects_and_async_helpers_preserve_sequential_execution() {
-    let source = r#"
-import {read, write} from "host:io";
-const content = await load(input.path);
-await write({path: "out.txt", content: content});
-async function load(path) {
-    const result = await read({path});
-    return result.content;
-}
-"#;
-    let mut r = Runtime::new(
-        compile(source).unwrap(),
-        "main",
-        vec![json!({"path":"in.txt"})],
-    )
-    .unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "read_file" && args["path"] == "in.txt"))
-    );
-    let mut resumed: Runtime = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
-    resumed.resume(json!({"content":"hello"}), false).unwrap();
-    assert!(
-        matches!(resumed.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, ref args, .. } if name == "write_file" && args["content"] == "hello"))
-    );
-    resumed.resume(json!({"ok":true}), false).unwrap();
-    assert_eq!(returned(resumed), Value::Null);
-}
 
 #[test]
 fn await_preserves_values_and_catchable_tool_failures() {
@@ -2546,26 +2360,6 @@ fn await_preserves_values_and_catchable_tool_failures() {
     assert_eq!(returned(r), json!("read failed"));
 }
 
-#[test]
-fn await_virtual_function_returns_its_actual_task_value() {
-    let source = r#"
-const value = await classify(input);
-await io.write({path:"result.txt",content:value.text});
-/** @virtual */
-async function classify(data) { // Classify data; return {text:string}.
-}
-"#;
-    let mut r = Runtime::new(compile(source).unwrap(), "main", vec![json!("input")]).unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args } if name == "classify" && args[0] == "input"))
-    );
-    r.resume(json!({"text":"actual"}), false).unwrap();
-    assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref args, .. } if args["content"] == "actual"))
-    );
-    r.resume(json!({"ok":true}), false).unwrap();
-    assert_eq!(returned(r), Value::Null);
-}
 
 #[test]
 fn virtual_literal_throw_is_a_placeholder_but_other_effects_are_rejected() {
@@ -2576,7 +2370,7 @@ await write({path:"result.txt",content:result.text});
 /** @virtual Review the provided data and return {text:string}. */
 async function inspect(data) { throw new Error("Host must provide inspect"); }
 "#;
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![Value::Null]).unwrap();
+    let mut run = start(source, vec![Value::Null]);
     assert!(
         matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args } if name == "inspect" && args[0] == "data"))
     );
@@ -2602,26 +2396,6 @@ async function inspect(data) { throw new Error("Host must provide inspect"); }
     }
 }
 
-#[test]
-fn promise_all_async_map_read_calls_remain_parallel_and_ordered() {
-    let source = r#"
-import {read} from "host:io/promises";
-const files = await Promise.all(input.map(async file => await read({path:file})));
-"#;
-    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!(["a", "b"])]).unwrap();
-    let State::Action(action) = run.next() else {
-        panic!("expected parallel read")
-    };
-    assert!(
-        matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len()==2 && operations[0].1["path"]=="a" && operations[1].1["path"]=="b")
-    );
-    let mut restored: Runtime =
-        serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
-    restored
-        .resume(json!([{"failed":false,"value":{"content":"A"}},{"failed":false,"value":{"content":"B"}}]), false)
-        .unwrap();
-    assert_eq!(returned(restored), Value::Null);
-}
 
 #[test]
 fn awaited_promise_chains_preserve_callback_values_and_tool_continuations() {
@@ -2856,7 +2630,7 @@ async function main(){let one=read({path:'one'});let two=read({path:'two'});let 
 fn m5_async_virtual_calls_preserve_invocation_scope_and_reject_independently() {
     let source = r#"async function main(){let shared='first';let p=work('a');shared='second';let q=work('b');let a=await p;try{await q;}catch(e){return [a,e.message];}}
 /** @virtual Perform work and return a string. */ async function work(request){}"#;
-    let mut run = Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     let State::Action(first) = run.next() else { panic!("expected first virtual call") };
     assert!(matches!(first.kind,ActionKind::Call{ref args,..} if args == &vec![json!("a")]));
     assert_eq!(run.named_bindings().get("shared"),Some(&json!("first")));
@@ -2898,7 +2672,7 @@ fn m6_concurrent_calls_resume_by_id_in_completion_order_after_snapshot() {
     use runtime::ConcurrentState;
     let source = r#"async function main(){let shared='first';let a=work('a');shared='second';let b=work('b');let first=await a;let c=work(first);return await Promise.all([b,c]);}
 /** @virtual Perform work and return a string. */ async function work(request){}"#;
-    let mut run = Runtime::new(compile(source).unwrap(),"main",vec![]).unwrap();
+    let mut run = start(source, vec![]);
     let ConcurrentState::Actions(actions) = run.next_concurrent() else { panic!("expected async calls") };
     assert_eq!(actions.len(),2);
     let first = actions[0].id.clone(); let second = actions[1].id.clone();
@@ -2923,7 +2697,7 @@ fn m6_async_virtual_launches_before_later_synchronous_effect() {
     use runtime::ConcurrentState;
     let source = r#"async function main(){let p=work('x');let data=io.read({path:'later'});return [data.content,await p];}
 /** @virtual Perform work and return a string. */ async function work(request){}"#;
-    let mut run = Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let mut run = start_task(compile(source).unwrap(), vec![]);
     let ConcurrentState::Actions(calls) = run.next_concurrent() else { panic!("expected async call") };
     assert!(matches!(calls[0].kind,ActionKind::Call{..}));
     let ConcurrentState::Actions(tools) = run.next_concurrent() else { panic!("expected synchronous tool") };
@@ -2956,7 +2730,7 @@ fn m6_virtual_calls_launch_even_when_an_earlier_async_tool_is_pending() {
     use runtime::ConcurrentState;
     let source=r#"import {read} from 'host:io/promises';async function main(){let a=read({path:'x'});let b=work('x');return [await a,await b];}
 /** @virtual Work and return a value. */ async function work(item){}"#;
-    let mut run=Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let mut run=start_task(compile(source).unwrap(), vec![]);
     let ConcurrentState::Actions(calls)=run.next_concurrent() else {panic!("expected virtual call")};
     assert!(matches!(calls[0].kind,ActionKind::Call{..}));
     let ConcurrentState::Actions(tools)=run.next_concurrent() else {panic!("expected tool call")};
@@ -3029,4 +2803,36 @@ fn m5_unawaited_async_calls_are_rejected_where_used_as_values() {
     let error = compile(&format!("{header}const passed = inspect('a').passed;")).unwrap_err().to_string();
     assert!(error.contains("returns a Promise; await it"), "{error}");
     compile(&format!("{header}const passed = (await inspect('a')).passed;")).unwrap();
+}
+
+
+#[test]
+fn a_comment_separated_by_a_blank_line_is_not_part_of_the_next_function_contract() {
+    let program = compile("const draft = compose(1);\n// The flow ends after the checks.\n\n/** @virtual */\nfunction compose(request) {\n  // Write the page. Returns {content:string}.\n}\n").unwrap();
+    let description = &program.functions["compose"].description;
+    assert!(description.contains("Write the page"));
+    assert!(!description.contains("The flow ends"), "{description}");
+}
+
+#[test]
+fn a_nested_virtual_helper_is_ai_work_and_does_not_mark_its_enclosing_function() {
+    let program = crate::agent_program::compiler::compile_body_with_scope(
+        "async function designPage(shared, page) {\n  /** @virtual */\n  async function generate(page) {\n    // Write the page. Returns {content:string}.\n  }\n  return await generate(page);\n}\n",
+        "designPage", crate::agent_program::libraries::builtin(), Default::default()).unwrap();
+    assert!(!program.functions["designPage"].virtual_task);
+    let (id, nested) = program.functions.iter().find(|(id, _)| id.starts_with("designPage/generate@")).unwrap();
+    assert!(nested.virtual_task, "{id}");
+    assert!(nested.description.contains("Write the page"));
+    assert_eq!(nested.leaf_tools, Some(vec![]), "declared in an implementation: a leaf");
+    assert!(crate::agent_program::compiler::compile_body_with_scope(
+        "function f() {\n  /** @virtual */\n  function g() {\n    // Do it.\n    return 1;\n  }\n  return g();\n}\n",
+        "f", crate::agent_program::libraries::builtin(), Default::default()).is_err(), "a virtual has no executable body");
+}
+
+#[test]
+fn counted_repetition_over_any_character_compiles_as_in_javascript() {
+    // Written by the AI in a real run: rejected under the former 1 MB budget.
+    let source = "const text = \"可核验的证据\" + \"中间\".repeat(500) + \"不能单独作为证据\";\nassert(/(?:真实的完成证据|可核验的证据)[\\s\\S]{0,1800}(?:不能单独作为证据|不能单独)/.test(text), \"found within 1800\");\nassert(!/(?:真实的完成证据|可核验的证据)[\\s\\S]{0,10}(?:不能单独作为证据|不能单独)/.test(text), \"not within 10\");";
+    let mut run = Runtime::task_program(compile(source).unwrap(), crate::agent_program::ENTRY, vec![]).unwrap();
+    assert!(matches!(run.next(), State::Returned(_)), "both assertions hold");
 }

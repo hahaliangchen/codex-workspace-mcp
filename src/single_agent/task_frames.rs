@@ -323,66 +323,30 @@ pub(super) async fn create_task(
     step: usize,
 ) -> Result<String> {
     let parent = frame_task(s, w);
-    if parent == tree::ROOT {
-        create_main_task(s, w, call, request_id, step).await?;
-        Ok(s.scope.clone())
-    } else {
-        create_function_task(s, w, &parent, call, request_id, step).await
-    }
+    ensure!(parent != tree::ROOT, "the host opens the main task for each user request");
+    create_function_task(s, w, &parent, call, request_id, step).await
 }
 
-async fn create_main_task(
-    s: &Session<'_>,
-    w: &mut Window,
-    call: &crate::model_stream::ToolCall,
-    request_id: &str,
-    step: usize,
-) -> Result<()> {
-    let (task, turn, scope, mut frame, call, request_id) = (
-        s.task.to_owned(),
-        s.turn,
-        s.scope.clone(),
-        w.clone(),
-        call.clone(),
-        request_id.to_owned(),
-    );
+/// Each user request is a main task. The host opens it with the request as
+/// its goal before the first model request; the AI never creates it.
+pub(super) async fn open_main_task(s: &Session<'_>, w: &mut Window, request: &str) -> Result<()> {
+    let goal: String = request.trim().chars().take(16000).collect();
+    let goal = if goal.is_empty() { "User request".to_owned() } else { goal };
+    let (task, turn, scope, mut frame) = (s.task.to_owned(), s.turn, s.scope.clone(), w.clone());
     *w = db(s.state.workspace.root(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        record_call(&tx, &task, turn, step, &request_id, &call, tree::ROOT)?;
-        tx.execute_batch("SAVEPOINT create_task")?;
-        let created = (|| -> Result<(Value, String)> {
-            let args: Value = serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
-            ensure!(args.as_object().is_some_and(|v|v.keys().all(|k|matches!(k.as_str(),"goal"|"reason"|"briefing"))), "create_task accepts only goal, reason and briefing; express child functions in execute_program");
-            let mut root = tree::get(&tx, &task, tree::ROOT)?;
-            ensure!(root.status == "running", "TASK_STACK_FRAME_MISMATCH: the conversation is not at its top level");
-            let ordinal = tree::children(&tx, &task, tree::ROOT)?.len();
-            let (mut node, mut finish) = new_task(&root, &args, ordinal, "main", turn)?;
-            tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
-            tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
-            root.status = "suspended".into();
-            tree::emit(&tx, &task, "task/node_suspended", &mut root, turn)?;
-            node.status = "running".into();
-            tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
-            Ok((json!({"task":{"node_id":node.node_id,"goal":node.goal},
-                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete top-level flow covering the user goal and helpers for its steps; import the published tools from host:<library>. No main or return value is required. Use ordinary helper(args) for serial tasks; async virtual functions and Promise.all run independent AI work concurrently. Import async tools from host:<library>/promises. generator/yield is rejected. Helper returns resume the caller; top-level completion finishes the task; the host records execution without another model completion verdict."}),
-                node.node_id))
-        })();
-        if created.is_err() {
-            tx.execute_batch("ROLLBACK TO create_task")?;
-        }
-        tx.execute_batch("RELEASE create_task")?;
-        let (result, owner, marker) = match created {
-            Ok((result, node)) => (result, node, true),
-            Err(error) => (json!({"error":format!("{error:#}")}), tree::ROOT.to_owned(), false),
-        };
-        {
-            let seq = record_result(&tx, &task, turn, &json!(step), &json!(request_id), &call.call_id, &owner, &result)?;
-            frame.messages.push(sourced(json!({"role":"tool","tool_call_id":call.call_id,"content":with_seq(&result,seq).to_string()}), &task, seq));
-        }
-        if marker {
-            frame.task_node_id = Some(owner);
-            frame.current_step_node_id = None;
-        }
+        let mut root = tree::get(&tx, &task, tree::ROOT)?;
+        ensure!(root.status == "running", "TASK_STACK_FRAME_MISMATCH: the conversation is not at its top level");
+        let ordinal = tree::children(&tx, &task, tree::ROOT)?.len();
+        let (mut node, mut finish) = new_task(&root, &json!({"goal":goal}), ordinal, "main", turn)?;
+        tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
+        tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
+        root.status = "suspended".into();
+        tree::emit(&tx, &task, "task/node_suspended", &mut root, turn)?;
+        node.status = "running".into();
+        tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
+        frame.task_node_id = Some(node.node_id);
+        frame.current_step_node_id = None;
         write_window(&tx, &task, &scope, &frame)?;
         tx.commit()?;
         Ok(frame)
@@ -558,10 +522,18 @@ fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node) -> Result<Wind
         .context("compiled function descriptor required")?;
     let task = Value::Object(task.clone());
     let input = super::program_flow::call_view(&task)?;
+    let virtual_function = task["role"] != "body";
+    if virtual_function {
+        // A virtual function's context is its signature, contract and actual
+        // arguments: nothing of its caller's conversation or scope comes along.
+        let mut messages = vec![json!({"role":"system","content":s.prompt()})];
+        inherit_material(parent, &mut messages);
+        child.messages = messages;
+    }
     child.messages.push(json!({"role":"user","name":"program_task_input","content":input.to_string(),"_frame_input":true}));
     child.program = super::program_flow::task_runtime(&task)?;
     child.program_task = Some(task);
-    if let Some(index) = super::function_scope::index(&child) {
+    if !virtual_function && let Some(index) = super::function_scope::index(&child) {
         child.messages.push(index);
     }
     let mut session = s.clone();
@@ -1102,15 +1074,6 @@ mod tests {
         async fn persist(&mut self) {
             save(&self.session(), &self.w).await.unwrap();
         }
-        fn tool_call(&mut self, name: &str, args: Value) -> crate::model_stream::ToolCall {
-            let call = crate::model_stream::ToolCall {
-                call_id: agent_service::uuid_like(),
-                name: name.into(),
-                arguments: args.to_string(),
-            };
-            self.w.messages.push(json!({"role":"assistant","tool_calls":[{"id":call.call_id,"type":"function","function":{"name":name,"arguments":call.arguments}}]}));
-            call
-        }
         async fn user(&mut self, text: &str) -> i64 {
             let seq = append(
                 &self.session(),
@@ -1125,40 +1088,6 @@ mod tests {
                 .push(sourced(json!({"role":"user","content":text}), "t", seq));
             self.persist().await;
             seq
-        }
-        /// Create the main task as the model would; returns (task, first step).
-        async fn start(&mut self, goal: &str, first: &str) -> (String, String) {
-            let call = self.tool_call("create_task", json!({"goal":goal,"briefing":first}));
-            self.persist().await;
-            let mut w = self.w.clone();
-            create_task(&self.session(), &mut w, &call, "request_test", 1)
-                .await
-                .unwrap();
-            self.w = w;
-            let task = self.w.task_node_id.clone().unwrap();
-            self.step("Task started", first).await;
-            (task.clone(), self.current(&task))
-        }
-        /// Finish the current step as the model would; returns the next step.
-        async fn step(&mut self, result: &str, next: &str) -> String {
-            let _ = result;
-            let mut w = self.w.clone();
-            complete_round(&self.session(), &mut w).await.unwrap();
-            begin_round(&self.session(), &mut w, next).await.unwrap();
-            self.w = w;
-            let task = self.w.task_node_id.clone().unwrap();
-            self.current(&task)
-        }
-        fn current(&self, task: &str) -> String {
-            tree::current_step(&agent_service::open_db(&self.root).unwrap(), "t", task)
-                .unwrap()
-                .unwrap()
-                .node_id
-        }
-        fn active(&self) -> Node {
-            tree::active(&agent_service::open_db(&self.root).unwrap(), "t")
-                .unwrap()
-                .unwrap()
         }
     }
 
@@ -1239,24 +1168,7 @@ mod tests {
         json!({"role":"assistant","content":content})
     }
 
-    fn tool_names(body: &Value) -> Vec<String> {
-        body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap().to_owned())
-            .collect()
-    }
 
-    fn tool_result<'a>(body: &'a Value, id: &str) -> &'a str {
-        body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
-            .and_then(|m| m["content"].as_str())
-            .unwrap_or_else(|| panic!("no result for {id}"))
-    }
 
     #[test]
     fn inherited_skill_material_is_deduplicated_by_asset_not_delivery_event() {
@@ -1285,127 +1197,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
     }
 
-    /// A plugin saves a plan for the user's confirmation inside a task: the host
-    /// pauses there. The task stays open, so the next message continues it.
-    #[tokio::test]
-    async fn a_saved_plan_pauses_the_task_instead_of_finishing_it() {
-        let mut h = Harness::new().await;
-        let root = h.root.clone();
-        let (address,seen,server)=model(move|n,_| match n {
-            0=>call("start","create_task",json!({"goal":"Create a presentation","briefing":"Draft the outline"})),
-            1=>{
-                crate::main_task_anchor::propose_plan(&root,"t",json!({"items":[{"id":"p1","title":"Cover","requirements":"Title and subtitle"}]})).unwrap();
-                call("board","read_task_board",json!({}))
-            },
-            _=>panic!("the host must pause after the plan proposal"),
-        }).await;
-        h.state = agent_service::tests::test_state(&h.root, address);
-        h.user("Create a presentation").await;
-        let mut window = h.w.clone();
-        assert!(matches!(
-            run_loop(&h.session(), &mut window, 5).await.unwrap(),
-            LoopResult::Answer
-        ));
-        server.abort();
-        assert_eq!(seen.lock().unwrap().len(), 2);
-        let active = h.active();
-        assert_eq!(
-            (active.kind.as_str(), active.status.as_str()),
-            ("task", "running"),
-            "the task waits for the user instead of finishing"
-        );
-        assert!(approval_boundary(&h.session()).unwrap().is_some());
-        assert_eq!(window.messages.last().unwrap()["role"], "assistant");
-    }
 
-    /// Before its task exists the main execution may only create it. Steps
-    /// are created by the agent, so one step spans many requests.
-    #[tokio::test]
-    async fn tools_require_a_task_and_host_records_each_ai_request() {
-        let (address,seen,server)=model(|n,body| {
-            let names=tool_names(body);
-            assert_eq!(names.iter().any(|t|t=="create_task"), n < 2);
-            if n < 2 {assert_eq!(names,vec!["create_task"],"publish only the callable bootstrap operation before a task exists");}
-            for name in ["create_step","update_task_definition","branch_task","return_task","plan_tasks","start_task"] {assert!(!names.iter().any(|t|t==name),"{name} must not be advertised");}
-            match n {
-                0=>{
-                    let status=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="task_status").unwrap();
-                    assert!(status["content"].as_str().unwrap().contains("No task is running"));
-                    call("early","read_file",json!({"path":"source.txt"}))
-                },
-                1=>{
-                    assert!(tool_result(body,"early").contains("NO_TASK"));
-                    call("start","create_task",json!({"goal":"Write result.txt from the source","briefing":"Read the source"}))
-                },
-                2=>call("board","read_task_board",json!({})),
-                3=>json!({"role":"assistant","tool_calls":[
-                    {"id":"together","type":"function","function":{"name":"create_task","arguments":json!({"goal":"nested","reason":"test","briefing":"test"}).to_string()}},
-                    {"id":"read","type":"function","function":{"name":"read_file","arguments":json!({"path":"source.txt"}).to_string()}}]}),
-                4=>{
-                    assert!(tool_result(body,"together").contains("TOOL_UNAVAILABLE"));
-                    assert!(tool_result(body,"read").contains("source document"));
-                    call("again","read_file",json!({"path":"source.txt"}))
-                },
-                5=>call("next","read_task_board",json!({})),
-                6=>{
-                    assert!(tool_result(body,"next").contains("Round"));
-                    call("write","write_file",json!({"path":"result.txt","content":"verified output"}))
-                },
-                7=>answer("Written result.txt from the source."),
-                _=>panic!("no host continuation after the answer"),
-            }
-        }).await;
-        let mut h = Harness::new().await;
-        std::fs::write(h.root.join("source.txt"), "source document").unwrap();
-        h.state = agent_service::tests::test_state(&h.root, address);
-        h.user("Write an output using the source").await;
-        let mut window = h.w.clone();
-        assert!(matches!(
-            run_loop(&h.session(), &mut window, 12).await.unwrap(),
-            LoopResult::Answer
-        ));
-        server.abort();
-        assert_eq!(seen.lock().unwrap().len(), 8);
-        assert_eq!(
-            std::fs::read_to_string(h.root.join("result.txt")).unwrap(),
-            "verified output"
-        );
-        let conn = agent_service::open_db(&h.root).unwrap();
-        let nodes = tree::nodes(&conn, "t").unwrap();
-        let main = nodes.iter().find(|n| n.kind == "task").unwrap();
-        let steps = nodes
-            .iter()
-            .filter(|n| n.kind == "step" && n.parent_id.as_deref() == Some(main.node_id.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(steps.len(), 6);
-        assert!(steps.iter().all(|s| s.status == "done"));
-        assert!(steps.iter().all(|s| s.metadata["request_id"].is_string()));
-        assert_eq!(steps.last().unwrap().metadata["phase"], "executing");
-        assert_eq!(main.status, "done");
-        assert_eq!(
-            main.result.as_ref().unwrap()["result"],
-            "Written result.txt from the source."
-        );
-        assert!(nodes.iter().any(|n| n.kind == "finish"
-            && n.parent_id.as_deref() == Some(main.node_id.as_str())
-            && n.status == "done"));
-        assert_eq!(
-            tree::get(&conn, "t", tree::ROOT).unwrap().status,
-            "running",
-            "the conversation is back at its top level"
-        );
-        let flow: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='flow/node_add'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(flow, 8, "one Flow request node per model request");
-        // Work belongs to the step it was done in.
-        let owner:String=conn.query_row("SELECT node_id FROM agent_task_events WHERE task_id='t' AND kind='tool/call' AND json_extract(data,'$.callId')='write'",[],|r|r.get(0)).unwrap();
-        assert_eq!(owner, steps[4].node_id);
-    }
 
     #[tokio::test]
     async fn a_plain_answer_needs_no_task() {
@@ -1429,302 +1221,15 @@ mod tests {
         assert_eq!(nodes[0].status, "running");
     }
 
-    #[tokio::test]
-    async fn retired_task_lists_are_rejected_without_changing_the_active_scope() {
-        let mut h = Harness::new().await;
-        let call = h.tool_call(
-            "create_task",
-            json!({"goal":"One main", "tasks":[{"goal":"Old child"}]}),
-        );
-        let mut window = h.w.clone();
-        create_task(&h.session(), &mut window, &call, "bad-list", 1)
-            .await
-            .unwrap();
-        assert_eq!(window.task_node_id, None);
-        assert!(
-            window.messages.last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .contains("only goal, reason and briefing")
-        );
-        let conn = agent_service::open_db(&h.root).unwrap();
-        assert_eq!(tree::nodes(&conn, "t").unwrap().len(), 1);
-        assert_eq!(tree::get(&conn, "t", tree::ROOT).unwrap().status, "running");
-        let native = tools(&h.session(), &window);
-        let names = native
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            native.len(),
-            names.len(),
-            "one catalog entry per dispatcher target"
-        );
-        for removed in [
-            "create_step",
-            "return_task",
-            "load_tool_group",
-            "list_tool_groups",
-            "unload_tool_group",
-        ] {
-            assert!(!names.contains(removed));
-        }
-    }
 
-    #[tokio::test]
-    async fn a_native_fork_cannot_bypass_the_compiled_program() {
-        let (address, seen, server) =
-            model(|n, body| match n {
-                0 => call(
-                    "main",
-                    "create_task",
-                    json!({"goal":"Check dispatch boundary"}),
-                ),
-                1 => {
-                    assert!(!tool_names(body).iter().any(|n| matches!(
-                        n.as_str(),
-                        "spawn_agent" | "join_agents" | "create_task"
-                    )));
-                    call(
-                        "bypass",
-                        "spawn_agent",
-                        json!({"name":"unauthorized path","task":"Run without a program"}),
-                    )
-                }
-                2 => {
-                    assert!(tool_result(body, "bypass").contains("TOOL_UNAVAILABLE"));
-                    answer("The private fork entry was rejected.")
-                }
-                _ => panic!("must not start a delegate or another model loop"),
-            })
-            .await;
-        let mut h = Harness::new().await;
-        h.state = agent_service::tests::test_state(&h.root, address);
-        h.user("Check dispatch boundary").await;
-        let mut window = h.w.clone();
-        assert!(matches!(
-            run_loop(&h.session(), &mut window, 5).await.unwrap(),
-            LoopResult::Answer
-        ));
-        server.abort();
-        assert_eq!(seen.lock().unwrap().len(), 3);
-        let conn = agent_service::open_db(&h.root).unwrap();
-        assert_eq!(tree::nodes(&conn, "t").unwrap().iter().filter(|node| node.metadata["role"] == "delegate").count(), 0);
-    }
 
     /// 烧水热菜 on the real loop. The main task's steps share its context; the
     /// broken pot is a temporary task under the switch-on step with its own
     /// context. Its summary is the result of the create_task call that started
     /// it, and the step continues.
 
-    #[tokio::test]
-    async fn an_invalid_temporary_task_is_an_ordinary_tool_error() {
-        let mut h = Harness::new().await;
-        let (main, _) = h.start("Heat the dinner", "Switch on the pot").await;
-        let call = h.tool_call("create_task", json!({"tasks":[]}));
-        h.persist().await;
-        let mut w = h.w.clone();
-        let scope = create_task(&h.session(), &mut w, &call, "request", 1)
-            .await
-            .unwrap();
-        assert_eq!(scope, "main");
-        assert!(
-            w.messages.last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .contains("function call requires a suspended flow program")
-        );
-        assert_eq!(h.active().node_id, main);
-        assert_eq!(
-            tree::nodes(&agent_service::open_db(&h.root).unwrap(), "t")
-                .unwrap()
-                .iter()
-                .filter(|n| n.kind == "task")
-                .count(),
-            1
-        );
-    }
 
-    /// A task as a function on the real loop: the caller's materials stay while
-    /// it runs; a child receives only the materials passed as asset_ids (its
-    #[tokio::test]
-    async fn every_round_receives_compact_activity_and_keeps_original_results_by_reference() {
-        let mut h = Harness::new().await;
-        std::fs::write(h.root.join("source.txt"), "PRIVATE_SOURCE_BODY").unwrap();
-        let root = h.root.clone();
-        let (address, seen, server) = model(move |n, body| match n {
-            0 => call("start", "create_task", json!({"goal":"Process source.txt"})),
-            1 => call("board", "read_task_board", json!({})),
-            2 => call("read", "read_file", json!({"path":"source.txt"})),
-            3 => {
-                let messages = body["messages"].as_array().unwrap();
-                assert!(
-                    !messages.iter().any(|m| m["name"] == "task_activity"),
-                    "the old duplicate ledger is no longer attached to every round"
-                );
-                assert!(
-                    tool_result(body, "read").contains("PRIVATE_SOURCE_BODY"),
-                    "the overview does not replace native tool delivery"
-                );
-                call(
-                    "write",
-                    "write_file",
-                    json!({"path":"processed.txt","content":"Processed source"}),
-                )
-            }
-            4 => {
-                let messages = body["messages"].as_array().unwrap();
-                assert!(
-                    !messages.iter().any(|m| m["name"] == "step_result"),
-                    "below capacity completed rounds keep their native exchange"
-                );
-                assert!(
-                    tool_result(body, "read").contains("PRIVATE_SOURCE_BODY"),
-                    "an earlier read stays usable without reading it again"
-                );
-                let index: Value = serde_json::from_str(
-                    messages
-                        .iter()
-                        .find(|m| m["name"] == "task_asset_index")
-                        .unwrap()["content"]
-                        .as_str()
-                        .unwrap(),
-                )
-                .unwrap();
-                let entry = index["assets"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|a| a["source_tool"] == "read_file")
-                    .unwrap();
-                assert_eq!(entry["in_context"], true);
-                let original = crate::context_assets::read(
-                    &root,
-                    "t",
-                    &json!({"asset_id":entry["asset_id"]}),
-                    None,
-                )
-                .unwrap();
-                assert!(
-                    original.to_string().contains("PRIVATE_SOURCE_BODY"),
-                    "the complete original remains available"
-                );
-                assert!(
-                    tool_result(body, "write").contains("processed.txt"),
-                    "the newest exchange stays in native form"
-                );
-                answer("Source processed")
-            }
-            _ => panic!("unexpected model request {n}"),
-        })
-        .await;
-        h.state = agent_service::tests::test_state(&h.root, address);
-        h.user("Process source.txt").await;
-        let mut window = h.w.clone();
-        let outcome = run_loop(&h.session(), &mut window, 10).await;
-        server.abort();
-        assert!(matches!(outcome.unwrap(), LoopResult::Answer));
-        assert_eq!(
-            std::fs::read_to_string(h.root.join("processed.txt")).unwrap(),
-            "Processed source"
-        );
-        let conn = agent_service::open_db(&h.root).unwrap();
-        let reads:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='tool/call' AND json_extract(data,'$.name')='read_file'",[],|row|row.get(0)).unwrap();
-        assert_eq!(reads, 1);
-        assert!(
-            !seen
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|body| completion_request(body))
-        );
-        assert!(
-            !window.messages.iter().any(|m| m["name"] == "task_activity"),
-            "overviews stay outside persisted conversational history"
-        );
-    }
 
-    /// A new user request starts a clean main context: only the memory index
-    /// of earlier turns, plus the skills still active. Details come from
-    /// history by node.
-    #[tokio::test]
-    async fn each_request_starts_a_clean_context_with_the_memory_index() {
-        let (address,seen,server)=model(|n,body| {
-            let text=body["messages"].to_string();
-            match n {
-                0=>call("t1","create_task",json!({"goal":"Write the note","briefing":"Write note.txt"})),
-                1=>call("board","read_task_board",json!({})),
-                2=>call("write","write_file",json!({"path":"note.txt","content":"NOTE_BODY"})),
-                3=>answer("NOTE_WRITTEN to note.txt"),
-                4=>{
-                    assert!(!text.contains("NOTE_BODY"),"earlier working records are not loaded");
-                    let memory=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="conversation_memory").expect("memory index");
-                    let index:Value=serde_json::from_str(memory["content"].as_str().unwrap()).unwrap();
-                    let earlier=&index["entries"][0];
-                    assert_eq!((earlier["turn"].as_i64(),earlier["request"].as_str()),(Some(1),Some("Write a note")));
-                    assert_eq!(earlier["kind"], "task");
-                    assert_eq!(earlier["task"]["goal"], "Write the note");
-                    assert!(earlier["answer"].as_str().unwrap().contains("NOTE_WRITTEN"));
-                    assert!(super::super::tests::declares(body,"io","write"),"permitted file declarations carry over");
-                    call("t2","create_task",json!({"goal":"Report what the note says","briefing":"Read the earlier task"}))
-                },
-                5=>{
-                    let memory=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="conversation_memory").unwrap();
-                    let index:Value=serde_json::from_str(memory["content"].as_str().unwrap()).unwrap();
-                    call("history","read_session_history",json!({"node_id":index["entries"][0]["task"]["node_id"],"include_descendants":true,"query":"write_file"}))
-                },
-                6=>{
-                    let history=tool_result(body,"history");
-                    assert!(history.contains("NOTE_BODY"),"details come from history by node: {history}");
-                    answer("The note says NOTE_BODY")
-                },
-                _=>panic!("unexpected request {n}"),
-            }
-        }).await;
-        let mut h = Harness::new().await;
-        h.state = agent_service::tests::test_state(&h.root, address);
-        run_task(
-            h.state.clone(),
-            "t".into(),
-            "fake".into(),
-            "Write a note".into(),
-            10,
-            CancellationToken::new(),
-            1,
-            false,
-        )
-        .await
-        .unwrap();
-        run_task(
-            h.state.clone(),
-            "t".into(),
-            "fake".into(),
-            "What did the note say?".into(),
-            10,
-            CancellationToken::new(),
-            2,
-            false,
-        )
-        .await
-        .unwrap();
-        server.abort();
-        assert_eq!(seen.lock().unwrap().len(), 7);
-        let conn = agent_service::open_db(&h.root).unwrap();
-        let resets:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='t' AND kind='context/main_reset'",[],|r|r.get(0)).unwrap();
-        assert_eq!(resets, 2);
-        let tasks = tree::nodes(&conn, "t")
-            .unwrap()
-            .into_iter()
-            .filter(|n| n.kind == "task")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            tasks
-                .iter()
-                .map(|t| (t.metadata["turn"].as_i64(), t.status.as_str()))
-                .collect::<Vec<_>>(),
-            [(Some(1), "done"), (Some(2), "done")]
-        );
-    }
 
     /// A turn that stops before the finish node leaves the task open; the next
     /// message continues it in the same context instead of starting over.
@@ -1917,48 +1422,6 @@ mod tests {
         assert!(entries.iter().all(|entry| entry["kind"] == "qa"));
     }
 
-    #[tokio::test]
-    async fn a_blocked_function_returns_its_result_without_a_completion_check() {
-        let summary = "未完成：外部编辑冲突。请用户选择保留的稿件后再继续。";
-        let (address, seen, server) = raw_model(move |n, _| match n {
-            0 => call(
-                "start",
-                "create_task",
-                json!({"goal":"Complete the document"}),
-            ),
-            1 => answer(summary),
-            _ => panic!("a blocked function returns without another AI call"),
-        })
-        .await;
-        let mut h = Harness::new().await;
-        h.state = agent_service::tests::test_state(&h.root, address);
-        h.user("Complete the document").await;
-        let mut window = h.w.clone();
-        let outcome = run_loop(&h.session(), &mut window, 4).await;
-        server.abort();
-        assert!(matches!(outcome.unwrap(), LoopResult::Answer));
-        assert_eq!(seen.lock().unwrap().len(), 2);
-        let conn = agent_service::open_db(&h.root).unwrap();
-        let nodes = tree::nodes(&conn, "t").unwrap();
-        let task = nodes.iter().find(|n| n.kind == "task").unwrap();
-        assert_eq!(task.result.as_ref().unwrap()["result"], summary);
-        assert!(
-            nodes
-                .iter()
-                .any(|n| n.kind == "finish" && n.status == "done")
-        );
-        let saved: String = conn
-            .query_row(
-                "SELECT state FROM agent_runtime_windows WHERE task_id='t' AND scope='main'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&saved).unwrap()["task_node_id"],
-            tree::ROOT
-        );
-    }
 
     #[tokio::test]
     async fn parallel_frames_keep_identity_and_serial_returns_do_not_touch_a_sibling() {

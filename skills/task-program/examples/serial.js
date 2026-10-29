@@ -1,6 +1,10 @@
-// 最小串行流程：设计 → 保存 → 读回 → 验收 → 交付。不启动子 Agent。
 import * as io from "host:io";
-const request = input;
+// 最小串行流程：设计 → 保存 → 读回 → 验收 → 交付。
+const request = {
+  topic: "通用 Agent 的职责边界",
+  output: "agent-overview.html",
+  requirements: "制作一个独立中文 HTML，说明用户、AI、通用宿主、插件和工具的职责。内嵌 CSS，可在桌面与手机阅读；准确区分流程结束与业务验收。"
+};
 
 const draft = compose(request);
 const receipt = io.write({path: request.output, content: draft.content});
