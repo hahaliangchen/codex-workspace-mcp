@@ -361,12 +361,6 @@ pub fn tagged(mut message: Value, reference: &Value) -> Value {
 pub fn delivered(result: &Value, reference: &Value) -> Value {
     json!({"asset_reference":reference,"original_result":result})
 }
-/// Hand off an asset without loading its body into the recipient's window.
-pub fn referenced(message: Value, reference: &Value) -> Value {
-    let mut message = tagged(message, reference);
-    reference_only(&mut message);
-    message
-}
 fn receipt(reference: &Value) -> String {
     let mut handle = serde_json::Map::new();
     for key in [

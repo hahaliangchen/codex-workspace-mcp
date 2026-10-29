@@ -9,6 +9,9 @@ fn connection(root: &Path) -> Result<rusqlite::Connection> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_file_baselines (
         task_id TEXT NOT NULL, workspace TEXT NOT NULL, path TEXT NOT NULL,
         exists_at_baseline INTEGER NOT NULL, bytes BLOB,
+        PRIMARY KEY(task_id, workspace, path));
+        CREATE TABLE IF NOT EXISTS agent_parallel_file_owners (
+        task_id TEXT NOT NULL, workspace TEXT NOT NULL, path TEXT NOT NULL, owner TEXT NOT NULL,
         PRIMARY KEY(task_id, workspace, path));")?;
     Ok(conn)
 }
@@ -113,6 +116,20 @@ fn proposed_content(name: &str, args: &Value, base: Option<&[u8]>) -> Result<Vec
 }
 
 impl Prepared {
+    pub(super) fn other_parallel_writer(&self, root: &Path, task: &str, owner: &str) -> Result<bool> {
+        let conn = connection(root)?;
+        let previous: Option<String> = conn.query_row(
+            "SELECT owner FROM agent_parallel_file_owners WHERE task_id=?1 AND workspace=?2 AND path=?3",
+            params![task,self.workspace,self.relative], |row| row.get(0),
+        ).optional()?;
+        Ok(previous.is_some_and(|previous| previous != owner))
+    }
+    pub(super) fn record_parallel_writer(&self, root: &Path, task: &str, owner: &str) -> Result<()> {
+        let conn = connection(root)?;
+        conn.execute("INSERT INTO agent_parallel_file_owners(task_id,workspace,path,owner) VALUES (?1,?2,?3,?4) ON CONFLICT(task_id,workspace,path) DO UPDATE SET owner=excluded.owner",
+            params![task,self.workspace,self.relative,owner])?;
+        Ok(())
+    }
     pub(super) fn conflict(&self) -> Result<bool> {
         Ok(crate::file_edit::snapshot(&self.target)?.as_deref() != self.base.as_deref())
     }
@@ -164,6 +181,26 @@ mod tests {
         assert_eq!(fs::read_to_string(saved["candidate_path"].as_str().unwrap())?, "agent\n");
         assert_eq!(saved["error_code"], "ASSET_CONFLICT");
         assert_eq!(saved["candidate"], "file");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_writers_record_the_owner_and_preserve_the_second_candidate() -> Result<()> {
+        let root = root();
+        let path = root.join("document.txt");
+        fs::write(&path, "original")?;
+        let first = prepare(&root, "task", &root, "write_file", json!({"path":"document.txt","content":"first"}))?;
+        assert!(!first.other_parallel_writer(&root, "task", "one")?);
+        fs::write(&path, "first")?;
+        assert!(first.committed(&root, "task")?);
+        first.record_parallel_writer(&root, "task", "one")?;
+        let second = prepare(&root, "task", &root, "write_file", json!({"path":"document.txt","content":"second"}))?;
+        assert!(!second.other_parallel_writer(&root, "task", "one")?);
+        assert!(second.other_parallel_writer(&root, "task", "two")?);
+        let conflict = second.preserve(&root)?;
+        assert_eq!(fs::read_to_string(&path)?, "first");
+        assert_eq!(fs::read_to_string(conflict["candidate_path"].as_str().unwrap())?, "second");
         fs::remove_dir_all(root)?;
         Ok(())
     }

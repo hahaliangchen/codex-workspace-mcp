@@ -6,6 +6,8 @@ use crate::agent_program::{self, Action, Runtime, State, runtime::ActionKind};
 pub(super) enum Round {
     Exchange(String, Value),
     Recover,
+    Concurrent(Vec<Action>),
+    Waiting,
 }
 pub(super) fn library_catalog(
     s: &Session<'_>,
@@ -20,7 +22,7 @@ pub(super) fn library_catalog(
     agent_program::libraries::catalog(definitions, &packages)
 }
 /// One call representation for ordinary, virtual and forked functions.
-fn function_task(
+pub(super) fn function_task(
     program: &agent_program::Program,
     name: &str,
     arguments: &[Value],
@@ -78,7 +80,7 @@ pub(super) fn task_runtime(task: &Value) -> Result<Option<Runtime>> {
         return Ok(None);
     }
     let (_, arguments) = call_arguments(task)?;
-    fork_runtime(&json!({"program":{"compiled":task["body"]["compiled"],"entry":task["name"],"args":arguments}})).map(Some)
+    compiled_runtime(&json!({"program":{"compiled":task["body"]["compiled"],"entry":task["name"],"args":arguments}})).map(Some)
 }
 pub(super) fn install_scoped(
     s: &Session<'_>,
@@ -162,7 +164,7 @@ fn install_with(
     let entry = args["entry"].as_str().unwrap_or("main");
     ensure!(
         entry == "main",
-        "execute_program enters the task through its single main; helpers run through ordinary calls/fork"
+        "execute_program enters the task through its single main; helpers run through ordinary or async calls"
     );
     let count = program
         .functions
@@ -235,17 +237,17 @@ fn install_body_with(
         json!({"status":"started","function":entry,"version":agent_program::VERSION,"source_hash":crate::visual_artifacts::hash(source.as_bytes())}),
     )
 }
-pub(super) fn fork_runtime(args: &Value) -> Result<Runtime> {
-    fork_runtime_with_scope(args, BTreeMap::new())
+pub(super) fn compiled_runtime(args: &Value) -> Result<Runtime> {
+    compiled_runtime_with_scope(args, BTreeMap::new())
 }
-pub(super) fn fork_runtime_with_scope(
+pub(super) fn compiled_runtime_with_scope(
     args: &Value,
     scope: BTreeMap<String, Value>,
 ) -> Result<Runtime> {
     let p = args
         .get("program")
         .filter(|v| v.is_object())
-        .context("fork requires a compiled flow function")?;
+        .context("compiled flow function required")?;
     let program: agent_program::Program =
         serde_json::from_value(p["compiled"].clone()).context("compiled host program required")?;
     let entry = p["entry"].as_str().context("program.entry is required")?;
@@ -265,9 +267,7 @@ pub(super) fn internal_call(w: &Window, call: &crate::model_stream::ToolCall) ->
             action.id == call.call_id
                 && matches!(
                     (&action.kind, call.name.as_str()),
-                    (ActionKind::Fork { .. }, "spawn_agent")
-                        | (ActionKind::Join { .. }, "join_agents")
-                        | (ActionKind::ParallelReads { .. }, "parallel_read_batch")
+                    (ActionKind::ParallelReads { .. }, "parallel_read_batch")
                 )
         })
 }
@@ -292,7 +292,7 @@ fn recorded(s: &Session<'_>, id: &str) -> Result<Option<(i64, Value)>> {
     .transpose()
 }
 fn resolve(
-    s: &Session<'_>,
+    _s: &Session<'_>,
     w: &mut Window,
     action: &Action,
     mut value: Value,
@@ -301,41 +301,7 @@ fn resolve(
 ) -> Result<()> {
     if !failed {
         match &action.kind {
-            ActionKind::Fork { .. } => {
-                if value["agent_id"].is_string() {
-                    value = crate::collaboration_jobs::agent_handle(
-                        s.state.workspace.root(),
-                        s.task,
-                        value["agent_id"].as_str().unwrap(),
-                    )?;
-                } else {
-                    failed = true;
-                    value = json!({"message":"fork did not return an Agent handle","result":value});
-                }
-            }
-            ActionKind::Join { ids } => {
-                let conn = crate::collaboration_jobs::db(s.state.workspace.root())?;
-                let mut results = Vec::new();
-                for id in ids {
-                    let raw: String = conn.query_row(
-                        "SELECT result FROM agent_delegates WHERE task_id=?1 AND id=?2",
-                        params![s.task, id],
-                        |r| r.get(0),
-                    )?;
-                    let result: Value = serde_json::from_str(&raw)?;
-                    if result["status"] != "completed" {
-                        failed = true;
-                        results.push(json!({"agent_id":id,"status":result["status"],"error":result["error"]}));
-                    } else {
-                        results.push(result["program_value"].clone());
-                    }
-                }
-                value = if failed {
-                    json!({"message":"a forked function failed","children":results})
-                } else {
-                    json!(results)
-                };
-            }
+            ActionKind::Fork { .. } | ActionKind::Join { .. } => anyhow::bail!("saved fork/join calls are retired"),
             ActionKind::Tool { .. } | ActionKind::ParallelReads { .. } => {}
             ActionKind::Task { .. } | ActionKind::Call { .. } => {
                 match value["result"]
@@ -360,13 +326,32 @@ fn resolve(
     }
     w.program.as_mut().unwrap().resume(value, failed)
 }
-async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
+pub(super) async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
     // Version rejection must precede receipt consumption or dispatch.
     if w.program
         .as_ref()
         .is_some_and(|p| p.program.version != agent_program::VERSION)
     {
         return Ok(());
+    }
+    let inflight = w.program.as_ref().map(|p| p.inflight_actions()).unwrap_or_default();
+    let mut completed = Vec::new();
+    for action in inflight {
+        if let Some((seq, event)) = recorded(s, &action.id)? { completed.push((seq, action, event)); }
+    }
+    completed.sort_by_key(|(seq, _, _)| *seq);
+    for (_, action, event) in completed {
+        let mut value = event["meta"]["result"].clone();
+        let mut failed = event["message"]["isError"] == true;
+        if !failed {
+            match value["result"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
+                Some(result) if result.get("$task_error").is_some() => { failed = true; value = result["$task_error"].clone(); }
+                Some(result) => value = result,
+                None => { failed = true; value = json!({"message":"async function returned no valid JSON value"}); }
+            }
+        }
+        w.program.as_mut().unwrap().resume_action(&action.id, value, failed)?;
+        save(s, w).await?;
     }
     let Some(action) = w.program.as_ref().and_then(|p| p.pending.clone()) else {
         return Ok(());
@@ -383,6 +368,14 @@ async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
         save(s, w).await?;
     }
     Ok(())
+}
+pub(super) async fn interrupt_unfinished(s: &Session<'_>, w: &mut Window) -> Result<()> {
+    let actions = w.program.as_ref().map(|runtime| runtime.inflight_actions()).unwrap_or_default();
+    for action in actions {
+        task_frames::interrupt_parallel_function(s, &action.id).await?;
+        w.program.as_mut().unwrap().resume_action(&action.id, json!({"message":"async function was interrupted; its external effects were not replayed"}), true)?;
+    }
+    save(s, w).await
 }
 async fn exchange(
     s: &Session<'_>,
@@ -435,9 +428,17 @@ async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value
 }
 pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result<Round> {
     recover(s, w).await?;
-    let state = w.program.as_mut().unwrap().next();
+    let state = w.program.as_mut().unwrap().next_concurrent();
     save(s, w).await?;
+    let state = match state {
+        agent_program::runtime::ConcurrentState::Actions(actions) if actions.first().is_some_and(|action| w.program.as_ref().unwrap().async_scope(&action.id).is_some()) => return Ok(Round::Concurrent(actions)),
+        agent_program::runtime::ConcurrentState::Actions(mut actions) => State::Action(actions.remove(0)),
+        agent_program::runtime::ConcurrentState::Waiting => return Ok(Round::Waiting),
+        agent_program::runtime::ConcurrentState::Returned(value) => State::Returned(value),
+        agent_program::runtime::ConcurrentState::Failed(error) => State::Failed(error),
+    };
     match state {
+        State::Waiting => unreachable!(),
         State::Failed(error) => {
             append(s, "program/error", json!({"error":error}), true).await?;
             if w.program_task.is_some() {
@@ -506,13 +507,9 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 ActionKind::Tool { name, args } => (name.clone(), args.clone()),
                 ActionKind::ParallelReads { operations } => (
                     "parallel_read_batch".into(),
-                    json!({"operations":operations.iter().map(|(name,args)|json!({"name":name,"args":args})).collect::<Vec<_>>()}),
+                    json!({"operations":operations.iter().map(|(name,args)|json!({"name":name,"args":args})).collect::<Vec<_>>(), "settled": w.program.as_ref().unwrap().is_pending_async_batch()}),
                 ),
-                ActionKind::Fork { entry, args } => (
-                    "spawn_agent".into(),
-                    json!({"name":format!("function {entry}"),"task":format!("Execute the compiled {entry} function with its provided arguments and return its value"),"program":{"compiled":w.program.as_ref().unwrap().program,"entry":entry,"args":args}}),
-                ),
-                ActionKind::Join { ids } => ("join_agents".into(), json!({"agent_ids":ids})),
+                ActionKind::Fork { .. } | ActionKind::Join { .. } => anyhow::bail!("saved fork/join calls are retired"),
             };
             #[cfg(test)]
             super::documented_examples::inject_before_read(s.state.workspace.root(), &name, &args)?;
@@ -531,148 +528,391 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    #[tokio::test]
-    async fn restart_recovers_private_fork_and_join_from_the_same_runtime_without_new_tasks() {
-        for recover_fork in [false, true] {
-            let root = TestRoot::new();
-            let state =
-                agent_service::tests::test_state(root.path(), "127.0.0.1:1".parse().unwrap());
-            let mut conn = crate::collaboration_jobs::db(root.path()).unwrap();
-            conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
-            let tx = conn.transaction().unwrap();
-            crate::task_tree::ensure_root(&tx, "task", 1).unwrap();
-            tx.commit().unwrap();
-            let cancel = CancellationToken::new();
-            let session = Session {
-                agent_id: None,
-                task_node_id: None,
-                step_node_id: None,
-                plugin: None,
-                state: &state,
-                task: "task",
-                model: "fake",
-                turn: 1,
-                cancel: &cancel,
-                ban_execution: false,
-                scope: "main".into(),
-                parent: None,
-                input_budget: INPUT_BUDGET,
-            };
-            let mut window = Window {
-                messages: vec![json!({"role":"system","content":MAIN_PROMPT})],
-                ..Default::default()
-            };
-            let start = crate::model_stream::ToolCall {
-                call_id: "start".into(),
-                name: "create_task".into(),
-                arguments: json!({"goal":"Resume the compiled function"}).to_string(),
-            };
-            window.messages.push(json!({"role":"assistant","tool_calls":[{"id":start.call_id,"type":"function","function":{"name":start.name,"arguments":start.arguments}}]}));
-            task_frames::create_task(&session, &mut window, &start, "start-node", 1)
-                .await
-                .unwrap();
-            let owner = window.task_node_id.clone().unwrap();
-            let source = if recover_fork {
-                "function main(){const child=fork(work);const values=join(child);return {values,workspace:child.workspace};} function work(){return 7;}"
-            } else {
-                "function main(){return join({agent_id:'saved-child'});}"
-            };
-            install(&mut window, &json!({"source":source})).unwrap();
-            assert!(matches!(
-                next(&session, &mut window, 2).await.unwrap(),
-                Round::Exchange(_, _)
-            ));
-            let pending = window.program.as_ref().unwrap().pending.as_ref().unwrap();
-            let call = if recover_fork {
-                pending.id.as_str()
-            } else {
-                "original-fork"
-            };
-            conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,result,delivered,created_at) VALUES ('saved-child','task',1,?1,'work',?2,'completed',?3,1,0)",params![call,json!({"caller_task_node_id":owner}).to_string(),json!({"status":"completed","program_value":7}).to_string()]).unwrap();
-            save(&session, &window).await.unwrap();
-            run_task(
-                state.clone(),
-                "task".into(),
-                "fake".into(),
-                "Continue".into(),
-                2,
-                cancel,
-                2,
-                false,
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| {
-                    r.get::<_, String>(0)
-                })
-                .unwrap(),
-                "completed"
-            );
-            assert_eq!(
-                conn.query_row("SELECT count(*) FROM agent_delegates", [], |r| r
-                    .get::<_, usize>(0))
-                    .unwrap(),
-                1
-            );
-            assert_eq!(
-                crate::task_tree::nodes(&conn, "task")
-                    .unwrap()
-                    .iter()
-                    .filter(|n| n.kind == "task")
-                    .count(),
-                1,
-                "recovered forks must not create orphan task nodes"
-            );
-            let request_table: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_request_contexts')",
-                [], |r| r.get(0),
-            ).unwrap();
-            if request_table {
-                assert_eq!(
-                    conn.query_row("SELECT count(*) FROM agent_request_contexts", [], |r| r
-                        .get::<_, usize>(
-                        0
-                    ))
-                    .unwrap(),
-                    0,
-                    "control recovery must not ask the model to rebuild scheduling"
-                );
-            }
-            let raw: String = conn
-                .query_row(
-                    "SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            let returned = serde_json::from_str::<Value>(&raw).unwrap()["program_value"].clone();
-            if recover_fork {
-                assert_eq!(returned["values"], json!([7]));
-                assert_eq!(returned["workspace"]["mode"], "shared");
-                assert_eq!(returned["workspace"]["integration_required"], false);
-            } else {
-                assert_eq!(returned, json!([7]));
-            }
-        }
-    }
-
     struct TestRoot(std::path::PathBuf);
     impl TestRoot {
         fn new() -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("ts-program-test-{}", agent_service::uuid_like()));
+            let root = std::env::temp_dir().join(format!("ts-program-test-{}", agent_service::uuid_like()));
             std::fs::create_dir_all(&root).unwrap();
             Self(root)
         }
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
+        fn path(&self) -> &std::path::Path { &self.0 }
     }
     impl Drop for TestRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[tokio::test]
+    async fn interrupted_parallel_functions_are_not_replayed_after_resume() {
+        let root=TestRoot::new();
+        let count=Arc::new(AtomicUsize::new(0)); let counter=count.clone();
+        let source=r#"async function main(){try{return await Promise.all([work('a'),work('b')]);}catch(e){return e.message;}}
+/** @virtual Complete independent work and return a value. */ async function work(item){}"#;
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(_):Json<Value>| {
+            let n=counter.fetch_add(1,Ordering::SeqCst);
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Do work"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})}
+                else {tokio::time::sleep(Duration::from_secs(5)).await;json!({"role":"assistant","content":"\"late\""})};
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        let cancel=CancellationToken::new(); let token=cancel.clone(); let first_state=state.clone();
+        let running=tokio::spawn(async move{run_task(first_state,"task".into(),"fake".into(),"Do work".into(),10,token,1,false).await});
+        tokio::time::timeout(Duration::from_secs(30),async {while count.load(Ordering::SeqCst)<4 {tokio::time::sleep(Duration::from_millis(10)).await;}}).await.unwrap();
+        assert!(crate::task_tree::active(&conn,"task").unwrap().is_some());
+        cancel.cancel();let _=tokio::time::timeout(Duration::from_secs(4),running).await.unwrap().unwrap();
+        let started=count.load(Ordering::SeqCst);
+        run_task(state,"task".into(),"fake".into(),"Resume".into(),10,CancellationToken::new(),2,false).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst),started,"uncertain model requests must not be repeated");
+        let raw:String=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'",[],|r|r.get(0)).unwrap();
+        let message = serde_json::from_str::<Value>(&raw).unwrap()["program_value"].as_str().unwrap().to_owned();
+        assert!(message.contains("interrupted") || message.contains("cancelled"), "{message}");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn async_virtual_refinement_can_call_another_async_virtual() {
+        let root=TestRoot::new();let count=Arc::new(AtomicUsize::new(0));let counter=count.clone();
+        let source=r#"async function main(){return await outer('x');}
+/** @virtual Execute the outer function and return its result. */ async function outer(item){}"#;
+        let body_source=r#"async function outer(item){let value=await inner(item);return value;}
+/** @virtual Perform inner work and return a string. */ async function inner(data){}"#;
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
+            let n=counter.fetch_add(1,Ordering::SeqCst);
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Nested async"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})}
+                else {
+                    let input=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    if input["name"]=="outer" {json!({"role":"assistant","tool_calls":[{"id":"body","type":"function","function":{"name":"define_task_body","arguments":json!({"source":body_source}).to_string()}}]})}
+                    else {assert_eq!(input["bindings"]["data"],"x");json!({"role":"assistant","content":"\"ok\""})}
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Nested async".into(),15,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        let raw:String=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'",[],|r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"],"ok");
+        assert_eq!(count.load(Ordering::SeqCst),4);
+    }
+    #[tokio::test]
+    async fn async_virtual_functions_run_in_independent_concurrent_windows() {
+        let root = TestRoot::new();
+        let requests = Arc::new(AtomicUsize::new(0)); let counter = requests.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source = r#"async function main(){let shared='first';let a=inspect('a');shared='second';let b=inspect('b');return await Promise.all([a,b]);}
+/** @virtual Inspect a value and return {item,shared}. */ async function inspect(item){}"#;
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let current = current.clone(); let highest = highest.clone();
+            async move {
+                let message = if n == 0 {
+                    json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Inspect two items"}).to_string()}}]})
+                } else if n == 1 {
+                    json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})
+                } else {
+                    let input = body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input: Value = serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let item = input["bindings"]["item"].as_str().unwrap().to_owned();
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1; highest.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(if item == "a" { 140 } else { 30 })).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    json!({"role":"assistant","content":json!({"item":item}).to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state, "task".into(), "fake".into(), "Inspect items".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        server.abort();
+        assert_eq!(peak.load(Ordering::SeqCst),2,"independent AI requests must overlap");
+        let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"],json!([{"item":"a"},{"item":"b"}]));
+    }
+    #[tokio::test]
+    async fn async_virtual_failure_rejects_only_its_own_promise() {
+        let root = TestRoot::new();
+        let requests = Arc::new(AtomicUsize::new(0)); let counter = requests.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source = r#"async function main(){let shared='first';let a=inspect('a');shared='second';let b=inspect('b');try{await b;}catch(e){return [await a,e.message];}}
+/** @virtual Inspect a value and return {item,shared}. */ async function inspect(item){}"#;
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let current = current.clone(); let highest = highest.clone();
+            async move {
+                let message = if n == 0 {
+                    json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Inspect two items"}).to_string()}}]})
+                } else if n == 1 {
+                    json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})
+                } else {
+                    let input = body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input: Value = serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let item = input["bindings"]["item"].as_str().unwrap().to_owned();
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1; highest.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(if item == "a" { 140 } else { 30 })).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    json!({"role":"assistant","content":if item == "b" {json!({"$task_error":{"message":"review failed"}}).to_string()} else {json!({"item":item}).to_string()}})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state, "task".into(), "fake".into(), "Inspect items".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        server.abort();
+        assert_eq!(peak.load(Ordering::SeqCst),2,"independent AI requests must overlap");
+        let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"],json!([{"item":"a"},"review failed"]));
+    }
+    #[tokio::test]
+    async fn five_async_virtual_functions_share_model_concurrency_limit() {
+        let root = TestRoot::new();
+        let requests = Arc::new(AtomicUsize::new(0)); let counter = requests.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source = r#"async function main(){return await Promise.all(['a','b','c','d','e'].map(x=>inspect(x)));}
+/** @virtual Inspect a value and return {item,shared}. */ async function inspect(item){}"#;
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let current = current.clone(); let highest = highest.clone();
+            async move {
+                let message = if n == 0 {
+                    json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Inspect two items"}).to_string()}}]})
+                } else if n == 1 {
+                    json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})
+                } else {
+                    let input = body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input: Value = serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let item = input["bindings"]["item"].as_str().unwrap().to_owned();
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1; highest.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    json!({"role":"assistant","content":json!({"item":item}).to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state, "task".into(), "fake".into(), "Inspect items".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        server.abort();
+        assert_eq!(peak.load(Ordering::SeqCst),3,"five functions must use the default three model slots");
+        assert_eq!(requests.load(Ordering::SeqCst),7);
+        let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"],json!([{"item":"a"},{"item":"b"},{"item":"c"},{"item":"d"},{"item":"e"}]));
+    }
+    #[tokio::test]
+    async fn parallel_virtual_writes_to_same_file_preserve_the_conflicting_candidate() {
+        let root=TestRoot::new(); let count=Arc::new(AtomicUsize::new(0));let counter=count.clone();
+        let source=r#"async function main(){try{return await Promise.all([work('a'),work('b')]);}catch(e){return e.message;}}
+/** @virtual Write the requested value and return a string. */ async function work(item){}"#;
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {
+            let n=counter.fetch_add(1,Ordering::SeqCst);
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Write a file"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})}
+                else {
+                    let messages=body["messages"].as_array().unwrap();
+                    let input=messages.iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let item=input["bindings"]["item"].as_str().unwrap(); let id=format!("write-{item}");
+                    if messages.iter().any(|m|m["role"]=="tool" && m["tool_call_id"]==id) {
+                        json!({"role":"assistant","content":json!(item).to_string()})
+                    } else {
+                        json!({"role":"assistant","tool_calls":[{"id":id,"type":"function","function":{"name":"write_file","arguments":json!({"path":"same.txt","content":item}).to_string()}}]})
+                    }
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Write a file".into(),15,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        let actual=std::fs::read_to_string(root.path().join("same.txt")).unwrap();
+        let conflicts=std::fs::read_dir(root.path().join(".codex-workspace-mcp/conflicts")).unwrap().collect::<Vec<_>>();
+        assert_eq!(conflicts.len(),1);
+        let candidate=std::fs::read_to_string(conflicts[0].as_ref().unwrap().path()).unwrap();
+        assert!(matches!((actual.as_str(),candidate.as_str()),("a","b")|("b","a")));
+    }
+    #[tokio::test]
+    async fn published_async_twenty_page_example_runs_unchanged() {
+        let root=TestRoot::new();std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        for path in ["README.md","docs/agent-program.md","docs/generic-agent-design.md","docs/skill_packages.md","docs/task_delegation.md"] {std::fs::write(root.path().join(path),"Fixture source").unwrap();}
+        let count=Arc::new(AtomicUsize::new(0));let counter=count.clone();
+        let source=include_str!("../../skills/task-program/examples/parallel-twenty-html.js");
+        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
+            let n=counter.fetch_add(1,Ordering::SeqCst);
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Make twenty pages"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})}
+                else {
+                    let input=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();let input:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let result=match input["name"].as_str().unwrap() {
+                        "designStyles" => json!({"content":"body { color: black; }"}),
+                        "generatePageBody" => json!({"path":input["bindings"]["page"]["path"],"sections":[{"heading":"概述","blocks":[{"kind":"paragraph","text":"材料描述的内容"}]},{"heading":"说明","blocks":[{"kind":"paragraph","text":"实际任务范围"}]}]}),
+                        "reviewDocumentation" => {assert_eq!(input["bindings"]["actualPages"].as_array().unwrap().len(),20);json!({"passed":true,"evidence":["checked"],"issues":[]})},
+                        name => panic!("unexpected virtual {name}"),
+                    };
+                    json!({"role":"assistant","content":result.to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Make twenty pages".into(),50,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        assert_eq!(count.load(Ordering::SeqCst),24);
+        for i in 1..=20 {let page=root.path().join(format!("page{i:02}.html"));assert!(std::fs::read_to_string(page).unwrap().contains("shared.css"));}
+        assert!(root.path().join("shared.css").is_file());
+    }
+    #[tokio::test]
+    async fn five_page_async_design_write_read_and_review_uses_concurrent_windows() {
+        let root = TestRoot::new();
+        let count = Arc::new(AtomicUsize::new(0)); let counter = count.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source = r#"import * as io from 'host:io';
+const pages=input.pages;
+const designs=await Promise.all(pages.map(page=>design(page)));
+for(let i=0;i<pages.length;i++){io.write({path:pages[i],content:designs[i].content});}
+const reviews=await Promise.all(pages.map(page=>review(page,io.read({path:page}).content)));
+for(const review of reviews){assert(review.passed,'review failed');}
+/** @virtual Design this page and return its HTML as {content}. */ async function design(page){}
+/** @virtual Inspect the actual page and return {passed}. */ async function review(page,content){}"#;
+        let pages = (1..=5).map(|i|format!("page{i}.html")).collect::<Vec<_>>();
+        let inputs = pages.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n=counter.fetch_add(1,Ordering::SeqCst); let current=current.clone(); let highest=highest.clone(); let inputs=inputs.clone();
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Make five pages"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source,"input":{"pages":inputs}}).to_string()}}]})}
+                else {
+                    let input=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let name=input["name"].as_str().unwrap(); let page=input["bindings"]["page"].as_str().unwrap();
+                    let now=current.fetch_add(1,Ordering::SeqCst)+1;highest.fetch_max(now,Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;current.fetch_sub(1,Ordering::SeqCst);
+                    let output=if name=="design" {json!({"content":format!("<html><body>{page}</body></html>")})} else {
+                        json!({"passed":input["bindings"]["content"].as_str().unwrap().contains(page)})
+                    };
+                    json!({"role":"assistant","content":output.to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Make five pages".into(),20,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        assert_eq!(count.load(Ordering::SeqCst),12); assert!(peak.load(Ordering::SeqCst)>=2);
+        assert_eq!(conn.query_row("SELECT status FROM agent_tasks WHERE id='task'",[],|r|r.get::<_,String>(0)).unwrap(),"completed");
+        for page in pages {assert!(std::fs::read_to_string(root.path().join(&page)).unwrap().contains(&page));}
+    }
+    #[tokio::test]
+    async fn published_async_five_page_example_runs_unchanged() {
+        let root = TestRoot::new();
+        let count = Arc::new(AtomicUsize::new(0)); let counter = count.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source=include_str!("../../skills/task-program/examples/parallel-five-pages.js");
+        let inputs:Value=serde_json::from_str(include_str!("../../skills/task-program/examples/parallel-five-pages.input.json")).unwrap();
+        std::fs::create_dir_all(root.path().join("docs")).unwrap();
+        std::fs::write(root.path().join("docs/generic-agent-design.md"),"Source material").unwrap();
+        let pages=inputs["pages"].as_array().unwrap().iter().map(|page|page["path"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n=counter.fetch_add(1,Ordering::SeqCst); let current=current.clone(); let highest=highest.clone(); let inputs=inputs.clone();
+            async move {
+                let message=if n==0 {json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Make five pages"}).to_string()}}]})}
+                else if n==1 {json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source,"input":inputs}).to_string()}}]})}
+                else {
+                    let input=body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let name=input["name"].as_str().unwrap(); let page=input["bindings"]["page"]["path"].as_str().unwrap();
+                    let now=current.fetch_add(1,Ordering::SeqCst)+1;highest.fetch_max(now,Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(60)).await;current.fetch_sub(1,Ordering::SeqCst);
+                    let output=if name=="designPage" {json!({"content":format!("<html><body>{page}</body></html>")})} else {
+                        json!({"passed":input["bindings"]["content"].as_str().unwrap().contains(page),"path":page,"issues":[],"evidence":["checked"]})
+                    };
+                    json!({"role":"assistant","content":output.to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state=agent_service::tests::test_state(root.path(),listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
+        let conn=agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
+        run_task(state,"task".into(),"fake".into(),"Make five pages".into(),20,CancellationToken::new(),1,false).await.unwrap();server.abort();
+        assert_eq!(count.load(Ordering::SeqCst),12); assert!(peak.load(Ordering::SeqCst)>=2);
+        assert_eq!(conn.query_row("SELECT status FROM agent_tasks WHERE id='task'",[],|r|r.get::<_,String>(0)).unwrap(),"completed");
+        for page in pages {assert!(std::fs::read_to_string(root.path().join(&page)).unwrap().contains(&page));}
+    }
+    #[tokio::test]
+    async fn async_parent_resumes_on_first_completion_while_sibling_runs() {
+        let root = TestRoot::new();
+        let requests = Arc::new(AtomicUsize::new(0)); let counter = requests.clone();
+        let active = Arc::new(AtomicUsize::new(0)); let current = active.clone();
+        let peak = Arc::new(AtomicUsize::new(0)); let highest = peak.clone();
+        let source = r#"async function main(){let shared='first';let a=inspect('a');shared='second';let b=inspect('b');let second=await b;let c=inspect(second.item);return await Promise.all([a,c]);}
+/** @virtual Inspect a value and return {item,shared}. */ async function inspect(item){}"#;
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let current = current.clone(); let highest = highest.clone();
+            async move {
+                let message = if n == 0 {
+                    json!({"role":"assistant","tool_calls":[{"id":"create","type":"function","function":{"name":"create_task","arguments":json!({"goal":"Inspect two items"}).to_string()}}]})
+                } else if n == 1 {
+                    json!({"role":"assistant","tool_calls":[{"id":"program","type":"function","function":{"name":"execute_program","arguments":json!({"source":source}).to_string()}}]})
+                } else {
+                    let input = body["messages"].as_array().unwrap().iter().find(|m|m["name"]=="program_task_input").unwrap();
+                    let input: Value = serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
+                    let item = input["bindings"]["item"].as_str().unwrap().to_owned();
+                    let now = current.fetch_add(1, Ordering::SeqCst) + 1; highest.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(if item == "a" { 350 } else { 30 })).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    json!({"role":"assistant","content":json!({"item":item}).to_string()})
+                };
+                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state, "task".into(), "fake".into(), "Inspect items".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        server.abort();
+        assert_eq!(requests.load(Ordering::SeqCst),5,"a third AI call must start after b returns");
+        assert_eq!(peak.load(Ordering::SeqCst),2,"the third call must overlap the slow first call");
+        let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"],json!([{"item":"a"},{"item":"b"}]));
     }
     #[tokio::test]
     async fn parallel_reads_overlap_and_feed_one_sequential_ai_task() {
@@ -700,6 +940,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
         let source = r#"
+import * as io from "host:io/promises";
 async function main() {
   const pages = await Promise.all([
     io.read({path:"first"}),
@@ -757,7 +998,7 @@ async function main() {
         })).unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
-        let source = r#"async function main(){try{return await Promise.all([io.read({path:"good"}),io.read({path:"bad"})]);}catch(error){return error.error;}}"#;
+        let source = r#"import * as io from 'host:io/promises'; async function main(){try{return await Promise.all([io.read({path:"good"}),io.read({path:"bad"})]);}catch(error){return error.message;}}"#;
         let app = Router::new().route("/v1/chat/completions", post(move |Json(_): Json<Value>| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let (name,args) = match n { 0 => ("create_task",json!({"goal":"Read files"})), 1 => ("execute_program",json!({"source":source})), _ => panic!("unexpected request") };
@@ -776,6 +1017,46 @@ async function main() {
         assert_eq!(requests.load(Ordering::SeqCst), 2, "the host must not replay or replan the batch");
         let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
         assert!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"].as_str().unwrap().contains("read failed"));
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='parallel_read_batch'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='parallel_read/item' AND json_extract(data,'$.is_error')=1", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
+    }
+    #[tokio::test]
+    async fn async_read_batch_records_independent_outcomes_without_replay() {
+        let root = TestRoot::new();
+        let finished = Arc::new(AtomicUsize::new(0));
+        let done = finished.clone();
+        let catalog = Arc::new(crate::builtin_plugins::ToolCatalog::default());
+        catalog.register(&["read_file"], Arc::new(move |_, _, args| {
+            let done = done.clone();
+            Box::pin(async move {
+                let path = args["path"].as_str().unwrap();
+                if path == "good" { tokio::time::sleep(Duration::from_millis(50)).await; }
+                done.fetch_add(1, Ordering::SeqCst);
+                if path == "bad" { anyhow::bail!("read failed") }
+                Ok(json!({"content":path}))
+            })
+        })).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let source = r#"import {read} from 'host:io/promises'; async function main(){let result=await Promise.allSettled([read({path:'good'}),read({path:'bad'})]);return [result[0].status,result[0].value.content,result[1].status,result[1].reason.message];}"#;
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(_): Json<Value>| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let (name,args) = match n { 0 => ("create_task",json!({"goal":"Read files"})), 1 => ("execute_program",json!({"source":source})), _ => panic!("unexpected request") };
+            let message = json!({"role":"assistant","tool_calls":[{"id":format!("call-{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
+            async move { Json(json!({"choices":[{"finish_reason":"tool_calls","message":message}]})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        state.tool_catalog = Some(catalog);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state, "task".into(), "fake".into(), "Read files".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        server.abort();
+        assert_eq!(finished.load(Ordering::SeqCst), 2, "all started reads must settle");
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "the host must not replay or replan the batch");
+        let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='task' AND scope='main'", [], |r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["program_value"], json!(["fulfilled","good","rejected","read failed"]));
         assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.name')='parallel_read_batch'", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
         assert_eq!(conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='parallel_read/item' AND json_extract(data,'$.is_error')=1", [], |r|r.get::<_,i64>(0)).unwrap(), 1);
     }
@@ -864,7 +1145,7 @@ async function main() {
             let (name, args) = match n {
                 0 => ("create_task",json!({"goal":"Read the pages"})),
                 1 => ("execute_program",json!({"source":"function main(){return review(['one.txt','two.txt']);} /** @virtual */ function review(paths){ /* Read both files. */ }"})),
-                2 => ("define_task_body",json!({"source":"async function review(paths){return await Promise.all(paths.map(path => io.read({path:path})));}"})),
+                2 => ("define_task_body",json!({"source":"import * as io from 'host:io/promises'; async function review(paths){return await Promise.all(paths.map(path => io.read({path:path})));}"})),
                 _ => panic!("async body should not need another model request"),
             };
             let message = json!({"role":"assistant","tool_calls":[{"id":format!("call-{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
@@ -884,274 +1165,6 @@ async function main() {
         assert_eq!(result[0]["content"], "one");
         assert_eq!(result[1]["content"], "two");
     }
-    #[tokio::test]
-    async fn ts_program_drives_two_agents_tools_tasks_and_join_without_model_scheduler_rounds() {
-        let root = TestRoot::new();
-        std::fs::write(root.path().join("spec.txt"), "SHARED_SOURCE").unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let requests = count.clone();
-        let source = r#"
-function worker(input) {
-  const value = make_text(input.text);
-  io.write({path:input.path,content:value});
-  return {path:input.path, text:value};
-}
-/** @virtual */
-function make_text(text) {
-  // Return the supplied text as a JSON string.
-}
-function main() {
-  const spec=io.read({path:"spec.txt"});
-  const a=fork(worker,{path:"a.txt",text:"OUTPUT_A"});
-  const b=fork(worker,{path:"b.txt",text:"OUTPUT_B"});
-  const [x,y]=join(a,b);
-  const checkA=io.read({path:x.path});
-  const checkB=io.read({path:y.path});
-  return {outputs:[x.path,y.path],source:spec,checkA,checkB};
-}"#;
-        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
-            let requests=requests.clone();async move {
-                let n=requests.fetch_add(1,Ordering::SeqCst);
-                let messages=body["messages"].as_array().unwrap();
-                let message=if let Some(input)=messages.iter().find(|m|m["name"]=="program_task_input") {
-                    let task:Value=serde_json::from_str(input["content"].as_str().unwrap()).unwrap();
-                    assert_eq!(task["name"], "make_text");
-                    json!({"role":"assistant","content":task["bindings"]["text"].to_string()})
-                } else {
-                    let (name,args)=match n {0=>("create_task",json!({"goal":"Use two Agents with typed function returns"})),1=>("execute_program",json!({"source":source})),_=>panic!("unexpected scheduler model request {n}")};
-                    json!({"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
-                };
-                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
-            }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let conn = agent_service::open_db(root.path()).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(40),
-            run_task(
-                state,
-                "task".into(),
-                "fake".into(),
-                "Use two Agents for two files".into(),
-                8,
-                CancellationToken::new(),
-                1,
-                false,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        server.abort();
-        let status: String = conn
-            .query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let events =
-            crate::session_history::load_events(&conn, "task", &Default::default()).unwrap();
-        assert_eq!(
-            status,
-            "completed",
-            "{}",
-            events
-                .iter()
-                .filter(|e| e.kind == "turn/end")
-                .map(|e| e.data().unwrap().to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            4,
-            "only setup and two comment tasks call a model"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
-            "OUTPUT_A"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
-            "OUTPUT_B"
-        );
-        assert!(!events.iter().any(|e|e.kind=="tool/result" && e.data().unwrap()["message"]["isError"]==true));
-        let completed = crate::collaboration_jobs::statuses(root.path(), "task").unwrap();
-        assert_eq!(completed.as_array().unwrap().len(), 2);
-        assert!(
-            completed
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|j| j["status"] == "completed")
-        );
-        assert!(
-            crate::collaboration_jobs::statuses(root.path(), "task")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|s| s["status"] != "running" && s["delivered"] == true)
-        );
-    }
-    #[tokio::test]
-    async fn comment_tasks_use_tools_return_typed_values_and_resume_two_forked_callers() {
-        let root = TestRoot::new();
-        std::fs::write(root.path().join("spec.txt"), "SHARED_SOURCE").unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let requests = count.clone();
-        let source = r#"
-function main() {
-  const spec=io.read({path:"spec.txt"});
-  let parentState="before";
-  const unusedParent="passed at fork time";
-  const a=fork(worker,{path:"a.txt",text:"A",source:spec.content},parentState,unusedParent);
-  parentState="between";
-  const b=fork(worker,{path:"b.txt",text:"B",source:spec.content},parentState,unusedParent);
-  parentState="after";
-  const [x,y]=join(a,b);
-  return {x,y};
-}
-function worker(part,state,marker) {
-  const saved=produce(part,state,marker);
-  const checked=io.read({path:saved.path});
-  return {path:saved.path,content:checked.content};
-}
-/** @virtual */
-function produce(part,state,marker) {
-  // Write part.text to part.path using the actual file tool.
-  // Reuse part.source as shared background; return {path:string} after saving.
-}
-"#;
-        let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>|{
-            let n=requests.fetch_add(1,Ordering::SeqCst);
-            async move {
-                let messages=body["messages"].as_array().unwrap();
-                let message=if let Some(task)=messages.iter().find(|m|m["name"]=="program_task_input") {
-                    assert!(!messages.iter().any(|m|m["name"]=="task_program_skill"));
-                    assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_program_guide"));
-                    assert!(messages.iter().any(|m|m["name"]=="program_task_execution"));
-                    let names=body["tools"].as_array().unwrap().iter().map(|t|t["function"]["name"].as_str().unwrap()).collect::<Vec<_>>();
-                    assert!(names.contains(&"invoke_library"));
-                    assert!(!names.contains(&"write_file"));
-                    for name in ["create_task","execute_program","spawn_agent","join_agents"] {assert!(!names.contains(&name),"{name} must not be advertised to a task body");}
-                    let task:Value=serde_json::from_str(task["content"].as_str().unwrap()).unwrap();
-                    assert_eq!(task["name"],"produce");
-                    assert!(names.contains(&"define_task_body"));
-                    let part=&task["bindings"]["part"];
-                    assert_eq!(part["source"],"SHARED_SOURCE");
-                    assert_eq!(task["bindings"]["marker"],"passed at fork time");
-                    assert_eq!(task["bindings"]["state"],if part["text"]=="A"{"before"}else{"between"});
-                    assert!(messages.iter().any(|m|m["name"]=="scope_variables"),"other visible values remain discoverable");
-                    if messages.iter().any(|m|m["role"]=="assistant" && m["tool_calls"].as_array().is_some_and(|a|a.iter().any(|c|c["function"]["name"]=="invoke_library"))) {
-                        json!({"role":"assistant","content":json!({"path":part["path"]}).to_string()})
-                    } else {
-                        json!({"role":"assistant","tool_calls":[{"id":format!("write{n}"),"type":"function","function":{"name":"invoke_library","arguments":json!({"method":"io.write","args":{"path":part["path"],"content":part["text"]}}).to_string()}}]})
-                    }
-                } else {
-                    assert!(messages.iter().any(|m|m["name"]=="program_environment"));
-                    assert!(!messages.iter().any(|m|m["name"]=="task_program_skill"));
-                    if n > 0 { assert!(body["tools"].as_array().unwrap().iter().any(|t|t["function"]["name"]=="read_program_guide")); }
-                    let (name,args)=match n {0=>("create_task",json!({"goal":"Two forked helpers with comment tasks"})),1=>("execute_program",json!({"source":source})),_=>panic!("unexpected planner request {n}")};
-                    json!({"role":"assistant","tool_calls":[{"id":format!("m{n}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
-                };
-                Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
-            }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let conn = agent_service::open_db(root.path()).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)",[]).unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(40),
-            run_task(
-                state,
-                "task".into(),
-                "fake".into(),
-                "Use two Agents for two distinct files".into(),
-                12,
-                CancellationToken::new(),
-                1,
-                false,
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        server.abort();
-        let events =
-            crate::session_history::load_events(&conn, "task", &Default::default()).unwrap();
-        let status: String = conn
-            .query_row("SELECT status FROM agent_tasks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            status,
-            "completed",
-            "{}",
-            events
-                .iter()
-                .filter(|e| e.kind == "turn/end")
-                .map(|e| e.data().unwrap().to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            6,
-            "setup plus two tool-using task bodies; no scheduler or completion model calls"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
-            "A"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("b.txt")).unwrap(),
-            "B"
-        );
-        let jobs = crate::collaboration_jobs::statuses(root.path(), "task").unwrap();
-        assert!(
-            jobs.as_array()
-                .unwrap()
-                .iter()
-                .all(|j| j["status"] == "completed")
-        );
-        let nodes = crate::task_tree::nodes(&conn, "task").unwrap();
-        let bodies = nodes
-            .iter()
-            .filter(|n| n.inputs["program_task"].is_object())
-            .collect::<Vec<_>>();
-        assert_eq!(bodies.len(), 2);
-        for node in bodies {
-            assert_eq!(node.status, "done");
-            let remaining: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM agent_runtime_windows WHERE scope=?1",
-                    [crate::task_tree::frame_scope(node)],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                remaining, 0,
-                "local working window must be released after return"
-            );
-        }
-        let raw: String = conn
-            .query_row(
-                "SELECT state FROM agent_runtime_windows WHERE scope='main'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let final_window: Window = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            final_window.program_value,
-            json!({"x":{"path":"a.txt","content":"A"},"y":{"path":"b.txt","content":"B"}}).into()
-        );
-    }
-
     #[tokio::test]
     async fn unavailable_write_fails_compilation_before_any_tool_effect() {
         let root = TestRoot::new();
@@ -1410,7 +1423,7 @@ function evaluate(request,content) {
             assert!(install_body(&mut child, &json!({"source":source})).is_err());
             assert!(child.program.is_none());
             assert!(
-                fork_runtime(&json!({"program":{"source":source,"entry":"work","args":[]}}))
+                compiled_runtime(&json!({"program":{"source":source,"entry":"work","args":[]}}))
                     .is_err()
             );
         }
@@ -1510,7 +1523,7 @@ function evaluate(request,content) {
     #[test]
     fn forked_functions_use_the_host_compiled_program() {
         let program=agent_program::compile("function work(input){return io.read({path:input.path});} function main(){return null;}").unwrap();
-        let mut fork = fork_runtime(
+        let mut fork = compiled_runtime(
             &json!({"program":{"compiled":program,"entry":"work","args":[{"path":"source.txt"}]}}),
         )
         .unwrap();

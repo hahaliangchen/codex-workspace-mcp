@@ -16,7 +16,7 @@ struct Compiler {
     /// Lexical scopes, outermost first: module, function, then blocks. Each
     /// maps a declared name to whether it may be reassigned.
     scopes: Vec<BTreeMap<String, bool>>,
-    /// Names inherited from the calling scope (task bodies and fork children).
+    /// Names inherited from the calling scope of task bodies.
     external: BTreeSet<String>,
     /// Compiler temporaries that rewritten source refers to by name.
     temp_names: BTreeSet<String>,
@@ -28,10 +28,13 @@ struct Compiler {
     nested: Vec<(String, Function)>,
     /// Top-level @virtual functions: their calls keep exact arity.
     virtuals: BTreeSet<String>,
+    /// Top-level async functions, whose calls return a Promise.
+    async_functions: BTreeSet<String>,
     code: Vec<Instruction>,
     temp: usize,
     loops: Vec<LoopContext>,
     handlers: usize,
+    finalizers: Vec<FinallyContext>,
     /// Branches that leave the optional chain being compiled.
     chain_exits: Option<Vec<usize>>,
     /// The next lowered expression is the object of the current chain link.
@@ -61,12 +64,24 @@ fn number_expr(value: f64) -> Expr {
     }
 }
 
+#[derive(Clone)]
+struct FinallyContext {
+    block: ast::BlockStmt,
+    handlers: usize,
+    runtime_scopes: usize,
+    scopes_len: usize,
+    loops_len: usize,
+}
+
 #[derive(Default)]
 struct LoopContext {
     breaks: Vec<usize>,
     continues: Vec<usize>,
     handlers: usize,
     scopes: usize,
+    is_switch: bool,
+    label: Option<String>,
+    label_loop: bool,
 }
 
 /// Names bound by a declaration pattern, without default-value expressions.
@@ -179,7 +194,62 @@ fn var_names(statements: &[ast::Stmt]) -> Vec<String> {
 }
 impl Compiler {
     fn condition(&mut self, e: &ast::Expr) -> Result<Expr> {
+        self.reject_unawaited(e, "using it as a condition")?;
         self.lower(e)
+    }
+    /// The name of a call known to return a Promise: a top-level async
+    /// function or a host:<library>/promises tool not shadowed by a local.
+    fn unawaited_call(&self, e: &ast::Expr) -> Option<String> {
+        let mut e = e;
+        while let ast::Expr::Paren(p) = e { e = &p.expr; }
+        let ast::Expr::Call(call) = e else { return None };
+        let ast::Callee::Expr(callee) = &call.callee else { return None };
+        let shadowed = |name: &str| self.temp_names.contains(name) || self.scopes.iter().skip(1).any(|scope| scope.contains_key(name));
+        match &**callee {
+            ast::Expr::Ident(i) if !shadowed(i.sym.as_ref()) => {
+                let name = i.sym.as_ref();
+                let asynchronous = self.async_functions.contains(name)
+                    || self.imports.get(name).is_some_and(|tool| tool.starts_with("async-tool:"));
+                asynchronous.then(|| name.to_owned())
+            }
+            ast::Expr::Member(m) => {
+                let (ast::Expr::Ident(library), ast::MemberProp::Ident(method)) = (&*m.obj, &m.prop) else { return None };
+                if shadowed(library.sym.as_ref()) { return None; }
+                let tool = self.libraries.get(library.sym.as_ref())?.get(method.sym.as_ref())?;
+                tool.starts_with("async-tool:").then(|| format!("{}.{}", library.sym, method.sym))
+            }
+            _ => None,
+        }
+    }
+    /// Using an un-awaited Promise as a value is almost always a missing
+    /// await, and a Promise is always truthy, so such checks would pass.
+    fn reject_unawaited(&self, e: &ast::Expr, usage: &str) -> Result<()> {
+        match self.unawaited_call(e) {
+            Some(name) => self.error(e.span(), &format!("{name}(...) returns a Promise; await it before {usage}")),
+            None => Ok(()),
+        }
+    }
+    /// The direct operands of `e` that must not be un-awaited Promises.
+    fn reject_unawaited_operands(&self, e: &ast::Expr) -> Result<()> {
+        let promise_method = |prop: &ast::MemberProp| matches!(prop, ast::MemberProp::Ident(p) if matches!(p.sym.as_ref(), "then" | "catch" | "finally"));
+        match e {
+            ast::Expr::Member(m) if !promise_method(&m.prop) => self.reject_unawaited(&m.obj, "reading its properties"),
+            ast::Expr::Call(ast::CallExpr { callee: ast::Callee::Expr(callee), .. }) => match &**callee {
+                ast::Expr::Member(m) if !promise_method(&m.prop) => self.reject_unawaited(&m.obj, "calling its methods"),
+                _ => Ok(()),
+            },
+            ast::Expr::OptChain(chain) => match &*chain.base {
+                ast::OptChainBase::Member(m) if !promise_method(&m.prop) => self.reject_unawaited(&m.obj, "reading its properties"),
+                _ => Ok(()),
+            },
+            ast::Expr::Bin(b) => {
+                self.reject_unawaited(&b.left, "using it in an operator")?;
+                self.reject_unawaited(&b.right, "using it in an operator")
+            }
+            ast::Expr::Unary(u) if u.op != ast::UnaryOp::Void => self.reject_unawaited(&u.arg, "using it in an operator"),
+            ast::Expr::Tpl(t) => t.exprs.iter().try_for_each(|e| self.reject_unawaited(e, "putting it in a template string")),
+            _ => Ok(()),
+        }
     }
     fn logical(&mut self, op: &str, left: Expr, right: &ast::Expr, span: Span) -> Result<Expr> {
         let left = self.snapshot(span, left);
@@ -292,13 +362,13 @@ impl Compiler {
     }
     /// break/continue leave the exception handlers and block scopes opened
     /// inside the loop; the loop's own stay.
-    fn leave_to_loop(&mut self, span: Span) {
-        let context = self.loops.last().expect("inside a loop");
+    fn leave_to_loop(&mut self, span: Span, index: usize, current: (usize, usize)) {
+        let context = &self.loops[index];
         let (handlers, scopes) = (context.handlers, context.scopes);
-        for _ in handlers..self.handlers {
+        for _ in handlers..current.0 {
             self.emit(span, Op::EndCatch);
         }
-        for _ in scopes..self.runtime_scopes {
+        for _ in scopes..current.1 {
             self.emit(span, Op::LeaveScope);
         }
     }
@@ -311,6 +381,35 @@ impl Compiler {
             self.code[at].op = Op::Jump(next);
         }
     }
+    /// Emit finalizers crossed by a return or a jump to an enclosing loop.
+    /// The generated code unwinds to the lexical environment of each finally;
+    /// compiler state is restored afterwards for the other control-flow paths.
+    fn emit_finalizers(&mut self, target_loop: Option<usize>, span: Span) -> Result<(usize, usize)> {
+        let original_handlers = self.handlers;
+        let original_runtime_scopes = self.runtime_scopes;
+        let mut removed = Vec::new();
+        while self.finalizers.last().is_some_and(|ctx| target_loop.is_none_or(|target| target < ctx.loops_len)) {
+            let ctx = self.finalizers.pop().unwrap();
+            for _ in ctx.handlers..self.handlers { self.emit(span, Op::EndCatch); }
+            for _ in ctx.runtime_scopes..self.runtime_scopes { self.emit(span, Op::LeaveScope); }
+            self.handlers = ctx.handlers;
+            self.runtime_scopes = ctx.runtime_scopes;
+            let scopes = self.scopes.split_off(ctx.scopes_len);
+            let loops = self.loops.split_off(ctx.loops_len);
+            self.stmt(&ast::Stmt::Block(ctx.block.clone()))?;
+            removed.push((ctx, scopes, loops));
+        }
+        let remaining = (self.handlers, self.runtime_scopes);
+        while let Some((ctx, scopes, loops)) = removed.pop() {
+            self.scopes.extend(scopes);
+            self.loops.extend(loops);
+            self.finalizers.push(ctx);
+        }
+        self.handlers = original_handlers;
+        self.runtime_scopes = original_runtime_scopes;
+        Ok(remaining)
+    }
+
     /// Names are bound when their scope is entered; a declaration initializes
     /// a let/const and assigns a hoisted var.
     fn variable_declaration(&mut self, v: &ast::VarDecl) -> Result<()> {
@@ -366,7 +465,7 @@ impl Compiler {
     fn declare(&mut self, name: &str, mutable: bool, span: Span) -> Result<()> {
         if matches!(
             name,
-            "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON" | "Promise"
+            "tools" | "call" | "ai" | "assert" | "JSON" | "Promise"
         ) || name.starts_with("$temp")
             || self.libraries.contains_key(name)
             || self.imports.contains_key(name)
@@ -518,15 +617,14 @@ impl Compiler {
     fn resolve_level(&self, name: &str) -> Option<usize> {
         self.scopes.iter().rposition(|scope| scope.contains_key(name))
     }
-    /// A callee resolved at compile time: fork/join, an imported tool, a
+    /// A callee resolved at compile time: an imported tool, a
     /// library method or a top-level function that no inner binding shadows.
     /// Anything else is a function value called at run time.
     fn static_callee(&self, target: &ast::Expr) -> bool {
         match target {
             ast::Expr::Ident(i) => {
                 let name = i.sym.as_ref();
-                matches!(name, "fork" | "join")
-                    || self.imports.contains_key(name)
+                self.imports.contains_key(name)
                     || (self.names.contains(name) && matches!(self.resolve_level(name), Some(0) | None))
                     || self.resolve(name).is_none()
             }
@@ -584,45 +682,60 @@ impl Compiler {
             function_id: id.clone(),
             nested: Vec::new(),
             virtuals: self.virtuals.clone(),
+            async_functions: self.async_functions.clone(),
             code: Vec::new(),
             temp: 0,
             loops: Vec::new(),
             handlers: 0,
+            finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
         };
         let mut params = Vec::new();
-        for pattern in &source.params {
-            let ast::Pat::Ident(i) = pattern else {
-                return c.error(pattern.span(), "use simple function parameters");
-            };
-            c.declare(i.id.sym.as_ref(), true, pattern.span())?;
-            params.push(i.id.sym.to_string());
+        let mut parameter_lexical = Vec::new();
+        let mut parameter_patterns = Vec::new();
+        let mut parameter_names = Vec::new();
+        let patterned = source.params.iter().any(|p| !matches!(p, ast::Pat::Ident(_)));
+        let rest_parameter = source.params.iter().position(|p| matches!(p, ast::Pat::Rest(_)));
+        for (index, pattern) in source.params.iter().enumerate() {
+            let names = pattern_names(pattern);
+            for name in &names { c.declare(name, true, pattern.span())?; }
+            parameter_names.extend(names.iter().cloned());
+            if let ast::Pat::Ident(i) = pattern && !patterned {
+                params.push(i.id.sym.to_string());
+            } else {
+                let argument = format!("$$param{index}");
+                params.push(argument.clone());
+                parameter_lexical.extend(names);
+                let pattern = match pattern { ast::Pat::Rest(rest) => &*rest.arg, _ => pattern };
+                parameter_patterns.push((pattern, argument));
+            }
+        }
+        // The function name is available in parameter initializers.
+        if let Some(name) = &source.self_name {
+            let scope = c.scopes.last_mut().expect("function scope");
+            if !scope.contains_key(name) { scope.insert(name.clone(), false); }
+        }
+        for (pattern, argument) in parameter_patterns {
+            c.bind_value(pattern, Expr::Variable(argument), true)?;
         }
         let (vars, lexical) = match &source.body {
             FunctionBody::Block(body) => {
-                let vars: Vec<String> = var_names(&body.stmts)
-                    .into_iter()
-                    .filter(|name| !params.contains(name))
-                    .collect();
-                for name in &vars {
-                    c.declare(name, true, body.span)?;
-                }
+                let vars: Vec<String> = var_names(&body.stmts).into_iter()
+                    .filter(|name| patterned || !parameter_names.contains(name)).collect();
                 let lexical = lexical_names(&body.stmts);
-                for (name, mutable) in &lexical {
-                    c.declare(name, *mutable, body.span)?;
+                let lexical_only = body.stmts.iter().filter(|stmt| matches!(stmt, ast::Stmt::Decl(ast::Decl::Var(v)) if v.kind != ast::VarDeclKind::Var)).cloned().collect::<Vec<_>>();
+                if let Some((name, _)) = lexical_names(&lexical_only).iter().find(|(name, _)| parameter_names.contains(name)) {
+                    return c.error(body.span, &format!("duplicate parameter and lexical binding {name}"));
                 }
+                if patterned { c.scopes.push(BTreeMap::new()); }
+                for name in &vars { c.declare(name, true, body.span)?; }
+                for (name, mutable) in &lexical { c.declare(name, *mutable, body.span)?; }
+                if patterned { c.emit(body.span, Op::EnterFunctionBody); }
                 (vars, lexical)
             }
             _ => (Vec::new(), Vec::new()),
         };
-        // A named function expression sees itself unless its own names shadow it.
-        if let Some(name) = &source.self_name {
-            let scope = c.scopes.last_mut().expect("function scope");
-            if !scope.contains_key(name) {
-                scope.insert(name.clone(), false);
-            }
-        }
         match source.body {
             FunctionBody::Block(body) => {
                 c.hoist_functions(&body.stmts)?;
@@ -644,6 +757,9 @@ impl Compiler {
                 description: String::new(),
                 virtual_task: false,
                 params,
+                rest_parameter,
+                parameter_scope: patterned,
+                parameter_lexical,
                 vars,
                 lexical: lexical.into_iter().map(|(name, _)| name).collect(),
                 module: false,
@@ -721,26 +837,11 @@ impl Compiler {
         let ast::Callee::Expr(target) = &call.callee else {
             return self.error(call.span, "use a declared helper or library.method");
         };
-        if matches!(&**target, ast::Expr::Ident(i) if i.sym == *"join") {
-            if call.args.is_empty() {
-                return self.error(call.span, "join needs fork handles");
-            }
-            return Ok(Effect::Join(
-                call.args
-                    .iter()
-                    .map(|a| self.expr(&a.expr))
-                    .collect::<Result<_>>()?,
-            ));
+        if matches!(&**target, ast::Expr::Ident(i) if matches!(i.sym.as_ref(), "fork" | "join") && !self.names.contains(i.sym.as_ref()) && self.resolve(i.sym.as_ref()).is_none()) {
+            return self.error(call.span, "fork/join have been retired; use async virtual functions and Promise.all");
         }
-        let fork = matches!(&**target, ast::Expr::Ident(i) if i.sym == *"fork");
-        let (target, actuals) = if fork {
-            let Some(first) = call.args.first() else {
-                return self.error(call.span, "fork needs a declared helper");
-            };
-            (&*first.expr, &call.args[1..])
-        } else {
-            (&**target, &call.args[..])
-        };
+        let actuals = &call.args[..];
+        let target = &**target;
         let args = actuals
             .iter()
             .map(|a| self.expr(&a.expr))
@@ -759,10 +860,8 @@ impl Compiler {
                 if i.sym == *"main" {
                     return self.error(call.span, "main is the sole entry, not a callable helper");
                 }
-                // AI functions and fork targets bind arguments by position for
-                // another context, so their arity is exact. Ordinary functions
-                // follow JavaScript.
-                let exact = fork || self.virtuals.contains(i.sym.as_ref());
+                // Virtual calls bind arguments exactly; ordinary functions use JS arity.
+                let exact = self.virtuals.contains(i.sym.as_ref());
                 if exact && self.arities[i.sym.as_ref()] != args.len() {
                     return self.error(
                         call.span,
@@ -774,11 +873,7 @@ impl Compiler {
                         ),
                     );
                 }
-                return Ok(if fork {
-                    Effect::Fork(i.sym.to_string(), args)
-                } else {
-                    Effect::Call(i.sym.to_string(), args)
-                });
+                return Ok(Effect::Call(i.sym.to_string(), args));
             }
             ast::Expr::Member(m) if matches!(&*m.obj,ast::Expr::Ident(i) if self.libraries.contains_key(i.sym.as_ref())) =>
             {
@@ -805,13 +900,10 @@ impl Compiler {
             _ => {
                 return self.error(
                     call.span,
-                    "use helper(args), library.method(args), fork(helper,args) or join(handles); call/ai wrappers are unsupported",
+                    "use helper(args) or library.method(args); call/ai wrappers are unsupported",
                 );
             }
         };
-        if fork {
-            return self.error(call.span, "fork takes a declared helper function");
-        }
         if matches!(
             target.as_str(),
             "execute_program"
@@ -821,147 +913,13 @@ impl Compiler {
                 | "spawn_agent"
                 | "join_agents"
         ) {
-            return self.error(call.span,"use local functions and fork/join rather than recursively controlling program/task execution");
+            return self.error(call.span,"use local and async virtual functions rather than recursively controlling program/task execution");
         }
         if args.len() > 1 {
             return self.error(call.span, "a tool call takes one JSON argument object");
         }
         Ok(Effect::Tool(target, args))
     }
-    // Only chains rooted in Promise.resolve/reject are lowered here. They are
-    // consumed by await immediately; no Promise handle is represented as JSON.
-    fn is_awaited_promise_chain(e: &ast::Expr) -> bool {
-        let ast::Expr::Call(call) = e else {
-            return false;
-        };
-        let ast::Callee::Expr(target) = &call.callee else {
-            return false;
-        };
-        let ast::Expr::Member(member) = &**target else {
-            return false;
-        };
-        let ast::MemberProp::Ident(method) = &member.prop else {
-            return false;
-        };
-        if matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise") {
-            return matches!(method.sym.as_ref(), "resolve" | "reject");
-        }
-        matches!(method.sym.as_ref(), "then" | "catch")
-            && Self::is_awaited_promise_chain(&member.obj)
-    }
-    // Keep initial argument evaluation outside the subset with catchable effects:
-    // JavaScript evaluates it before Promise.resolve/reject creates a promise.
-    fn safe_promise_root_argument(e: &ast::Expr) -> bool {
-        match e {
-            ast::Expr::Lit(_) | ast::Expr::Ident(_) => true,
-            ast::Expr::Array(a) => a.elems.iter().all(|item| {
-                item.as_ref().is_none_or(|item| {
-                    item.spread.is_none() && Self::safe_promise_root_argument(&item.expr)
-                })
-            }),
-            ast::Expr::Object(o) => o.props.iter().all(|prop| match prop {
-                ast::PropOrSpread::Prop(p) => match &**p {
-                    ast::Prop::Shorthand(_) => true,
-                    ast::Prop::KeyValue(kv) => {
-                        matches!(
-                            kv.key,
-                            ast::PropName::Ident(_) | ast::PropName::Str(_) | ast::PropName::Num(_)
-                        ) && Self::safe_promise_root_argument(&kv.value)
-                    }
-                    _ => false,
-                },
-                _ => false,
-            }),
-            _ => false,
-        }
-    }
-    fn promise_callback(&mut self, callback: &ast::Expr, argument: Expr) -> Result<Expr> {
-        let ast::Expr::Arrow(arrow) = callback else {
-            return self.error(
-                callback.span(),
-                "awaited Promise callbacks must be expression arrows",
-            );
-        };
-        if arrow.is_generator || arrow.params.len() > 1 {
-            return self.error(
-                arrow.span,
-                "awaited Promise callbacks take zero or one simple parameter",
-            );
-        }
-        let ast::BlockStmtOrExpr::Expr(expression) = &*arrow.body else {
-            return self.error(
-                arrow.span,
-                "awaited Promise callbacks require an expression body",
-            );
-        };
-        let parameter = match arrow.params.first() {
-            Some(ast::Pat::Ident(binding)) => Some(binding.id.sym.to_string()),
-            Some(other) => {
-                return self.error(other.span(), "awaited Promise callbacks require a simple parameter");
-            }
-            None => None,
-        };
-        // The parameter is a binding of the callback's own block scope, so
-        // closures created in the callback capture it.
-        let entered = self.enter_scope(
-            arrow.span,
-            parameter.iter().map(|name| (name.clone(), true)).collect(),
-        )?;
-        match &parameter {
-            Some(name) => {
-                self.emit(arrow.span, Op::Declare(name.clone(), argument));
-            }
-            // The previous result must still be evaluated if the callback ignores it.
-            None => {
-                let temporary = self.temp();
-                self.emit(arrow.span, Op::Set(temporary, argument));
-            }
-        }
-        let value = if Self::is_awaited_promise_chain(expression) {
-            self.awaited_promise_chain(expression)?
-        } else {
-            self.lower(expression)?
-        };
-        let value = self.snapshot(arrow.span, value);
-        self.leave_scope(arrow.span, entered);
-        Ok(value)
-    }
-
-    /// Compile a direct array callback into the containing resumable frame.
-    /// Its parameters are bindings of a block scope entered for each element,
-    /// so closures created in the callback capture them.
-    fn array_callback(&mut self, callback: &ast::Expr, arguments: &[Expr]) -> Result<Expr> {
-        let (span, params, body) = match callback {
-            ast::Expr::Arrow(arrow) if !arrow.is_async && !arrow.is_generator => {
-                let ast::BlockStmtOrExpr::Expr(body) = &*arrow.body else {
-                    return self.error(arrow.span, "array callback requires an expression body");
-                };
-                (arrow.span, arrow.params.iter().collect::<Vec<_>>(), &**body)
-            }
-            ast::Expr::Fn(function) if function.ident.is_none() && !function.function.is_async && !function.function.is_generator => {
-                let Some(body) = &function.function.body else { return self.error(function.span(), "array callback needs a body") };
-                let [ast::Stmt::Return(ret)] = body.stmts.as_slice() else { return self.error(body.span, "array callback function must contain a single return expression") };
-                let Some(value) = &ret.arg else { return self.error(ret.span, "array callback must return an expression") };
-                (function.function.span, function.function.params.iter().map(|p| &p.pat).collect(), &**value)
-            }
-            _ => return self.error(callback.span(), "map/filter requires a synchronous direct callback"),
-        };
-        if params.len() > arguments.len() { return self.error(callback.span(), "array callback accepts at most three simple parameters"); }
-        let mut names = Vec::new();
-        for parameter in &params {
-            let ast::Pat::Ident(binding) = parameter else { return self.error(parameter.span(), "array callback parameters must be simple names") };
-            names.push(binding.id.sym.to_string());
-        }
-        let entered = self.enter_scope(span, names.iter().map(|name| (name.clone(), true)).collect())?;
-        for (name, argument) in names.iter().zip(arguments) {
-            self.emit(span, Op::Declare(name.clone(), argument.clone()));
-        }
-        let value = self.lower(body)?;
-        let value = self.snapshot(span, value);
-        self.leave_scope(span, entered);
-        Ok(value)
-    }
-
     // ------------------------------------------------------------ globals
 
     /// A global name, unless a local, function, import or library shadows it.
@@ -990,6 +948,15 @@ impl Compiler {
         let ast::Callee::Expr(callee) = &call.callee else {
             return Ok(None);
         };
+        if matches!(&**callee, ast::Expr::Ident(i) if i.sym == *"$$apply") {
+            ensure!(call.args.len() == 2 && call.args.iter().all(|arg| arg.spread.is_none()), "internal apply requires a function and argument array");
+            let callee = self.lower(&call.args[0].expr)?;
+            let callee = self.snapshot(call.span, callee);
+            let args = self.lower(&call.args[1].expr)?;
+            let dest = self.temp();
+            self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Apply { callee, args }));
+            return Ok(Some(Expr::Variable(dest)));
+        }
         let name = match &**callee {
             ast::Expr::Ident(i) if self.global(i.sym.as_ref()) => {
                 let name = i.sym.to_string();
@@ -1027,7 +994,7 @@ impl Compiler {
             let source = self.lower(&call.args[0].expr)?;
             let source = self.snapshot(call.args[0].span(), source);
             let array = self.snapshot(call.span, Expr::NodeBuiltin(name, vec![source]));
-            return self.callback_method(array, "map", &call.args[1..], call.span).map(Some);
+            return self.call_method_on(array, "map", &call.args[1..], call.span).map(Some);
         }
         if !(min..=max).contains(&call.args.len()) {
             return self.error(call.span, &format!("{name} takes {min} to {max} arguments"));
@@ -1117,6 +1084,26 @@ impl Compiler {
                 Ok(Expr::Member(Box::new(object), Box::new(key)))
             }
             ast::OptChainBase::Call(call) => {
+                if chain.optional {
+                    let callee = self.lower_object(&call.callee)?;
+                    let callee = self.snapshot(call.callee.span(), callee);
+                    self.chain_guard(call.span, callee.clone());
+                    if call.args.iter().any(|arg| arg.spread.is_some()) {
+                        let array = ast::Expr::Array(ast::ArrayLit { span: call.span, elems: call.args.iter().cloned().map(Some).collect() });
+                        let args = self.lower(&array)?;
+                        let dest = self.temp();
+                        self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Apply { callee, args }));
+                        return Ok(Expr::Variable(dest));
+                    }
+                    let mut args = Vec::new();
+                    for arg in &call.args {
+                        let value = self.lower(&arg.expr)?;
+                        args.push(self.snapshot(arg.span(), value));
+                    }
+                    let dest = self.temp();
+                    self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Dynamic { callee, args }));
+                    return Ok(Expr::Variable(dest));
+                }
                 let (member, optional) = match &*call.callee {
                     ast::Expr::OptChain(inner) => match &*inner.base {
                         ast::OptChainBase::Member(m) => (m, inner.optional),
@@ -1150,6 +1137,26 @@ impl Compiler {
 
     // --------------------------------------------------------------- methods
 
+    fn call_method_spread(&mut self, receiver: Expr, key: Expr, args: &[ast::ExprOrSpread], span: Span) -> Result<Expr> {
+        let key = self.snapshot(span, Expr::NodeBuiltin("String".into(), vec![key]));
+        let is_object = Expr::Binary("===".into(), Box::new(Expr::Unary("typeof".into(), Box::new(receiver.clone()))), Box::new(Expr::Value(json!("object"))));
+        let not_null = Expr::Binary("!=".into(), Box::new(receiver.clone()), Box::new(Expr::Value(Value::Null)));
+        let check = Expr::Binary("&&".into(), Box::new(is_object), Box::new(not_null));
+        let has = Expr::Conditional(Box::new(check), Box::new(Expr::Binary("in".into(), Box::new(key.clone()), Box::new(receiver.clone()))), Box::new(Expr::Value(json!(false))));
+        let has = self.snapshot(span, has);
+        let callee = self.snapshot(span, Expr::Member(Box::new(receiver.clone()), Box::new(key.clone())));
+        let array = ast::Expr::Array(ast::ArrayLit { span, elems: args.iter().cloned().map(Some).collect() });
+        let args = self.lower(&array)?;
+        let dest = self.temp();
+        let builtin = self.emit(span, Op::Branch(has, 0));
+        self.emit(span, Op::Effect(Some(dest.clone()), Effect::Apply { callee, args: args.clone() }));
+        let done = self.emit(span, Op::Jump(0));
+        self.land(builtin);
+        self.emit(span, Op::Effect(Some(dest.clone()), Effect::DynamicMethodApply { receiver, name: key, args }));
+        self.land(done);
+        Ok(Expr::Variable(dest))
+    }
+
     /// `receiver.method(args)` for a built-in receiver kind. Callback methods
     /// are compiled into this frame so that their callbacks can suspend.
     fn call_method_on(
@@ -1159,11 +1166,15 @@ impl Compiler {
         args: &[ast::ExprOrSpread],
         span: Span,
     ) -> Result<Expr> {
-        if CALLBACK_METHODS.contains(&method) && !(matches!(method, "sort" | "toSorted") && args.is_empty()) {
-            return self.callback_method(receiver, method, args, span);
+        if method != "map" && CALLBACK_METHODS.contains(&method) && args.first().is_some_and(|a| match &*a.expr {
+            ast::Expr::Arrow(f) => f.is_async,
+            ast::Expr::Fn(f) => f.function.is_async,
+            _ => false,
+        }) {
+            return self.error(span, "async callbacks require Promise support");
         }
         if args.iter().any(|a| a.spread.is_some()) {
-            return self.error(span, "method argument spreads are unsupported");
+            return self.call_method_spread(receiver, Expr::Value(json!(method)), args, span);
         }
         if let Some(reason) = super::js_methods::unavailable_method(method) {
             return self.error(span, reason);
@@ -1195,396 +1206,16 @@ impl Compiler {
         Ok(Expr::Variable(dest))
     }
 
-    /// Visit indices in order (or in reverse), optionally skipping holes.
-    /// `body` gets the element, its index and a list of jumps to the end.
-    #[allow(clippy::too_many_arguments)]
-    fn array_loop(
-        &mut self,
-        span: Span,
-        source: &Expr,
-        length: &Expr,
-        from: Option<Expr>,
-        backward: bool,
-        skip_holes: bool,
-        body: impl FnOnce(&mut Self, Expr, Expr, &mut Vec<usize>) -> Result<()>,
-    ) -> Result<()> {
-        let index = self.temp();
-        let one = || Box::new(Expr::Value(json!(1)));
-        let start_value = match (from, backward) {
-            (Some(from), _) => from,
-            (None, false) => Expr::Value(json!(0)),
-            (None, true) => Expr::Binary("-".into(), Box::new(length.clone()), one()),
-        };
-        self.emit(span, Op::Set(index.clone(), start_value));
-        let start = self.code.len();
-        let position = || Box::new(Expr::Variable(index.clone()));
-        let test = if backward {
-            Expr::Binary(">=".into(), position(), Box::new(Expr::Value(json!(0))))
-        } else {
-            Expr::Binary("<".into(), position(), Box::new(length.clone()))
-        };
-        let exit = self.emit(span, Op::Branch(test, 0));
-        let hole = skip_holes.then(|| {
-            let present = Expr::Binary("hasIndex".into(), Box::new(source.clone()), position());
-            self.emit(span, Op::Branch(present, 0))
-        });
-        let item = self.snapshot(span, Expr::Member(Box::new(source.clone()), position()));
-        let mut breaks = Vec::new();
-        body(self, item, Expr::Variable(index.clone()), &mut breaks)?;
-        let next = self.code.len();
-        let step = if backward { "-" } else { "+" };
-        self.emit(span, Op::Set(index.clone(), Expr::Binary(step.into(), position(), one())));
-        self.emit(span, Op::Jump(start));
-        let end = self.code.len();
-        if let Op::Branch(_, target) = &mut self.code[exit].op {
-            *target = end;
-        }
-        if let Some(hole) = hole
-            && let Op::Branch(_, target) = &mut self.code[hole].op
-        {
-            *target = next;
-        }
-        for at in breaks {
-            self.code[at].op = Op::Jump(end);
-        }
-        Ok(())
-    }
-
-    /// Patch a forward branch emitted at `at` to the current position.
     fn land(&mut self, at: usize) {
         let here = self.code.len();
         match &mut self.code[at].op {
-            Op::Branch(_, target) => *target = here,
-            Op::Jump(target) => *target = here,
+            Op::Branch(_, target) | Op::Jump(target) => *target = here,
             _ => unreachable!("only branches and jumps are patched"),
         }
     }
 
-    /// Array methods with a callback, compiled into the calling frame. The
-    /// callback is a direct arrow or function with a single return expression.
-    fn callback_method(
-        &mut self,
-        receiver: Expr,
-        method: &str,
-        args: &[ast::ExprOrSpread],
-        span: Span,
-    ) -> Result<Expr> {
-        if args.iter().any(|a| a.spread.is_some()) {
-            return self.error(span, "callback argument spreads are unsupported");
-        }
-        let reduce = matches!(method, "reduce" | "reduceRight");
-        if (reduce && !(1..=2).contains(&args.len())) || (!reduce && args.len() != 1) {
-            return self.error(
-                span,
-                &format!(
-                    "{method} takes one direct callback{}",
-                    if reduce { " and an optional initial value" } else { "; a thisArg is unsupported" }
-                ),
-            );
-        }
-        let v = |name: &str| Expr::Variable(name.to_owned());
-        let num = |n: i64| Expr::Value(json!(n));
-        let bin = |op: &str, a: Expr, b: Expr| Expr::Binary(op.into(), Box::new(a), Box::new(b));
-        let source = self.snapshot(span, receiver);
-        let length = self.snapshot(span, Expr::Unary("arrayLength".into(), Box::new(source.clone())));
-        let callback = &*args[0].expr;
-        let result = self.temp();
-        match method {
-            "map" | "flatMap" => {
-                self.emit(span, Op::Set(result.clone(), Expr::Array(Vec::new())));
-                self.emit(
-                    span,
-                    Op::SetMember {
-                        object: v(&result),
-                        key: Expr::Value(json!("length")),
-                        value: length.clone(),
-                    },
-                );
-                let target = result.clone();
-                let list = source.clone();
-                self.array_loop(span, &source, &length, None, false, true, |c, item, index, _| {
-                    let value = c.array_callback(callback, &[item, index.clone(), list])?;
-                    c.emit(span, Op::SetMember { object: v(&target), key: index, value });
-                    Ok(())
-                })?;
-                if method == "flatMap" {
-                    let flat = Expr::StringMethod(Box::new(v(&result)), "flat".into(), vec![num(1)]);
-                    return Ok(self.snapshot(span, flat));
-                }
-            }
-            "filter" => {
-                self.emit(span, Op::Set(result.clone(), Expr::Array(Vec::new())));
-                let target = result.clone();
-                let list = source.clone();
-                self.array_loop(span, &source, &length, None, false, true, |c, item, index, _| {
-                    let value = c.array_callback(callback, &[item.clone(), index, list])?;
-                    let skip = c.emit(span, Op::Branch(value, 0));
-                    let destination = c.temp();
-                    c.emit(span, Op::Append { target: target.clone(), items: vec![item], destination });
-                    c.land(skip);
-                    Ok(())
-                })?;
-            }
-            "forEach" => {
-                self.emit(span, Op::Set(result.clone(), Expr::Undefined));
-                let list = source.clone();
-                self.array_loop(span, &source, &length, None, false, true, |c, item, index, _| {
-                    let value = c.array_callback(callback, &[item, index, list])?;
-                    c.snapshot(span, value);
-                    Ok(())
-                })?;
-            }
-            "some" | "every" | "find" | "findIndex" | "findLast" | "findLastIndex" => {
-                let initial = match method {
-                    "some" => Expr::Value(json!(false)),
-                    "every" => Expr::Value(json!(true)),
-                    "find" | "findLast" => Expr::Undefined,
-                    _ => num(-1),
-                };
-                self.emit(span, Op::Set(result.clone(), initial));
-                let backward = method.starts_with("findLast");
-                // some/every skip holes; the find family reads them as undefined.
-                let skip_holes = matches!(method, "some" | "every");
-                let target = result.clone();
-                let list = source.clone();
-                self.array_loop(span, &source, &length, None, backward, skip_holes, |c, item, index, breaks| {
-                    let value = c.array_callback(callback, &[item.clone(), index.clone(), list])?;
-                    let value = c.snapshot(span, value);
-                    // every stops at the first falsy result, the others at the first truthy one.
-                    let test = if method == "every" { Expr::Unary("!".into(), Box::new(value)) } else { value };
-                    let skip = c.emit(span, Op::Branch(test, 0));
-                    let found = match method {
-                        "some" => Expr::Value(json!(true)),
-                        "every" => Expr::Value(json!(false)),
-                        "find" | "findLast" => item,
-                        _ => index,
-                    };
-                    c.emit(span, Op::Set(target.clone(), found));
-                    breaks.push(c.emit(span, Op::Jump(0)));
-                    c.land(skip);
-                    Ok(())
-                })?;
-            }
-            "reduce" | "reduceRight" => {
-                let backward = method == "reduceRight";
-                let accumulator = result.clone();
-                let from = if let Some(initial) = args.get(1) {
-                    let value = self.lower(&initial.expr)?;
-                    self.emit(span, Op::Set(accumulator.clone(), value));
-                    None
-                } else {
-                    // The first present element is the initial accumulator.
-                    let k = self.temp();
-                    let first = if backward { bin("-", length.clone(), num(1)) } else { num(0) };
-                    self.emit(span, Op::Set(k.clone(), first));
-                    let seek = self.code.len();
-                    let in_range = if backward { bin(">=", v(&k), num(0)) } else { bin("<", v(&k), length.clone()) };
-                    let empty = self.emit(span, Op::Branch(in_range, 0));
-                    let missing = self.emit(span, Op::Branch(bin("hasIndex", source.clone(), v(&k)), 0));
-                    self.emit(span, Op::Set(accumulator.clone(), Expr::Member(Box::new(source.clone()), Box::new(v(&k)))));
-                    let step = if backward { "-" } else { "+" };
-                    self.emit(span, Op::Set(k.clone(), bin(step, v(&k), num(1))));
-                    let found = self.emit(span, Op::Jump(0));
-                    self.land(missing);
-                    self.emit(span, Op::Set(k.clone(), bin(step, v(&k), num(1))));
-                    self.emit(span, Op::Jump(seek));
-                    self.land(empty);
-                    let error = Expr::NodeBuiltin(
-                        "new TypeError".into(),
-                        vec![Expr::Value(json!("Reduce of empty array with no initial value"))],
-                    );
-                    self.emit(span, Op::Throw(error));
-                    self.land(found);
-                    Some(v(&k))
-                };
-                let list = source.clone();
-                self.array_loop(span, &source, &length, from, backward, true, |c, item, index, _| {
-                    let value = c.array_callback(callback, &[v(&accumulator), item, index, list])?;
-                    c.emit(span, Op::Set(accumulator.clone(), value));
-                    Ok(())
-                })?;
-            }
-            "sort" | "toSorted" => {
-                // SortIndexedProperties: present values other than undefined
-                // are compared; undefined values follow them. sort keeps holes
-                // last; toSorted reads holes as undefined.
-                let values = self.temp();
-                let undefined = self.temp();
-                self.emit(span, Op::Set(values.clone(), Expr::Array(Vec::new())));
-                self.emit(span, Op::Set(undefined.clone(), num(0)));
-                {
-                    let (values, undefined) = (values.clone(), undefined.clone());
-                    self.array_loop(span, &source, &length, None, false, method == "sort", |c, item, _, _| {
-                        let defined = c.emit(span, Op::Branch(bin("===", item.clone(), Expr::Undefined), 0));
-                        c.emit(span, Op::Set(undefined.clone(), bin("+", v(&undefined), num(1))));
-                        let done = c.emit(span, Op::Jump(0));
-                        c.land(defined);
-                        let destination = c.temp();
-                        c.emit(span, Op::Append { target: values.clone(), items: vec![item], destination });
-                        c.land(done);
-                        Ok(())
-                    })?;
-                }
-                let sorted = self.merge_sort(span, &values, callback)?;
-                let count = self.temp();
-                self.emit(span, Op::Set(count.clone(), num(0)));
-                let pad = self.code.len();
-                let padded = self.emit(span, Op::Branch(bin("<", v(&count), v(&undefined)), 0));
-                let destination = self.temp();
-                self.emit(span, Op::Append { target: sorted.clone(), items: vec![Expr::Undefined], destination });
-                self.emit(span, Op::Set(count.clone(), bin("+", v(&count), num(1))));
-                self.emit(span, Op::Jump(pad));
-                self.land(padded);
-                let value = if method == "sort" {
-                    Expr::NodeBuiltin("$sortWriteBack".into(), vec![source.clone(), v(&sorted)])
-                } else {
-                    v(&sorted)
-                };
-                self.emit(span, Op::Set(result.clone(), value));
-            }
-            _ => unreachable!("callback method list"),
-        }
-        Ok(Expr::Variable(result))
-    }
-
-    /// A stable bottom-up merge sort of the array in `values`, with the
-    /// comparator inlined. SortCompare treats NaN as 0; equal elements keep
-    /// their order because the left run wins ties.
-    fn merge_sort(&mut self, span: Span, values: &str, comparator: &ast::Expr) -> Result<String> {
-        let v = |name: &str| Expr::Variable(name.to_owned());
-        let num = |n: i64| Expr::Value(json!(n));
-        let bin = |op: &str, a: Expr, b: Expr| Expr::Binary(op.into(), Box::new(a), Box::new(b));
-        let min = |a: Expr, b: Expr| Expr::NodeBuiltin("Math.min".into(), vec![a, b]);
-        let at = |list: &str, index: &str| Expr::Member(Box::new(v(list)), Box::new(v(index)));
-        let names: Vec<String> = (0..12).map(|_| self.temp()).collect();
-        let [arr, tmp, n, width, i, left, mid, right, l, r, k, swap] = <[String; 12]>::try_from(names).unwrap();
-        self.emit(span, Op::Set(arr.clone(), v(values)));
-        self.emit(span, Op::Set(n.clone(), Expr::Unary("arrayLength".into(), Box::new(v(&arr)))));
-        self.emit(span, Op::Set(tmp.clone(), Expr::Array(Vec::new())));
-        self.emit(span, Op::SetMember { object: v(&tmp), key: Expr::Value(json!("length")), value: v(&n) });
-        self.emit(span, Op::Set(width.clone(), num(1)));
-        let outer = self.code.len();
-        let outer_exit = self.emit(span, Op::Branch(bin("<", v(&width), v(&n)), 0));
-        self.emit(span, Op::Set(i.clone(), num(0)));
-        let pass = self.code.len();
-        let pass_exit = self.emit(span, Op::Branch(bin("<", v(&i), v(&n)), 0));
-        self.emit(span, Op::Set(left.clone(), v(&i)));
-        self.emit(span, Op::Set(mid.clone(), min(bin("+", v(&i), v(&width)), v(&n))));
-        self.emit(span, Op::Set(right.clone(), min(bin("+", v(&i), bin("*", num(2), v(&width))), v(&n))));
-        self.emit(span, Op::Set(l.clone(), v(&left)));
-        self.emit(span, Op::Set(r.clone(), v(&mid)));
-        self.emit(span, Op::Set(k.clone(), v(&left)));
-        let merge = self.code.len();
-        let merge_exit = self.emit(span, Op::Branch(bin("<", v(&k), v(&right)), 0));
-        let left_done = self.emit(span, Op::Branch(bin("<", v(&l), v(&mid)), 0));
-        let right_done = self.emit(span, Op::Branch(bin("<", v(&r), v(&right)), 0));
-        let a = self.snapshot(span, at(&arr, &l));
-        let b = self.snapshot(span, at(&arr, &r));
-        let order = self.array_callback(comparator, &[a, b])?;
-        let order = self.snapshot(span, Expr::Unary("+".into(), Box::new(order)));
-        let keep_left = self.emit(span, Op::Branch(bin(">", order, num(0)), 0));
-        // take the right element
-        self.land(left_done);
-        self.emit(span, Op::SetMember { object: v(&tmp), key: v(&k), value: at(&arr, &r) });
-        self.emit(span, Op::Set(r.clone(), bin("+", v(&r), num(1))));
-        let advance_right = self.emit(span, Op::Jump(0));
-        // take the left element
-        self.land(right_done);
-        self.land(keep_left);
-        self.emit(span, Op::SetMember { object: v(&tmp), key: v(&k), value: at(&arr, &l) });
-        self.emit(span, Op::Set(l.clone(), bin("+", v(&l), num(1))));
-        self.land(advance_right);
-        self.emit(span, Op::Set(k.clone(), bin("+", v(&k), num(1))));
-        self.emit(span, Op::Jump(merge));
-        self.land(merge_exit);
-        self.emit(span, Op::Set(i.clone(), bin("+", v(&i), bin("*", num(2), v(&width)))));
-        self.emit(span, Op::Jump(pass));
-        self.land(pass_exit);
-        self.emit(span, Op::Set(swap.clone(), v(&arr)));
-        self.emit(span, Op::Set(arr.clone(), v(&tmp)));
-        self.emit(span, Op::Set(tmp.clone(), v(&swap)));
-        self.emit(span, Op::Set(width.clone(), bin("*", v(&width), num(2))));
-        self.emit(span, Op::Jump(outer));
-        self.land(outer_exit);
-        Ok(arr)
-    }
-
-    fn awaited_promise_chain(&mut self, e: &ast::Expr) -> Result<Expr> {
-        let ast::Expr::Call(call) = e else {
-            return self.error(e.span(), "invalid awaited Promise chain");
-        };
-        let ast::Callee::Expr(target) = &call.callee else {
-            return self.error(call.span, "invalid awaited Promise chain");
-        };
-        let ast::Expr::Member(member) = &**target else {
-            return self.error(call.span, "invalid awaited Promise chain");
-        };
-        let ast::MemberProp::Ident(method) = &member.prop else {
-            return self.error(call.span, "invalid awaited Promise method");
-        };
-        if call.args.iter().any(|arg| arg.spread.is_some()) {
-            return self.error(call.span, "Promise argument spreads are unsupported");
-        }
-        if matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise") {
-            if call.args.len() > 1 {
-                return self.error(
-                    call.span,
-                    "Promise.resolve/reject accepts at most one argument",
-                );
-            }
-            if call
-                .args
-                .first()
-                .is_some_and(|arg| !Self::safe_promise_root_argument(&arg.expr))
-            {
-                return self.error(call.span, "Promise.resolve/reject arguments must be simple values without effects or property access");
-            }
-            let value = if let Some(arg) = call.args.first() {
-                self.lower(&arg.expr)?
-            } else {
-                Expr::Value(Value::Null)
-            };
-            if method.sym == *"reject" {
-                self.emit(call.span, Op::Throw(value));
-                return Ok(Expr::Value(Value::Null));
-            }
-            return Ok(value);
-        }
-        if call.args.len() != 1 {
-            return self.error(call.span, "awaited then/catch requires one callback");
-        }
-        if method.sym == *"then" {
-            let value = self.awaited_promise_chain(&member.obj)?;
-            return self.promise_callback(&call.args[0].expr, value);
-        }
-        let error = self.temp();
-        let result = self.temp();
-        self.temp_names.insert(error.clone());
-        self.temp_names.insert(result.clone());
-        let start = self.emit(
-            call.span,
-            Op::Catch {
-                target: 0,
-                name: error.clone(),
-            },
-        );
-        self.handlers += 1;
-        let value = self.awaited_promise_chain(&member.obj)?;
-        self.handlers -= 1;
-        self.emit(call.span, Op::Set(result.clone(), value));
-        self.emit(call.span, Op::EndCatch);
-        let jump = self.emit(call.span, Op::Jump(0));
-        let handler = self.code.len();
-        let value = self.promise_callback(&call.args[0].expr, Expr::Variable(error))?;
-        self.emit(call.span, Op::Set(result.clone(), value));
-        let end = self.code.len();
-        if let Op::Catch { target, .. } = &mut self.code[start].op {
-            *target = handler;
-        }
-        self.code[jump].op = Op::Jump(end);
-        Ok(Expr::Variable(result))
-    }
     fn lower_inner(&mut self, e: &ast::Expr) -> Result<Expr> {
+        self.reject_unawaited_operands(e)?;
         match e {
             ast::Expr::OptChain(chain) => self.with_chain(chain.span, |c| c.chain_link(chain)),
             ast::Expr::New(new)
@@ -1631,6 +1262,21 @@ impl Compiler {
                 };
                 Ok(Expr::Value(json!(kind)))
             }
+            ast::Expr::New(new) if matches!(&*new.callee, ast::Expr::Ident(i) if i.sym == *"Promise") && self.global("Promise") => {
+                let args = new.args.as_deref().unwrap_or(&[]);
+                if args.iter().any(|arg| arg.spread.is_some()) {
+                    return self.error(new.span, "Promise constructor spread arguments are not yet supported");
+                }
+                let mut values = Vec::new();
+                for arg in args {
+                    let value = self.lower(&arg.expr)?;
+                    values.push(self.snapshot(arg.span(), value));
+                }
+                let executor = values.into_iter().next().unwrap_or(Expr::Undefined);
+                let destination = self.temp();
+                self.emit(new.span, Op::Effect(Some(destination.clone()), Effect::PromiseConstruct { executor }));
+                Ok(Expr::Variable(destination))
+            }
             ast::Expr::New(new) if matches!(&*new.callee, ast::Expr::Ident(i) if i.sym == *"RegExp") => {
                 if self.resolve("RegExp").is_some() {
                     return self.error(new.span, "shadowed RegExp constructor is unsupported");
@@ -1647,153 +1293,10 @@ impl Compiler {
                 Ok(Expr::RegExp(lowered))
             }
             ast::Expr::Await(awaited) => {
-                if Self::is_awaited_promise_chain(&awaited.arg) {
-                    return self.awaited_promise_chain(&awaited.arg);
-                }
-                let ast::Expr::Call(all) = &*awaited.arg else {
-                    return self.lower(&awaited.arg);
-                };
-                let is_all = matches!(&all.callee, ast::Callee::Expr(e)
-                    if matches!(&**e, ast::Expr::Member(m)
-                        if matches!(&*m.obj, ast::Expr::Ident(i) if i.sym == *"Promise")
-                        && matches!(&m.prop, ast::MemberProp::Ident(i) if i.sym == *"all")));
-                // Ordinary flow effects already suspend until their result is available.
-                // Awaiting one effect or JSON value preserves that sequencing without
-                // creating a Promise or another task.
-                if !is_all {
-                    return self.lower(&awaited.arg);
-                }
-                if all.args.len() != 1 || all.args[0].spread.is_some() {
-                    return self.error(
-                        awaited.span,
-                        "use await Promise.all([read-only tool calls])",
-                    );
-                }
-                if let ast::Expr::Call(map) = &*all.args[0].expr {
-                    let ast::Callee::Expr(target) = &map.callee else {
-                        return self.error(map.span, "use array.map(item => io.read(...))");
-                    };
-                    let ast::Expr::Member(member) = &**target else {
-                        return self.error(map.span, "use array.map(item => io.read(...))");
-                    };
-                    if !matches!(&member.prop, ast::MemberProp::Ident(i) if i.sym == *"map")
-                        || map.args.len() != 1
-                        || map.args[0].spread.is_some()
-                    {
-                        return self.error(map.span, "use array.map(item => io.read(...))");
-                    }
-                    let items = self.expr(&member.obj)?;
-                    let ast::Expr::Arrow(arrow) = &*map.args[0].expr else {
-                        return self.error(map.span, "map needs an arrow with one parameter");
-                    };
-                    if arrow.is_generator || arrow.params.len() != 1 {
-                        return self.error(arrow.span, "map needs one arrow parameter");
-                    }
-                    let ast::Pat::Ident(parameter) = &arrow.params[0] else {
-                        return self.error(arrow.span, "map needs a simple parameter");
-                    };
-                    let name = parameter.id.sym.to_string();
-                    if self.resolve(&name).is_some() {
-                        return self.error(
-                            arrow.span,
-                            "map parameter must not shadow an existing binding",
-                        );
-                    }
-                    let ast::BlockStmtOrExpr::Expr(body) = &*arrow.body else {
-                        return self.error(arrow.span, "map body must be one read-only tool call");
-                    };
-                    let body_expr = match &**body {
-                        ast::Expr::Await(awaited) if arrow.is_async => &*awaited.arg,
-                        expr => expr,
-                    };
-                    let ast::Expr::Call(call) = body_expr else {
-                        return self.error(arrow.span, "map body must be one read-only tool call");
-                    };
-                    // The parameter exists only while each read's arguments are built.
-                    self.scopes.push(BTreeMap::new());
-                    self.declare(&name, false, arrow.span)?;
-                    let effect = self.effect(call);
-                    self.scopes.pop();
-                    let (tool, args) = match effect? {
-                        Effect::Tool(tool, args)
-                            if matches!(
-                                tool.as_str(),
-                                "read_file" | "read_file_lines" | "search_text" | "list_dir"
-                            ) =>
-                        {
-                            (tool, args)
-                        }
-                        _ => {
-                            return self.error(
-                                call.span,
-                                "Promise.all accepts only file reads, listings and searches",
-                            );
-                        }
-                    };
-                    let dest = self.temp();
-                    self.emit(
-                        awaited.span,
-                        Op::Effect(
-                            Some(dest.clone()),
-                            Effect::ParallelReadMap {
-                                name: tool,
-                                items,
-                                parameter: name,
-                                args,
-                            },
-                        ),
-                    );
-                    return Ok(Expr::Variable(dest));
-                }
-                let ast::Expr::Array(array) = &*all.args[0].expr else {
-                    return self.error(
-                        awaited.span,
-                        "Promise.all needs an array of calls or array.map(item => read-only call)",
-                    );
-                };
-                if array.elems.len() > 32 {
-                    return self.error(
-                        awaited.span,
-                        "Promise.all supports at most 32 read-only calls",
-                    );
-                }
-                let mut operations = Vec::new();
-                for item in &array.elems {
-                    let Some(item) = item else {
-                        return self.error(array.span, "array holes are unsupported");
-                    };
-                    if item.spread.is_some() {
-                        return self.error(item.span(), "array spreads are unsupported");
-                    }
-                    let ast::Expr::Call(call) = &*item.expr else {
-                        return self.error(
-                            item.span(),
-                            "Promise.all accepts only read-only library calls",
-                        );
-                    };
-                    match self.effect(call)? {
-                        Effect::Tool(name, args)
-                            if matches!(
-                                name.as_str(),
-                                "read_file" | "read_file_lines" | "search_text" | "list_dir"
-                            ) =>
-                        {
-                            operations.push((name, args))
-                        }
-                        _ => {
-                            return self.error(
-                                call.span,
-                                "Promise.all accepts only file reads, listings and searches",
-                            );
-                        }
-                    }
-                }
-                let dest = self.temp();
-                self.emit(
-                    awaited.span,
-                    Op::Effect(Some(dest.clone()), Effect::ParallelReads(operations)),
-                );
-                Ok(Expr::Variable(dest))
+                let value = self.lower(&awaited.arg)?;
+                let destination = self.temp();
+                self.emit(awaited.span, Op::Await { value, destination: destination.clone() });
+                Ok(Expr::Variable(destination))
             }
             ast::Expr::Bin(b) => {
                 let op = match b.op {
@@ -2031,6 +1534,61 @@ impl Compiler {
                     self.code[success].op = Op::Jump(end);
                     return Ok(Expr::Value(json!(true)));
                 }
+                if call.args.iter().any(|arg| arg.spread.is_some()) {
+                    let ast::Callee::Expr(target) = &call.callee else { return self.error(call.span, "spread call needs a function value"); };
+                    if matches!(&**target, ast::Expr::Ident(i) if i.sym == *"assert") {
+                        return self.error(call.span, "spread is unavailable for this special call");
+                    }
+                    if let ast::Expr::Member(member) = &**target && self.native_value(target)?.is_none() {
+                        let receiver = self.lower(&member.obj)?;
+                        let receiver = self.snapshot(member.obj.span(), receiver);
+                        let key = self.member_key(&member.prop, member.span)?;
+                        return self.call_method_spread(receiver, key, &call.args, call.span);
+                    }
+                    let callee = self.lower(target)?;
+                    let callee = self.snapshot(target.span(), callee);
+                    let array = ast::Expr::Array(ast::ArrayLit { span: call.span, elems: call.args.iter().cloned().map(Some).collect() });
+                    let args = self.lower(&array)?;
+                    let dest = self.temp();
+                    self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Apply { callee, args }));
+                    return Ok(Expr::Variable(dest));
+                }
+                if let ast::Callee::Expr(target) = &call.callee
+                    && let ast::Expr::Member(member) = &**target
+                    && matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise")
+                    && self.global("Promise")
+                    && let ast::MemberProp::Ident(method) = &member.prop
+                    && matches!(method.sym.as_ref(), "resolve" | "reject")
+                {
+                    if call.args.iter().any(|arg| arg.spread.is_some()) {
+                        return self.error(call.span, "Promise.resolve/reject spread arguments are not yet supported");
+                    }
+                    let mut args = Vec::new();
+                    for arg in &call.args {
+                        let value = self.lower(&arg.expr)?;
+                        args.push(self.snapshot(arg.span(), value));
+                    }
+                    let value = args.into_iter().next().unwrap_or(Expr::Undefined);
+                    let destination = self.temp();
+                    self.emit(call.span, Op::Effect(Some(destination.clone()), Effect::PromiseCreate { reject: method.sym == *"reject", value }));
+                    return Ok(Expr::Variable(destination));
+                }
+                if let ast::Callee::Expr(target) = &call.callee
+                    && let ast::Expr::Member(member) = &**target
+                    && matches!(&*member.obj, ast::Expr::Ident(i) if i.sym == *"Promise")
+                    && self.global("Promise")
+                    && let ast::MemberProp::Ident(method) = &member.prop
+                    && matches!(method.sym.as_ref(), "all" | "allSettled" | "race" | "any")
+                {
+                    if call.args.iter().any(|arg| arg.spread.is_some()) { return self.error(call.span, "Promise combinator spread arguments are not yet supported"); }
+                    let mut args = Vec::new();
+                    for arg in &call.args { let value = self.lower(&arg.expr)?; args.push(self.snapshot(arg.span(), value)); }
+                    let value = args.into_iter().next().unwrap_or(Expr::Undefined);
+                    let name = match method.sym.as_ref() { "all" => "$$promiseAll", "allSettled" => "$$promiseAllSettled", "race" => "$$promiseRace", _ => "$$promiseAny" };
+                    let destination = self.temp();
+                    self.emit(call.span, Op::Effect(Some(destination.clone()), Effect::Call(name.into(), vec![value])));
+                    return Ok(Expr::Variable(destination));
+                }
                 if let Some(value) = self.builtin_call(call)? {
                     return Ok(value);
                 }
@@ -2124,11 +1682,7 @@ impl Compiler {
                 if !self.static_callee(target) {
                     return self.dynamic_call(call, target);
                 }
-                for (index, arg) in call.args.iter().enumerate() {
-                    if index == 0 && matches!(target,ast::Expr::Ident(i) if i.sym == *"fork") {
-                        args.push(arg.clone());
-                        continue;
-                    }
+                for arg in &call.args {
                     let lowered = self.lower(&arg.expr)?;
                     let name = self.temp();
                     self.emit(arg.span(), Op::Set(name.clone(), lowered));
@@ -2152,6 +1706,33 @@ impl Compiler {
                 Ok(Expr::Variable(dest))
             }
             ast::Expr::Paren(p) => self.lower(&p.expr),
+            ast::Expr::Object(o) if o.props.iter().any(|p| matches!(p, ast::PropOrSpread::Spread(_))) => {
+                let target = self.temp();
+                self.emit(o.span, Op::Set(target.clone(), Expr::Object(Vec::new())));
+                for prop in &o.props {
+                    match prop {
+                        ast::PropOrSpread::Spread(spread) => {
+                            let value = self.lower(&spread.expr)?;
+                            let merged = Expr::NodeBuiltin("Object.assign".into(), vec![Expr::Variable(target.clone()), value]);
+                            self.emit(spread.dot3_token, Op::Set(target.clone(), merged));
+                        }
+                        ast::PropOrSpread::Prop(prop) => {
+                            let (key, value) = match &**prop {
+                                ast::Prop::KeyValue(p) => (self.property(&p.key)?, self.lower(&p.value)?),
+                                ast::Prop::Shorthand(i) => (i.sym.to_string(), self.expr(&ast::Expr::Ident(i.clone()))?),
+                                ast::Prop::Method(method) => {
+                                    let key = self.property(&method.key)?;
+                                    let id = self.compile_function(FunctionSource::function(&method.function, Some(key.clone()), None))?;
+                                    (key, Expr::Function(id))
+                                }
+                                _ => return self.error(prop.span(), "object getters and setters are unsupported"),
+                            };
+                            self.emit(prop.span(), Op::SetMember { object: Expr::Variable(target.clone()), key: Expr::Value(json!(key)), value });
+                        }
+                    }
+                }
+                Ok(Expr::Variable(target))
+            }
             ast::Expr::Object(o) => {
                 let mut fields = Vec::new();
                 for p in &o.props {
@@ -2182,6 +1763,31 @@ impl Compiler {
                     }
                 }
                 Ok(Expr::Object(fields))
+            }
+            ast::Expr::Array(a) if a.elems.iter().any(|item| item.as_ref().is_some_and(|item| item.spread.is_some())) => {
+                let target = self.temp();
+                self.emit(a.span, Op::Set(target.clone(), Expr::Array(Vec::new())));
+                for item in &a.elems {
+                    let Some(item) = item else { return self.error(a.span, "array holes are unsupported"); };
+                    let value = self.lower(&item.expr)?;
+                    if item.spread.is_some() {
+                        let value = self.snapshot(item.span(), value);
+                        let array = Expr::Unary("isArray".into(), Box::new(value.clone()));
+                        let string = Expr::Binary("===".into(), Box::new(Expr::Unary("typeof".into(), Box::new(value.clone()))), Box::new(Expr::Value(json!("string"))));
+                        let invalid = self.emit(item.span(), Op::Branch(Expr::Binary("||".into(), Box::new(array), Box::new(string)), 0));
+                        let success = self.emit(item.span(), Op::Jump(0));
+                        self.land(invalid);
+                        self.emit(item.span(), Op::Throw(Expr::NodeBuiltin("new TypeError".into(), vec![Expr::Value(json!("spread value is not iterable"))])));
+                        self.land(success);
+                        let source = Expr::NodeBuiltin("Array.from".into(), vec![value]);
+                        let combined = Expr::StringMethod(Box::new(Expr::Variable(target.clone())), "concat".into(), vec![source]);
+                        self.emit(item.span(), Op::Set(target.clone(), combined));
+                    } else {
+                        let destination = self.temp();
+                        self.emit(item.span(), Op::Append { target: target.clone(), items: vec![value], destination });
+                    }
+                }
+                Ok(Expr::Variable(target))
             }
             ast::Expr::Array(a) => {
                 let mut values = Vec::new();
@@ -2235,48 +1841,121 @@ impl Compiler {
         self.snapshot(e.span(), value);
         Ok(())
     }
-    /// Initialize (`declare`) or assign the names of a declaration pattern.
+    /// Evaluate the source once, then initialize the pattern left-to-right.
     fn binding(&mut self, p: &ast::Pat, e: &ast::Expr, declare: bool) -> Result<()> {
-        let bind = |name: String, value: Expr| {
-            if declare {
-                Op::Declare(name, value)
-            } else {
-                Op::Set(name, value)
-            }
-        };
+        let value = self.lower(e)?;
+        let value = self.snapshot(e.span(), value);
+        self.bind_value(p, value, declare)
+    }
+    fn default_value(&mut self, span: Span, value: Expr, default: &ast::Expr) -> Result<Expr> {
+        let name = self.temp();
+        self.emit(span, Op::Set(name.clone(), value));
+        let test = Expr::Binary("===".into(), Box::new(Expr::Variable(name.clone())), Box::new(Expr::Undefined));
+        let skip = self.emit(span, Op::Branch(test, 0));
+        let replacement = self.lower(default)?;
+        self.emit(span, Op::Set(name.clone(), replacement));
+        self.land(skip);
+        Ok(Expr::Variable(name))
+    }
+    fn bind_value(&mut self, p: &ast::Pat, value: Expr, declare: bool) -> Result<()> {
         match p {
             ast::Pat::Ident(i) => {
-                let value = self.lower(e)?;
-                self.emit(p.span(), bind(i.id.sym.to_string(), value));
+                let op = if declare { Op::Declare(i.id.sym.to_string(), value) } else { Op::Set(i.id.sym.to_string(), value) };
+                self.emit(p.span(), op);
+            }
+            ast::Pat::Assign(a) => {
+                let value = self.default_value(a.span, value, &a.right)?;
+                self.bind_value(&a.left, value, declare)?;
             }
             ast::Pat::Array(a) => {
-                let temp = self.temp();
-                self.value(e, temp.clone())?;
-                for (index, p) in a.elems.iter().enumerate() {
-                    match p {
-                        Some(ast::Pat::Ident(i)) => {
-                            self.emit(
-                                p.as_ref().unwrap().span(),
-                                bind(
-                                    i.id.sym.to_string(),
-                                    Expr::Member(
-                                        Box::new(Expr::Variable(temp.clone())),
-                                        Box::new(Expr::Value(json!(index))),
-                                    ),
-                                ),
-                            );
-                        }
-                        _ => {
-                            return self
-                                .error(a.span, "only simple array destructuring is supported");
+                let value = self.snapshot(a.span, value);
+                let array = Expr::Unary("isArray".into(), Box::new(value.clone()));
+                let string = Expr::Binary("===".into(), Box::new(Expr::Unary("typeof".into(), Box::new(value.clone()))), Box::new(Expr::Value(json!("string"))));
+                let valid = Expr::Binary("||".into(), Box::new(array), Box::new(string));
+                let invalid = self.emit(a.span, Op::Branch(valid, 0));
+                let success = self.emit(a.span, Op::Jump(0));
+                self.land(invalid);
+                self.emit(a.span, Op::Throw(Expr::NodeBuiltin("new TypeError".into(), vec![Expr::Value(json!("destructuring value is not iterable"))])));
+                self.land(success);
+                for (index, item) in a.elems.iter().enumerate() {
+                    if let Some(item) = item {
+                        if let ast::Pat::Rest(rest) = item {
+                            let array = Expr::NodeBuiltin("Array.from".into(), vec![value.clone()]);
+                            let tail = Expr::StringMethod(Box::new(array), "slice".into(), vec![Expr::Value(json!(index))]);
+                            self.bind_value(&rest.arg, tail, declare)?;
+                        } else {
+                            let member = Expr::Member(Box::new(value.clone()), Box::new(Expr::Value(json!(index))));
+                            self.bind_value(item, member, declare)?;
                         }
                     }
                 }
             }
-            _ => return self.error(p.span(), "use simple identifier or array bindings"),
+            ast::Pat::Object(o) => {
+                let value = self.snapshot(o.span, value);
+                // Property access rejects null and undefined even for {}.
+                self.snapshot(o.span, Expr::Member(Box::new(value.clone()), Box::new(Expr::Value(json!("")))));
+                let mut excluded = Vec::new();
+                for prop in &o.props {
+                    match prop {
+                        ast::ObjectPatProp::KeyValue(k) => {
+                            let key = match &k.key {
+                                ast::PropName::Ident(i) => Expr::Value(json!(i.sym.to_string())),
+                                ast::PropName::Str(v) => Expr::Value(json!(v.value.to_string_lossy().into_owned())),
+                                ast::PropName::Num(v) => number_expr(v.value),
+                                ast::PropName::Computed(v) => { let key = self.lower(&v.expr)?; self.snapshot(v.span, key) },
+                                _ => return self.error(k.key.span(), "unsupported destructuring key"),
+                            };
+                            let key = self.snapshot(k.key.span(), Expr::NodeBuiltin("String".into(), vec![key]));
+                            excluded.push(key.clone());
+                            self.bind_value(&k.value, Expr::Member(Box::new(value.clone()), Box::new(key)), declare)?;
+                        }
+                        ast::ObjectPatProp::Assign(a) => {
+                            let key = Expr::Value(json!(a.key.id.sym.to_string()));
+                            excluded.push(key.clone());
+                            let member = Expr::Member(Box::new(value.clone()), Box::new(key));
+                            let member = if let Some(default) = &a.value { self.default_value(a.span, member, default)? } else { member };
+                            let op = if declare { Op::Declare(a.key.id.sym.to_string(), member) } else { Op::Set(a.key.id.sym.to_string(), member) };
+                            self.emit(a.span, op);
+                        }
+                        ast::ObjectPatProp::Rest(r) => {
+                            let copy = Expr::NodeBuiltin("Object.assign".into(), vec![Expr::Object(Vec::new()), value.clone()]);
+                            let copy = self.snapshot(r.span, copy);
+                            for key in &excluded {
+                                self.snapshot(r.span, Expr::NodeBuiltin("delete".into(), vec![copy.clone(), key.clone()]));
+                            }
+                            self.bind_value(&r.arg, copy, declare)?;
+                        }
+                    }
+                }
+            }
+            _ => return self.error(p.span(), "unsupported destructuring pattern"),
         }
         Ok(())
     }
+    fn loop_head(&mut self, head: &ast::ForHead, span: Span) -> Result<(ast::Pat, Option<ast::VarDeclKind>)> {
+        match head {
+            ast::ForHead::VarDecl(v) if v.decls.len() == 1 && v.decls[0].init.is_none() => Ok((v.decls[0].name.clone(), Some(v.kind))),
+            ast::ForHead::Pat(pattern) => {
+                for name in pattern_names(pattern) { self.local_target(&name, span)?; }
+                Ok(((**pattern).clone(), None))
+            }
+            _ => self.error(span, "unsupported loop binding"),
+        }
+    }
+    fn loop_bind(&mut self, pattern: &ast::Pat, value: Expr, declare: bool) -> Result<()> {
+        if let ast::Pat::Expr(expression) = pattern {
+            if let ast::Expr::Member(member) = &**expression {
+                let object = self.lower(&member.obj)?;
+                let object = self.snapshot(member.obj.span(), object);
+                let key = self.member_key(&member.prop, member.span)?;
+                self.emit(member.span, Op::SetMember { object, key, value });
+                return Ok(());
+            }
+            return self.error(pattern.span(), "unsupported loop assignment target");
+        }
+        self.bind_value(pattern, value, declare)
+    }
+
     fn stmt(&mut self, s: &ast::Stmt) -> Result<()> {
         use ast::Stmt as S;
         match s {
@@ -2301,6 +1980,8 @@ impl Compiler {
                 } else {
                     Expr::Undefined
                 };
+                let value = if self.finalizers.is_empty() { value } else { self.snapshot(r.span, value) };
+                self.emit_finalizers(None, r.span)?;
                 self.emit(r.span, Op::Return(value));
             }
             S::If(i) => {
@@ -2395,35 +2076,128 @@ impl Compiler {
                 self.end_loop(end, next);
                 self.leave_scope(f.span, entered);
             }
-            S::Break(b) => {
-                if b.label.is_some() || self.loops.is_empty() {
-                    return self.error(b.span, "break requires an enclosing loop and no label");
+            S::Labeled(label) => {
+                fn targets_loop(stmt: &ast::Stmt) -> bool {
+                    match stmt {
+                        ast::Stmt::For(_) | ast::Stmt::ForIn(_) | ast::Stmt::ForOf(_) | ast::Stmt::While(_) | ast::Stmt::DoWhile(_) => true,
+                        ast::Stmt::Labeled(inner) => targets_loop(&inner.body),
+                        _ => false,
+                    }
                 }
-                self.leave_to_loop(b.span);
+                let name = label.label.sym.to_string();
+                if self.loops.iter().any(|context| context.label.as_deref() == Some(&name)) {
+                    return self.error(label.span, "duplicate label");
+                }
+                self.begin_loop();
+                let context = self.loops.last_mut().unwrap();
+                context.is_switch = true;
+                context.label = Some(name);
+                context.label_loop = targets_loop(&label.body);
+                self.stmt(&label.body)?;
+                let end = self.code.len();
+                self.end_loop(end, end);
+            }
+            S::Switch(switch) => {
+                let discriminant = self.lower(&switch.discriminant)?;
+                let discriminant = self.snapshot(switch.discriminant.span(), discriminant);
+                let statements: Vec<_> = switch.cases.iter().flat_map(|case| case.cons.iter().cloned()).collect();
+                let entered = self.enter_scope(switch.span, lexical_names(&statements))?;
+                self.hoist_functions(&statements)?;
+                let mut jumps = Vec::new();
+                let mut default = None;
+                for (index, case) in switch.cases.iter().enumerate() {
+                    if let Some(test) = &case.test {
+                        let value = self.lower(test)?;
+                        let equal = Expr::Binary("===".into(), Box::new(discriminant.clone()), Box::new(value));
+                        let next = self.emit(case.span, Op::Branch(equal, 0));
+                        jumps.push((index, self.emit(case.span, Op::Jump(0))));
+                        self.land(next);
+                    } else { default = Some(index); }
+                }
+                let unmatched = self.emit(switch.span, Op::Jump(0));
+                self.begin_loop();
+                self.loops.last_mut().unwrap().is_switch = true;
+                let mut locations = Vec::new();
+                for case in &switch.cases {
+                    locations.push(self.code.len());
+                    for stmt in &case.cons { self.stmt(stmt)?; }
+                }
+                let end = self.code.len();
+                for (index, jump) in jumps { self.code[jump].op = Op::Jump(locations[index]); }
+                self.code[unmatched].op = Op::Jump(default.map(|i| locations[i]).unwrap_or(end));
+                self.end_loop(end, end);
+                self.leave_scope(switch.span, entered);
+            }
+            S::Break(b) => {
+                let target = if let Some(label) = &b.label {
+                    self.loops.iter().rposition(|context| context.label.as_deref() == Some(label.sym.as_ref()))
+                } else {
+                    self.loops.iter().rposition(|context| context.label.is_none())
+                };
+                let Some(target) = target else { return self.error(b.span, "break requires an enclosing loop, switch, or matching label"); };
+                let remaining = self.emit_finalizers(Some(target), b.span)?;
+                self.leave_to_loop(b.span, target, remaining);
                 let at = self.emit(b.span, Op::Jump(0));
-                self.loops.last_mut().unwrap().breaks.push(at);
+                self.loops[target].breaks.push(at);
             }
             S::Continue(c) => {
-                if c.label.is_some() || self.loops.is_empty() {
-                    return self.error(c.span, "continue requires an enclosing loop and no label");
-                }
-                self.leave_to_loop(c.span);
+                let target = if let Some(label) = &c.label {
+                    self.loops.iter().rposition(|context| context.label.as_deref() == Some(label.sym.as_ref()) && context.label_loop)
+                        .and_then(|index| self.loops.iter().enumerate().skip(index + 1).find(|(_, context)| !context.is_switch).map(|(index, _)| index))
+                } else {
+                    self.loops.iter().rposition(|context| !context.is_switch)
+                };
+                let Some(target) = target else { return self.error(c.span, "continue requires an enclosing loop or matching loop label"); };
+                let remaining = self.emit_finalizers(Some(target), c.span)?;
+                self.leave_to_loop(c.span, target, remaining);
                 let at = self.emit(c.span, Op::Jump(0));
-                self.loops.last_mut().unwrap().continues.push(at);
+                self.loops[target].continues.push(at);
+            }
+            S::ForIn(f) => {
+                let (pattern, kind) = self.loop_head(&f.left, f.span)?;
+                let head_scope = if matches!(kind, Some(ast::VarDeclKind::Let | ast::VarDeclKind::Const)) {
+                    let names = pattern_names(&pattern).into_iter().map(|name| (name, kind == Some(ast::VarDeclKind::Let))).collect();
+                    self.enter_scope(f.span, names)?
+                } else { false };
+                let items = self.temp();
+                let index = self.temp();
+                let item = self.temp();
+                let source = self.lower(&f.right)?;
+                let source = self.snapshot(f.right.span(), source);
+                let is_null = Expr::Binary("==".into(), Box::new(source.clone()), Box::new(Expr::Value(Value::Null)));
+                let keys = Expr::Conditional(Box::new(is_null), Box::new(Expr::Array(Vec::new())), Box::new(Expr::NodeBuiltin("Object.keys".into(), vec![source.clone()])));
+                self.emit(f.span, Op::Set(items.clone(), keys));
+                self.emit(f.span, Op::Set(index.clone(), Expr::Value(json!(0))));
+                let start = self.code.len();
+                let next = self.emit(f.span, Op::ForNext { items, index, item: item.clone(), end: 0 });
+                // JS skips a property deleted before it is visited. Primitive
+                // strings have immutable indexed properties.
+                let object = Expr::Binary("===".into(), Box::new(Expr::Unary("typeof".into(), Box::new(source.clone()))), Box::new(Expr::Value(json!("object"))));
+                let present = Expr::Binary("in".into(), Box::new(Expr::Variable(item.clone())), Box::new(source));
+                self.emit(f.span, Op::Branch(Expr::Conditional(Box::new(object), Box::new(present), Box::new(Expr::Value(json!(true)))), start));
+                self.begin_loop();
+                let entered = if matches!(kind, Some(ast::VarDeclKind::Let | ast::VarDeclKind::Const)) {
+                    let names = pattern_names(&pattern).into_iter().map(|name| (name, kind == Some(ast::VarDeclKind::Let))).collect();
+                    self.enter_scope(f.span, names)?
+                } else { false };
+                self.loop_bind(&pattern, Expr::Variable(item), entered)?;
+                self.stmt(&f.body)?;
+                self.leave_scope(f.span, entered);
+                self.emit(f.span, Op::Jump(start));
+                let end = self.code.len();
+                if let Op::ForNext { end: target, .. } = &mut self.code[next].op { *target = end; }
+                self.end_loop(end, start);
+                self.leave_scope(f.span, head_scope);
             }
             S::ForOf(f) => {
                 if f.is_await {
                     return self.error(f.span, "for await is unsupported");
                 }
-                let (name, kind) = match &f.left {
-                    ast::ForHead::VarDecl(v) if v.decls.len() == 1 && v.decls[0].init.is_none() => {
-                        match &v.decls[0].name {
-                            ast::Pat::Ident(i) => (i.id.sym.to_string(), v.kind),
-                            _ => return self.error(f.span, "use a simple for...of binding"),
-                        }
-                    }
-                    _ => return self.error(f.span, "use for (const item of array)"),
-                };
+                let (pattern, kind) = self.loop_head(&f.left, f.span)?;
+                let head_scope = if matches!(kind, Some(ast::VarDeclKind::Let | ast::VarDeclKind::Const)) {
+                    let names = pattern_names(&pattern).into_iter().map(|name| (name, kind == Some(ast::VarDeclKind::Let))).collect();
+                    self.enter_scope(f.span, names)?
+                } else { false };
                 let items = self.temp();
                 let index = self.temp();
                 let item = self.temp();
@@ -2442,20 +2216,11 @@ impl Compiler {
                 );
                 // A let/const binding is fresh in every iteration; a var is hoisted.
                 self.begin_loop();
-                let entered = if kind == ast::VarDeclKind::Var {
-                    false
-                } else {
-                    self.enter_scope(f.span, vec![(name.clone(), kind == ast::VarDeclKind::Let)])?
-                };
-                let value = Expr::Variable(item);
-                self.emit(
-                    f.span,
-                    if entered {
-                        Op::Declare(name, value)
-                    } else {
-                        Op::Set(name, value)
-                    },
-                );
+                let entered = if matches!(kind, Some(ast::VarDeclKind::Let | ast::VarDeclKind::Const)) {
+                    let names = pattern_names(&pattern).into_iter().map(|name| (name, kind == Some(ast::VarDeclKind::Let))).collect();
+                    self.enter_scope(f.span, names)?
+                } else { false };
+                self.loop_bind(&pattern, Expr::Variable(item), entered)?;
                 self.stmt(&f.body)?;
                 self.leave_scope(f.span, entered);
                 self.emit(f.span, Op::Jump(start));
@@ -2464,18 +2229,41 @@ impl Compiler {
                     *target = end;
                 }
                 self.end_loop(end, start);
+                self.leave_scope(f.span, head_scope);
             }
 
             S::Try(t) => {
-                if t.finalizer.is_some() {
-                    return self.error(t.span, "finally is not supported in this version");
+                if let Some(finalizer) = &t.finalizer {
+                    let context = FinallyContext {
+                        block: finalizer.clone(), handlers: self.handlers,
+                        runtime_scopes: self.runtime_scopes, scopes_len: self.scopes.len(), loops_len: self.loops.len(),
+                    };
+                    let thrown = self.temp();
+                    let outer = self.emit(t.span, Op::Catch { target: 0, name: thrown.clone() });
+                    self.handlers += 1;
+                    self.finalizers.push(context);
+                    if t.handler.is_some() {
+                        let mut inner = t.clone();
+                        inner.finalizer = None;
+                        self.stmt(&ast::Stmt::Try(inner))?;
+                    } else {
+                        self.stmt(&ast::Stmt::Block(t.block.clone()))?;
+                    }
+                    self.finalizers.pop();
+                    self.handlers -= 1;
+                    self.emit(t.span, Op::EndCatch);
+                    self.stmt(&ast::Stmt::Block(finalizer.clone()))?;
+                    let end_jump = self.emit(t.span, Op::Jump(0));
+                    let handler = self.code.len();
+                    self.stmt(&ast::Stmt::Block(finalizer.clone()))?;
+                    self.emit(t.span, Op::Throw(Expr::Variable(thrown)));
+                    let end = self.code.len();
+                    if let Op::Catch { target, .. } = &mut self.code[outer].op { *target = handler; }
+                    self.code[end_jump].op = Op::Jump(end);
+                    return Ok(());
                 }
                 let h = t.handler.as_ref().context("try requires catch")?;
-                let param = match &h.param {
-                    Some(ast::Pat::Ident(i)) => Some(i.id.sym.to_string()),
-                    None => None,
-                    _ => return self.error(h.span, "use catch(error)"),
-                };
+                let param = h.param.as_ref();
                 // The handler receives the thrown value in a temporary; the
                 // catch parameter is a binding of the handler's own scope.
                 let thrown = self.temp();
@@ -2497,12 +2285,12 @@ impl Compiler {
                 self.emit(t.span, Op::EndCatch);
                 let jump = self.emit(t.span, Op::Jump(0));
                 let handler = self.code.len();
-                let mut names: Vec<(String, bool)> =
-                    param.iter().map(|name| (name.clone(), true)).collect();
+                let mut names: Vec<(String, bool)> = param
+                    .map(pattern_names).unwrap_or_default().into_iter().map(|name| (name, true)).collect();
                 names.extend(lexical_names(&h.body.stmts));
                 let entered = self.enter_scope(h.span, names)?;
                 if let Some(param) = param {
-                    self.emit(h.span, Op::Declare(param, Expr::Variable(thrown)));
+                    self.bind_value(param, Expr::Variable(thrown), true)?;
                 }
                 self.hoist_functions(&h.body.stmts)?;
                 for s in &h.body.stmts {
@@ -2540,7 +2328,7 @@ pub fn compile_with_libraries(
     source: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    compile_inner(source, "main", false, libraries, BTreeSet::new())
+    link_prelude(compile_inner(source, "main", false, libraries, BTreeSet::new(), false)?)
 }
 #[cfg(test)]
 pub fn compile_body_with_libraries(
@@ -2556,7 +2344,7 @@ pub fn compile_body_with_scope(
     libraries: super::libraries::Libraries,
     external_names: BTreeSet<String>,
 ) -> Result<Program> {
-    let program = compile_inner(source, entry, true, libraries, external_names)?;
+    let program = link_prelude(compile_inner(source, entry, true, libraries, external_names, false)?)?;
     ensure!(
         !program.functions[entry].virtual_task,
         "define_task_body must implement the current function, not return another empty stub"
@@ -2573,7 +2361,7 @@ pub fn compile_entry_with_libraries(
     entry: &str,
     libraries: super::libraries::Libraries,
 ) -> Result<Program> {
-    compile_inner(source, entry, false, libraries, BTreeSet::new())
+    link_prelude(compile_inner(source, entry, false, libraries, BTreeSet::new(), false)?)
 }
 fn compile_inner(
     source: &str,
@@ -2581,6 +2369,7 @@ fn compile_inner(
     refinement: bool,
     libraries: super::libraries::Libraries,
     external_names: BTreeSet<String>,
+    internal: bool,
 ) -> Result<Program> {
     ensure!(
         source.len() <= 100_000,
@@ -2607,6 +2396,17 @@ fn compile_inner(
         let p = map.lookup_char_pos(e.span().lo);
         bail!("TS_PROGRAM {}:{}: {:?}", p.line, p.col.0 + 1, e.kind());
     }
+    if !internal {
+        struct Reserved(bool);
+        impl Visit for Reserved {
+            fn visit_ident(&mut self, node: &ast::Ident) {
+                if node.sym.starts_with("$$") { self.0 = true; }
+            }
+        }
+        let mut reserved = Reserved(false);
+        module.visit_with(&mut reserved);
+        ensure!(!reserved.0, "TS_PROGRAM: names beginning with $$ are reserved for the prelude");
+    }
     let (leading, trailing) = comments.take_all();
     let mut notes = leading
         .borrow()
@@ -2631,9 +2431,11 @@ fn compile_inner(
                 let Some(namespace) = module_name.strip_prefix("host:") else {
                     bail!("TS_PROGRAM 1:1: tool imports must use host:<library>");
                 };
-                let Some(methods) = libraries.get(namespace) else {
+                let (library, asynchronous) = namespace.strip_suffix("/promises").map(|base| (base, true)).unwrap_or((namespace, false));
+                let Some(base_methods) = libraries.get(library) else {
                     bail!("TS_PROGRAM 1:1: unknown or unavailable tool library {namespace}");
                 };
+                let methods: BTreeMap<String, String> = base_methods.iter().map(|(name, tool)| (name.clone(), if asynchronous { format!("async-tool:{tool}") } else { tool.clone() })).collect();
                 ensure!(
                     !import.type_only && !import.specifiers.is_empty(),
                     "TS_PROGRAM 1:1: import tool methods or a namespace"
@@ -2716,7 +2518,7 @@ fn compile_inner(
         ensure!(
             !matches!(
                 f.ident.sym.as_ref(),
-                "tools" | "call" | "fork" | "join" | "ai" | "assert" | "JSON" | "Promise"
+                "tools" | "call" | "ai" | "assert" | "JSON" | "Promise"
             ),
             "reserved function name {}",
             f.ident.sym
@@ -2801,6 +2603,11 @@ fn compile_inner(
         .filter(|(_, (virtual_task, _))| *virtual_task)
         .map(|(name, _)| name.clone())
         .collect::<BTreeSet<_>>();
+    let async_functions = declarations
+        .iter()
+        .filter(|f| f.function.is_async)
+        .map(|f| f.ident.sym.to_string())
+        .collect::<BTreeSet<_>>();
     // Top-level declarations form the module scope. The top-level flow runs
     // in it, and every top-level function sees it through its scope chain.
     // Top-level functions are bindings of it too, so they can be used as values.
@@ -2826,10 +2633,12 @@ fn compile_inner(
             function_id: "main".into(),
             nested: Vec::new(),
             virtuals: virtuals.clone(),
+            async_functions: async_functions.clone(),
             code: Vec::new(),
             temp: 0,
             loops: Vec::new(),
             handlers: 0,
+            finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
         };
@@ -2859,6 +2668,9 @@ fn compile_inner(
                 description: String::new(),
                 virtual_task: false,
                 params: vec!["input".into()],
+                rest_parameter: None,
+                parameter_scope: false,
+                parameter_lexical: Vec::new(),
                 vars: module_vars,
                 lexical: module_lexical.into_iter().map(|(name, _)| name).collect(),
                 module: true,
@@ -2883,10 +2695,12 @@ fn compile_inner(
             function_id: f.ident.sym.to_string(),
             nested: Vec::new(),
             virtuals: virtuals.clone(),
+            async_functions: async_functions.clone(),
             code: Vec::new(),
             temp: 0,
             loops: Vec::new(),
             handlers: 0,
+            finalizers: Vec::new(),
             chain_exits: None,
             chain_object: false,
         };
@@ -2897,32 +2711,48 @@ fn compile_inner(
             return c.error(f.function.span, "main accepts zero or one input parameter");
         }
         let mut params = Vec::new();
-        for p in &f.function.params {
-            let ast::Pat::Ident(i) = &p.pat else {
-                return c.error(p.span, "use simple function parameters");
-            };
-            c.declare(i.id.sym.as_ref(), true, p.span)?;
-            params.push(i.id.sym.to_string());
+        let mut parameter_names = Vec::new();
+        let mut parameter_lexical = Vec::new();
+        let mut parameter_patterns = Vec::new();
+        let patterned = f.function.params.iter().any(|p| !matches!(p.pat, ast::Pat::Ident(_)));
+        let rest_parameter = f.function.params.iter().position(|p| matches!(p.pat, ast::Pat::Rest(_)));
+        for (index, p) in f.function.params.iter().enumerate() {
+            let names = pattern_names(&p.pat);
+            for name in &names { c.declare(name, true, p.span)?; }
+            parameter_names.extend(names.iter().cloned());
+            if let ast::Pat::Ident(i) = &p.pat && !patterned {
+                params.push(i.id.sym.to_string());
+            } else {
+                let argument = format!("$$param{index}");
+                params.push(argument.clone());
+                parameter_lexical.extend(names);
+                let pattern = match &p.pat { ast::Pat::Rest(rest) => &*rest.arg, other => other };
+                parameter_patterns.push((pattern, argument));
+            }
         }
         let body = f
             .function
             .body
             .as_ref()
             .context("function body is required")?;
-        // var names are hoisted to the function; let/const of the body's top
-        // level start in their dead zone.
-        let vars: Vec<String> = var_names(&body.stmts)
-            .into_iter()
-            .filter(|name| !params.contains(name))
-            .collect();
-        for name in &vars {
-            c.declare(name, true, body.span)?;
-        }
-        let lexical = lexical_names(&body.stmts);
-        for (name, mutable) in &lexical {
-            c.declare(name, *mutable, body.span)?;
-        }
         let (virtual_task, description) = contracts[f.ident.sym.as_ref()].clone();
+        if virtual_task && !parameter_patterns.is_empty() {
+            return c.error(f.function.span, "@virtual functions require simple parameters");
+        }
+        for (pattern, argument) in parameter_patterns {
+            c.bind_value(pattern, Expr::Variable(argument), true)?;
+        }
+        let vars: Vec<String> = var_names(&body.stmts).into_iter()
+            .filter(|name| patterned || !parameter_names.contains(name)).collect();
+        let lexical = lexical_names(&body.stmts);
+        let lexical_only = body.stmts.iter().filter(|stmt| matches!(stmt, ast::Stmt::Decl(ast::Decl::Var(v)) if v.kind != ast::VarDeclKind::Var)).cloned().collect::<Vec<_>>();
+        if let Some((name, _)) = lexical_names(&lexical_only).iter().find(|(name, _)| parameter_names.contains(name)) {
+            return c.error(body.span, &format!("duplicate parameter and lexical binding {name}"));
+        }
+        if patterned { c.scopes.push(BTreeMap::new()); }
+        for name in &vars { c.declare(name, true, body.span)?; }
+        for (name, mutable) in &lexical { c.declare(name, *mutable, body.span)?; }
+        if patterned { c.emit(body.span, Op::EnterFunctionBody); }
         let empty = body.stmts.iter().all(|s| matches!(s, ast::Stmt::Empty(_)));
         // A sole `throw new Error("literal")` is a conventional unavailable-implementation
         // sentinel. Do not ignore arbitrary throws, expressions or side effects.
@@ -2993,6 +2823,9 @@ fn compile_inner(
                 description,
                 virtual_task,
                 params,
+                rest_parameter,
+                parameter_scope: patterned,
+                parameter_lexical,
                 vars,
                 lexical: lexical.into_iter().map(|(name, _)| name).collect(),
                 module: false,
@@ -3009,6 +2842,19 @@ fn compile_inner(
     Ok(Program {
         version: VERSION,
         source: source.into(),
+        prelude_hash: String::new(),
         functions,
     })
+}
+
+fn link_prelude(mut program: Program) -> Result<Program> {
+    for (name, function) in &super::prelude::program().functions {
+        if name.starts_with("$$") { program.functions.insert(name.clone(), function.clone()); }
+    }
+    program.prelude_hash = super::prelude::hash();
+    Ok(program)
+}
+
+pub(super) fn compile_prelude() -> Result<Program> {
+    compile_inner(super::prelude::SOURCE, "$$map", false, super::libraries::Libraries::new(), BTreeSet::new(), true)
 }

@@ -163,7 +163,6 @@ mod tests {
             ("context assets", include_str!("context_assets.rs")),
             ("vision", include_str!("image_analysis.rs")),
             ("vision jobs", include_str!("visual_jobs.rs")),
-            ("delegation", include_str!("collaboration_jobs.rs")),
             ("database", include_str!("agent_service.rs")),
             ("prompt", include_str!("../prompts/single_agent.md")),
         ] {

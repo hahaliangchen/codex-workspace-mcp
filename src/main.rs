@@ -8,7 +8,6 @@ mod attachments;
 mod browser_control;
 mod builtin_plugins;
 mod code_map;
-mod collaboration_jobs;
 mod composer_catalog;
 #[cfg(test)]
 mod context_acceptance;
@@ -16,7 +15,6 @@ mod context_assets;
 mod context_window;
 mod database;
 mod db_writer;
-mod delegate_git;
 mod file_edit;
 mod flow_skills;
 mod go_index;

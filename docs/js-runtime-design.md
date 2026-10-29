@@ -1,6 +1,6 @@
 # JS 运行时设计（语言版本 14）
 
-状态：第 14 节的决定已于 2026-10-29 确认。M0–M2 已实现（2026-10-29）；M3 起尚未实现。基于 2026-10-28 的工作区（版本 13，含未提交的 heap.rs、js_value.rs、vm_eval.rs、js_methods.rs、promise.rs）。并发虚函数的目标与验证清单见 [promise-virtual-tasks.md](promise-virtual-tasks.md)。
+状态：M0–M8 的实现、示例迁移和约定回归已完成。运行时保留少量旧快照类型和串行动作适配，以便恢复或明确拒绝已退役的 fork/join 现场；异步只读调用在宿主合批。已知 JS 子集边界和并发验证见 [promise-virtual-tasks.md](promise-virtual-tasks.md)。
 
 ## 1. 目标与不变的机制
 
@@ -195,7 +195,7 @@ const reviews = await Promise.all(pages.map(page => inspect(page.content)));  //
 ```
 
 - 现在的写法（同步调用，写不写 `await` 都可以）在版本 14 中继续有效。
-- 防止对异步调用漏写 `await`：编译期拒绝直接对未 await 的异步调用取成员或参与运算，例如 `readAsync(x).content`、`inspect(x).passed`。运行时读取 Promise 上不存在的属性时，报“这是 Promise，可能漏了 await”。这是唯一一处有意偏离 JS（JS 在这里返回 undefined）。
+- 防止对异步调用漏写 `await`：编译期拒绝直接对未 await 的异步调用取成员、调用方法（`then`/`catch`/`finally` 除外）、参与运算、作为条件或 assert 实参、放进模板字符串，例如 `readAsync(x).content`、`inspect(x).passed`、`if (inspect(x))`。识别范围是未被局部名遮蔽的顶层 async 函数和 `host:<库>/promises` 工具；局部 async 函数值只由运行时检查。运行时读取 Promise 上不存在的属性时，报“这是 Promise，可能漏了 await”。这是唯一一处有意偏离 JS（JS 在这里返回 undefined）。
 
 ## 8. AI 可见作用域（父作用域继承）
 
@@ -368,6 +368,7 @@ async function inspectPage(shared, page, content) {
 | M1 | 堆环境带 TDZ（`heap.rs`）；`EnterScope`/`LeaveScope`/`CopyScope`/`Declare` 指令；编译器作用域栈取代平铺变量表；var 提升、catch 作用域、`for (let …)` 每轮新绑定；去掉调用点拷贝变量（`captures`）；AI 可见快照改为沿调用链各帧的环境链收集；版本号 14 |
 | 旧测试 | JSON 边界按 JSON.stringify 处理 undefined 和函数（对象中省略、数组中为 null，位置实参为 null）；路径/URL 报错不再重复前缀；9 个测试的断言改为 JS 语义 |
 | M2 | 嵌套函数声明（提升）、函数表达式、箭头、对象方法简写、具名函数表达式自引用；`Expr::Function` 建闭包，`Expr::Native` 表示内置函数和工具值；`Effect::Dynamic`、`Effect::Method` 在运行时按被调值分派（`Runtime::invoke`）；顶层函数作为闭包绑定在模块环境；普通函数实参按 JS 规则，@virtual 和 fork 目标仍严格；内联回调的参数改为块级作用域绑定，可嵌套回调和闭包 |
+| M3 | 编译并链接 JS 预置库，以普通可恢复函数帧执行数组回调、比较函数及字符串替换函数；记录预置库哈希并检查恢复兼容性；删除编译器回调内联；五页流程在夹具回执下运行完成 |
 
 测试现状：`cargo test agent_program::` 106 个全过；全量 351 过、18 失败、11 忽略。18 个失败均为改动前就有的环境类测试（attachments 6、browser_control 4、collaboration_jobs 2，agent_service、interjections、memory_panel、plugin_sessions、request_context、skill_packages 各 1）。`single_agent::tests::independent_file_writes_overlap_while_same_file_writes_queue` 是计时测试，全量并发时偶尔失败，单独运行通过。
 
@@ -376,11 +377,23 @@ async function inspectPage(shared, page, content) {
 - 函数 id：顶层函数用函数名；嵌套函数为 `外层id/名字@行:列`（匿名为 `<anonymous>`）。运行时在 `new_with_scope` 中把顶层函数作为闭包绑定到模块环境；嵌套函数声明在所在块或函数开头用 `Declare` 初始化。
 - 变量：编译器临时量 `$tempN` 存在帧的 `vm_locals`；源码变量在帧的 `env` 环境链上，按名查找（`vm_eval::Locals`）。
 - 调用：编译期能确定的（顶层函数名、导入的工具、`lib.method`、fork/join）仍走 `Effect::Call`/`Effect::Tool`；其余函数值调用走 `Effect::Dynamic`，`obj.name()` 走 `Effect::Method`（先查函数属性，再查内置方法）。未知方法名在运行时抛 TypeError。
-- 回调：`map`/`filter` 等仍由编译器内联（`callback_method`、`array_callback`、`merge_sort`），只接受写在调用处的单表达式回调。这是 M3 要替换的部分。
+- 回调：`map`/`filter` 等由 JS 预置库执行，旧的编译期内联回调已删除；预置库调用和回调使用可存盘的普通函数帧。
 
-### 16.3 下一步：M3
+### 16.3 M3 实现内容与验收
 
 1. 新增 `src/agent_program/prelude.js` 与 `prelude.rs`：用 JS 写 map、filter、forEach、find、findIndex、findLast、findLastIndex、some、every、reduce、reduceRight、flatMap、带比较函数的 sort/toSorted、`Array.from(items, mapFn)`、replace/replaceAll 的函数替换；接收者作为第一个参数，`$$` 开头的原生内部函数只对预置库开放。
 2. 预置库按进程编译一次，Program 记录预置库源码哈希，续跑时哈希不符就拒绝。预置库函数标记为 internal，AI 可见快照跳过它们的帧。
 3. `Effect::Method` 遇到数组接收者的这些方法名时调用预置库函数；删除编译期内联回调的代码。
 4. 验收：多语句回调、把函数变量作为回调（如 `.filter(Boolean)`）、回调里调用工具并跨存盘恢复；`fixtures/model-five-page-acceptance.js` 在夹具回执下跑完。
+
+### 16.4 下一步：M4
+
+已实现声明、普通函数参数和 catch 的解构与默认值、解构剩余项、字面量展开、switch、标签跳转、简单绑定的 for-in 和可选函数调用。函数剩余参数、调用参数展开及 finally 已接入，并覆盖跨存盘恢复。非简单参数在独立的参数作用域中初始化，再进入函数体作用域；默认值中的闭包保留参数环境。M4 主体已实现，继续核对边界与快照兼容性后推进 M5 的 Promise 调度。
+
+### 16.5 M5–M8 进度
+
+普通 async 函数、Promise、await、FIFO 回调、通用组合子和异步工具已接入；并发只读请求合批并逐项结算。普通 thenable 同化和提取 Promise 方法值仍不支持；同步工具调用按原顺序执行；少量旧快照变体暂保留兼容。
+
+async 虚函数使用独立窗口、调用时作用域快照和按调用 ID 的持久化回执；父流程收到一个结果即可继续，其他调用可仍在运行。模型请求共享三个并发槽位；中断时结果未知的调用不会自动重放。并发窗口对同一文件的整文件写入发生冲突时保留待写副本。
+
+fork/join 不再允许出现在新源码中，旧子 Agent 和 Git 工作树执行模块已移除；历史记录不删除。五页、二十页示例已改为 async 虚函数，均有真实宿主和受控模型回执的端到端测试。五页示例在隔离目录使用配置的真实模型原样运行：一次十次虚函数请求完成、五页存在且无缺失本地链接；后续三次五页均生成但第 3 页的 AI 检查未通过，程序按断言停止；发现的问题包括内容缺项、日期判断和示例语法与源材料不符。一次检查包含浏览器诊断，但尚无完整视觉验收。补充源文档版本语法约束后，最终一轮真实模型运行完成：11 次模型请求，五页读回验收全部通过，独立检查没有缺失本地链接。串行示例也已完成真实模型复测；自动回归 425 项通过、10 项忽略（包括需真实模型的测试）。

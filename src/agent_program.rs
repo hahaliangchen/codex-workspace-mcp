@@ -9,6 +9,7 @@ mod vm_eval;
 pub(crate) mod declarations;
 pub(crate) mod libraries;
 mod promise;
+mod prelude;
 pub(crate) mod runtime;
 #[cfg(test)]
 mod tests;
@@ -44,6 +45,8 @@ pub struct Location {
 pub struct Program {
     pub version: u32,
     pub source: String,
+    #[serde(default)]
+    pub prelude_hash: String,
     pub functions: BTreeMap<String, Function>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -53,6 +56,14 @@ pub struct Function {
     #[serde(default)]
     pub virtual_task: bool,
     pub params: Vec<String>,
+    /// Index of the final rest parameter, if present.
+    #[serde(default)]
+    pub rest_parameter: Option<usize>,
+    /// Non-simple parameters initialize in a separate environment.
+    #[serde(default)]
+    pub parameter_scope: bool,
+    #[serde(default)]
+    pub parameter_lexical: Vec<String>,
     /// Hoisted `var` names, undefined on entry.
     #[serde(default)]
     pub vars: Vec<String>,
@@ -82,6 +93,8 @@ pub enum Op {
     Declare(String, Expr),
     /// Enter a block scope whose let/const names start in their dead zone.
     EnterScope(Vec<String>),
+    /// Enter the body environment after non-simple parameter initialization.
+    EnterFunctionBody,
     LeaveScope,
     /// Fresh per-iteration copy of the current scope for `for (let …)`.
     CopyScope,
@@ -92,6 +105,7 @@ pub enum Op {
         items: Vec<Expr>,
         destination: String,
     },
+    Await { value: Expr, destination: String },
     Return(Expr),
     Branch(Expr, usize),
     Jump(usize),
@@ -135,6 +149,8 @@ pub enum Expr {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Effect {
+    PromiseCreate { reject: bool, value: Expr },
+    PromiseConstruct { executor: Expr },
     Tool(String, Vec<Expr>),
     ParallelReads(Vec<(String, Vec<Expr>)>),
     ParallelReadMap {
@@ -153,6 +169,12 @@ pub enum Effect {
     },
     /// Call a function value: a closure, a built-in or a tool.
     Dynamic { callee: Expr, args: Vec<Expr> },
+    /// Internal prelude call using an array of arguments.
+    Apply { callee: Expr, args: Expr },
+    /// A method call with a computed name and an array of arguments.
+    DynamicMethodApply { receiver: Expr, name: Expr, args: Expr },
+    /// A method call whose arguments are supplied in an array.
+    MethodApply { receiver: Expr, name: String, args: Expr, #[serde(default)] ignore_property: bool },
     /// `receiver.name(args)`: a function-valued property, else a built-in method.
     Method {
         receiver: Expr,

@@ -48,6 +48,15 @@ pub(super) enum HeapNode {
         function: String,
         environment: HeapId,
     },
+    /// Promise identity and reactions reside on the serialized heap.
+    Promise {
+        outcome: Option<super::promise::Outcome>,
+        reactions: Vec<super::promise::ContinuationId>,
+        handled: bool,
+    },
+    /// The shared already-resolved flag for a constructor's resolve/reject pair.
+    PromiseCapability { promise: HeapId, resolved: bool },
+    PromiseResolver { capability: HeapId, reject: bool },
     /// A built-in function or tool used as a value.
     Native(String),
 }
@@ -143,7 +152,7 @@ impl Heap {
             VmValue::Undefined => true,
             VmValue::Reference(id) => matches!(
                 self.nodes.get(id),
-                Some(HeapNode::Closure { .. } | HeapNode::Native(_))
+                Some(HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseResolver { .. })
             ),
             _ => false,
         }
@@ -221,7 +230,8 @@ impl Heap {
                             })
                             .collect::<Result<Vec<_>>>()?,
                     ),
-                    HeapNode::Environment { .. } | HeapNode::Closure { .. } | HeapNode::Native(_) => {
+                    HeapNode::Promise { .. } => bail!("promise cannot cross the JSON host boundary"),
+                    HeapNode::Environment { .. } | HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseCapability { .. } | HeapNode::PromiseResolver { .. } => {
                         bail!("function or environment cannot cross the JSON host boundary")
                     }
                 };
@@ -240,6 +250,9 @@ impl Heap {
 
     pub(super) fn get(&self, id: HeapId) -> Result<&HeapNode> {
         self.nodes.get(&id).context("unknown heap reference")
+    }
+    pub(super) fn get_mut(&mut self, id: HeapId) -> Result<&mut HeapNode> {
+        self.nodes.get_mut(&id).context("unknown heap reference")
     }
 
     /// Reclaim unreachable nodes between instructions, when the interpreter
@@ -287,6 +300,11 @@ impl Heap {
                     }
                 }
                 HeapNode::Closure { environment, .. } => pending.push(*environment),
+                HeapNode::Promise { outcome, .. } => {
+                    if let Some(super::promise::Outcome::Fulfilled(value) | super::promise::Outcome::Rejected(value)) = outcome { visit(value); }
+                }
+                HeapNode::PromiseCapability { promise, .. } => pending.push(*promise),
+                HeapNode::PromiseResolver { capability, .. } => pending.push(*capability),
                 HeapNode::Native(_) => {}
             }
         }

@@ -110,6 +110,13 @@ pub(super) fn member(heap: &Heap, object: &VmValue, key: &VmValue) -> Result<VmV
                 "name" => VmValue::String(js::function_name(id).to_owned()),
                 _ => VmValue::Undefined,
             },
+            HeapNode::PromiseResolver { .. } => match name.as_str() {
+                "name" => VmValue::String(String::new()),
+                "length" => number(1.0),
+                _ => VmValue::Undefined,
+            },
+            HeapNode::PromiseCapability { .. } => VmValue::Undefined,
+            HeapNode::Promise { .. } => bail!("TypeError: this is a Promise; the value may need await"),
             HeapNode::Environment { .. } => VmValue::Undefined,
         },
         VmValue::String(text) => {
@@ -132,7 +139,8 @@ fn instance_of(heap: &Heap, value: &VmValue, class: &str) -> Result<bool> {
     Ok(match value {
         VmValue::Reference(id) => match (heap.get(*id)?, class) {
             (HeapNode::Array(_), "Array" | "Object") => true,
-            (HeapNode::Closure { .. } | HeapNode::Native(_), "Function" | "Object") => true,
+            (HeapNode::Promise { .. }, "Promise" | "Object") => true,
+            (HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseResolver { .. }, "Function" | "Object") => true,
             (HeapNode::Object(_), "Object") => true,
             (HeapNode::Object(_), "RegExp") => heap.regex_parts(*id).is_some(),
             (HeapNode::Object(_), "Error") => heap
@@ -317,7 +325,7 @@ pub(super) fn eval(expr: &Expr, locals: Locals<'_>, heap: &mut Heap) -> Result<V
                         VmValue::String(_) => "string",
                         VmValue::Promise(_) => "object",
                         VmValue::Reference(id) => {
-                            if matches!(heap.get(*id)?, HeapNode::Closure { .. } | HeapNode::Native(_)) {
+                            if matches!(heap.get(*id)?, HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseResolver { .. }) {
                                 "function"
                             } else {
                                 "object"
@@ -403,7 +411,7 @@ pub(super) fn eval(expr: &Expr, locals: Locals<'_>, heap: &mut Heap) -> Result<V
 /// Whether a value can be called.
 pub(super) fn callable(heap: &Heap, value: &VmValue) -> bool {
     matches!(value, VmValue::Reference(id)
-        if matches!(heap.get(*id), Ok(HeapNode::Closure { .. } | HeapNode::Native(_))))
+        if matches!(heap.get(*id), Ok(HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseResolver { .. })))
 }
 
 #[cfg(test)]

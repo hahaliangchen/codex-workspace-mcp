@@ -22,6 +22,35 @@ use tokio_util::sync::CancellationToken;
 pub(crate) static MUTATIONS: RwLock<()> = RwLock::const_new(());
 static FILE_MUTATIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<Mutex<()>>>>> = std::sync::OnceLock::new();
 
+/// Cross-process lease complements the in-process file mutation lock.
+pub(crate) struct ResourceClaim { root: PathBuf, resource: String, owner: String }
+impl Drop for ResourceClaim {
+    fn drop(&mut self) {
+        if let Ok(conn) = crate::agent_service::open_db(&self.root) {
+            let _ = conn.execute("DELETE FROM agent_resource_claims WHERE resource=?1 AND owner=?2", params![self.resource,self.owner]);
+        }
+    }
+}
+pub(crate) fn resource_key(workspace: &Path, name: &str, args: &Value) -> Result<Option<String>> {
+    if matches!(name, "write_file" | "edit_file" | "replace_range") {
+        let path = args["path"].as_str().context("write path required")?;
+        return Ok(Some(format!("local:{}", crate::file_edit::workspace_path(workspace,path)?.display())));
+    }
+    Ok(None)
+}
+pub(crate) fn claim_resource(root: &Path, task: &str, call_id: &str, resource: String) -> Result<ResourceClaim> {
+    let owner=format!("main:{task}:{call_id}");
+    let mut conn=crate::agent_service::open_db(root)?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_resource_claims(resource TEXT PRIMARY KEY,task_id TEXT NOT NULL,owner TEXT NOT NULL,owner_agent TEXT,expires_at INTEGER NOT NULL);")?;
+    let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now=chrono::Utc::now().timestamp_millis();
+    let previous:Option<(String,i64)>=tx.query_row("SELECT owner,expires_at FROM agent_resource_claims WHERE resource=?1",[&resource],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((other,expiry))=previous {ensure!(other==owner || expiry<=now,"RESOURCE_WRITE_OWNERSHIP_CONFLICT: {resource} is owned by {other}");}
+    tx.execute("INSERT INTO agent_resource_claims(resource,task_id,owner,owner_agent,expires_at) VALUES (?1,?2,?3,NULL,?4) ON CONFLICT(resource) DO UPDATE SET task_id=excluded.task_id,owner=excluded.owner,owner_agent=NULL,expires_at=excluded.expires_at",params![resource,task,owner,now+30*60*1000])?;
+    tx.commit()?;
+    Ok(ResourceClaim{root:root.to_path_buf(),resource,owner})
+}
+
 pub(crate) enum MutationGuard {
     File { _workspace: tokio::sync::RwLockReadGuard<'static, ()>, _file: tokio::sync::OwnedMutexGuard<()> },
     Workspace { _workspace: tokio::sync::RwLockWriteGuard<'static, ()> },

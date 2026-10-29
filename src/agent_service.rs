@@ -1509,7 +1509,6 @@ fn spawn_supervised_task(
             Err(error) => Some(format!("task worker stopped unexpectedly: {error}")),
         };
         if let Some(message) = failure {
-            crate::collaboration_jobs::cancel_all(state.workspace.root(), &task_id);
             tracing::error!(task_id = %task_id, error = %message, "agent task failed");
             let root = state.workspace.root();
             if let Err(error) = emit(root, &task_id, "turn/end",

@@ -85,6 +85,10 @@ fn new_task(
         .unwrap_or("")
         .to_owned();
     task.metadata = json!({"role":role,"turn":turn});
+    if parent.metadata["parallel"] == true {
+        task.metadata["parallel"] = json!(true);
+        task.metadata["parallel_owner"] = parent.metadata["parallel_owner"].clone();
+    }
     let finish = tree::planned(
         &task,
         &json!({"title":"Finish","goal":"Return this task result to the waiting caller or serial iterator; never call AI here"}),
@@ -360,7 +364,7 @@ async fn create_main_task(
             node.status = "running".into();
             tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
             Ok((json!({"task":{"node_id":node.node_id,"goal":node.goal},
-                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete top-level flow covering the user goal and helpers for its steps; import the published tools from host:<library>. No main or return value is required. Use ordinary helper(args) for serial tasks; the async entry supports await Promise.all for the documented read-only operations. Use fork/join only when multi-agent work is explicitly authorized; generator/yield is rejected. Helper returns resume the caller; top-level completion finishes the task; the host records execution without another model completion verdict."}),
+                "instruction":"Execute this task using its supplied materials. Prepare missing skill/tool contracts, then submit a complete top-level flow covering the user goal and helpers for its steps; import the published tools from host:<library>. No main or return value is required. Use ordinary helper(args) for serial tasks; async virtual functions and Promise.all run independent AI work concurrently. Import async tools from host:<library>/promises. generator/yield is rejected. Helper returns resume the caller; top-level completion finishes the task; the host records execution without another model completion verdict."}),
                 node.node_id))
         })();
         if created.is_err() {
@@ -385,6 +389,74 @@ async fn create_main_task(
     })
     .await?;
     Ok(())
+}
+
+/// Create an independent window for one asynchronous virtual function.
+pub(super) async fn start_parallel_function(
+    s: &Session<'_>, parent_frame: &Window, action: &crate::agent_program::Action, step: usize,
+) -> Result<(String, Window)> {
+    let crate::agent_program::runtime::ActionKind::Call { name, args } = &action.kind else {
+        anyhow::bail!("parallel function requires an async virtual call");
+    };
+    let runtime = parent_frame.program.as_ref().context("parallel caller has no program")?;
+    let snapshot = runtime.async_scope(&action.id).context("parallel call has no saved scope")?.clone();
+    let function = super::program_flow::function_task(&runtime.program, name, args)?;
+    let arguments = json!({"goal":name,"briefing":function["description"],"program_task":function});
+    let parent_id = frame_task(s, parent_frame);
+    let conn = agent_service::open_db(s.state.workspace.root())?;
+    let parent = tree::get(&conn, s.task, &parent_id)?;
+    ensure!(parent.status == "running", "parallel caller is not running");
+    let depth = tree::path(&conn, s.task, &parent_id)?.iter().filter(|node| tree::is_temp(node)).count();
+    ensure!(depth < tree::MAX_TEMP_TASKS, "TASK_DEPTH_LIMIT");
+    let ordinal = tree::children(&conn, s.task, &parent_id)?.len();
+    let (mut node, mut finish) = new_task(&parent, &arguments, ordinal, "temp", s.turn)?;
+    node.metadata["parallel"] = json!(true);
+    node.metadata["parallel_owner"] = json!(node.node_id);
+    node.metadata["parallel_call_id"] = json!(action.id);
+    finish.metadata = json!({"parallel":{"task":parent_id,"scope":s.scope,"call_id":action.id,"step":step,"flowNodeId":action.id}});
+    let mut inherited = parent_frame.clone();
+    inherited.program = None;
+    inherited.scope_values.extend(snapshot);
+    let mut child = temporary_frame(s, &inherited, &node)?;
+    child.parallel_root = Some(node.node_id.clone());
+    let child_scope = tree::frame_scope(&node);
+    let call = crate::model_stream::ToolCall { call_id:action.id.clone(), name:"create_task".into(), arguments:arguments.to_string() };
+    let (task, turn, scope, child_copy, action_id, parent_id) = (s.task.to_owned(), s.turn, child_scope.clone(), child.clone(), action.id.clone(), parent_id);
+    db(s.state.workspace.root(), move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut node = node; let mut finish = finish;
+        record_call(&tx, &task, turn, step, &action_id, &call, &parent_id)?;
+        tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
+        tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
+        node.status = "running".into();
+        tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
+        write_window(&tx, &task, &scope, &child_copy)?;
+        tx.commit()?;
+        Ok(())
+    }).await?;
+    Ok((child_scope, child))
+}
+
+pub(super) async fn interrupt_parallel_function(s: &Session<'_>, call_id: &str) -> Result<()> {
+    let task = s.task.to_owned(); let call_id = call_id.to_owned(); let turn = s.turn;
+    db(s.state.workspace.root(), move |conn| {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let nodes = tree::nodes(&tx, &task)?;
+        if let Some(root) = nodes.iter().find(|node| node.metadata["parallel_call_id"] == call_id) {
+            let root_id = root.node_id.clone();
+            for mut node in nodes {
+                if matches!(node.status.as_str(), "running" | "suspended" | "current")
+                    && tree::path(&tx, &task, &node.node_id)?.iter().any(|ancestor| ancestor.node_id == root_id)
+                {
+                    node.status = "interrupted".into();
+                    node.result = Some(json!({"message":"execution interrupted; effects were not replayed"}));
+                    tree::emit(&tx, &task, "task/node_returned", &mut node, turn)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }).await
 }
 
 /// Enter exactly one compiled function. The suspended Runtime is the only
@@ -516,6 +588,7 @@ fn inherited_frame(s: &Session<'_>, parent: &Window, node: &Node) -> Window {
         active_skills: parent.active_skills.clone(),
         active_skill_scopes: parent.active_skill_scopes.clone(),
         token_calibration: parent.token_calibration.clone(),
+        parallel_root: parent.parallel_root.clone(),
         ..Default::default()
     }
 }
@@ -582,6 +655,7 @@ pub(super) async fn finish(
         }
         let finish = tree::finish_node(&tx, &task, &id)?;
         let iterator = finish.as_ref().map(|f| f.metadata["iterator"].clone()).unwrap_or(Value::Null);
+        let parallel = finish.as_ref().map(|f| f.metadata["parallel"].clone()).unwrap_or(Value::Null);
         node.status = "done".into();
         node.result = Some(summary.clone());
         let returned = tree::emit(&tx, &task, "task/node_returned", &mut node, turn)?;
@@ -589,6 +663,17 @@ pub(super) async fn finish(
             finish.status = "done".into();
             finish.result = Some(summary);
             tree::emit(&tx, &task, "task/node_returned", &mut finish, turn)?;
+        }
+        if parallel.is_object() {
+            let parent = parallel["task"].as_str().context("parallel caller missing")?;
+            let call_id = parallel["call_id"].as_str().context("parallel call id missing")?;
+            let answer = json!({"task":node.title,"node_id":node.node_id,"return_event_seq":returned,"result":text,"assets":saved});
+            record_result(&tx, &task, turn, &parallel["step"], &parallel["flowNodeId"], call_id, parent, &answer)?;
+            let mut frame = frame;
+            super::function_scope::release_finished(&mut frame);
+            write_window(&tx, &task, &old_scope, &frame)?;
+            tx.commit()?;
+            return Ok(None);
         }
         if iterator.is_null() && node.agent_id.is_some() {
             let mut frame=frame;
@@ -829,52 +914,6 @@ pub(super) async fn fresh_main_window(
     Ok(window)
 }
 
-pub(super) async fn delegate_context(
-    s: &Session<'_>,
-    w: &Window,
-    args: &Value,
-) -> Result<(Value, Value)> {
-    let mut conn = agent_service::open_db(s.state.workspace.root())?;
-    let parent_id = frame_task(s, w);
-    ensure!(parent_id != tree::ROOT, "fork requires an active flow task");
-    let parent = tree::get(&conn, s.task, &parent_id)?;
-    let node = {
-        let node = tree::planned(
-            &parent,
-            &json!({"title":args["name"],"goal":args["task"],"done_when":args.get("done_when").unwrap_or(&args["task"]),"executor":"delegate","inputs":{}}),
-            tree::nodes(&conn, s.task)?.len(),
-            "task",
-        )?;
-        // emit reads the next seq before writing; a deferred transaction would
-        // fail immediately with SQLITE_BUSY instead of waiting for the lock.
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut recorded = node.clone();
-        recorded.briefing = args["context"].as_str().unwrap_or("").to_owned();
-        recorded.metadata = json!({"role":"delegate","turn":s.turn});
-        tree::emit(&tx, s.task, "task/node_planned", &mut recorded, s.turn)?;
-        let mut finish = tree::planned(
-            &recorded,
-            &json!({"title":"Finish","goal":"End the delegated task and return its summary"}),
-            tree::FINISH_ORDINAL,
-            "finish",
-        )?;
-        tree::emit(&tx, s.task, "task/node_planned", &mut finish, s.turn)?;
-        tx.commit()?;
-        recorded
-    };
-    drop(conn);
-    let frame = child_material(s, w, &node).await?;
-    let mut shared = serde_json::to_value(frame)?;
-    shared["task_node"] = serde_json::to_value(&node)?;
-    shared["caller_task_node_id"] = json!(parent.node_id);
-    let mut assignment = args.clone();
-    assignment["name"] = json!(node.title);
-    assignment["task"] = json!(node.goal);
-    assignment["task_node_id"] = json!(node.node_id);
-    assignment["context"] = json!(node.briefing);
-    Ok((assignment, shared))
-}
-
 fn fit_input_bodies(s: &Session<'_>, child: &mut Window) -> Result<()> {
     let definitions = tools(s, child);
     let mut bodies = Vec::new();
@@ -925,25 +964,6 @@ fn fit_input_bodies(s: &Session<'_>, child: &mut Window) -> Result<()> {
     Ok(())
 }
 
-async fn child_material(s: &Session<'_>, parent: &Window, node: &Node) -> Result<Window> {
-    let conn = agent_service::open_db(s.state.workspace.root())?;
-    let path = tree::path(
-        &conn,
-        s.task,
-        node.parent_id.as_deref().context("child parent missing")?,
-    )?;
-    drop(conn);
-    let mut child = inherited_frame(s, parent, node);
-    focus_frame(&mut child, node, &path)?;
-    if let Some(snapshot) = super::function_scope::index(&child) {
-        child.messages.push(snapshot);
-    }
-    let mut session = s.clone();
-    session.scope = tree::scope(&node.node_id);
-    fit_input_bodies(&session, &mut child)?;
-    Ok(child)
-}
-
 fn scope_environment(parent: &Window, owner: &str) -> Value {
     json!({"role":"user","name":"scope_environment","_frame_input":true,
         "content":json!({"host_status":true,"not_a_user_request":true,
@@ -953,23 +973,6 @@ fn scope_environment(parent: &Window, owner: &str) -> Value {
 }
 
 /// Point a frame at the node it now executes: refresh its path and node card.
-fn focus_frame(frame: &mut Window, node: &Node, ancestors: &[Node]) -> Result<()> {
-    frame.messages.retain(|m| {
-        !matches!(
-            m["name"].as_str(),
-            Some("task_path" | "task_node" | "task_instruction")
-        )
-    });
-    frame.messages.insert(1.min(frame.messages.len()),json!({"role":"system","name":"task_path","content":json!(ancestors.iter().map(|n|json!({"node_id":n.node_id,"title":n.title,"goal":n.goal,"reason":n.spawned_from})).collect::<Vec<_>>()).to_string()}));
-    frame.messages.insert(
-        2.min(frame.messages.len()),
-        json!({"role":"system","name":"task_node","content":serde_json::to_string(node)?}),
-    );
-    frame.task_node_id = Some(node.node_id.clone());
-    frame.instruction_versions.clear();
-    Ok(())
-}
-
 fn inherit_material(parent: &Window, messages: &mut Vec<Value>) {
     for message in &parent.messages {
         if message["_pinned"] == true
@@ -1505,13 +1508,8 @@ mod tests {
         ));
         server.abort();
         assert_eq!(seen.lock().unwrap().len(), 3);
-        assert!(
-            crate::collaboration_jobs::statuses(&h.root, "t")
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        let conn = agent_service::open_db(&h.root).unwrap();
+        assert_eq!(tree::nodes(&conn, "t").unwrap().iter().filter(|node| node.metadata["role"] == "delegate").count(), 0);
     }
 
     /// 烧水热菜 on the real loop. The main task's steps share its context; the
@@ -1965,7 +1963,8 @@ mod tests {
     #[tokio::test]
     async fn parallel_frames_keep_identity_and_serial_returns_do_not_touch_a_sibling() {
         let h = Harness::new().await;
-        let mut conn = crate::collaboration_jobs::db(&h.root).unwrap();
+        let mut conn = agent_service::open_db(&h.root).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_delegates(id TEXT PRIMARY KEY,task_id TEXT,turn INTEGER,call_id TEXT,name TEXT,specification TEXT,status TEXT,created_at INTEGER,event_count INTEGER NOT NULL DEFAULT 0);").unwrap();
         let tx = conn.transaction().unwrap();
         let root = tree::get(&tx, "t", tree::ROOT).unwrap();
         let mut frames = Vec::new();
@@ -1992,7 +1991,7 @@ mod tests {
             tree::emit(&tx, "t", "task/node_planned", &mut end, 1).unwrap();
             frames.push(Window {
                 task_node_id: Some(task.node_id),
-                messages: vec![json!({"role":"system","content":DELEGATE_PROMPT})],
+                messages: vec![json!({"role":"system","content":MAIN_PROMPT})],
                 ..Default::default()
             });
         }

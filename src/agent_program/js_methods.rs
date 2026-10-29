@@ -1144,7 +1144,7 @@ fn json_stringify(heap: &Heap, value: &VmValue, keys: Option<&[String]>, gap: &s
             VmValue::Promise(_) => "{}".into(),
             VmValue::Reference(id) => {
                 let node = heap.get(*id)?;
-                if matches!(node, HeapNode::Closure { .. }) {
+                if matches!(node, HeapNode::Closure { .. } | HeapNode::Native(_) | HeapNode::PromiseResolver { .. }) {
                     return Ok(None);
                 }
                 ensure!(!stack.contains(id), "TypeError: Converting circular structure to JSON");
@@ -1221,7 +1221,9 @@ pub(super) fn builtin_arity(name: &str) -> Option<(usize, usize)> {
         "Array.of" => (0, 64),
         "JSON.stringify" => (1, 3),
         "JSON.parse" => (1, 1),
-        "delete" => (2, 2),
+        "delete" | "$$has" | "$$sortWriteBack" => (2, 2),
+        "$$replacementMatches" => (3, 3),
+        "$$textLimit" => (1, 1),
         _ if name.strip_prefix("new ").is_some_and(|class| super::vm_eval::ERROR_CLASSES.contains(&class)) => (0, 2),
         _ => return None,
     })
@@ -1306,7 +1308,53 @@ pub(super) fn builtin(heap: &mut Heap, name: &str, args: &[VmValue]) -> Result<V
         return new_error(heap, class, &first, &arg(args, 1));
     }
     Ok(match name {
-        "$sortWriteBack" => {
+        "$$textLimit" => text_result(to_string(heap, &first)?)?,
+        "$$replacementMatches" => {
+            let text = to_string(heap, &first)?;
+            let pattern = arg(args, 1);
+            let all = matches!(arg(args, 2), VmValue::Boolean(true));
+            let mut matches: Vec<(usize, usize, Vec<VmValue>, Option<Vec<(String, VmValue)>>)> = Vec::new();
+            let mut captured_bytes = 0usize;
+            if let Some((source, flags)) = regex_parts(heap, &pattern) {
+                ensure!(!all || flags.contains('g'), "TypeError: replaceAll must be called with a global RegExp");
+                ensure!(text.len() <= 2 * 1024 * 1024, "RangeError: regex input exceeds 2 MiB");
+                let re = super::values::compile_regex(&source, &flags)?;
+                for captures in re.captures_iter(&text) {
+                    ensure!(matches.len() < REGEX_RESULT_LIMIT, "RangeError: too many replacements");
+                    captured_bytes += captures.iter().flatten().map(|m| m.as_str().len()).sum::<usize>();
+                    ensure!(captured_bytes <= TEXT_RESULT_LIMIT, "RangeError: replacement matches exceed 4 MiB");
+                    let whole = captures.get(0).unwrap();
+                    let capture_args = captures.iter().map(|m| match m { Some(m) => VmValue::String(m.as_str().to_owned()), None => VmValue::Undefined }).collect();
+                    let names: Vec<_> = re.capture_names().enumerate().filter_map(|(index, name)| name.map(|name| (name.to_owned(), captures.get(index).map(|m| VmValue::String(m.as_str().to_owned())).unwrap_or(VmValue::Undefined)))).collect();
+                    matches.push((whole.start(), whole.end(), capture_args, (!names.is_empty()).then_some(names)));
+                    if !flags.contains('g') { break; }
+                }
+            } else {
+                let search = to_string(heap, &pattern)?;
+                let positions: Vec<usize> = if !all { text.find(&search).into_iter().collect() }
+                    else if search.is_empty() { std::iter::once(0).chain(text.char_indices().map(|(i, c)| i + c.len_utf8())).collect() }
+                    else { text.match_indices(&search).map(|(i, _)| i).collect() };
+                ensure!(positions.len() <= REGEX_RESULT_LIMIT, "RangeError: too many replacements");
+                ensure!(positions.len().saturating_mul(search.len()) <= TEXT_RESULT_LIMIT, "RangeError: replacement matches exceed 4 MiB");
+                for start in positions { matches.push((start, start + search.len(), vec![VmValue::String(search.clone())], None)); }
+            }
+            let mut rows = Vec::new();
+            for (start, end, callback_args, groups) in matches {
+                let start = char_index(&text, start);
+                let end = char_index(&text, end);
+                let has_groups = groups.is_some();
+                let groups = match groups { Some(groups) => VmValue::Reference(heap.allocate(HeapNode::Object(groups))?), None => VmValue::Undefined };
+                let callback_args = new_array(heap, callback_args)?;
+                rows.push(VmValue::Reference(heap.allocate(HeapNode::Object(vec![("start".into(), number(start as f64)), ("end".into(), number(end as f64)), ("args".into(), callback_args), ("hasGroups".into(), VmValue::Boolean(has_groups)), ("groups".into(), groups)]))?));
+            }
+            new_array(heap, rows)?
+        }
+        "$$has" => {
+            let VmValue::Reference(id) = first else { bail!("TypeError: receiver is not an array") };
+            let index = to_number(heap, &arg(args, 1))?;
+            VmValue::Boolean(index >= 0.0 && index.fract() == 0.0 && heap.has_array_index(id, index as usize)?)
+        }
+        "$sortWriteBack" | "$$sortWriteBack" => {
             // sort() in place: the sorted values, then the original holes.
             let (VmValue::Reference(target), VmValue::Reference(sorted)) = (&first, &arg(args, 1)) else {
                 bail!("internal sort write-back needs arrays")

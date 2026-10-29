@@ -151,7 +151,7 @@ pub fn path(conn: &Connection, task: &str, id: &str) -> Result<Vec<Node>> {
 pub fn active(conn: &Connection, task: &str) -> Result<Option<Node>> {
     let running = nodes(conn, task)?
         .into_iter()
-        .filter(|n| n.executor == "inline" && n.agent_id.is_none() && n.status == "running")
+        .filter(|n| n.executor == "inline" && n.agent_id.is_none() && n.status == "running" && n.metadata["parallel"] != true)
         .collect::<Vec<_>>();
     ensure!(running.len() <= 1, "TASK_STACK_MULTIPLE_RUNNING_NODES");
     let Some(node) = running.into_iter().next() else {
@@ -355,29 +355,6 @@ pub fn board(conn: &Connection, task: &str) -> Result<Value> {
     let active = active(conn, task)?;
     Ok(json!({"active_node_id":active.as_ref().map(|n|&n.node_id),
         "path":active.as_ref().map(|n|path(conn,task,&n.node_id)).transpose()?,"nodes":nodes(conn,task)?}))
-}
-
-pub fn finish_delegate(
-    tx: &Transaction<'_>,
-    task: &str,
-    agent: &str,
-    result: &Value,
-    turn: usize,
-) -> Result<()> {
-    let Some(mut node) = nodes(tx, task)?
-        .into_iter()
-        .find(|n| n.executor == "delegate" && n.agent_id.as_deref() == Some(agent))
-    else {
-        return Ok(());
-    };
-    if matches!(node.status.as_str(), "running" | "suspended") {
-        // Normal completion already passed through task_frames::finish. A
-        // stopped executor must not manufacture a finish without confirmation.
-        node.status = "interrupted".into();
-        node.result = Some(json!({"result":result["report"],"execution":result}));
-        emit(tx, task, "task/node_returned", &mut node, turn)?;
-    }
-    Ok(())
 }
 
 pub fn rebuild(tx: &Transaction<'_>, task: &str) -> Result<()> {

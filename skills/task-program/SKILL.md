@@ -41,14 +41,13 @@ function inspect(request, content) {
 }
 ```
 
-### 授权两个 Agent 并发制作五页
+### 并发制作并验收五页
 
-源码：[parallel-five-pages.js](examples/parallel-five-pages.js)；输入：[parallel-five-pages.input.json](examples/parallel-five-pages.input.json)。request 含 source 路径、requirements 和五项 pages；每项有 path/title/focus。源文档真实读取一次后向两路传 shared，pages 切成3+2，先启动两路再 join。主 Agent 收齐结果后，按句柄的工作区信息检查并合并 Git 分支，再逐页读回、验收。makePages 中的循环在每个分支内串行执行，不派生更多 Agent。
+源码：[parallel-five-pages.js](examples/parallel-five-pages.js)；输入：[parallel-five-pages.input.json](examples/parallel-five-pages.input.json)。读取真实源材料后，每页通过 async 虚函数并发设计；父流程统一写入，再对实际读回的内容并发验收。失败进入 `await` 的异常路径。
 
 ```js
-// 教学案例：用户已授权两个执行 Agent 并行制作五个独立 HTML。
+// 五页并发设计、统一写入，再并发检查实际读回的内容。
 import * as io from "host:io";
-import * as host from "host:host";
 const request = input;
 
 assert(request.pages.length === 5, "此教学示例接收五页清单");
@@ -59,88 +58,52 @@ const shared = {
   requirements: request.requirements
 };
 
-// 先启动两路再等待；传相同公共材料与不同的独占页面清单。
-const a = fork(makePages, shared, request.pages.slice(0, 3));
-const b = fork(makePages, shared, request.pages.slice(3));
-const outcomes = join(a, b);
-
-// Git 分支的文件在独立工作树中；合并后才能从主工作区读回。
-integrate(a);
-integrate(b);
-
-// join 只收齐结果。主 Agent 仍要逐页读回并验收。
-const files = [];
-const reviews = [];
-for (const outcome of outcomes) {
-  for (const file of outcome.files) {
-    const actual = io.read({path: file.path});
-    const review = inspectPage(shared, file, actual.content);
-    assert(review.passed, "验收失败：" + file.path);
-    files.push(file);
-    reviews.push(review);
-  }
+const designs = await Promise.all(request.pages.map(page => designPage(shared, page)));
+for (let i = 0; i < request.pages.length; i++) {
+  io.write({path: request.pages[i].path, content: designs[i].content});
 }
-assert(files.length === request.pages.length, "交付数量不符");
-// 已检查所有页面；流程自然结束。
-
-function makePages(shared, pages) {
-  // 一个分支是一个 Agent；其中逐页串行执行，不再 fork。
-  const files = [];
-  for (const page of pages) {
-    const draft = designPage(shared, page);
-    const receipt = io.write({path: page.path, content: draft.content});
-    files.push({path: page.path, title: page.title, focus: page.focus, receipt});
-  }
-  return {files};
+const reviews = await Promise.all(request.pages.map(async page => {
+  const actual = io.read({path: page.path});
+  return await inspectPage(shared, page, actual.content);
+}));
+for (const review of reviews) {
+  assert(review.passed, "验收失败：" + review.path);
 }
 
 /** @virtual */
-function designPage(shared, page) {
-  // shared 含真实源材料与公共设计要求，page 含本页标题、重点和输出路径。
-  // 直接完成本页设计：内容忠实于源材料，主题不同于其他页，HTML/CSS 自包含。
-  // 返回 {content:string}；不重新查找已传入的材料，不把相同职责改名转交。
+async function designPage(shared, page) {
+  // shared 含实际源材料与统一要求，page 含标题、重点和输出路径。
+  // 设计本页，逐项覆盖 page.focus 中的要求并依据实际源材料说明；
+  // 区分现行机制和历史记录，不擅自推断源材料的版本或日期。
+  // 主题不同于其他页，HTML/CSS 自包含。
+  // 返回 {content:string}；不写文件，不重复读取已传入的材料。
 }
 
 /** @virtual */
-function inspectPage(shared, page, content) {
-  // 对照 shared.source_content、requirements 及 page 的标题/重点检查真实读回正文。
-  // 检查主题覆盖、事实、完整 HTML、外部依赖和明显缺项。
+async function inspectPage(shared, page, content) {
+  // 对照实际源材料和本页要求检查真实读回正文。
   // 返回 {passed:boolean, path:string, issues:[string], evidence:[string]}。
-  // 不把成功写入或数量正确视为内容验收，不虚构浏览器视觉检查。
-}
-
-function integrate(handle) {
-  assert(handle.workspace, "缺少分支工作区信息");
-  if (handle.workspace.integration_required) {
-    const changes = host.inspect_agent_changes({agent_id: handle.agent_id});
-    return host.merge_agent_result({agent_id: handle.agent_id, expected_head: changes.head});
-  }
-  return null;
+  // 不虚构未执行的浏览器或视觉检查。
 }
 ```
 
-此案例将失败上抛，未演示自动修复；真实业务需要的确认、修复或视觉渲染检查仍由业务 Skill 定义。不能以这些例子中的内容检查代替浏览器视觉检查或 PPT 导出。接到非 HTML 任务时按实际工具契约与产物要求改写函数职责。
-
-## 已跑通的并发参考与换场景
-
-[真实 20 页 HTML 流程](examples/parallel-twenty-html.js) 是主 Agent 与一个子 Agent 的完整案例：先读资料和由 AI 设计样式，再 fork 具体写页函数并由主 Agent 同时制作另一半；join 只收集结果，Git 模式需检查差异并合并，之后读回验收。2026-10-27 此具体流程真实完成 20 页、基础结构与 AI 内容检查；未进行浏览器视觉验收。示例正文仅作为按需查阅的案例，不要求每次加载或复制完整源码。
-
-迁移的是分工、独立输出、具体函数、受限虚函数、join 与实际结果整合的思路，不是示例的业务内容。遇到其他任务，先依据用户要求与适用业务技能确定输入、生成工具及格式、实际验收和所需检查，再编排具体函数；不假设共享样式、页数、文件路径、Git 差异形式或本例的检查适用于新任务。只在授权并发时 fork，不把样例变为统一工作流。
+[二十页示例](examples/parallel-twenty-html.js)先设计共享样式，再并发生成每页正文，统一写入、读回和验收。示例中的页数、格式和检查标准仅适用于该业务；未执行浏览器或视觉检查时不能声称已完成。
 
 ## 固定写法
 
 - 顶层语句按顺序覆盖用户要求的工作、验证和交付；源码无需 main，也无需返回值。execute_program 的 input 在源码中直接作为 input 使用。顶层普通 function 定义辅助任务，helper(args) 调用。
 - 内部值保存在 VM 堆中，对象和数组在普通函数调用间保留引用；宿主工具和 AI 参数／结果使用 JSON。支持 const/let/var、局部赋值及赋值表达式、对象／下标赋值及复合赋值、更新、++/--、+= -= *= /= %=、对象简写、简单数组解构、成员／下标读取、模板字符串。
-- 控制流支持 if/else、传统 for、while、do/while、数组 for...of、无标签 break/continue、三元、assert、return、try/catch/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
+- 控制流支持 if/else、传统 for、while、do/while、数组 for...of、简单绑定的 for...in、switch、带标签 break/continue、三元、assert、return、try/catch/finally/throw。已知循环写进代码，不交给一个宽泛注释任务反复调度。
 - + - * / %、比较、逻辑 && || ?? !、模板转换由宿主确定性计算，普通表达式绝不请求 AI。条件中空字符串、false、null、undefined、0 和 NaN 为假，数组和对象为真。&& 和 || 返回所选操作数；短路和三元只执行选中的分支，副作用按从左到右的顺序执行一次。基本数字、布尔与字符串支持部分转换，对象到原始值的转换仍有限制。
 - 数字采用 IEEE-754 双精度，超过安全整数范围会像 JS Number 一样舍入；除零产生非有限数，但非有限数不能直接越过宿主 JSON 边界。=== 对对象比较引用身份；基本原始值的 == 支持部分类型转换。复杂对象转换和完整 JS 数值语义仍未覆盖。
-- 通过 import * as io from "host:io" 或 import {read, write as save} from "host:io" 引入已发布工具，使用 io.read({path}) 或 read({path})。program_tool_headers 仅列出名称；用 read_tool_contracts({methods:["io.read"]}) 或按 libraries 获取完整参数与返回契约；导入不扩大权限。获授权的多 Agent 用 fork(helper,args)、join(handles)；子 Agent 不再派生 Agent。
-- 本地数组 push 收集结果；支持确定性方法 includes/indexOf/slice/at/concat、字符串 lastIndexOf/startsWith/endsWith/trim/toLowerCase/toUpperCase/split/replace/replaceAll/match、正则 test、数组 join、JSON.stringify/parse、Array.isArray、Object.keys/values、typeof。Object.keys/values 仅接受对象，整数键按索引排序，其余键按插入顺序；宿主 JSON 输入的键顺序可能已经变化。replace/replaceAll 仅接受字符串查找和字面替换文本，不展开捕获组；未知方法编译失败，不能假定会让 AI 解释。
-- 函数是值：嵌套函数声明、函数表达式、箭头函数和对象方法简写都创建闭包，可以保存、传递和调用。数组 map/filter 等方法的回调仍需直接写在调用处：同步表达式箭头，或函数体仅有单条 return 表达式的匿名函数；可使用 value、index、array 三个简单参数，以及可见变量、普通函数或工具，回调内可以再嵌套回调。多语句回调、异步回调和把函数变量作为回调传入暂不支持。普通函数按 JS 处理实参数量；@virtual 函数和 fork 目标的实参数量必须与参数一致。支持通过索引和 length 产生稀疏数组；数组字面量空位和一般非索引数组属性尚不支持。
+- 从 `host:<library>` 导入同步工具；从 `host:<library>/promises` 导入异步工具。所有调用仍经过权限与工具契约检查。
+- 本地数组 push 收集结果；支持确定性方法 includes/indexOf/slice/at/concat、字符串 lastIndexOf/startsWith/endsWith/trim/toLowerCase/toUpperCase/split/replace/replaceAll/match、正则 test、数组 join、JSON.stringify/parse、Array.isArray、Object.keys/values、typeof。Object.keys/values 仅接受对象，整数键按索引排序，其余键按插入顺序；宿主 JSON 输入的键顺序可能已经变化。replace/replaceAll 接受字符串或正则查找（replaceAll 的正则须带 g），替换文本按 JS 展开 $&、$1、$<name> 等，替换函数见下条；未知方法编译失败，不能假定会让 AI 解释。
+- 声明、普通函数参数和 catch 支持解构及默认值；对象与数组字面量支持展开，可使用可选函数调用。支持函数剩余参数与调用参数展开。非简单参数在独立参数作用域初始化，默认值与其中的闭包不读取函数体局部绑定。
+- 函数和闭包可保存、传递和调用。数组 map 支持 async 回调；其他数组回调目前要求同步。普通函数按 JS 处理实参数量；虚函数严格核对参数。
 - 路径与 URL 可直接计算：`path.join/resolve/relative/normalize/dirname/basename/extname` 和 `url.parse(value, base)`；结果用于普通流程，不调用 AI。resolve 至少一个绝对路径、relative 的两个参数必须绝对；url.parse 返回 href/origin/protocol/hostname/port/pathname/search/hash。它们由宿主 Rust 实现，处理路径不访问文件系统；文件访问仍使用 io。
-- 支持正则字面量及 `/pattern/i.test(text)`、`text.match(/pattern/g)`；只有 g/i/m/s/u 标志，Rust regex 语法不支持环视和回溯引用。test 无状态；match 未命中返回 null，非 g 返回完整匹配和捕获组数组，g 返回完整匹配数组。模式最多 8192 字节，输入最多 2 MiB，结果最多 10000 项、捕获文本最多 4 MiB；超出时报错。不是完整 JavaScript RegExp，支持 new RegExp；不支持正则替换或 lastIndex。
-- 顶层流程或 async 函数可对单个函数、AI 能力或工具调用使用 await，按宿主原有串行机制等待结果；也可使用 await Promise.all([只读调用...])，或 await Promise.all(paths.map(path => io.read({path}))) 并发读取、列目录或搜索；最多 32 项，结果按输入顺序返回。仅允许 io.read、io.read_lines、io.list、io.search；AI 判断、写入和修复仍串行，不由此启动子 Agent。失败经既有异常路径处理，不自动重放。示例见 examples/async-page-review.js；串行基线见 examples/serial-page-review.js。
-- 以上是受限异步语法，不是完整 Promise 或 JS 环境。async 函数与单个 await 通过宿主暂停与恢复执行，不产生 Promise 对象；Promise.all 的 map 箭头仅允许一个简单参数和一个只读调用，允许 async / await，参数不能遮蔽已有局部变量。直接 await 的 Promise.resolve/reject 链以简单值为初始参数，不支持有副作用的表达式或属性访问；它支持 then/catch 的零或一个简单参数的表达式箭头，按顺序执行；不提供一般 Promise 对象和其他 Promise 链。禁止function*/yield、call()/ai() 包装、非工具模块导入和导出、TS 类型、class/this/自定义 new、for-in、switch、finally、标签跳转、展开／剩余／默认参数、BigInt 和 JS 全局环境。
+- 支持正则字面量及 `/pattern/i.test(text)`、`text.match(/pattern/g)`；只有 g/i/m/s/u 标志，Rust regex 语法不支持环视和回溯引用。test 无状态；match 未命中返回 null，非 g 返回完整匹配和捕获组数组，g 返回完整匹配数组。模式最多 8192 字节，输入最多 2 MiB，结果最多 10000 项、捕获文本最多 4 MiB；超出时报错。不是完整 JavaScript RegExp，支持 new RegExp 和 replace/replaceAll；不支持 lastIndex。
+- async 函数返回 Promise，await 挂起并在结果到达后恢复。`Promise.all`、`allSettled`、`race`、`any`、`then`、`catch`、`finally` 可组合结果；只读异步工具最多 32 项一批。async 虚函数可并发，模型请求共享并发槽位。Promise 按 JS 微任务顺序执行，用 Promise 结算另一个 Promise 时同样多等两轮。对顶层 async 函数或 /promises 工具的调用不 await 就直接取属性、参与运算、作为条件、传给 assert 或放进模板字符串，会在编译时报错；需要先保存 Promise 或 await。
+- 这是受限 JS 环境：普通 thenable 同化和提取 Promise 方法值尚不支持；禁止 function*/yield、call()/ai() 包装、通用模块、TypeScript 类型、class/this 和 BigInt。
 
 let/const 属于所在的块，内层块可以重复声明同名变量并遮蔽外层，声明前读取会抛出 ReferenceError；var 属于所在函数并提升，首次无初值为 undefined。函数只看自己的变量和顶层变量，调用方的局部变量作为参数传入。普通函数中的对象别名共享修改；AI 作用域和宿主工具以 JSON 交接。字符串 length、索引、slice 和 indexOf 使用 Unicode 标量。模板只插入原始值，对象和数组使用 JSON.stringify。完整规范在 docs/agent-program.md。
 
@@ -195,7 +158,7 @@ function deliver(output, request) {
 
 函数契约若约定了返回值与输入之间可由代码确定的关系，调用方在使用返回值之前应直接核对该关系；不匹配不能当成当前对象的有效证据，应安排核实或返回明确失败。具体字段和关系由该任务的契约决定，通用运行时不要求统一字段，也不把文字检查误称为实际资源验证。
 
-虚函数任务在当前 Agent 的局部作用域执行，可直接使用已公布工具；也可 define_task_body 补写当前函数及新 helper，继续分解工作；当前函数提供真实实现时去掉 @virtual，其内部尚需 AI 工作的新函数保留 @virtual，不新建第二个 main、不重复创建当前任务。形参与实参一律按位置绑定，普通调用、fork、补写函数都相同；例如 work(shared,part) 的并发调用是 fork(work,shared,part)，每个形参分别接收一个实参，不隐式打包对象；补写保持原参数个数，不会自动把多个参数打包成一个对象。program_task_input 给出函数签名和 bindings（各形参的实际局部值），bindings 不是参数内部的一层数据。若签名是 make(input)，bindings.input 为 {pages,...}，函数内直接用 input.pages；不能再套 input.input。有代码的普通 helper 在 Runtime 函数帧内执行，不创建 AI 任务节点；虚函数调用创建 AI 任务，其工具调用是步骤。顶层运行完毕结束，helper 返回恢复调用方。
+虚函数任务在当前 Agent 的局部作用域执行，可直接使用已公布工具；也可 define_task_body 补写当前函数及新 helper，继续分解工作；当前函数提供真实实现时去掉 @virtual，其内部尚需 AI 工作的新函数保留 @virtual，不新建第二个 main、不重复创建当前任务。形参与实参按位置绑定；例如 work(shared,part) 的异步调用是 work(shared,part)，每个形参分别接收一个实参，不隐式打包对象；补写保持原参数个数，不会自动把多个参数打包成一个对象。program_task_input 给出函数签名和 bindings（各形参的实际局部值），bindings 不是参数内部的一层数据。若签名是 make(input)，bindings.input 为 {pages,...}，函数内直接用 input.pages；不能再套 input.input。有代码的普通 helper 在 Runtime 函数帧内执行，不创建 AI 任务节点；虚函数调用创建 AI 任务，其工具调用是步骤。顶层运行完毕结束，helper 返回恢复调用方。
 
 当前调用为 process(shared, part) 时，可补写：
 
@@ -220,7 +183,7 @@ define_task_body 是按需补写具体实现的方式，不是执行前的必经
 
 ## 作用域与生命周期
 
-当前函数的真实参数由 program_task_input.bindings 自动提供。普通函数代码按词法作用域只能引用自己的变量和顶层变量，调用方的局部变量需要作为参数传入。子 Agent 使用 fork 时的快照，之后父作用域变化不自动同步。AI 函数可以看到调用链上各层可见变量的索引：未引用的变量不自动发送正文，scope_variables 提供名称、类型与大小，AI 可用 host.read_scope({name,path}) 按需读取；虚函数只有自然语言注释，不会从注释猜测代码变量引用。源码变量保留到函数返回，编译器临时量可回收。历史工具调用、回执不是自动重放的变量。
+当前函数的真实参数由 program_task_input.bindings 自动提供。普通函数代码按词法作用域只能引用自己的变量和顶层变量，调用方的局部变量需要作为参数传入。异步虚函数使用调用时的作用域快照，之后父作用域变化不自动同步。AI 函数可以看到调用链上各层可见变量的索引：未引用的变量不自动发送正文，scope_variables 提供名称、类型与大小，AI 可用 host.read_scope({name,path}) 按需读取；虚函数只有自然语言注释，不会从注释猜测代码变量引用。源码变量保留到函数返回，编译器临时量可回收。历史工具调用、回执不是自动重放的变量。
 
 容量折叠先扣除固定指令和当前函数输入的开销，再按剩余工作空间的80%触发、向60%回落。自然增长的旧步骤可以折叠为可恢复引用；当前输入及最新交换保留。完整活跃输入超出硬上限时需分页或缩小单次处理范围，不把引用冒充已读取正文。
 
@@ -238,14 +201,10 @@ define_task_body 是按需补写具体实现的方式，不是执行前的必经
 
 execute_program 和 define_task_body 都在任何实际操作前编译整份源码；失败会带行列、附近源码和错误原因返回当前 AI，当前任务及原有结果保留。根据诊断重写完整源码并在原作用域重新提交，不重建任务、不重放已完成操作、不把编译失败当作完成。需要先检查时可用 check_program；它复用同一编译与作用域规则，不安装、不执行、不调用业务工具，并非每次都必须增加的前置步骤。反复无法修正时如实报告阻碍。此修正机制只处理源码，不自动重试未知写入或改写业务目标。
 
-库方法在源码和 invoke_library 中都返回工具原始 JSON，直接按声明读取字段；资产交付的 original_result 包装不属于库返回契约。host.read_asset 的快照结构是该方法自身的数据契约。编排使用 fork/join，不调用原生 spawn_agent/join_agents；不维护工具组加载状态。
+库方法在源码和 invoke_library 中都返回工具原始 JSON，直接按声明读取字段；资产交付的 original_result 包装不属于库返回契约。host.read_asset 的快照结构是该方法自身的数据契约。使用 async 虚函数和 Promise 编排并发；不维护工具组加载状态。
 
 工具返回值保持原 schema；资产编号和工具结果回执从 task_asset_index 读取。需要证据事件号时使用对应条目的 delivery_reference.event_seq，不从业务返回值猜 event_seq。
 
-## 并发的工作区与整合
+## 并发与工作区
 
-fork 返回 {agent_id, workspace} 控制句柄。workspace.mode 为 shared 或 git_worktree；workspace.path 是分支文件实际所在的目录。Git 可写项目中的分支有独立 worktree，workspace.integration_required=true；普通非Git目录共享文件，值为false。这个标记表达隔离方式，不是可轮询的合并进度。重启恢复同一个句柄，业务函数返回不添加这些字段。
-
-join(a,b) 始终只等待并返回 [a的函数值,b的函数值]，即使只有一路也返回数组；它不复制文件、不合并、不验收。返回路径相对于执行该函数的工作区，不保证相对于主目录。主Agent使用仍保留的句柄，在 join 后先调用 host.inspect_agent_changes({agent_id})，检查差异符合分工，再以返回的 head 调用 host.merge_agent_result({agent_id,expected_head})；合并成功后才读主目录中的分支产物并验收。冲突或合并失败应停止或按实际错误处理，不能用手工复制伪装整合成功。普通共享目录跳过Git操作。
-
-先派发所需分支，再在主Agent写入文件：Git分支从当前已提交版本创建，脏工作树会被拒绝。需要供子Agent读取的新文件须在分支前准备并明确传递；共享材料也可直接作为实参传入。公共样式等互不重叠的产物可以由主Agent制作，但分支中的检查不能把尚未合并的主目录文件当作已存在。
+并发虚函数在同一工作区运行，调用时固定参数和可见作用域。独立任务应分别处理各自的文件，或返回内容交给父流程统一写入。并发函数对同一文件的整文件写入发生冲突时，宿主保留现有文件和待写副本并停止，不自动合并或重放。

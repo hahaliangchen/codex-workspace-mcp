@@ -1,3 +1,4 @@
+import * as io from "host:io/promises";
 // 文件读取并发；AI 在一个上下文中按顺序判断，不启动子 Agent。
 async function main(request) {
   const actuals = await Promise.all(request.paths.map(path => io.read({path: path})));

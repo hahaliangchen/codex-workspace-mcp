@@ -1,6 +1,6 @@
-//! Serializable Promise state and FIFO reaction queue. The interpreter does
-//! not yet expose these as JavaScript Promise objects or dispatch jobs.
-use super::heap::VmValue;
+//! Serializable Promise state and the FIFO reaction queue used by async frames.
+//! General JavaScript Promise methods are introduced separately.
+use super::heap::{Heap, HeapId, HeapNode, VmValue};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, VecDeque};
 pub(super) struct PromiseId(u64);
 
 /// An interpreter-owned continuation. The scheduler stores an opaque ID;
-/// future execution frames will own the callback and its lexical environment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// runtime frames own the saved state and lexical environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct ContinuationId(pub(super) u64);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,9 +38,30 @@ pub(super) struct PromiseScheduler {
     jobs: VecDeque<Job>,
 }
 
-// These primitives will be used by the async interpreter in the next step.
+// The legacy Promise primitives remain available for older snapshots.
 #[allow(dead_code)]
 impl PromiseScheduler {
+    pub(super) fn create_heap_promise(&mut self, heap: &mut Heap) -> Result<HeapId> {
+        heap.allocate(HeapNode::Promise { outcome: None, reactions: Vec::new(), handled: false })
+    }
+    pub(super) fn subscribe_heap_promise(&mut self, heap: &mut Heap, id: HeapId, continuation: ContinuationId) -> Result<()> {
+        let HeapNode::Promise { outcome, reactions, handled } = heap.get_mut(id)? else { anyhow::bail!("not a promise") };
+        *handled = true;
+        match outcome {
+            Some(outcome) => self.jobs.push_back(Job { continuation, outcome: outcome.clone() }),
+            None => reactions.push(continuation),
+        }
+        Ok(())
+    }
+    pub(super) fn settle_heap_promise(&mut self, heap: &mut Heap, id: HeapId, result: Outcome) -> Result<bool> {
+        let HeapNode::Promise { outcome, reactions, .. } = heap.get_mut(id)? else { anyhow::bail!("not a promise") };
+        if outcome.is_some() { return Ok(false); }
+        *outcome = Some(result.clone());
+        for continuation in std::mem::take(reactions) {
+            self.jobs.push_back(Job { continuation, outcome: result.clone() });
+        }
+        Ok(true)
+    }
     pub(super) fn roots(&self) -> Vec<VmValue> {
         self.promises
             .values()
@@ -99,6 +120,9 @@ impl PromiseScheduler {
         Ok(true)
     }
 
+    pub(super) fn enqueue(&mut self, continuation: ContinuationId, outcome: Outcome) {
+        self.jobs.push_back(Job { continuation, outcome });
+    }
     pub(super) fn pop_job(&mut self) -> Option<Job> {
         self.jobs.pop_front()
     }
@@ -108,6 +132,58 @@ impl PromiseScheduler {
 mod tests {
     use super::super::heap::{Heap, HeapNode, JsNumber};
     use super::*;
+
+    #[test]
+    fn heap_promise_preserves_identity_results_and_fifo_jobs_across_restore() {
+        let mut heap = Heap::default();
+        let mut scheduler = PromiseScheduler::default();
+        let object = heap.allocate(HeapNode::Object(Vec::new())).unwrap();
+        let promise = scheduler.create_heap_promise(&mut heap).unwrap();
+        scheduler.subscribe_heap_promise(&mut heap, promise, ContinuationId(1)).unwrap();
+        scheduler.subscribe_heap_promise(&mut heap, promise, ContinuationId(2)).unwrap();
+        scheduler.settle_heap_promise(&mut heap, promise, Outcome::Fulfilled(VmValue::Reference(object))).unwrap();
+        let mut roots = scheduler.roots();
+        roots.push(VmValue::Reference(promise));
+        heap.collect(&roots).unwrap();
+        let snapshot = serde_json::to_vec(&(heap, scheduler)).unwrap();
+        let (mut heap, mut scheduler): (Heap, PromiseScheduler) = serde_json::from_slice(&snapshot).unwrap();
+        assert!(!scheduler.settle_heap_promise(&mut heap, promise, Outcome::Fulfilled(VmValue::Null)).unwrap());
+        scheduler.subscribe_heap_promise(&mut heap, promise, ContinuationId(3)).unwrap();
+        for id in 1..=3 {
+            assert_eq!(scheduler.pop_job(), Some(Job { continuation: ContinuationId(id), outcome: Outcome::Fulfilled(VmValue::Reference(object)) }));
+        }
+        assert_eq!(heap.get(promise).unwrap(), &HeapNode::Promise { outcome: Some(Outcome::Fulfilled(VmValue::Reference(object))), reactions: vec![], handled: true });
+        assert!(heap.to_json(&VmValue::Reference(promise)).is_err());
+        assert_eq!(super::super::js_methods::builtin(&mut heap, "JSON.stringify", &[VmValue::Reference(promise)]).unwrap(), VmValue::String("{}".into()));
+        assert!(super::super::vm_eval::member(&heap, &VmValue::Reference(promise), &VmValue::String("content".into())).unwrap_err().to_string().contains("await"));
+    }
+
+    #[test]
+    fn settled_heap_promise_keeps_result_alive_without_queued_jobs() {
+        let mut heap = Heap::default();
+        let mut scheduler = PromiseScheduler::default();
+        let result = heap.allocate(HeapNode::Object(Vec::new())).unwrap();
+        let promise = scheduler.create_heap_promise(&mut heap).unwrap();
+        scheduler.settle_heap_promise(&mut heap, promise, Outcome::Fulfilled(VmValue::Reference(result))).unwrap();
+        let snapshot = serde_json::to_vec(&(heap, scheduler)).unwrap();
+        let (mut heap, _): (Heap, PromiseScheduler) = serde_json::from_slice(&snapshot).unwrap();
+        heap.collect(&[VmValue::Reference(promise)]).unwrap();
+        assert!(matches!(heap.get(result), Ok(HeapNode::Object(_))));
+    }
+
+    #[test]
+    fn pending_heap_promise_keeps_subscriptions_after_restore() {
+        let mut heap = Heap::default();
+        let mut scheduler = PromiseScheduler::default();
+        let promise = scheduler.create_heap_promise(&mut heap).unwrap();
+        scheduler.subscribe_heap_promise(&mut heap, promise, ContinuationId(7)).unwrap();
+        let snapshot = serde_json::to_vec(&(heap, scheduler)).unwrap();
+        let (mut heap, mut scheduler): (Heap, PromiseScheduler) = serde_json::from_slice(&snapshot).unwrap();
+        let failure = Outcome::Rejected(VmValue::String("failed".into()));
+        assert!(scheduler.settle_heap_promise(&mut heap, promise, failure.clone()).unwrap());
+        assert_eq!(scheduler.pop_job(), Some(Job { continuation: ContinuationId(7), outcome: failure }));
+        assert!(scheduler.pop_job().is_none());
+    }
 
     #[test]
     fn reactions_are_fifo_and_survive_snapshot_without_duplicate_settlement() {

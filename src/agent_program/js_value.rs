@@ -204,6 +204,9 @@ fn to_string_inner(heap: &Heap, value: &VmValue, active: &mut BTreeSet<HeapId>) 
                 format!("function {}() {{ [flow code] }}", function_name(function))
             }
             HeapNode::Native(name) => format!("function {}() {{ [native code] }}", function_name(name)),
+            HeapNode::PromiseResolver { .. } => "function () { [native code] }".into(),
+            HeapNode::PromiseCapability { .. } => "[object Object]".into(),
+            HeapNode::Promise { .. } => "[object Promise]".into(),
             HeapNode::Environment { .. } => "[object Object]".into(),
         },
     })

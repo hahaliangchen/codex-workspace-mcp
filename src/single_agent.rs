@@ -27,8 +27,6 @@ mod task_frames;
 const INPUT_BUDGET: usize =
     crate::context_window::MAX_TOKENS - crate::model_settings::OUTPUT_RESERVE;
 const PAGE_CHARS: usize = 24_000;
-const DELEGATE_PROMPT: &str = include_str!("../prompts/delegate_agent.md");
-
 const MAIN_PROMPT: &str = include_str!("../prompts/single_agent.md");
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -51,6 +49,8 @@ struct Window {
     program_value: Option<Value>,
     #[serde(default)]
     program_task: Option<Value>,
+    #[serde(default)]
+    parallel_root: Option<String>,
     // Failed bodies are evidence, not programs to automatically rerun.
     #[serde(default)]
     failed_programs: Vec<crate::agent_program::Runtime>,
@@ -100,13 +100,7 @@ impl Session<'_> {
             "agent"
         }
     }
-    fn prompt(&self) -> &'static str {
-        if self.delegate_id().is_some() {
-            DELEGATE_PROMPT
-        } else {
-            MAIN_PROMPT
-        }
-    }
+    fn prompt(&self) -> &'static str { MAIN_PROMPT }
 }
 enum LoopResult {
     Answer,
@@ -133,16 +127,9 @@ async fn save(s: &Session<'_>, w: &Window) -> Result<()> {
         s.scope.clone(),
         serde_json::to_string(w)?,
     );
-    let delegate = s.delegate_id().map(str::to_owned);
-    let assets = delegate
-        .as_ref()
-        .map(|_| crate::context_assets::catalog(&w.messages)["assets"].clone());
     db(s.state.workspace.root(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("INSERT INTO agent_runtime_windows VALUES (?1,?2,?3) ON CONFLICT(task_id,scope) DO UPDATE SET state=excluded.state", params![task,scope,text])?;
-        if let Some(id) = delegate {
-            crate::collaboration_jobs::remember_assets(&tx, &task, &id, assets.as_ref().unwrap())?;
-        }
         tx.commit()?;
         Ok(())
     }).await
@@ -273,26 +260,12 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         tools.push(crate::visual_jobs::tool());
         tools.push(function("refresh_asset", "Explicitly re-read the current local file/range behind an existing file asset. Returns its current version as an asset; keeps the old snapshot and reference. Never replays commands or captures screenshots.",json!({"asset_id":{"type":"string"}}),json!(["asset_id"])));
     }
-    if s.is_primary() {
-        tools.extend(crate::collaboration_jobs::tools());
-    }
     tools.retain(|tool| {
         let name = tool["function"]["name"].as_str().unwrap_or("");
         page_allows(s, name)
             && (w.program_task.is_none()
                 || w.program.is_some()
-                || !matches!(
-                    name,
-                    "execute_program"
-                        | "create_task"
-                        | "spawn_agent"
-                        | "join_agents"
-                        | "wait_agents"
-                        | "review_agent_result"
-                        | "cancel_agent"
-                        | "inspect_agent_changes"
-                        | "merge_agent_result"
-                ))
+                || !matches!(name, "execute_program" | "create_task"))
     });
     tools
 }
@@ -309,13 +282,6 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
             | "define_task_body"
             | "check_program"
             | "read_scope"
-            | "spawn_agent"
-            | "join_agents"
-            | "wait_agents"
-            | "review_agent_result"
-            | "cancel_agent"
-            | "inspect_agent_changes"
-            | "merge_agent_result"
             | "read_attachment"
             | "analyze_images"
             | "image_analysis_results"
@@ -335,13 +301,6 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
 }
 
 fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str) -> Result<()> {
-    if let Some(id) = s.delegate_id() {
-        crate::collaboration_jobs::ensure_active(s.state.workspace.root(), s.task, id)?;
-    }
-    ensure!(
-        !crate::collaboration_jobs::is_tool(name) || s.is_primary(),
-        "DELEGATE_RECURSION_DENIED"
-    );
     ensure!(
         page_allows(s, name),
         "PLUGIN_SCOPE_DENIED: tool {name} does not belong to this conversation's plugin"
@@ -632,13 +591,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             "MAIN_TASK_ANCHOR_UNAVAILABLE: {error:#}; no model request may omit the main task requirements"
         )),
     };
-    if let Some(id) = s.delegate_id() {
-        let spec = crate::collaboration_jobs::specification(s.state.workspace.root(), s.task, id)
-            .unwrap_or_else(
-                |_| json!({"error":"Delegated task unavailable. Stop and report this failure."}),
-            );
-        wire.insert(1.min(wire.len()), json!({"role":"system","name":"delegated_assignment","content":format!("Execute the forked child function in parent_assignment using its inherited parent environment, declared inputs and current user requirements. Reuse the actual supplied arguments and visible scope variables and advertised tools; recover only specifically missing material. Parent operations are historical inputs, not your own actions. Keep local work in this scope; return a concise result, artifact handles, checks and unresolved issues. Do not fork Agents, expand permissions or change project/plugin binding. The caller owns integration and final acceptance. Confirmed requirements remain binding; return a concrete conflict rather than changing them. Assignment: {spec}")}));
-    }
     // Notes are re-read for every request rather than stored in the window, so
     // compression never drops them and edits apply on the next request.
     if let Ok(Some(project)) = crate::project_notes::task_project(s.state.workspace.root(), s.task)
@@ -704,15 +656,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         && pending > 0
     {
         wire.push(json!({"role":"user","name":"visual_job_status","content":json!({"host_status":true,"pending_visual_checks":pending,"not_a_user_request":true}).to_string()}));
-    }
-    if s.is_primary() {
-        if let Ok(statuses) = crate::collaboration_jobs::statuses(s.state.workspace.root(), s.task)
-        {
-            let pending=statuses.as_array().into_iter().flatten().filter(|v|v["status"]=="running" || v["delivered"]!=true).map(|v|json!({"agent_id":v["agent_id"],"name":v["name"],"status":v["status"],"delivered":v["delivered"]})).collect::<Vec<_>>();
-            if !pending.is_empty() && comment_task.is_none() {
-                wire.push(json!({"role":"user","name":"delegate_status","content":json!({"host_status":true,"not_a_user_request":true,"delegates":pending,"instruction":"Fork handles belong to the calling program, which joins them with join(handles). Continue the current task and return its result to the caller; do not reschedule the caller or poll siblings. For explicit artifact review use the methods in program_tool_headers and cite receipt references from task_asset_index."}).to_string()}));
-            }
-        }
     }
     let mut published = definitions.to_vec();
     // create_task is present only before a main scope exists. Match the
@@ -947,7 +890,7 @@ async fn model_round(
         .context("Cannot persist model input and flow node; request was not sent")?;
     w.previous_node = Some(node.clone());
     save(s, w).await?;
-    if s.delegate_id().is_none() {
+    if s.delegate_id().is_none() && w.parallel_root.is_none() {
         agent_service::set_active_flow_node(s.state, s.task, s.turn, &node).await;
     }
     let diagnostics = crate::model_transport::ModelRequestLog::new(
@@ -986,9 +929,8 @@ async fn model_round(
             let response = crate::visual_probe::successful_response(response).await?;
             // The same stream decoder is used for both modes; child text stays
             // in its flow record and never becomes an execution-agent answer.
-            if s.is_primary()
+            if s.is_primary() && w.parallel_root.is_none()
                 && !crate::visual_jobs::outstanding(s.state.workspace.root(), s.task)?
-                && !has_delegates(s, w)?
             {
                 let (message, stats) = agent_service::consume_model_stream_observed(
                     response,
@@ -1068,7 +1010,6 @@ async fn model_round(
     let no_calls = crate::model_stream::tool_calls(&message).is_empty();
     let awaiting_async = no_calls
         && (has_visual_jobs(s, w)?
-            || (s.is_primary() && has_delegates(s, w)?)
             || !pending_plugin_jobs(s, w)?.is_empty());
     let provisional = no_calls && (s.scope.starts_with("node:") || awaiting_async);
     let seq = append(
@@ -1113,9 +1054,6 @@ async fn business_tool(
     call_id: &str,
 ) -> Result<Value> {
     ensure!(page_allows(s, name), "PLUGIN_SCOPE_DENIED: {name}");
-    if let Some(id) = s.delegate_id() {
-        crate::collaboration_jobs::ensure_active(s.state.workspace.root(), s.task, id)?;
-    }
     if name == "read_session_history" {
         let mut args = args;
         if s.delegate_id().is_some() || s.plugin.is_some() {
@@ -1165,11 +1103,7 @@ async fn business_tool(
     let tool_workspace = if name == "view_image" {
         s.state.workspace.clone()
     } else {
-        let path = if let Some(id) = s.delegate_id() {
-            let spec =
-                crate::collaboration_jobs::specification(s.state.workspace.root(), s.task, id)?;
-            crate::delegate_git::workspace(s.state.workspace.root(), &spec)?
-        } else if let Some(plugin) =
+        let path = if let Some(plugin) =
             crate::plugin_sessions::owner(s.state.workspace.root(), s.task)?
         {
             crate::plugin_sessions::workspace_dir(s.state.workspace.root(), &plugin)?
@@ -1193,22 +1127,30 @@ async fn business_tool(
         Some(crate::workspace_changes::mutation_guard(tool_workspace.root(), name, &args, s.cancel).await?)
     } else { None };
     let _claim = if let Some(resource) =
-        crate::collaboration_jobs::resource_key(tool_workspace.root(), name, &args)?
+        crate::workspace_changes::resource_key(tool_workspace.root(), name, &args)?
     {
-        Some(crate::collaboration_jobs::claim_resource(
-            s.state.workspace.root(),
-            s.task,
-            s.delegate_id(),
-            call_id,
-            resource,
+        Some(crate::workspace_changes::claim_resource(
+            s.state.workspace.root(), s.task, call_id, resource,
         )?)
     } else {
         None
     };
+    let parallel_owner = s.task_node_id.as_deref().and_then(|id| {
+        let conn = agent_service::open_db(s.state.workspace.root()).ok()?;
+        let node = crate::task_tree::get(&conn, s.task, id).ok()?;
+        node.metadata["parallel_owner"].as_str().map(str::to_owned)
+    });
     let managed = if matches!(name, "write_file" | "edit_file" | "replace_range") {
         let prepared = managed_files::prepare(s.state.workspace.root(), s.task, tool_workspace.root(), name, args.clone())?;
         if prepared.conflict()? {
             return prepared.preserve(s.state.workspace.root());
+        }
+        if name == "write_file" && let Some(owner) = &parallel_owner
+            && prepared.other_parallel_writer(s.state.workspace.root(), s.task, owner)?
+        {
+            let mut conflict = prepared.preserve(s.state.workspace.root())?;
+            conflict["message"] = json!("Another parallel function changed this file; the current file and proposed version were preserved.");
+            return Ok(conflict);
         }
         Some(prepared)
     } else {
@@ -1305,6 +1247,7 @@ async fn business_tool(
         return match result {
             Ok(value) => {
                 if prepared.committed(s.state.workspace.root(), s.task)? {
+                    if let Some(owner) = &parallel_owner { prepared.record_parallel_writer(s.state.workspace.root(), s.task, owner)?; }
                     Ok(value)
                 } else {
                     prepared.preserve(s.state.workspace.root())
@@ -1416,129 +1359,6 @@ fn has_visual_jobs(s: &Session<'_>, w: &Window) -> Result<bool> {
     }
     Ok(false)
 }
-fn has_delegates(s: &Session<'_>, w: &Window) -> Result<bool> {
-    crate::collaboration_jobs::outstanding_for(
-        s.state.workspace.root(),
-        s.task,
-        &task_frames::frame_task(s, w),
-    )
-}
-
-async fn deliver_delegates(s: &Session<'_>, w: &mut Window) -> Result<()> {
-    let jobs = crate::collaboration_jobs::ready(s.state.workspace.root(), s.task)?;
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    let mut receipts = Vec::new();
-    for job in jobs {
-        let spec = crate::collaboration_jobs::specification(
-            s.state.workspace.root(),
-            s.task,
-            job["agent_id"].as_str().context("delegate id missing")?,
-        )?;
-        if spec["caller_task_node_id"]
-            .as_str()
-            .is_some_and(|owner| owner != task_frames::frame_task(s, w))
-        {
-            continue;
-        }
-        // The full outcome is already archived at subagent/end. The handoff
-        // event and the main window contain handles, never another body copy.
-        let seq = job["end_seq"]
-            .as_i64()
-            .context("delegate outcome reference missing")?;
-        let delivery = json!({"not_a_user_request":true,"agent_id":job["agent_id"],"name":job["name"],"status":job["result"]["status"],"error":job["result"]["error"],"report":job,"acceptance":"unreviewed; verify reported artifacts and evidence before review_agent_result"});
-        let (root, task, id) = (
-            s.state.workspace.root().to_path_buf(),
-            s.task.to_owned(),
-            job["agent_id"].clone(),
-        );
-        let reference = tokio::task::spawn_blocking(move || {
-            crate::context_assets::register(
-                &root,
-                &task,
-                seq,
-                "delegate_result",
-                &json!({"agent_id":id}),
-                &delivery,
-            )
-        })
-        .await??;
-        receipts.push((
-            job["agent_id"]
-                .as_str()
-                .context("delegate ID missing")?
-                .to_owned(),
-            reference,
-            delegate_return_value(&job),
-        ));
-    }
-    if receipts.is_empty() {
-        return Ok(());
-    }
-    let (task, scope, turn, mut next) = (s.task.to_owned(), s.scope.clone(), s.turn, w.clone());
-    *w = db(s.state.workspace.root(), move |conn| {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (id, reference, returned) in receipts {
-            let seq = agent_service::append_event_tx(&tx,&task,"subagent/result",
-                &json!({"turn":turn,"report":{"agent_id":id,"name":reference["name"],"status":reference["status"]},"asset_reference":reference}),None)?;
-            let mut receipt = crate::context_assets::referenced(sourced(json!({"role":"user","name":"delegate_completion"}),&task,seq),&reference);
-            let mut content: Value = serde_json::from_str(receipt["content"].as_str().unwrap())?;
-            content["not_a_user_request"] = json!(true);
-            content["return_value"] = returned;
-            content["acceptance"] = json!("Typed child function return. The parent program owns integration and required artifact checks; return is not business acceptance.");
-            receipt["content"] = json!(content.to_string());
-            next.messages.push(receipt);
-            tx.execute("UPDATE agent_delegates SET delivered=1 WHERE task_id=?1 AND id=?2",params![task,id])?;
-        }
-        let updated = tx.execute("UPDATE agent_runtime_windows SET state=?3 WHERE task_id=?1 AND scope=?2",params![task,scope,serde_json::to_string(&next)?])?;
-        ensure!(updated==1,"main working window missing; delegate delivery was not committed");
-        tx.commit()?;
-        Ok(next)
-    }).await?;
-    Ok(())
-}
-
-/// Pass the function's return, not its entire archived execution envelope.
-/// The full report/index remains behind the receipt's existing detail handle.
-fn delegate_return_value(job: &Value) -> Value {
-    let result = &job["result"];
-    let text = match &result["report"] {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        value => value.to_string(),
-    };
-    let assets = result["artifact_index"]["assets"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let handles = assets
-        .iter()
-        .take(64)
-        .map(|asset| {
-            let mut handle = serde_json::Map::new();
-            for key in [
-                "asset_id",
-                "source_tool",
-                "source_path",
-                "revision",
-                "source_version",
-                "content_hash",
-                "read_reference",
-            ] {
-                if let Some(value) = asset.get(key) {
-                    handle.insert(key.to_owned(), value.clone());
-                }
-            }
-            Value::Object(handle)
-        })
-        .collect::<Vec<_>>();
-    json!({"agent_id":job["agent_id"],"status":result["status"],"error":result["error"],
-        "summary":text.chars().take(6000).collect::<String>(),
-        "summary_omitted_chars":text.chars().count().saturating_sub(6000),
-        "assets":handles,"assets_omitted":assets.len().saturating_sub(64),"git":result["git"]})
-}
-
 /// Move messages the user sent mid-turn into the working window; true when any arrived.
 async fn deliver_interjections(s: &Session<'_>, w: &mut Window) -> Result<bool> {
     let (task, scope, mut next) = (s.task.to_owned(), s.scope.clone(), w.clone());
@@ -1678,10 +1498,12 @@ async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
     Ok(())
 }
 
-async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<LoopResult> {
+fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LoopResult>> + Send + 'a>> {
+    Box::pin(async move {
     let initial_approval = approval_boundary(s)?;
     let mut step = 0;
     let mut model_rounds = 0;
+    let mut async_children: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
     // The context in view is the current task's; create_task and finish switch it.
     let mut current = s.clone();
     while model_rounds < max_rounds {
@@ -1689,11 +1511,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         current.step_node_id = w.current_step_node_id.clone();
         let s = &current;
         activate_page_plugin(s, w).await?;
-        if let Some(id) = s.delegate_id() {
-            crate::collaboration_jobs::ensure_active(s.state.workspace.root(), s.task, id)?;
-        }
-        if s.is_primary() {
-            deliver_delegates(s, w).await?;
+        if s.is_primary() && w.parallel_root.is_none() {
             deliver_interjections(s, w).await?;
         }
         {
@@ -1726,6 +1544,52 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
             match program_flow::next(s, w, step).await? {
                 program_flow::Round::Exchange(node, message) => (node, message),
                 program_flow::Round::Recover => continue,
+                program_flow::Round::Concurrent(actions) => {
+                    for action in actions {
+                        let (scope, child) = task_frames::start_parallel_function(s, w, &action, step).await?;
+                        let state = s.state.clone(); let task = s.task.to_owned(); let model = s.model.to_owned();
+                        let turn = s.turn; let cancel = s.cancel.clone(); let ban_execution = s.ban_execution;
+                        let plugin = s.plugin.clone(); let budget = s.input_budget;
+                        async_children.spawn(async move {
+                            let mut session = Session { agent_id: None, task_node_id: child.task_node_id.clone(), step_node_id: None,
+                                plugin, state: &state, task: &task, model: &model, turn, cancel: &cancel,
+                                ban_execution, scope, parent: None, input_budget: budget };
+                            let mut child = child;
+                            match Box::pin(run_loop(&session, &mut child, 64)).await {
+                                Ok(LoopResult::Answer) => Ok(()),
+                                result => {
+                                    if child.program.as_ref().is_some_and(|program| !program.inflight_actions().is_empty()) {
+                                        let mut cleanup = session.clone();
+                                        if let Some(id) = child.task_node_id.as_deref() {
+                                            if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
+                                                if let Ok(node) = crate::task_tree::get(&conn, &task, id) { cleanup.scope = crate::task_tree::frame_scope(&node); }
+                                            }
+                                        }
+                                        program_flow::recover(&cleanup, &mut child).await?;
+                                        program_flow::interrupt_unfinished(&cleanup, &mut child).await?;
+                                    }
+                                    let message = match result { Ok(LoopResult::Limit) => "async function reached its execution limit".to_owned(), Err(error) => format!("{error:#}"), _ => unreachable!() };
+                                    let error = json!({"role":"assistant", "content":json!({"$task_error":{"message":message}}).to_string()});
+                                    for _ in 0..=crate::task_tree::MAX_TEMP_TASKS {
+                                        if let Some((scope, parent)) = task_frames::finish(&session, &mut child, &error).await? {
+                                            child = parent; session.scope = scope;
+                                        } else { break; }
+                                    }
+                                    Ok(())
+                                }
+                            }
+                        });
+                    }
+                    continue;
+                }
+                program_flow::Round::Waiting => {
+                    if let Some(result) = async_children.join_next().await {
+                        result.context("async function task failed")??;
+                    } else {
+                        program_flow::interrupt_unfinished(s, w).await?;
+                    }
+                    continue;
+                }
             }
         } else {
             model_rounds += 1;
@@ -1738,17 +1602,6 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         if calls.is_empty() {
             {
                 task_frames::complete_round(s, w).await?;
-                if s.is_primary() && has_delegates(s, w)? {
-                    crate::collaboration_jobs::wait(
-                        s.state.workspace.root(),
-                        s.task,
-                        s.cancel,
-                        30000,
-                    )
-                    .await?;
-                    deliver_delegates(s, w).await?;
-                    continue;
-                }
                 // Background plugin tasks: the turn waits for them instead of ending.
                 if !pending_plugin_jobs(s, w)?.is_empty() {
                     let deadline = std::time::Instant::now() + Duration::from_secs(900);
@@ -1807,7 +1660,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     "model returned an empty answer"
                 );
                 // The user spoke while this answer was being written: keep working on it.
-                if s.is_primary() && deliver_interjections(s, w).await? {
+                if s.is_primary() && w.parallel_root.is_none() && deliver_interjections(s, w).await? {
                     continue;
                 }
                 // A no-tool reply returns this function. Finish resumes the
@@ -1904,7 +1757,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                     "NO_TASK: {} was not executed. Call create_task alone with goal and necessary background before using tools. To answer without tools, reply directly.",call.name);
                 // Mode enforcement is independent of the model's advertised schema.
                 if !program_flow::internal_call(w,&call) {validate_tool(s,w,&definitions,&call.name)?;}
-                if crate::task_tree::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill"|"join_agents"|"execute_program"|"define_task_body") {
+                if crate::task_tree::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill"|"execute_program"|"define_task_body") {
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
@@ -1935,10 +1788,19 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                                 "name":operations[index]["name"],"arguments":operations[index]["args"],"is_error":failed,"result":value}), false).await?;
                         }
                         let mut results = Vec::with_capacity(operations.len());
-                        for result in settled {
-                            let value = result?;
-                            if value["error_code"] == "ASSET_CONFLICT" { return Ok(value); }
-                            results.push(value);
+                        if args["settled"] == true {
+                            for result in settled {
+                                match result {
+                                    Ok(value) => results.push(json!({"failed":value["error_code"] == "ASSET_CONFLICT", "value":value})),
+                                    Err(error) => results.push(json!({"failed":true, "value":{"message":format!("{error:#}")}})),
+                                }
+                            }
+                        } else {
+                            for result in settled {
+                                let value = result?;
+                                if value["error_code"] == "ASSET_CONFLICT" { return Ok(value); }
+                                results.push(value);
+                            }
                         }
                         material_source = Some((call.name.clone(), args.clone()));
                         Ok(json!(results))
@@ -1958,46 +1820,6 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
                         let conn=agent_service::open_db(s.state.workspace.root())?;
                         board["task_tree"]=crate::task_tree::board(&conn,s.task)?;
                         Ok(board)
-                    },
-                    "spawn_agent" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        ensure!(args["program"].is_object() && w.program.as_ref().and_then(|p|p.pending.as_ref()).is_some_and(|a|a.id==call.call_id && matches!(a.kind,crate::agent_program::runtime::ActionKind::Fork{..})), "compiled child programs must come from the host's pending fork instruction");
-                        if let Some(saved)=crate::collaboration_jobs::submitted_handle(s.state.workspace.root(),s.task,&call.call_id)? {
-                            Ok(saved)
-                        } else {
-                            let runtime=program_flow::fork_runtime_with_scope(&args, function_scope::values(w))?;
-                            let (assignment,mut shared)=task_frames::delegate_context(s,w,&args).await?;
-                            shared["program"]=serde_json::to_value(runtime)?;
-                            crate::collaboration_jobs::submit(s.state,s.task,s.turn,&call.call_id,&node,s.model,&assignment,s.ban_execution,shared,s.cancel)
-                        }
-                    },
-                    "wait_agents" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::wait(s.state.workspace.root(),s.task,s.cancel,args["wait_ms"].as_u64().unwrap_or(0)).await?;
-                        Ok(json!({"delegates":crate::collaboration_jobs::statuses(s.state.workspace.root(),s.task)?}))
-                    },
-                    "join_agents" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        ensure!(w.program.as_ref().and_then(|p|p.pending.as_ref()).is_some_and(|a|a.id==call.call_id && matches!(a.kind,crate::agent_program::runtime::ActionKind::Join{..})), "join must come from the suspended flow program");
-                        crate::collaboration_jobs::join(s.state.workspace.root(),s.task,&task_frames::frame_task(s,w),&args,s.cancel).await
-                    },
-                    "review_agent_result" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::review(s.state.workspace.root(),s.task,&args)
-                    },
-                    "inspect_agent_changes" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::inspect_changes(s.state.workspace.root(),s.task,args["agent_id"].as_str().context("agent_id required")?)
-                    },
-                    "merge_agent_result" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::merge_result(s.state.workspace.root(),s.task,
-                            args["agent_id"].as_str().context("agent_id required")?,
-                            args["expected_head"].as_str().context("expected_head required")?)
-                    },
-                    "cancel_agent" => {
-                        ensure!(s.is_primary(),"DELEGATE_RECURSION_DENIED");
-                        crate::collaboration_jobs::cancel_one(s.state.workspace.root(),s.task,args["agent_id"].as_str().context("agent_id required")?)
                     },
                     "propose_project_note" => {
                         ensure!(s.is_primary() && s.plugin.is_none(),"project notes are proposed by the main Agent of a code session");
@@ -2261,6 +2083,7 @@ async fn run_loop(s: &Session<'_>, w: &mut Window, max_rounds: usize) -> Result<
         }
     }
     Ok(LoopResult::Limit)
+    })
 }
 
 fn approval_boundary(s: &Session<'_>) -> Result<Option<(String, &'static str)>> {
@@ -2282,98 +2105,6 @@ fn approval_boundary(s: &Session<'_>) -> Result<Option<(String, &'static str)>> 
     } else {
         Ok(None)
     }
-}
-
-/// Boxed boundary makes the shared main/delegate tool loop non-recursive in its
-/// future type. Delegates cannot advertise or execute delegation tools.
-pub(crate) fn run_delegate(
-    state: AgentServiceState,
-    task: String,
-    model: String,
-    turn: usize,
-    id: String,
-    parent: String,
-    ban_execution: bool,
-    shared_context: Value,
-    cancel: CancellationToken,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>> {
-    Box::pin(async move {
-        let specification =
-            crate::collaboration_jobs::specification(state.workspace.root(), &task, &id)?;
-        // A configured delegate model replaces the conversation's; with nothing
-        // configured the delegate runs exactly as the conversation does.
-        let settings = &state.delegate_agent_settings;
-        let (state, model) = if settings.provider.is_none()
-            && settings.model.is_none()
-            && settings.reasoning_effort.is_none()
-        {
-            (state, model)
-        } else {
-            let resolved = settings.resolve(&state, &model)?;
-            let model = resolved.default_model.clone();
-            (resolved, model)
-        };
-        let input_budget = state
-            .delegate_agent_settings
-            .resolved_input_budget(&state, &model);
-        let s = Session {
-            agent_id: Some(id.clone()),
-            task_node_id: specification["task_node_id"].as_str().map(str::to_owned),
-            step_node_id: None,
-            plugin: crate::plugin_sessions::owner(state.workspace.root(), &task)?,
-            state: &state,
-            task: &task,
-            model: &model,
-            turn,
-            cancel: &cancel,
-            ban_execution,
-            scope: format!("delegate:{id}"),
-            parent: Some(parent),
-            input_budget,
-        };
-        let mut w: Window =
-            serde_json::from_value(shared_context).context("invalid inherited execution window")?;
-        w.current_step_node_id = None;
-        if let Some(first) = w.messages.first_mut().filter(|m| m["role"] == "system") {
-            first["content"] = json!(DELEGATE_PROMPT);
-        } else {
-            w.messages
-                .insert(0, json!({"role":"system","content":DELEGATE_PROMPT}));
-        }
-        w.messages
-            .push(json!({"role":"user","name":"parent_assignment",
-            "content":specification.to_string()}));
-        save(&s, &w).await?;
-        let outcome = run_loop(&s, &mut w, 64).await;
-        let status = if cancel.is_cancelled() {
-            "cancelled"
-        } else {
-            match &outcome {
-                Ok(LoopResult::Answer) => "completed",
-                Ok(_) => "max_steps",
-                Err(_) => "failed",
-            }
-        };
-        let last = w.messages.iter().rev().find(|m| {
-            m["role"] == "assistant" && m["tool_calls"].as_array().is_none_or(|a| a.is_empty())
-        });
-        let task_return = w
-            .task_node_id
-            .as_deref()
-            .map(|id| -> Result<_> {
-                Ok(crate::task_tree::get(
-                    &agent_service::open_db(state.workspace.root())?,
-                    &task,
-                    id,
-                )?
-                .result)
-            })
-            .transpose()?
-            .flatten();
-        Ok(
-            json!({"status":status,"report":task_return.as_ref().map(|r|r["result"].clone()).or_else(||last.map(|m|m["content"].clone())),"task_return":task_return,"history_reference":last.map(|m|m["source"]["history_reference"].clone()),"error":outcome.err().map(|e|format!("{e:#}")),"context_scope":s.scope,"program_value":w.program_value}),
-        )
-    })
 }
 
 pub(crate) async fn run_task(
@@ -2489,28 +2220,6 @@ pub(crate) async fn run_task(
         }
     }
     for (id, after) in pending {
-        if let Some(action) = w
-            .program
-            .as_ref()
-            .and_then(|p| p.pending.as_ref())
-            .filter(|a| a.id == id)
-        {
-            let control = matches!(
-                action.kind,
-                crate::agent_program::runtime::ActionKind::Join { .. }
-            ) || (matches!(
-                action.kind,
-                crate::agent_program::runtime::ActionKind::Fork { .. }
-            ) && crate::collaboration_jobs::submitted_handle(
-                state.workspace.root(),
-                &task,
-                &id,
-            )?
-            .is_some());
-            if control {
-                continue;
-            }
-        }
         let (lookup_task, call) = (task.clone(), id.clone());
         let existing = db(state.workspace.root(), move |conn| {
             Ok(crate::session_history::load_events(
@@ -2580,8 +2289,17 @@ pub(crate) async fn run_task(
     save(&s, &w).await?;
     let outcome = run_loop(&s, &mut w, max_rounds).await;
     if !matches!(&outcome, Ok(LoopResult::Answer)) {
+        if w.program.as_ref().is_some_and(|program| !program.inflight_actions().is_empty()) {
+            let mut cleanup = s.clone();
+            if let Some(id) = w.task_node_id.as_deref() {
+                if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
+                    if let Ok(node) = crate::task_tree::get(&conn, &task, id) { cleanup.scope = crate::task_tree::frame_scope(&node); }
+                }
+            }
+            program_flow::recover(&cleanup, &mut w).await?;
+            program_flow::interrupt_unfinished(&cleanup, &mut w).await?;
+        }
         crate::visual_jobs::cancel(state.workspace.root(), &task);
-        crate::collaboration_jobs::cancel_all(state.workspace.root(), &task);
     }
     let status = if cancel.is_cancelled() {
         "cancelled"
@@ -2721,187 +2439,6 @@ mod tests {
         assert_eq!(changes["total"], 2);
         assert_eq!(changes["complete"], true);
         assert!(changes["files"].as_array().unwrap().iter().all(|f|f["conflicted"] == false));
-    }
-
-    #[tokio::test]
-    async fn git_delegate_file_tool_writes_only_its_worktree() {
-        let root = TestRoot::new();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root.path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        git(&["init", "-b", "main"]);
-        std::fs::write(root.path().join("base.txt"), "base\n").unwrap();
-        git(&["add", "-A"]);
-        git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@local",
-            "commit",
-            "-m",
-            "base",
-        ]);
-        let state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
-        let worktree = crate::delegate_git::prepare(root.path(), "worker")
-            .unwrap()
-            .unwrap();
-        let spec = json!({"git":worktree});
-        let conn = crate::collaboration_jobs::db(root.path()).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
-        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('worker','task',1,'call','work',?1,'running',0)",[spec.to_string()]).unwrap();
-        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('worker',?1,?2)",
-            rusqlite::params![crate::collaboration_jobs::test_instance(),chrono::Utc::now().timestamp_millis()+30_000]).unwrap();
-        let cancel = CancellationToken::new();
-        let session = Session {
-            agent_id: Some("worker".into()),
-            task_node_id: None,
-            step_node_id: None,
-            plugin: None,
-            state: &state,
-            task: "task",
-            model: "fake",
-            turn: 1,
-            cancel: &cancel,
-            ban_execution: false,
-            scope: "delegate:worker".into(),
-            parent: Some("main".into()),
-            input_budget: INPUT_BUDGET,
-        };
-        business_tool(
-            &session,
-            "node",
-            "write_file",
-            json!({"path":"child.txt","content":"child\n"}),
-            "write",
-        )
-        .await
-        .unwrap();
-        assert!(!root.path().join("child.txt").exists());
-        assert_eq!(
-            std::fs::read_to_string(
-                crate::delegate_git::workspace(root.path(), &spec)
-                    .unwrap()
-                    .join("child.txt")
-            )
-            .unwrap(),
-            "child\n"
-        );
-        let path = crate::delegate_git::workspace(root.path(), &spec).unwrap();
-        git(&["worktree", "remove", "--force", path.to_str().unwrap()]);
-        let _ = std::fs::remove_dir(path.parent().unwrap());
-    }
-
-    #[test]
-    fn function_return_keeps_bounded_summary_and_versioned_handles_not_working_bodies() {
-        let returned = delegate_return_value(&json!({"agent_id":"worker","result":{
-            "status":"failed","error":"one check failed","report":"结".repeat(6100),
-            "task_return":{"local_history":"PRIVATE_WORKING_TRANSCRIPT"},
-            "artifact_index":{"assets":[{"asset_id":"output","source_tool":"write_file","source_path":"result.txt","source_version":"v1","content_hash":"snapshot-hash","read_reference":{"tool":"read_asset","arguments":{"asset_id":"output"}},"body":"LARGE_OUTPUT_BODY"}]}
-        }}));
-        assert_eq!(returned["status"], "failed");
-        assert_eq!(returned["summary"].as_str().unwrap().chars().count(), 6000);
-        assert_eq!(returned["summary_omitted_chars"], 100);
-        assert_eq!(returned["assets"][0]["source_version"], "v1");
-        assert_eq!(
-            returned["assets"][0]["read_reference"]["arguments"]["asset_id"],
-            "output"
-        );
-        assert!(!returned.to_string().contains("PRIVATE_WORKING_TRANSCRIPT"));
-        assert!(!returned.to_string().contains("LARGE_OUTPUT_BODY"));
-    }
-
-    #[tokio::test]
-    async fn delegated_tools_preserve_permission_plugin_scope_and_forbid_recursion() {
-        let root = TestRoot::new();
-        let mut state =
-            agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
-        state.permission_mode = agent_service::PermissionMode::ReadOnly;
-        let conn = crate::collaboration_jobs::db(root.path()).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
-        conn.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES ('worker','task',1,'call','work','{}','running',0)",[]).unwrap();
-        conn.execute("INSERT INTO agent_delegate_executors(agent_id,owner_id,lease_until) VALUES ('worker',?1,?2)",
-            rusqlite::params![crate::collaboration_jobs::test_instance(),chrono::Utc::now().timestamp_millis()+30_000]).unwrap();
-        let cancel = CancellationToken::new();
-        let mut session = Session {
-            agent_id: Some("worker".into()),
-            task_node_id: None,
-            step_node_id: None,
-            plugin: None,
-            state: &state,
-            task: "task",
-            model: "fake",
-            turn: 1,
-            cancel: &cancel,
-            ban_execution: true,
-            scope: "delegate:worker".into(),
-            parent: Some("main-node".into()),
-            input_budget: INPUT_BUDGET,
-        };
-        let window = Window::default();
-        let definitions = tools(&session, &window);
-        for name in [
-            "spawn_agent",
-            "wait_agents",
-            "review_agent_result",
-            "cancel_agent",
-            "write_file",
-            "run_program",
-        ] {
-            assert!(!definitions.iter().any(|t| t["function"]["name"] == name));
-            assert!(validate_tool(&session, &window, &definitions, name).is_err());
-        }
-        // Even an accidentally advertised control tool cannot bypass the role boundary.
-        assert!(
-            validate_tool(
-                &session,
-                &window,
-                &crate::collaboration_jobs::tools(),
-                "spawn_agent"
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("DELEGATE_RECURSION_DENIED")
-        );
-        assert!(
-            business_tool(
-                &session,
-                "node",
-                "read_session_history",
-                json!({"task_id":"foreign"}),
-                "foreign-read"
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            business_tool(
-                &session,
-                "node",
-                "read_session_history",
-                json!({"scope":"all"}),
-                "foreign-search"
-            )
-            .await
-            .is_err()
-        );
-        session.plugin = Some("ppt-master".into());
-        assert!(
-            !tools(&session, &window)
-                .iter()
-                .any(|t| t["function"]["name"] == "read_file")
-        );
-        assert!(validate_tool(&session, &window, &definitions, "read_file").is_err()); // Scope checks also reject stale or accidentally overbroad definitions
-        assert!(validate_tool(&session, &window, &tools(&session, &window), "read_file").is_err());
     }
 
     async fn diagnostic_round(

@@ -99,7 +99,7 @@ function inspect(content, summary) { // Judge the page using the actual content 
         panic!("missing AI review")
     };
     assert!(
-        matches!(action.kind, ActionKind::Task { ref name, ref input, .. } if name == "inspect" && input["summary"] == json!({"hasTitle":true,"links":["href=\"one.html\""]})),
+        matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspect" && args[1] == json!({"hasTitle":true,"links":["href=\"one.html\""]})),
         "unexpected action: {:?}",
         action.kind
     );
@@ -214,6 +214,7 @@ fn serial_page_review_reads_in_order_then_uses_one_ai_scope() {
 fn await_promise_all_suspends_once_and_returns_ordered_read_results() {
     let mut run = runtime(
         r#"
+import * as io from "host:io/promises";
 async function main() {
   const paths = ["first.txt", "second.txt"];
   return await Promise.all([
@@ -244,7 +245,7 @@ async function main() {
     assert_eq!(again.id, action.id);
     recovered
         .resume(
-            json!([{"content":"first"},{"content":"second"},{"matches":[]}]),
+            json!([{"failed":false,"value":{"content":"first"}},{"failed":false,"value":{"content":"second"}},{"failed":false,"value":{"matches":[]}}]),
             false,
         )
         .unwrap();
@@ -255,21 +256,18 @@ async function main() {
 }
 
 #[test]
-fn promise_all_rejects_writes_and_ai_calls() {
-    assert!(
-        compile(
-            "async function main(){return await Promise.all([io.write({path:'a',content:'b'})]);}"
-        )
-        .is_err()
-    );
-    assert!(compile("async function main(){return await Promise.all([judge()]);} /** @virtual */ function judge(){}").is_err());
-    assert!(compile("async function main(){return await Promise.all([fork(worker)]);} function worker(){return 1;}").is_err());
+fn promise_all_accepts_synchronous_effects_with_javascript_ordering() {
+    let mut run = runtime("async function main(){return await Promise.all([io.write({path:'a',content:'b'})]);}");
+    assert!(matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "write_file")));
+    run.resume(json!({"ok":true}), false).unwrap();
+    assert_eq!(returned(run), json!([{"ok":true}]));
 }
 
 #[test]
 fn failed_parallel_reads_follow_catch_without_repeating_the_batch() {
     let mut run = runtime(
         r#"
+import * as io from "host:io/promises";
 async function main() {
   try { return await Promise.all([io.read({path:"a"}),io.read({path:"b"})]); }
   catch(error) { return error.message; }
@@ -301,7 +299,7 @@ fn promise_all_maps_dynamic_page_list_without_agents() {
             .collect::<Vec<_>>(),
         vec!["a.html", "b.html", "c.html", "d.html", "e.html"]
     );
-    run.resume(json!([{ "content":"a" },{ "content":"b" },{ "content":"c" },{ "content":"d" },{ "content":"e" }]), false).unwrap();
+    run.resume(json!(["a","b","c","d","e"].iter().map(|v|json!({"failed":false,"value":{"content":v}})).collect::<Vec<_>>()), false).unwrap();
     let State::Action(action) = run.next() else {
         panic!("missing AI inspection")
     };
@@ -314,6 +312,7 @@ fn promise_all_maps_dynamic_page_list_without_agents() {
 fn virtual_function_body_can_be_refined_to_an_async_entry() {
     let program = compile_body(
         r#"
+import * as io from "host:io/promises";
 async function review(paths) {
   return await Promise.all(paths.map(path => io.read({path:path})));
 }"#,
@@ -327,7 +326,7 @@ async function review(paths) {
     assert!(
         matches!(action.kind, ActionKind::ParallelReads { ref operations } if operations.len() == 2)
     );
-    run.resume(json!([{ "content":"a" },{ "content":"b" }]), false)
+    run.resume(json!([{"failed":false,"value":{"content":"a"}},{"failed":false,"value":{"content":"b"}}]), false)
         .unwrap();
     assert_eq!(returned(run), json!([{ "content":"a" },{ "content":"b" }]));
     assert!(compile_body("async function review(){return review();}", "review").is_err());
@@ -389,26 +388,6 @@ fn child_failure_unwinds_to_callers_catch_and_skips_following_effect() {
     };
     assert_eq!(error["message"], "not found");
     assert!(error["location"]["line"].is_number());
-}
-#[test]
-fn fork_and_join_preserve_handles_and_typed_results_in_order() {
-    let mut r = runtime(
-        "function worker(input){return input;} function main(){ const a=fork(worker,{n:1}); const b=fork(worker,{n:2}); const [x,y]=join(a,b); return {x,y}; }",
-    );
-    let State::Action(a) = r.next() else { panic!() };
-    assert!(
-        matches!(a.kind,ActionKind::Fork{ref entry,ref args} if entry=="worker" && args[0]["n"]==1.0)
-    );
-    r.resume(json!({"agent_id":"a"}), false).unwrap();
-    assert!(matches!(r.next(), State::Action(_)));
-    r.resume(json!({"agent_id":"b"}), false).unwrap();
-    let State::Action(join) = r.next() else {
-        panic!()
-    };
-    assert!(matches!(join.kind,ActionKind::Join{ids} if ids==vec!["a","b"]));
-    r.resume(json!([{"output":"A"},{"output":"B"}]), false)
-        .unwrap();
-    assert_eq!(returned(r), json!({"x":{"output":"A"},"y":{"output":"B"}}));
 }
 #[test]
 fn unsupported_code_is_rejected_with_location_before_effects() {
@@ -608,7 +587,7 @@ fn array_map_filter_callbacks_capture_inputs_and_survive_tool_suspension() {
     sparse.resume(json!({"content":"D"}), false).unwrap();
     assert_eq!(returned(sparse), json!([null,{"content":"B"},null,{"content":"D"}]));
     assert!(matches!(runtime("function main(){return (1).map(v=>v);}").next(), State::Failed(_)));
-    assert!(compile("function main(){return [1].map(async v=>v);}").is_err());
+    assert!(compile("async function main(){return await Promise.all([1].map(async v=>v));}").is_ok());
 }
 
 #[test]
@@ -625,7 +604,7 @@ fn business_judgment_is_an_explicit_task_with_named_inputs_and_evidence() {
             panic!()
         };
         assert!(
-            matches!(action.kind,ActionKind::Task{name,description,input} if name=="检查" && description.contains("evidence") && input["产物"]["path"]=="artifact.html" && input["要求"]["expected"]=="approved")
+            matches!(action.kind,ActionKind::Call{name,args} if name=="检查" && args[0]["path"]=="artifact.html" && args[1]["expected"]=="approved")
         );
         r.resume(
             json!({"passed":passed,"evidence":[{"source":"actual tool receipt"}]}),
@@ -815,7 +794,7 @@ function transform(content, request) {
         panic!()
     };
     assert!(
-        matches!(task.kind,ActionKind::Task{name,description,input} if name=="transform" && description.contains("Return {content: string}") && input==json!({"content":"SOURCE","request":{"source":"source.txt","output":"out.txt"}}))
+        matches!(task.kind,ActionKind::Call{name,args} if name=="transform" && args==vec![json!("SOURCE"),json!({"source":"source.txt","output":"out.txt"})])
     );
     let mut restored: Runtime = serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
     restored
@@ -839,7 +818,7 @@ fn comment_errors_propagate_and_nested_calls_choose_boolean_branches() {
     assert!(matches!(
         r.next(),
         State::Action(Action {
-            kind: ActionKind::Task { .. },
+            kind: ActionKind::Call { .. },
             ..
         })
     ));
@@ -992,12 +971,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "const typed = value as number;",
         "const typed = <number>value;",
         "const typed = value!;",
-        "for(const key in data){}",
-        "switch(value){case 1:break;}",
-        "try{}catch(error){}finally{}",
-        "const copy = {...data};",
-        "const copy = [...rows];",
-        "helper(...rows);",
         "const bigint = 1n;",
         "const infinity = 1e999;",
         "const infinity = value + 1e999;",
@@ -1005,7 +978,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "const value2 = new Date();",
         "const value2 = this.value;",
         "class Thing{}",
-        "const runtime = Promise.resolve(value);",
         "const runtime = process.exit();",
         "const runtime = data.check([,]);",
         "const runtime = data.check({[value]:1});",
@@ -1043,6 +1015,12 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
     }
     // Ordinary JavaScript operators and function values are accepted at every entry.
     for fragment in [
+        "for(const key in data){}",
+        "switch(value){case 1:break;}",
+        "try{}catch(error){}finally{}",
+        "const copy = {...data};",
+        "const copy = [...[1,2]];",
+        "Boolean(...[1]);",
         "async function hidden(){return 1;}",
         "function hidden(){return 1;}",
         "const fn = function(){return 1;};",
@@ -1071,8 +1049,6 @@ fn version_eight_rejects_javascript_extensions_at_every_source_entry() {
         "type Result = string; function main(){return 1;}",
         "interface Result{} function main(){return 1;}",
         "function main(input: string){return input;}",
-        "function main(){return 1;} function helper(input=1){return input;}",
-        "function main(){return 1;} function helper(...inputs){return inputs;}",
     ] {
         assert!(compile(source).is_err(), "{source}");
     }
@@ -1159,8 +1135,9 @@ fn recorded_twenty_page_parallel_example_compiles_with_declared_host_tools() {
     let program =
         compile(source).expect("recorded example must compile against its declared tools");
     assert!(program.functions["designStyles"].virtual_task);
-    assert!(program.functions["generatePageBodies"].virtual_task);
-    assert!(!program.functions["writePages"].virtual_task);
+    assert!(program.functions["generatePageBody"].virtual_task);
+    assert!(program.functions["generatePageBody"].is_async);
+    assert!(!program.functions["renderPage"].virtual_task);
 }
 
 #[test]
@@ -1199,6 +1176,7 @@ impl TutorialRun {
             let action = match run.next() {
                 State::Returned(value) => return Ok(value),
                 State::Failed(error) => return Err(error),
+                State::Waiting => panic!("serial tutorial cannot have concurrent calls"),
                 State::Action(action) => action,
             };
             let result = match action.kind {
@@ -1323,7 +1301,7 @@ fn documented_serial_example_writes_reads_and_checks_without_fork() {
 }
 
 #[test]
-fn documented_parallel_example_forks_disjoint_parts_then_checks_all_five() {
+fn documented_parallel_example_checks_all_five_pages() {
     let mut harness = TutorialRun::default();
     harness
         .files
@@ -1334,15 +1312,7 @@ fn documented_parallel_example_forks_disjoint_parts_then_checks_all_five() {
             include_str!("../../skills/task-program/examples/parallel-five-pages.input.json"),
         ))
         .unwrap();
-    assert_eq!(
-        &harness.events[..4],
-        [
-            "read_file:docs/generic-agent-design.md",
-            "fork:3",
-            "fork:2",
-            "join"
-        ]
-    );
+    assert_eq!(harness.events.first().unwrap(), "read_file:docs/generic-agent-design.md");
     assert_eq!(output, Value::Null);
     assert_eq!(harness.files.len(), 6); // one source plus five distinct outputs
     assert_eq!(
@@ -1400,7 +1370,7 @@ fn documented_examples_fail_instead_of_delivering_failed_reviews() {
                 .iter()
                 .filter(|e| matches!(e.as_str(), "inspect" | "inspectPage"))
                 .count(),
-            1
+            if source.contains("function inspectPage(") { 5 } else { 1 }
         );
     }
 }
@@ -1532,8 +1502,9 @@ fn no_implicit_semantic_effects_are_emitted_or_executed() {
     assert!(
         program
             .functions
-            .values()
-            .flat_map(|f| &f.code)
+            .iter()
+            .filter(|(name, _)| !name.starts_with("$$"))
+            .flat_map(|(_, f)| &f.code)
             .all(|i| !matches!(i.op, Op::Effect(_, _)))
     );
     let mut runtime = Runtime::task_program(program, "main", vec![]).unwrap();
@@ -1677,8 +1648,8 @@ function inspect(request) {}
         panic!("must enter AI work")
     };
     assert!(
-        matches!(action.kind, ActionKind::Task { ref name, ref description, ref input }
-        if name == "inspect" && description.contains("actual evidence") && !description.contains("@virtual") && input["request"]["path"] == "real.txt")
+        matches!(action.kind, ActionKind::Call { ref name, ref args }
+        if name == "inspect" && args[0]["path"] == "real.txt")
     );
     let mut restored: Runtime =
         serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
@@ -1794,7 +1765,7 @@ fn captured_receipt_concatenation_allows_both_writes_and_resumes_without_replay(
     )
     .unwrap();
     assert!(
-        matches!(run.next(),State::Action(Action{kind:ActionKind::Task{name,..},..}) if name=="create_page_content")
+        matches!(run.next(),State::Action(Action{kind:ActionKind::Call{name,..},..}) if name=="create_page_content")
     );
     run.resume(json!({"pages":[{"path":"one.html","title":"One","content":"first"},{"path":"two.html","title":"Two","content":"second"}]}),false).unwrap();
     for path in ["one.html", "two.html"] {
@@ -2073,6 +2044,393 @@ fn model_written_five_page_acceptance_flow_compiles() {
 }
 
 #[test]
+fn model_written_five_page_acceptance_flow_runs_with_recorded_receipts() {
+    let source = include_str!("fixtures/model-five-page-acceptance.js");
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    let pages = ["01-overview", "02-program-flow", "03-task-context", "04-parallel-agents", "05-verification"];
+    let requirements: Vec<_> = pages.iter().enumerate().map(|(i, page)| json!({
+        "file": format!("agent-design-html/{page}.html"), "purpose": "Document the design",
+        "requirements": [{"id": format!("req-{i}"), "criterion": "Has content", "evidence": [{"file": "docs/README.md", "quote": "reference"}]}]
+    })).collect();
+    let mut reads = 0;
+    let mut reviews = 0;
+    let mut models = 0;
+    for _ in 0..40 {
+        let action = match run.next() {
+            State::Action(action) => action,
+            State::Returned(_) => break,
+            other => panic!("fixture failed: {other:?}"),
+        };
+        let receipt = match action.kind {
+            ActionKind::Tool { name, args } if name == "read_file" => {
+                reads += 1;
+                if args["path"].as_str().unwrap().ends_with(".html") {
+                    json!({"content":"<!doctype html><html><head><title>Page</title></head><body><h1>Page</h1></body></html>"})
+                } else { json!({"content":"reference"}) }
+            }
+            ActionKind::Call { name, .. } if name == "deriveAcceptanceModel" => {
+                models += 1;
+                json!({"pageRequirements":requirements,"crossPageRules":[],"terminology":[]})
+            }
+            ActionKind::Call { name, .. } if name == "reviewPageContent" || name == "reviewCrossPageConsistency" => {
+                reviews += 1;
+                json!([])
+            }
+            other => panic!("unexpected fixture action: {other:?}"),
+        };
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(receipt, false).unwrap();
+    }
+    assert_eq!((reads, models, reviews), (8, 1, 12));
+    assert!(matches!(run.next(), State::Returned(_)));
+}
+
+#[test]
+fn callback_values_and_multistatement_callbacks_follow_js_semantics() {
+    let source = r#"function main() {
+      const values = [0, 1, 2, 3];
+      const selected = values.filter(Boolean);
+      return selected.map(value => {
+        const doubled = value * 2;
+        return [doubled].map(x => x + 1)[0];
+      });
+    }"#;
+    let run = runtime(source);
+    let run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([3, 5, 7]));
+}
+
+#[test]
+fn callback_tool_calls_resume_after_serialization() {
+    let source = r#"function main() {
+      return ['a', 'b'].map(path => {
+        const file = io.read({path});
+        return file.content;
+      });
+    }"#;
+    let mut run = runtime(source);
+    for (path, content) in [("a", "first"), ("b", "second")] {
+        assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref name, ref args }, .. }) if name == "read_file" && args["path"] == path));
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({"content": content}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!(["first", "second"]));
+}
+
+#[test]
+fn prelude_sort_and_array_from_use_function_values() {
+    let source = "function main(){ const order=(a,b)=>a.key-b.key; const rows=[{key:2,id:'a'},{key:1,id:'b'},{key:2,id:'c'}]; return [rows.toSorted(order).map(x=>x.id), Array.from([0,1,2], Boolean)]; }";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([["b", "a", "c"], [false, true, true]]));
+}
+
+#[test]
+fn sort_comparator_can_suspend_and_preserves_stable_order() {
+    let source = "function main(){return [{v:2,id:'a'},{v:1,id:'b'},{v:2,id:'c'}].toSorted((a,b)=>{io.read({path:'compare'});return a.v-b.v;}).map(x=>x.id);}";
+    let mut run = runtime(source);
+    let mut calls = 0;
+    loop {
+        match run.next() {
+            State::Action(Action { kind: ActionKind::Tool { name, args }, .. }) => {
+                assert_eq!(name, "read_file");
+                assert_eq!(args["path"], "compare");
+                calls += 1;
+                run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+                run.resume(json!({"content":"ok"}), false).unwrap();
+            }
+            State::Returned(result) => { assert_eq!(result, json!(["b", "a", "c"])); break; }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+    assert!(calls > 0);
+}
+
+#[test]
+fn prelude_hash_and_internal_names_are_enforced() {
+    assert!(compile("function main(){ return $$has([], 0); }").is_err());
+    let mut run = runtime("function main(){ return [1].map(x=>x); }");
+    run.program.prelude_hash = "old".into();
+    assert!(matches!(run.next(), State::Failed(_)));
+}
+
+#[test]
+fn replacement_callbacks_receive_captures_and_survive_tool_suspension() {
+    let source = r#"function main() {
+      return 'a1 b2'.replace(/([a-z])(\d)/g, (whole, letter, digit, offset, text) => {
+        const file = io.read({path: letter});
+        return file.content + digit + offset + text.length;
+      });
+    }"#;
+    let mut run = runtime(source);
+    for (path, content) in [("a", "A"), ("b", "B")] {
+        assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == path));
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({"content": content}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!("A105 B235"));
+    assert_eq!(returned(runtime("function main(){return 'ab'.replaceAll('', (_, i)=>String(i));}")), json!("0a1b2"));
+    assert_eq!(returned(runtime("function main(){try{return 'aa'.replaceAll(/a/, x=>x);}catch(e){return e.name;}}")), json!("TypeError"));
+}
+
+#[test]
+fn internal_prelude_frames_do_not_hide_or_expose_ai_scope() {
+    let source = "function main(){const userValue='visible';return [1].map(x=>inspect(x));} /** @virtual Inspect input and return a result. */ function inspect(x){}";
+    let mut run = Runtime::task_program(compile(source).unwrap(), "main", vec![]).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Call { ref name, .. }, .. }) if name == "inspect"));
+    let bindings = run.named_bindings();
+    assert_eq!(bindings["userValue"], "visible");
+    assert_eq!(bindings["x"], 1);
+    assert!(!bindings.contains_key("a") && !bindings.contains_key("f"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!("ok"), false).unwrap();
+    assert_eq!(returned(run), json!(["ok"]));
+}
+
+#[test]
+fn quickjs_closure_fixture_works_through_array_callback_after_restore() {
+    let run = runtime(include_str!("fixtures/quickjs-closure-callback.js"));
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(10));
+}
+
+#[test]
+fn m4_destructuring_callback_and_defaults_survive_suspension() {
+    let source = r#"function main() {
+      const input = {a: 2, b: 3};
+      const result = Object.entries(input).map(([key, value]) => {
+        const {content: extra = 'missing'} = io.read({path:key});
+        return [key, value + extra.length];
+      });
+      return result;
+    }"#;
+    let mut run = runtime(source);
+    for path in ["a", "b"] {
+        assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == path));
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({"content":"x"}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!([["a",3],["b",4]]));
+}
+
+#[test]
+fn m4_function_and_catch_patterns_use_defaults() {
+    let source = r#"function read({name, count = 2}) { return name + count; }
+function main(){ try { throw {message:'bad'}; } catch ({message, code = 4}) { return [read({name:'n'}), message, code]; } }"#;
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(["n2", "bad", 4]));
+    assert_eq!(returned(runtime("function f(a=b,b){return a;}function main(){try{f(undefined,2);}catch(e){return e.name;}}")), json!("ReferenceError"));
+    assert_eq!(returned(runtime("function main(){try{const {}=null;}catch(e){return e.name;}}")), json!("TypeError"));
+    assert_eq!(returned(runtime("function main(){try{const []=4;}catch(e){return e.name;}}")), json!("TypeError"));
+}
+
+#[test]
+fn m4_defaults_do_not_see_body_var_bindings() {
+    let source = "const x=9;function read(a=x){var x=1;return a;}io.write({path:'out',content:String(read())});";
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["content"] == "9"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert!(matches!(run.next(), State::Returned(_)));
+}
+
+#[test]
+fn m4_parameter_closures_keep_parameter_environment() {
+    let source = "function f(a=1,get=()=>a){var a=2;return [a,get()];}function main(){return f();}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([2,1]));
+    assert_eq!(returned(runtime("function f(a=1){function a(){return 3;}return a();}function main(){return f();}")), json!(3));
+    let source = "const x=9;const f=function self(get=()=>self){var self=1;return get()===f;};io.write({path:'result',content:String(f())});";
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["content"] == "true"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert!(matches!(run.next(), State::Returned(_)));
+}
+
+#[test]
+fn m4_parameter_initializer_can_suspend_before_body_scope() {
+    let source = "const path='outer';function read(a=io.read({path})){let path='inner';return [a.content,path];}io.write({path:'result',content:JSON.stringify(read())});";
+    let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!({})]).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == "outer"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"content":"ok"}), false).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["content"] == "[\"ok\",\"inner\"]"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert!(matches!(run.next(), State::Returned(_)));
+}
+
+#[test]
+fn m4_older_snapshot_without_parameter_scope_metadata_resumes() {
+    let mut run = runtime("function main(){const result=io.read({path:'legacy'});return result.content;}");
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut saved = serde_json::to_value(run).unwrap();
+    for function in saved["program"]["functions"].as_object_mut().unwrap().values_mut() {
+        let fields = function.as_object_mut().unwrap();
+        fields.remove("parameter_scope");
+        fields.remove("parameter_lexical");
+    }
+    let mut restored: Runtime = serde_json::from_value(saved).unwrap();
+    restored.resume(json!({"content":"ok"}), false).unwrap();
+    assert_eq!(returned(restored), json!("ok"));
+}
+
+#[test]
+fn m5_async_functions_resume_after_caller_continues() {
+    let source = "async function main(){const order=[];async function work(){order.push('before');await 0;order.push('after');}const pending=work();order.push('caller');await pending;return order;}";
+    let run = runtime(source);
+    let run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(["before","caller","after"]));
+}
+
+#[test]
+fn m4_optional_function_call_skips_arguments_and_survives_snapshot() {
+    let source = "function main(){ let f=null; let n=0; const missing=f?.(n++); f=x=>x+1; return [missing, n, f?.(2)]; }";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([null, 0, 3]));
+}
+
+#[test]
+fn m4_for_in_enumerates_keys_across_suspensions() {
+    let source = "function main(){let result=[];for(const key in {b:2,a:1}){io.read({path:key});result.push(key);}return result;}";
+    let mut run = runtime(source);
+    for key in ["b", "a"] {
+        assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == key));
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!(["b", "a"]));
+    assert_eq!(returned(runtime("function main(){const obj={a:1,b:2};const keys=[];for(const key in obj){keys.push(key);delete obj.b;}return keys;}")), json!(["a"]));
+    assert_eq!(returned(runtime("function main(){let key;let output='';for(key in {x:1,y:2})output+=key;return [output,key];}")), json!(["xy","y"]));
+}
+
+#[test]
+fn m4_switch_falls_through_and_continue_targets_enclosing_loop() {
+    let source = "function main(){let out='';for(let i=0;i<4;i++){switch(i){case 0:out+='a';break;case 1:continue;case 2:out+='b';default:out+='c';}out+='x';}return out;}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!("axbcxcx"));
+    let run = runtime(include_str!("fixtures/quickjs-switch-loop.js"));
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(true));
+}
+
+#[test]
+fn m4_labeled_break_and_continue_leave_nested_scopes() {
+    let source = "function main(){let n=0;outer:for(let i=0;i<3;i++){for(let j=0;j<3;j++){if(j===1)continue outer;n++;}}block:{n++;break block;n+=100;}return n;}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(4));
+}
+
+#[test]
+fn m4_destructuring_rest_preserves_values() {
+    let source = "function main(){const [first,...tail]=[1,2,3];const key='a';const {[key]:picked,...rest}={a:4,b:5};return [first,tail,picked,rest];}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([1,[2,3],4,{"b":5}]));
+}
+
+#[test]
+fn m4_literal_spread_preserves_evaluation_order() {
+    let source = "function main(){const data={a:1};const values=[0,...[1,2],3];const obj={...data,b:2};data.a=9;return [values,obj];}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([[0,1,2,3],{"a":1,"b":2}]));
+}
+
+#[test]
+fn m4_spread_call_preserves_argument_evaluation_order() {
+    let source = "function pack(a,b,c){return [a,b,c];}function main(){let n=0;return pack(++n,...[n+1,++n]);}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([1,2,2]));
+}
+
+#[test]
+fn m4_rest_parameters_keep_only_remaining_arguments_across_resume() {
+    let source = "function collect(first,...rest){io.read({path:'wait'});return [first,rest];}function main(){return [collect(1,2,3),collect(4)];}";
+    let mut run = runtime(source);
+    for _ in 0..2 {
+        assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { .. }, .. })));
+        run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({}), false).unwrap();
+    }
+    assert_eq!(returned(run), json!([[1,[2,3]],[4,[]]]));
+}
+
+#[test]
+fn m4_spread_method_and_async_calls_preserve_values() {
+    let source = "async function add(a,b){return a+b;} async function main(){const rows=[1];rows.push(...[2,3]);return [rows,await add(...[4,5])];}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([[1,2,3],9]));
+    assert_eq!(returned(runtime("function main(){let f=null;let n=0;const a=f?.(...[++n]);f=(x)=>x;return [a,n,f?.(...[2])];}")), json!([null,0,2]));
+    assert_eq!(returned(runtime("function main(){const o={f(x){return 'old';}};function change(){o.f=(x)=>'new';return [1];}return o.f(...change());}")), json!("old"));
+    assert_eq!(returned(runtime("function main(){const items=[1];const key='push';items[key](...[2,3]);return items;}")), json!([1,2,3]));
+}
+
+#[test]
+fn m4_finally_runs_for_return_throw_and_loop_jumps() {
+    let source = r#"function result(){try{return 2;}finally{io.read({path:'return'});}}
+function main(){let log='';for(let i=0;i<2;i++){try{if(i===0)continue;break;}finally{log+='f';}}
+try{throw 'bad';}catch(e){log+=e;}finally{log+='z';}
+return [result(),log];}"#;
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == "return"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!([2,"ffbadz"]));
+}
+
+#[test]
+fn m4_finally_can_override_return_and_runs_on_uncaught_throw() {
+    let source = "function f(){try{return 1;}finally{return 2;}}function main(){try{try{throw 'x';}finally{io.read({path:'cleanup'});}}catch(e){return [f(),e];}}";
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref args, .. }, .. }) if args["path"] == "cleanup"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!([2,"x"]));
+}
+
+#[test]
+fn m4_finally_preserves_outer_handlers_and_nested_return_order() {
+    let source = r#"function main(){let log='';try{for(let i=0;i<2;i++){try{break;}finally{log+='a';}}throw 'caught';}catch(e){log+=e;}
+function nested(){try{try{return 7;}finally{log+='b';}}finally{log+='c';}}return [nested(),log];}"#;
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!([7,"acaughtbc"]));
+    assert_eq!(returned(runtime("function f(){try{return 1;}finally{throw 'cleanup';}}function main(){try{return f();}catch(e){return e;}}")), json!("cleanup"));
+    assert_eq!(returned(runtime("function main(){for(let i=0;i<1;i++){try{return 1;}finally{break;}}return 2;}")), json!(2));
+}
+
+#[test]
+fn m4_finally_runs_after_failed_tool_and_preserves_error_on_restore() {
+    let source = "function main(){try{try{io.read({path:'bad'});}finally{io.write({path:'cleanup',content:'done'});}}catch(e){return e.message;}}";
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref name, .. }, .. }) if name == "read_file"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"message":"failed"}), true).unwrap();
+    assert!(matches!(run.next(), State::Action(Action { kind: ActionKind::Tool { ref name, .. }, .. }) if name == "write_file"));
+    run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!("failed"));
+}
+
+#[test]
+fn m4_for_in_member_and_for_of_destructuring_bindings() {
+    let source = "function main(){let target={};for(target.key in {a:1,b:2}){}let out=[];for(const [key,value] of Object.entries({x:3,y:4})){out.push(key+value);}return [target.key,out];}";
+    let run = runtime(source);
+    let run = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(returned(run), json!(["b",["x3","y4"]]));
+    assert_eq!(returned(runtime("function main(){const items={x:1};try{for(let items in items){}}catch(e){return e.name;}}")), json!("ReferenceError"));
+}
+
+#[test]
 fn source_variables_remain_visible_until_their_function_returns() {
     let source = "function main(){const doc=io.read({path:'large.txt'});const count=measure(doc.content);io.write({path:'count.txt',content:`${count}`});return count;} function measure(text){return text.length;}";
     let mut runtime = Runtime::new(compile(source).unwrap(), "main", vec![]).unwrap();
@@ -2199,7 +2557,7 @@ async function classify(data) { // Classify data; return {text:string}.
 "#;
     let mut r = Runtime::new(compile(source).unwrap(), "main", vec![json!("input")]).unwrap();
     assert!(
-        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Task { ref name, ref input, .. } if name == "classify" && input["data"] == "input"))
+        matches!(r.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args } if name == "classify" && args[0] == "input"))
     );
     r.resume(json!({"text":"actual"}), false).unwrap();
     assert!(
@@ -2220,7 +2578,7 @@ async function inspect(data) { throw new Error("Host must provide inspect"); }
 "#;
     let mut run = Runtime::new(compile(source).unwrap(), "main", vec![Value::Null]).unwrap();
     assert!(
-        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Task { ref name, ref input, .. } if name == "inspect" && input["data"] == "data"))
+        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args } if name == "inspect" && args[0] == "data"))
     );
     run.resume(json!({"text":"reviewed"}), false).unwrap();
     assert!(
@@ -2247,7 +2605,7 @@ async function inspect(data) { throw new Error("Host must provide inspect"); }
 #[test]
 fn promise_all_async_map_read_calls_remain_parallel_and_ordered() {
     let source = r#"
-import {read} from "host:io";
+import {read} from "host:io/promises";
 const files = await Promise.all(input.map(async file => await read({path:file})));
 "#;
     let mut run = Runtime::new(compile(source).unwrap(), "main", vec![json!(["a", "b"])]).unwrap();
@@ -2260,7 +2618,7 @@ const files = await Promise.all(input.map(async file => await read({path:file}))
     let mut restored: Runtime =
         serde_json::from_value(serde_json::to_value(&run).unwrap()).unwrap();
     restored
-        .resume(json!([{"content":"A"},{"content":"B"}]), false)
+        .resume(json!([{"failed":false,"value":{"content":"A"}},{"failed":false,"value":{"content":"B"}}]), false)
         .unwrap();
     assert_eq!(returned(restored), Value::Null);
 }
@@ -2297,4 +2655,378 @@ fn awaited_promise_chains_preserve_callback_values_and_tool_continuations() {
         .resume(json!({"message":"read failed"}), true)
         .unwrap();
     assert_eq!(returned(failed), json!("read failed"));
+}
+
+#[test]
+fn m5_coroutine_survives_host_action_and_propagates_failure() {
+    let mut run = runtime("async function main(){let order=[];async function work(){order.push('start');await 0;order.push('resume');throw new Error('bad');}let p=work();await io.read({path:'x'});order.push('caller');try{await p;}catch(e){order.push(e.message);}return order;}");
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"content":"ok"}), false).unwrap();
+    assert_eq!(returned(run), json!(["start","resume","caller","bad"]));
+}
+
+#[test]
+fn m5_async_returned_promises_are_adopted() {
+    let source = "async function main(){async function a(){await 0;return 7;}async function b(){return a();}return await b();}";
+    assert_eq!(returned(runtime(source)), json!(7));
+}
+
+#[test]
+fn m5_unhandled_async_failure_is_reported() {
+    let mut run = runtime("async function main(){async function work(){await 0;throw new Error('bad');}work();return 1;}");
+    assert!(matches!(run.next(), State::Failed(e) if e["message"] == "bad"));
+}
+
+#[test]
+fn m5_unhandled_async_failure_keeps_its_throw_site() {
+    for source in [
+        "async function main(){\nasync function work(){\nawait io.read({path:'x'});\nthrow new Error('bad');\n}\nwork().then(x=>x);\nreturn 1;\n}",
+        "async function main(){\nasync function work(){\nawait io.read({path:'x'});\nthrow 'plain';\n}\nwork();\nreturn 1;\n}",
+    ] {
+        let mut run = runtime(source);
+        assert!(matches!(run.next(), State::Action(_)));
+        let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        run.resume(json!({}), false).unwrap();
+        let State::Failed(error) = run.next() else { panic!("expected failure") };
+        assert_eq!(error["location"]["line"], 4, "{error}");
+        assert!(error["stack"].as_array().is_some_and(|stack| stack.iter().any(|frame| frame["function"].as_str().is_some_and(|name| name.contains("work")))), "{error}");
+    }
+}
+
+#[test]
+fn m5_resumed_coroutine_keeps_caller_scope_through_host_suspension() {
+    let mut run = runtime("async function main(){let secret='caller';async function work(){await 0;await io.read({path:'x'});return secret;}return await work();}");
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(run.named_bindings().get("secret"), Some(&json!("caller")));
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!("caller"));
+}
+
+#[test]
+fn m5_coroutine_jobs_are_fifo_and_survive_gc() {
+    let source = "async function main(){let order=[];async function work(n){await 0;order.push(n);}let a=work(1),b=work(2);for(let i=0;i<300;i++){}await a;await b;return order;}";
+    assert_eq!(returned(runtime(source)), json!([1,2]));
+}
+
+#[test]
+fn m5_promise_reactions_are_jobs_and_propagate_values_and_errors() {
+    let source = r#"async function main(){
+      let order=[]; let p=Promise.resolve(2);
+      let q=p.then(x=>{order.push('then');return x+1;});
+      order.push('caller');
+      let a=await q;
+      let b=await Promise.reject('bad').then(null, e=>e+'!');
+      let c=await Promise.resolve(5).then(null);
+      let d=await Promise.resolve(1).then(()=>{throw new Error('oops');}).catch(e=>e.message);
+      return [order,a,b,c,d,Promise.resolve(p)===p];
+    }"#;
+    assert_eq!(returned(runtime(source)), json!([["caller","then"],3,"bad!",5,"oops",true]));
+}
+
+#[test]
+fn m5_promise_callback_and_queue_survive_host_receipt_and_gc() {
+    let source = r#"async function main(){
+      let order=[]; let p=Promise.resolve(1).then(async x=>{await 0;order.push(x);return await io.read({path:'in'});});
+      let q=Promise.resolve(2).then(x=>order.push(x));
+      for(let i=0;i<300;i++){}
+      let value=await p; await q; return [order,value.content];
+    }"#;
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Tool { ref name, .. } if name == "read_file")));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"content":"ok"}), false).unwrap();
+    assert_eq!(returned(run), json!([[2,1],"ok"]));
+}
+
+#[test]
+fn m5_promise_rejection_is_reported_only_if_unhandled() {
+    assert_eq!(returned(runtime("async function main(){let p=Promise.reject('bad');let q=p.catch(e=>e);return await q;}")), json!("bad"));
+    let mut run = runtime("async function main(){Promise.reject('bad').then();return 1;}");
+    assert!(matches!(run.next(), State::Failed(e) if e["message"] == "bad"));
+}
+
+#[test]
+fn m5_queued_promise_callback_survives_caller_host_suspension() {
+    let source = "async function main(){let n=3;let p=Promise.resolve(2).then(function recur(x){if(x<=0)return n;return recur(x-1)+1;});for(let i=0;i<300;i++){}await io.read({path:'in'});return await p;}";
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!(5));
+}
+
+#[test]
+fn m5_promise_reaction_cannot_resolve_to_itself() {
+    let source = "async function main(){let q;q=Promise.resolve().then(()=>q);try{await q;}catch(e){return e.message;}return 'unexpected';}";
+    assert_eq!(returned(runtime(source)), json!("a promise cannot resolve to itself"));
+}
+
+#[test]
+fn m5_promise_constructor_runs_synchronously_and_uses_first_settlement() {
+    let source = r#"async function main(){let order=[];
+      let p=new Promise((resolve,reject)=>{order.push('executor');resolve(4);reject('ignored');throw new Error('ignored');});
+      order.push('caller');let value=await p;
+      let failed=await new Promise(()=>{throw new Error('fail');}).catch(e=>e.message);
+      let invalid;try{new Promise(7);}catch(e){invalid=e.name;}
+      return [order,value,failed,invalid];}"#;
+    assert_eq!(returned(runtime(source)), json!([["executor","caller"],4,"fail","TypeError"]));
+}
+
+#[test]
+fn m5_promise_constructor_resolvers_survive_queues_and_adopt_pending_promises() {
+    let source = r#"async function main(){let finish;
+      const inner=new Promise(resolve=>{finish=resolve;});
+      const outer=new Promise((resolve,reject)=>{resolve(inner);reject('ignored');});
+      for(let i=0;i<300;i++){}
+      Promise.resolve(8).then(finish);
+      return await outer;
+    }"#;
+    assert_eq!(returned(runtime(source)), json!(8));
+}
+
+#[test]
+fn m5_promise_executor_host_action_survives_snapshot_and_failure_is_catchable() {
+    let source = "async function main(){let p=new Promise((resolve,reject)=>{let r=io.read({path:'in'});resolve(r.content);});try{return await p;}catch(e){return e.message;}}";
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"message":"read failed"}), true).unwrap();
+    assert_eq!(returned(run), json!("read failed"));
+    let mut run = runtime(source);
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"content":"ok"}), false).unwrap();
+    assert_eq!(returned(run), json!("ok"));
+}
+
+#[test]
+fn m5_promise_executor_async_and_self_resolution() {
+    let source = "async function main(){let p=new Promise(async resolve=>{await 0;resolve(3);});let n=await p;let finish;let q=new Promise(resolve=>{finish=resolve;});finish(q);try{await q;}catch(e){return [n,e.name];}return 'unexpected';}";
+    assert_eq!(returned(runtime(source)), json!([3,"TypeError"]));
+}
+
+#[test]
+fn m5_promise_resolvers_are_functions_and_json_ignores_them() {
+    let source = "async function main(){let props;let p=new Promise(resolve=>{props=[typeof resolve,resolve instanceof Function,JSON.stringify([resolve]),JSON.stringify({resolve}),resolve.name,resolve.length];resolve();});await p;return props;}";
+    assert_eq!(returned(runtime(source)), json!(["function",true,"[null]","{}","",1]));
+}
+
+#[test]
+fn m5_general_promise_combinators_match_javascript() {
+    let source = r#"async function main(){
+      let all=await Promise.all([Promise.resolve(1),2,Promise.resolve(3)]);
+      let settled=await Promise.allSettled([Promise.resolve('a'),Promise.reject('b')]);
+      let race=await Promise.race([Promise.resolve('first'),Promise.resolve('second')]);
+      let any=await Promise.any([Promise.reject('x'),Promise.resolve('ok')]);
+      let failed;try{await Promise.any([Promise.reject('a'),Promise.reject('b')]);}catch(e){failed=[e.name,e.errors];}
+      let empty=await Promise.all([]);
+      return [all,settled,race,any,failed,empty];
+    }"#;
+    assert_eq!(returned(runtime(source)),json!([[1,2,3],[{"status":"fulfilled","value":"a"},{"status":"rejected","reason":"b"}],"first","ok",["AggregateError",["a","b"]],[]]));
+}
+
+#[test]
+fn m5_async_array_map_and_promise_finally() {
+    let source = r#"async function main(){let order=[];
+      let promises=[1,2].map(async x=>{order.push(x);await 0;return x*2;});
+      order.push('caller');let values=await Promise.all(promises);
+      let result=await Promise.resolve(9).finally(()=>{order.push('finally');});
+      let fail;try{await Promise.reject('bad').finally(()=>Promise.resolve());}catch(e){fail=e;}
+      return [order,values,result,fail];}"#;
+    assert_eq!(returned(runtime(source)),json!([[1,2,"caller","finally"],[2,4],9,"bad"]));
+}
+
+#[test]
+fn m5_async_host_operations_are_queued_before_serial_dispatch_and_restore() {
+    let source = r#"import {read} from 'host:io/promises';
+async function main(){let one=read({path:'one'});let two=read({path:'two'});let a=await Promise.all([one,two]);return [a[0].content,a[1].content];}"#;
+    let mut run = runtime(source);
+    let State::Action(first) = run.next() else { panic!("expected read batch") };
+    assert!(matches!(first.kind,ActionKind::ParallelReads{ref operations} if operations.len() == 2 && operations[0].1["path"] == "one" && operations[1].1["path"] == "two"));
+    let snapshot = serde_json::to_value(&run).unwrap();
+    assert_eq!(snapshot["active_async_batch"].as_array().unwrap().len(), 2);
+    let mut run: Runtime = serde_json::from_value(snapshot).unwrap();
+    run.resume(json!([{"failed":false,"value":{"content":"A"}},{"failed":false,"value":{"content":"B"}}]), false).unwrap();
+    assert_eq!(returned(run),json!(["A","B"]));
+}
+
+#[test]
+fn m5_async_virtual_calls_preserve_invocation_scope_and_reject_independently() {
+    let source = r#"async function main(){let shared='first';let p=work('a');shared='second';let q=work('b');let a=await p;try{await q;}catch(e){return [a,e.message];}}
+/** @virtual Perform work and return a string. */ async function work(request){}"#;
+    let mut run = Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let State::Action(first) = run.next() else { panic!("expected first virtual call") };
+    assert!(matches!(first.kind,ActionKind::Call{ref args,..} if args == &vec![json!("a")]));
+    assert_eq!(run.named_bindings().get("shared"),Some(&json!("first")));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!("A"),false).unwrap();
+    let State::Action(second) = run.next() else { panic!("expected second virtual call") };
+    assert!(matches!(second.kind,ActionKind::Call{ref args,..} if args == &vec![json!("b")]));
+    assert_eq!(run.named_bindings().get("shared"),Some(&json!("second")));
+    run.resume(json!({"message":"bad"}),true).unwrap();
+    assert_eq!(returned(run),json!(["A","bad"]));
+}
+
+#[test]
+fn m5_async_read_batch_preserves_individual_failures_and_receipts() {
+    let source = "import {read} from 'host:io/promises'; async function main(){let a=read({path:'missing'}),b=read({path:'ok'});let r=await Promise.allSettled([a,b]);return [r[0].status,r[0].reason.message,r[1].status,r[1].value.content];}";
+    let mut run = runtime(source);
+    let State::Action(action) = run.next() else { panic!("expected batch") };
+    assert!(matches!(action.kind,ActionKind::ParallelReads{ref operations} if operations.len()==2));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert!(run.resume(json!([{"failed":false,"value":{}}]),false).is_err());
+    assert!(matches!(run.next(),State::Action(a) if a.id == action.id));
+    run.resume(json!([{"failed":true,"value":{"message":"not found"}},{"failed":false,"value":{"content":"ok"}}]),false).unwrap();
+    assert_eq!(returned(run),json!(["rejected","not found","fulfilled","ok"]));
+}
+
+#[test]
+fn m5_synchronous_host_action_blocks_queued_async_actions() {
+    let source = "import {read as asyncRead} from 'host:io/promises'; import {read} from 'host:io'; async function main(){let a=asyncRead({path:'async'});let s=read({path:'sync'});let x=await a;return [s.content,x.content];}";
+    let mut run = runtime(source);
+    assert!(matches!(run.next(),State::Action(a) if matches!(a.kind,ActionKind::Tool{ref args,..} if args["path"]=="sync")));
+    run.resume(json!({"content":"S"}),false).unwrap();
+    assert!(matches!(run.next(),State::Action(a) if matches!(a.kind,ActionKind::Tool{ref args,..} if args["path"]=="async")));
+    run.resume(json!({"content":"A"}),false).unwrap();
+    assert_eq!(returned(run),json!(["S","A"]));
+}
+
+#[test]
+fn m6_concurrent_calls_resume_by_id_in_completion_order_after_snapshot() {
+    use runtime::ConcurrentState;
+    let source = r#"async function main(){let shared='first';let a=work('a');shared='second';let b=work('b');let first=await a;let c=work(first);return await Promise.all([b,c]);}
+/** @virtual Perform work and return a string. */ async function work(request){}"#;
+    let mut run = Runtime::new(compile(source).unwrap(),"main",vec![]).unwrap();
+    let ConcurrentState::Actions(actions) = run.next_concurrent() else { panic!("expected async calls") };
+    assert_eq!(actions.len(),2);
+    let first = actions[0].id.clone(); let second = actions[1].id.clone();
+    assert_eq!(run.async_scope(&first).unwrap().get("shared"),Some(&json!("first")));
+    assert_eq!(run.async_scope(&second).unwrap().get("shared"),Some(&json!("second")));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    assert_eq!(run.inflight_actions().len(),2);
+    run.resume_action(&first,json!("A"),false).unwrap();
+    assert!(run.resume_action(&first,json!("duplicate"),false).is_err());
+    let ConcurrentState::Actions(next) = run.next_concurrent() else { panic!("expected third call") };
+    assert_eq!(next.len(),1);
+    assert!(matches!(&next[0].kind,ActionKind::Call{args,..} if args == &vec![json!("A")]));
+    let third = next[0].id.clone();
+    run.resume_action(&third,json!("C"),false).unwrap();
+    assert!(matches!(run.next_concurrent(),ConcurrentState::Waiting));
+    run.resume_action(&second,json!("B"),false).unwrap();
+    assert!(matches!(run.next_concurrent(),ConcurrentState::Returned(v) if v == json!(["B","C"])));
+}
+
+#[test]
+fn m6_async_virtual_launches_before_later_synchronous_effect() {
+    use runtime::ConcurrentState;
+    let source = r#"async function main(){let p=work('x');let data=io.read({path:'later'});return [data.content,await p];}
+/** @virtual Perform work and return a string. */ async function work(request){}"#;
+    let mut run = Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let ConcurrentState::Actions(calls) = run.next_concurrent() else { panic!("expected async call") };
+    assert!(matches!(calls[0].kind,ActionKind::Call{..}));
+    let ConcurrentState::Actions(tools) = run.next_concurrent() else { panic!("expected synchronous tool") };
+    assert!(matches!(tools[0].kind,ActionKind::Tool{ref args,..} if args["path"]=="later"));
+    run.resume_action(&tools[0].id,json!({"content":"read"}),false).unwrap();
+    run.resume_action(&calls[0].id,json!("done"),false).unwrap();
+    assert!(matches!(run.next_concurrent(),ConcurrentState::Returned(value) if value==json!(["read","done"])));
+}
+
+#[test]
+fn m5_promise_then_accepts_host_tool_values_and_recovers() {
+    let source="async function main(){let p=Promise.resolve({path:'x'}).then(io.read);return (await p).content;}";
+    let mut run=runtime(source);
+    assert!(matches!(run.next(),State::Action(a) if matches!(a.kind,ActionKind::Tool{ref name,..} if name=="read_file")));
+    let mut run:Runtime=serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({"content":"ok"}),false).unwrap();
+    assert_eq!(returned(run),json!("ok"));
+}
+
+#[test]
+fn m7_fork_and_join_are_rejected_before_execution() {
+    assert_eq!(returned(runtime("function main(){const join=(x)=>x+1;return join(4);}")),json!(5));
+    for source in ["function main(){return fork(work);} function work(){return 1;}","function main(){return join('x');}"] {
+        assert!(compile(source).unwrap_err().to_string().contains("fork/join have been retired"));
+    }
+}
+
+#[test]
+fn m6_virtual_calls_launch_even_when_an_earlier_async_tool_is_pending() {
+    use runtime::ConcurrentState;
+    let source=r#"import {read} from 'host:io/promises';async function main(){let a=read({path:'x'});let b=work('x');return [await a,await b];}
+/** @virtual Work and return a value. */ async function work(item){}"#;
+    let mut run=Runtime::task_program(compile(source).unwrap(),"main",vec![]).unwrap();
+    let ConcurrentState::Actions(calls)=run.next_concurrent() else {panic!("expected virtual call")};
+    assert!(matches!(calls[0].kind,ActionKind::Call{..}));
+    let ConcurrentState::Actions(tools)=run.next_concurrent() else {panic!("expected tool call")};
+    assert!(matches!(tools[0].kind,ActionKind::Tool{..}));
+    run.resume_action(&tools[0].id,json!({"content":"ok"}),false).unwrap();
+    run.resume_action(&calls[0].id,json!("done"),false).unwrap();
+    assert!(matches!(run.next_concurrent(),ConcurrentState::Returned(v) if v==json!([{"content":"ok"},"done"])));
+}
+
+#[test]
+fn m5_promise_adoption_takes_javascript_microtask_turns() {
+    // Both expected orders were recorded from Node 22 running the same source.
+    let source = r#"async function main(){
+      const log=[];
+      async function f(){ return Promise.resolve('f'); }
+      const done=[f().then(v=>log.push(v))];
+      done.push(new Promise(r=>r(Promise.resolve('n'))).then(v=>log.push(v)));
+      done.push(Promise.resolve().then(()=>Promise.resolve('t')).then(v=>log.push(v)));
+      done.push(Promise.resolve().then(()=>log.push(1)).then(()=>log.push(2)).then(()=>log.push(3)).then(()=>log.push(4)).then(()=>log.push(5)));
+      async function g(){ return 'g'; }
+      done.push(g().then(v=>log.push(v)));
+      await Promise.all(done);
+      return log;
+    }"#;
+    assert_eq!(returned(runtime(source)), json!([1,"g",2,"f","n",3,"t",4,5]));
+    // Adoption after a host suspension, with the runtime saved and restored.
+    let mut run = runtime("async function main(){async function f(){await io.read({path:'x'});return Promise.resolve('late');}const log=[];const p=f().then(v=>log.push(v));Promise.resolve().then(()=>log.push(1)).then(()=>log.push(2)).then(()=>log.push(3));await p;return log;}");
+    assert!(matches!(run.next(), State::Action(_)));
+    let mut run: Runtime = serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+    run.resume(json!({}), false).unwrap();
+    assert_eq!(returned(run), json!([1,2,3,"late"]));
+}
+
+#[test]
+fn m5_unawaited_async_calls_are_rejected_where_used_as_values() {
+    let header = "import * as fs from \"host:io/promises\";\nimport {read as readAsync} from \"host:io/promises\";\n/** @virtual Inspect a page and return {passed:boolean}. */\nasync function inspect(page){}\nasync function work(){return 1;}\n";
+    for fragment in [
+        "const passed = inspect('a').passed;",
+        "const text = readAsync({path:'a'}).content;",
+        "const text = fs.read({path:'a'}).content;",
+        "const text = fs.read({path:'a'})?.content;",
+        "const text = (readAsync({path:'a'})).content.trim();",
+        "const text = readAsync({path:'a'}).toString();",
+        "if (inspect('a')) {}",
+        "assert(inspect('a'), 'failed');",
+        "const ok = !inspect('a');",
+        "const ok = inspect('a') && true;",
+        "const n = work() + 1;",
+        "const ok = inspect('a') ? 1 : 2;",
+        "while (work()) { break; }",
+        "const s = `${work()}`;",
+    ] {
+        let source = format!("{header}async function main(){{\n{fragment}\n}}");
+        let error = compile(&source).expect_err(fragment).to_string();
+        assert!(error.contains("returns a Promise; await it"), "{fragment}: {error}");
+    }
+    for fragment in [
+        "const passed = (await inspect('a')).passed;",
+        "const text = (await readAsync({path:'a'})).content;",
+        "const p = inspect('a'); const r = await p; return r.passed;",
+        "return await Promise.all([inspect('a'), fs.read({path:'a'})]);",
+        "return inspect('a').then(r => r.passed).catch(e => false).finally(() => {});",
+        "const inspect = (page) => ({passed: true}); return inspect('a').passed;",
+        "void work(); return 1;",
+    ] {
+        let source = format!("{header}async function main(){{\n{fragment}\n}}");
+        compile(&source).unwrap_or_else(|error| panic!("{fragment}: {error:#}"));
+    }
+    // Top-level flows have no entry function around them.
+    let error = compile(&format!("{header}const passed = inspect('a').passed;")).unwrap_err().to_string();
+    assert!(error.contains("returns a Promise; await it"), "{error}");
+    compile(&format!("{header}const passed = (await inspect('a')).passed;")).unwrap();
 }
