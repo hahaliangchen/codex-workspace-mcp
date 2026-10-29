@@ -1,13 +1,13 @@
 # codex-workspace-mcp
 
 > 当前执行、作用域、语言和插件边界，以[语言手册](docs/agent-program.md)及[通用 Agent 设计](docs/generic-agent-design.md)为准。旧设计执行路径已经移除；设计文档中的有日期测试记录只代表当时版本。
-> 当前执行语言为版本 14：对象引用、块级作用域、词法作用域、函数值与闭包已按 JS 语义执行；可挂起的回调方法、完整 Promise 与事件循环尚未实现，计划见 [JS 运行时设计](docs/js-runtime-design.md)。版本 12 的运行记录及历史测试见[统一清理记录](docs/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。
+> 当前执行语言为版本 14：Rust 虚拟机支持对象引用、词法作用域、闭包、可挂起的回调、Promise 和 async/await；具体语法范围及限制见 [JS 运行时设计](docs/js-runtime-design.md)。版本 12 的运行记录及历史测试见[统一清理记录](docs/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。
 
-由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。当前执行采用固定 JS 基础语法子集的流程调用与返回、父作用域继承、按容量折叠上下文；支持按需串行子任务和受约束的并发委派。模型直接连接提供商的 Chat Completions 接口。
+由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。流程使用 JS 基础语法子集表达，虚函数承载需要 AI 判断的任务，并支持异步并发。模型直接连接提供商的 Chat Completions 接口。
 
 ## 核心能力
 
-- 版本 14 流程语言：普通函数、常见基础循环／表达式、块级作用域与对象引用由 Rust 确定性执行，工具使用固定库名和自动生成的声明表达；智能生成和业务判断通过显式 @virtual 虚函数调用，支持授权 fork/join、异常与回执恢复。异步目前仍是受限的宿主等待，并非完整 Promise 或 Node 环境，详见[语言手册与串行／并发教程](docs/agent-program.md)。可执行示例：[最小串行](skills/task-program/examples/serial.js)、[两 Agent 并发五页](skills/task-program/examples/parallel-five-pages.js)，配套 JSON 输入与源码同目录。
+- 版本 14 流程语言：普通函数、基础循环／表达式、块级作用域和对象引用由 Rust 执行；工具通过宿主库导入，智能生成和业务判断通过显式 @virtual 虚函数调用。支持 Promise、async/await、异常与回执恢复，语言范围及示例见[语言手册](docs/agent-program.md)。
 - 文件读取、文本搜索、版本校验写入与编辑。
 - Go、Rust、Python、TypeScript/JavaScript 符号索引和职责记忆。
 - 受限原生程序执行、项目依赖与脚本、进程日志、HTTP 探测及浏览器操作。
@@ -18,7 +18,7 @@
 
 ### 一个程序、一套函数执行机制
 
-主 Agent 创建一次主任务，提交唯一 main。普通函数、工具调用与显式 @virtual AI 工作由同一个 Runtime 推进；需要细分时补写当前函数，不手动维护步骤、串行任务数组或结束确认。用户授权并发后使用 fork/join，最多同时运行五个执行分支。公共材料通过实际参数和作用域变量交接，分支工作对话不复制回父／兄弟。
+主 Agent 编写顶层流程。普通函数、工具调用与显式 @virtual AI 工作由同一个 Runtime 推进；异步虚函数可通过 Promise 组合并发执行，所需材料通过参数传入。
 
 工具只有固定 library.method 名字和一份真实契约。规划时读取自动生成的头文件，源码直接调用库方法，虚函数中的原生步骤通过 invoke_library 传输相同方法名。底层分发标识仍用于回执和审计，不构成另一套公开编排 API。插件提供业务 Skill、生产流程和工具；宿主不内置业务步骤。
 
