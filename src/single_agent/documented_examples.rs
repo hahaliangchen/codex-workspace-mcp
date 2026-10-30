@@ -182,3 +182,72 @@ async fn real_model_serial_published_example() -> Result<()> {
     eprintln!("REAL_SERIAL_COMPLETE root={}",root.display());
     Ok(())
 }
+
+/// The configured default model at low reasoning effort, in a fresh workspace.
+fn real_low_effort(name: &str) -> Result<(std::path::PathBuf, AgentServiceState, String)> {
+    let root=std::env::temp_dir().join(format!("{name}-{}",agent_service::uuid_like()));
+    std::fs::create_dir_all(&root)?;
+    let mut state=agent_service::tests::test_state(&root,"127.0.0.1:1".parse()?);
+    let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
+    crate::ai_proxy::apply_agent_config(&mut state,&config);
+    state.reasoning_effort=Some("low".into());
+    let model=state.model_map.get(&state.default_model).cloned().unwrap_or_else(||state.default_model.clone());
+    ensure!(!state.provider_url.is_empty() && !state.api_key.is_empty(),"configured model unavailable");
+    agent_service::open_db(&root)?.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('example','',?1,'running',0,0)",[&model])?;
+    Ok((root,state,model))
+}
+
+fn program_outcomes(root: &Path) -> Result<Vec<String>> {
+    let conn=agent_service::open_db(root)?;
+    let rows=conn.prepare("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE task_id='example' AND kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq")?
+        .query_map([],|row|row.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows.into_iter().flatten().collect())
+}
+
+fn last_answer(root: &Path) -> Result<String> {
+    Ok(agent_service::open_db(root)?.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE task_id='example' AND kind='assistant/message' ORDER BY seq DESC LIMIT 1",[],|row|row.get(0))?)
+}
+
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_leaf_asks_and_the_answer_continues() -> Result<()> {
+    let (root,state,model)=real_low_effort("ask-real")?;
+    eprintln!("REAL_ASK_START model={model} root={}",root.display());
+    let source="import * as io from \"host:io\";\nconst page = await writeIntro(\"an agent runtime that runs AI-written programs\");\nio.write({path: \"intro.html\", content: page.html});\n\n/** @virtual */\nasync function writeIntro(subject) {\n  // Write a short standalone HTML introduction to subject. Its audience, developers or managers, is not known and changes the whole page: ask the user which audience before writing anything. Returns {html:string}.\n}";
+    let prompt=format!("Run exactly this program: reply with it unchanged as your one ```js block.\n```js\n{source}\n```");
+    let started=std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(480),run_task(state.clone(),"example".into(),model.clone(),prompt,40,CancellationToken::new(),1,false)).await.context("first turn timed out")??;
+    let first=program_outcomes(&root)?;
+    eprintln!("REAL_ASK_FIRST seconds={:.0} outcomes={first:?}",started.elapsed().as_secs_f64());
+    ensure!(first.last().is_some_and(|text| text.contains("等你回答")),"the leaf did not ask: {first:?}");
+    ensure!(!root.join("intro.html").exists(),"the page was written before the answer");
+    tokio::time::timeout(Duration::from_secs(480),run_task(state,"example".into(),model,"Developers.".into(),40,CancellationToken::new(),2,false)).await.context("second turn timed out")??;
+    eprintln!("REAL_ASK_SECOND seconds={:.0} outcomes={:?} answer={:?}",started.elapsed().as_secs_f64(),program_outcomes(&root)?,last_answer(&root)?);
+    ensure!(root.join("intro.html").is_file(),"the answer did not lead to the page");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_user_message_stops_the_program() -> Result<()> {
+    let (root,state,model)=real_low_effort("interject-real")?;
+    eprintln!("REAL_INTERJECT_START model={model} root={}",root.display());
+    let source="import * as io from \"host:io\";\nconst topics = [\"agents\", \"programs\", \"tools\"];\nfor (const topic of topics) {\n  const page = await writePage(topic);\n  io.write({path: topic + \".html\", content: page.html});\n}\n\n/** @virtual */\nasync function writePage(topic) {\n  // Write a short standalone HTML page, under 40 lines, explaining topic in an agent runtime. Returns {html:string}.\n}";
+    let prompt=format!("Run exactly this program: reply with it unchanged as your one ```js block.\n```js\n{source}\n```");
+    // The user speaks once the first page is written.
+    let watched=root.clone();
+    let speaker=tokio::spawn(async move {
+        while !watched.join("agents.html").exists() { tokio::time::sleep(Duration::from_millis(200)).await; }
+        crate::interjections::submit(&watched,"example","Also add a page faq.html answering three common questions about the runtime.").map(|_|())
+    });
+    let started=std::time::Instant::now();
+    let result=tokio::time::timeout(Duration::from_secs(600),run_task(state,"example".into(),model,prompt,60,CancellationToken::new(),1,false)).await;
+    speaker.abort();
+    result.context("turn timed out")??;
+    let files=["agents.html","programs.html","tools.html","faq.html"].into_iter().filter(|file|root.join(file).is_file()).collect::<Vec<_>>();
+    let outcomes=program_outcomes(&root)?;
+    eprintln!("REAL_INTERJECT_DONE seconds={:.0} files={files:?} outcomes={outcomes:?} answer={:?}",started.elapsed().as_secs_f64(),last_answer(&root)?);
+    ensure!(outcomes.iter().any(|text| text.contains("被你的新消息打断")),"the program was not stopped: {outcomes:?}");
+    ensure!(root.join("faq.html").is_file(),"the main AI did not handle the message");
+    Ok(())
+}

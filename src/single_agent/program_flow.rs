@@ -598,8 +598,11 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
             ]
         }
         Err(error) if error["code"] == INTERRUPTED => {
-            let at = error["stopped_at"].as_str().filter(|at| !at.is_empty()).map(|at| format!("，停在 {at}")).unwrap_or_default();
-            vec![format!("程序被你的新消息打断{at}。"), "停下的这一步没有完成，之后的步骤没有执行。".to_owned()]
+            match error["stopped_at"].as_str().filter(|at| !at.is_empty()) {
+                Some(at) => vec![format!("程序被你的新消息打断，停在 {at}。"), "停下的这一步没有完成，之后的步骤没有执行。".to_owned()],
+                // Nothing was in flight: every step so far finished.
+                None => vec!["程序被你的新消息打断，停在两步之间。".to_owned(), "已开始的步骤都已完成，之后的步骤没有执行。".to_owned()],
+            }
         }
         Err(error) => {
             let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string());
@@ -624,7 +627,9 @@ pub(super) async fn stop_main(s: &Session<'_>, w: &mut Window, step: usize) -> R
     append(s, "program/interrupted", json!({"turn":s.turn,"stopped_at":error["stopped_at"]}), false).await?;
     let text = outcome(s, Err(&error))?;
     end_program(s, w, step, Value::Null, text).await?;
-    Ok(())
+    // The turn goes on: the main AI may answer the message with a new program.
+    w.program_value = None;
+    save(s, w).await
 }
 async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value) -> Result<Round> {
     let text = if w.program_task.is_some() {
@@ -1482,7 +1487,7 @@ mod tests {
         run_scripted(root.path(), move |body| match role_of(body).as_str() {
             "main" if body["messages"].to_string().contains("程序被你的新消息打断") => {
                 *log.lock().unwrap() = Some(body["messages"].to_string());
-                reply("Only a then.".into())
+                reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"a.txt.summary\", content: \"only a\"});\n```".into())
             }
             "main" => reply(TWO_LEVEL_MAIN.into()),
             "implement" => reply("```js\nasync function summarize(paths) {\n  try {\n    return judge(paths);\n  } catch (error) {\n    return {summary: \"fallback\"};\n  }\n}\n/** @virtual */\nfunction judge(paths) {\n  // Decide which files to keep. Returns {summary:string}.\n}\n```".into()),
@@ -1498,8 +1503,8 @@ mod tests {
         assert!(!root.path().join("out.txt").exists(), "neither the catch-all nor the rest of the program ran");
         let conn = agent_service::open_db(root.path()).unwrap();
         let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(answer, "Only a then.");
-        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(answer, "程序已完成。\n写入：a.txt.summary", "the new program the main AI wrote ran");
+        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' AND json_extract(data,'$.message.content') LIKE '程序被%' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(shown, "程序被你的新消息打断，停在 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 3 行 judge([\"a.txt\",\"b.txt\"])（AI 处理中）。\n停下的这一步没有完成，之后的步骤没有执行。");
     }
 
