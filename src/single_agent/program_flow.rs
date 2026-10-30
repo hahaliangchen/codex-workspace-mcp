@@ -1622,8 +1622,12 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
-        let cut = tokio::time::timeout(Duration::from_secs(2), run_task(state.clone(), "task".into(), "fake".into(), "Judge a and b".into(), 20, CancellationToken::new(), 1, false)).await;
-        assert!(cut.is_err(), "the first turn was cut off");
+        // Cut the first turn off once both leaves wait for the model.
+        let waiting = leaf.clone();
+        tokio::select! {
+            _ = run_task(state.clone(), "task".into(), "fake".into(), "Judge a and b".into(), 20, CancellationToken::new(), 1, false) => panic!("the first turn was not cut off"),
+            _ = async { while waiting.load(Ordering::SeqCst) < 2 { tokio::time::sleep(Duration::from_millis(20)).await; } } => {}
+        }
         assert_eq!(leaf.load(Ordering::SeqCst), 2);
         run_task(state, "task".into(), "fake".into(), "Go on".into(), 20, CancellationToken::new(), 2, false).await.unwrap();
         server.abort();
