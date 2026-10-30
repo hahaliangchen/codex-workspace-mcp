@@ -560,8 +560,7 @@ pub(super) async fn finish(
     message: &Value,
 ) -> Result<Option<(String, Window)>> {
     let id = frame_task(s, w);
-    // A saved proposal awaiting the user pauses the task instead of finishing it.
-    if id == tree::ROOT || (s.is_primary() && approval_boundary(s)?.is_some()) {
+    if id == tree::ROOT {
         return Ok(None);
     }
     let agent = s.delegate_id().map(str::to_owned);
@@ -1163,7 +1162,7 @@ mod tests {
                     "create_task",
                     json!({"goal":"Draft the plan","briefing":"Read the brief"}),
                 ),
-                1 => call("board", "read_task_board", json!({})),
+                1 => call("skills", "list_skills", json!({})),
                 2 => {
                     assert!(
                         text.contains("Draft the plan") && text.contains("Draft a plan"),

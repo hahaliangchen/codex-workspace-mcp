@@ -1944,10 +1944,6 @@ pub async fn run(
                 .delete(crate::agent_service::cancel_task),
         )
         .route(
-            "/agent/tasks/{task_id}/definition/decision",
-            post(crate::agent_service::decide_task_definition),
-        )
-        .route(
             "/agent/tasks/{task_id}/events",
             get(crate::agent_service::get_events),
         )

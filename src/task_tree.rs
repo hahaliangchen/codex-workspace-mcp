@@ -290,24 +290,11 @@ pub fn definition_version(conn: &Connection, task: &str) -> Result<Option<i64>> 
     Ok(conn.query_row("SELECT seq FROM agent_task_events WHERE task_id=?1 AND kind='task/definition' ORDER BY seq DESC LIMIT 1",[task],|r|r.get(0)).optional()?)
 }
 
-pub fn definition_changed(tx: &Transaction<'_>, task: &str, version: i64) -> Result<()> {
-    if let Ok(mut root) = get(tx, task, ROOT) {
-        root.definition_version = Some(version);
-        let turn=tx.query_row("SELECT COALESCE(MAX(json_extract(data,'$.turn')),0) FROM agent_task_events WHERE task_id=?1",[task],|r|r.get::<_,usize>(0))?;
-        emit(tx, task, "task/node_revised", &mut root, turn)?;
-    }
-    Ok(())
-}
 
 /// A workspace file named as a node's output must exist and come from this
 /// node or an accepted child: a successful write of that path, or, for files a
 /// program generated, a successful program run in this node.
 
-pub fn board(conn: &Connection, task: &str) -> Result<Value> {
-    let active = active(conn, task)?;
-    Ok(json!({"active_node_id":active.as_ref().map(|n|&n.node_id),
-        "path":active.as_ref().map(|n|path(conn,task,&n.node_id)).transpose()?,"nodes":nodes(conn,task)?}))
-}
 
 pub fn rebuild(tx: &Transaction<'_>, task: &str) -> Result<()> {
     tx.execute("DELETE FROM agent_task_nodes WHERE task_id=?1", [task])?;

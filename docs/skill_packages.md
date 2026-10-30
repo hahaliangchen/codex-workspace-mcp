@@ -191,8 +191,8 @@ Agent 自行通过说明判断技能是否适用，read_skill 成功交付正文
 宿主只注册清单实际声明的工具，不补充任何业务工具或参数。
 工具通过 `plugin/call` 接收 `{tool, arguments, context}`，其中 arguments 原样转发；
 context 的 `conversation_id` 是根聊天，`execution_id` 是当前执行节点。
-返回 `{value: <工具结果>}`；需要展示计划确认卡时可附带通用 `plan_proposal`
-（`items` 每项含 `id/title/requirements`）。保存提案不代表用户确认。
+返回 `{value: <工具结果>}`。旧的计划确认（`plan_proposal`）已随任务板删除，宿主不再处理该字段；
+需要用户确认的场景将以虚函数循环中的确认工具提供，形式待定。
 可选 `capabilities` 中声明 `attachments` 才转送附件；插件返回 `path/src`，宿主不拼业务 URI。
 声明 `visual_review` 才会收到 `plugin/reviewBrief`（见“图片审查说明与分析证据”）。
 `plugin/service`、`plugin/resource` 的业务方法、标识、资源归属均由插件检查。
@@ -232,7 +232,7 @@ Remote 包络、确认、工具映射、页面声明、凭证隔离与卸载。
 
 ## 独立插件页面登录接入
 
-页面通过 `POST /agent/plugins/{id}/{connect,session,service,upload,attachment,decide_definition,confirm_plan}`
+页面通过 `POST /agent/plugins/{id}/{connect,session,service,upload,attachment}`
 接入，当前用户凭证放在 Authorization。连接地址必须已由管理员注册，页面不能指定任意地址。
 宿主使用通用 `plugin/identity` 每次验证 subject；用户凭证仅存内存，不替换管理员配置。
 SQLite 的 `remote_plugin_sessions` 只保存聊天、插件、subject 与服务地址。
@@ -242,7 +242,7 @@ SQLite 的 `remote_plugin_sessions` 只保存聊天、插件、subject 与服务
 宿主响应将状态放在 `plugin_state` 中，宿主不解释其中字段。
 子执行节点携带同一根 conversation_id。重启后须重新认证。
 旧的插件聊天只有通过插件自己的 open 归属验证后，才能建立新的通用身份绑定。
-通用任务定义和计划确认仍由宿主按版本执行，不解析聊天里的“确认”字样。
+宿主不解析聊天里的“确认”字样来推进流程。
 
 PPT 专有的旧协议兼容与项目绑定已迁到 AI PPT 插件仓库，Agent 没有对应适配器。
 部署须同步更新插件后端、插件前端和 Agent；旧 `/agent/ppt/*` 路由已删除。

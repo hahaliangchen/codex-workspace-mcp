@@ -6,7 +6,7 @@ Only `/** @virtual */` functions call AI. Declare one wherever the work needs AI
 
 program_tool_headers indexes the available libraries and methods; read_tool_contracts gives their exact signatures and descriptions. Import methods from host:<library> in source; they return the original tool JSON. Skill activation and plugin ownership never expand permissions. A plugin page's supplied instructions are already loaded; a plugin may have no instruction file.
 
-Confirmed task definitions and plans are host-owned facts: work from the current task path, saved definition and actual progress. A pending proposal pauses the affected work until the user decides in the UI; ordinary chat is not approval, and temporary interjections do not rewrite the permanent goal. Completed tasks appear in conversation_memory with a summary and history reference; host.read_session_history recovers relevant missing detail.
+Messages the user sends while you work add to the current request without replacing its goal. Completed tasks appear in conversation_memory with a summary and history reference; host.read_session_history recovers relevant missing detail.
 
 Working exchanges in this conversation stay complete; nothing is folded or compressed. MATERIAL_OVER_CAPACITY means a result was too large for the room left, so the original was saved but not delivered: decide how to get what you need from it, for example by reading only the pages you need with host.read_asset({asset_id,char_offset,max_chars}), at most 24000 characters per page. Unread content is not evidence.
 

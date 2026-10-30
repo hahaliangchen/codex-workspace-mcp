@@ -10,7 +10,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -1156,7 +1155,6 @@ pub async fn get_task(
     State(state): State<AgentServiceState>,
     Path(task_id): Path<String>,
 ) -> impl IntoResponse {
-    let board_task_id = task_id.clone();
     let root = state.workspace.root().to_path_buf();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let conn = open_db(&root)?;
@@ -1166,13 +1164,7 @@ pub async fn get_task(
         Ok(Ok(Some(task))) => match open_db(state.workspace.root())
             .and_then(|conn| crate::session_browser::decorate(&conn, state.workspace.root(), task))
         {
-            Ok(mut task) => {
-                match crate::main_task_anchor::board(state.workspace.root(), &board_task_id, None) {
-                    Ok(board) => task["task_board"] = json!(board),
-                    Err(error) => task["task_board_error"] = json!(error.to_string()),
-                }
-                Json(task).into_response()
-            }
+            Ok(task) => Json(task).into_response(),
             Err(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error":"could not read sidebar state"})),
@@ -1187,47 +1179,6 @@ pub async fn get_task(
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error":"could not read task"})),
-        )
-            .into_response(),
-    }
-}
-
-/// Explicit task-board decision; no chat text or model-provided replacement fields.
-pub async fn decide_task_definition(
-    State(state): State<AgentServiceState>,
-    Path(task): Path<String>,
-    Json(args): Json<Value>,
-) -> impl IntoResponse {
-    let result = (|| -> anyhow::Result<Value> {
-        let conn = open_db(state.workspace.root())?;
-        let plugin: Option<String> = conn
-            .query_row(
-                "SELECT plugin_id FROM plugin_sessions WHERE task_id=?1",
-                [&task],
-                |r| r.get(0),
-            )
-            .optional()?;
-        anyhow::ensure!(
-            plugin.is_none(),
-            "plugin task decisions require the authenticated plugin session"
-        );
-        crate::main_task_anchor::decide_definition(
-            state.workspace.root(),
-            &task,
-            args["version"]
-                .as_i64()
-                .context("proposal version required")?,
-            args["approve"]
-                .as_bool()
-                .context("approve must be boolean")?,
-            "agent-ui",
-        )
-    })();
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error":error.to_string()})),
         )
             .into_response(),
     }

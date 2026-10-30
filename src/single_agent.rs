@@ -223,7 +223,6 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
         if w.program_task.is_some() {
             tools.push(crate::agent_program::body_tool());
         }
-        tools.push(function("read_task_board", "Read the task graph (tasks, steps and their results) and any plan saved for the user's confirmation. Domain-neutral; not a chat transcript or inferred completion.",json!({}),json!([])));
     }
     {
         tools.push(function("list_skills", "List installed skill packages and their short applicability descriptions. Load only a skill useful for the current task; the host does not classify the request.",json!({}),json!([])));
@@ -267,7 +266,7 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
             !matches!(
                 tool["function"]["name"].as_str(),
                 Some("read_asset" | "release_assets" | "list_context_assets" | "refresh_asset"
-                    | "read_task_board" | "read_session_history" | "propose_project_note")
+                    | "read_session_history" | "propose_project_note")
             )
         });
     }
@@ -281,7 +280,6 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
         name,
         "read_tool_contracts"
             | "read_program_guide"
-            | "read_task_board"
             | "define_task_body"
             | "read_scope"
             | "read_attachment"
@@ -591,25 +589,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             _ => {}
         }
     }
-    // Host-owned requirements are reconstructed independently for every wire
-    // request. They are never written into the compressible working window.
-    let anchor_error = match crate::main_task_anchor::frame_message(
-        s.state.workspace.root(),
-        s.task,
-        None,
-        s.task_node_id.as_deref().or(frame_id.as_deref()),
-    ) {
-        Ok(Some(anchor)) => {
-            let tokens = estimate(&anchor);
-            host_messages.push(host_message(anchor));
-            (tokens.saturating_add(4096) > s.input_budget).then(|| format!(
-                "MAIN_TASK_ANCHOR_OVER_CAPACITY: {tokens} requirement tokens plus reserved process capacity exceed the {} input budget; task definition was not silently omitted", s.input_budget))
-        }
-        Ok(None) => None,
-        Err(error) => Some(format!(
-            "MAIN_TASK_ANCHOR_UNAVAILABLE: {error:#}; no model request may omit the main task requirements"
-        )),
-    };
     // Notes are re-read for every request rather than stored in the window, so
     // compression never drops them and edits apply on the next request.
     if let Ok(Some(project)) = crate::project_notes::task_project(s.state.workspace.root(), s.task)
@@ -756,9 +735,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         if let Some(function) = definition["function"].as_object_mut() { function.remove("outputSchema"); }
     }
     let mut body = json!({"model":s.model,"stream":true,"messages":wire,"tools":published,"parallel_tool_calls":false});
-    if let Some(error) = anchor_error {
-        body["_host_task_anchor_error"] = json!(error);
-    }
     if let Some(error) = plugin_error {
         body["_host_plugin_instruction_error"] = json!(error);
     }
@@ -799,16 +775,6 @@ async fn model_round(
     round_session.step_node_id = w.current_step_node_id.clone();
     let s = &round_session;
     let mut body = request(s, &w.messages, definitions);
-    if let Some(error) = body
-        .as_object_mut()
-        .unwrap()
-        .remove("_host_task_anchor_error")
-    {
-        anyhow::bail!(
-            "{}",
-            error.as_str().unwrap_or("main task anchor unavailable")
-        );
-    }
     if let Some(error) = body
         .as_object_mut()
         .unwrap()
@@ -1499,7 +1465,6 @@ async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
 
 fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LoopResult>> + Send + 'a>> {
     Box::pin(async move {
-    let initial_approval = approval_boundary(s)?;
     let mut step = 0;
     let mut model_rounds = 0;
     let mut async_children: tokio::task::JoinSet<Result<()>> = tokio::task::JoinSet::new();
@@ -1516,24 +1481,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         {
             deliver_visual_jobs(s, w).await?;
             deliver_plugin_jobs(s, w).await?;
-        }
-        // A newly saved proposal is a host pause, not another planning step.
-        // Existing proposals remain editable by a subsequent user turn.
-        if step > 0
-            && let Some((version, message)) = approval_boundary(s)?
-            && initial_approval.as_ref().map(|v| &v.0) != Some(&version)
-        {
-            let message = json!({"role":"assistant","content":message});
-            let seq = append(
-                s,
-                "assistant/message",
-                json!({"actor":"host","turn":s.turn,"message":message}),
-                true,
-            )
-            .await?;
-            w.messages.push(sourced(message, s.task, seq));
-            save(s, w).await?;
-            return Ok(LoopResult::Answer);
         }
         step += 1;
         let definitions = tools(s, w);
@@ -1851,12 +1798,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                         Ok(json!({"declarations":crate::agent_program::declarations::headers(&selected, &definitions)}))
                     },
                     "define_task_body" => { validating_source = true; program_flow::install_scoped(s,w,&args,true) },
-                    "read_task_board" => {
-                        let mut board=crate::main_task_anchor::board(s.state.workspace.root(),s.task,None)?.unwrap_or_else(||json!({}));
-                        let conn=agent_service::open_db(s.state.workspace.root())?;
-                        board["task_tree"]=crate::task_tree::board(&conn,s.task)?;
-                        Ok(board)
-                    },
                     "propose_project_note" => {
                         ensure!(s.is_primary() && s.plugin.is_none(),"project notes are proposed by the main Agent of a code session");
                         let note=args["note"].as_str().map(str::trim).filter(|note|!note.is_empty()).context("note is required")?;
@@ -2122,27 +2063,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
     }
     Ok(LoopResult::Limit)
     })
-}
-
-fn approval_boundary(s: &Session<'_>) -> Result<Option<(String, &'static str)>> {
-    if !s.is_primary() {
-        return Ok(None);
-    }
-    let board = crate::main_task_anchor::board(s.state.workspace.root(), s.task, None)?
-        .unwrap_or(Value::Null);
-    if board["pending_definition"].is_object() {
-        Ok(Some((
-            format!("definition:{}", board["pending_definition"]["version"]),
-            "任务定义已保存，请通过任务卡片确认。",
-        )))
-    } else if board["plan"].is_object() && board["plan_confirmed"] != true {
-        Ok(Some((
-            format!("plan:{}", board["plan"]["version"]),
-            "计划已保存，请通过计划卡片确认；确认后继续。",
-        )))
-    } else {
-        Ok(None)
-    }
 }
 
 pub(crate) async fn run_task(
@@ -3085,12 +3005,6 @@ mod tests {
         let root = TestRoot::new();
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','PPT','fake','running',0,0)",[]).unwrap();
-        crate::main_task_anchor::propose_plan(
-            root.path(),
-            "task",
-            json!({"items":[{"id":"p1","title":"Cover","requirements":"Title and subtitle"}]}),
-        )
-        .unwrap();
         let mut state =
             agent_service::tests::test_state(root.path(), "127.0.0.1:1".parse().unwrap());
         state.provider_routes.insert(
@@ -3143,10 +3057,10 @@ mod tests {
         let second = b["messages"].as_array().unwrap();
         let stable_len = first
             .iter()
-            .position(|m| m["name"] == "main_task_anchor" || m["name"] == "skill_activation")
+            .position(|m| m["name"] == "skill_activation")
             .unwrap_or(first.len());
         assert_eq!(&first[..stable_len], &second[..stable_len]);
-        for name in ["main_task_anchor", "skill_activation"] {
+        for name in ["skill_activation"] {
             assert_eq!(
                 first.iter().find(|m| m["name"] == name).unwrap()["role"],
                 "user"
@@ -3156,10 +3070,6 @@ mod tests {
                 "user"
             );
         }
-        assert_ne!(
-            first.iter().find(|m| m["name"] == "main_task_anchor"),
-            second.iter().find(|m| m["name"] == "main_task_anchor")
-        );
         assert!(!a["messages"][0].to_string().contains("Context capacity:"));
         assert!(
             !b["messages"]
@@ -3742,66 +3652,4 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn fixed_main_requirement_and_saved_outline_are_injected_outside_compaction() {
-        let root = TestRoot::new();
-        let state = agent_service::tests::test_state(root.path(), "127.0.0.1:9".parse().unwrap());
-        let conn = agent_service::open_db(root.path()).unwrap();
-        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)",[]).unwrap();
-        conn.execute("INSERT INTO agent_task_events(task_id,seq,timestamp,kind,data) VALUES ('task',1,0,'user/message',?1)",
-            [json!({"message":{"role":"user","content":"Produce the requested deliverables; preserve supplied assets"}}).to_string()]).unwrap();
-        let proposal=crate::main_task_anchor::update(root.path(),"task",&json!({"objective":"Produce the requested deliverables","constraints":["Preserve supplied assets"],"completion_conditions":["All deliverables checked"],"source_event_seqs":[1]})).unwrap();
-        crate::main_task_anchor::decide_definition(
-            root.path(),
-            "task",
-            proposal["version"].as_i64().unwrap(),
-            true,
-            "user",
-        )
-        .unwrap();
-        crate::main_task_anchor::propose_plan(root.path(),"task",json!({"items":[{"id":"next","title":"Next actions","requirements":"List the agreed next steps"}]})).unwrap();
-        let cancel = CancellationToken::new();
-        let mut session = Session {
-            agent_id: None,
-            task_node_id: None,
-            step_node_id: None,
-            plugin: None,
-            state: &state,
-            task: "task",
-            model: "fake",
-            turn: 1,
-            cancel: &cancel,
-            ban_execution: false,
-            scope: "main".into(),
-            parent: None,
-            input_budget: INPUT_BUDGET,
-        };
-        let mut window = Window {
-            messages: vec![
-                json!({"role":"system","content":MAIN_PROMPT}),
-                json!({"role":"system","name":"context_summary","content":"Temporary working detail"}),
-            ],
-            ..Default::default()
-        };
-        let original_window = window.messages.clone();
-        let body = request(&session, &window.messages, &[]);
-        let anchor = body["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["name"] == "main_task_anchor")
-            .unwrap();
-        assert!(anchor.to_string().contains("Next actions"));
-        assert!(anchor.to_string().contains("Preserve supplied assets"));
-        assert_eq!(window.messages, original_window);
-        session.input_budget = 256;
-        assert!(
-            model_round(&session, &mut window, 1, &[])
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("MAIN_TASK_ANCHOR_OVER_CAPACITY")
-        );
-        assert_eq!(window.messages, original_window);
-    }
 }

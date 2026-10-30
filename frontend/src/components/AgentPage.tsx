@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, type Dispatch, type SetSta
 import clsx from 'clsx'
 import { useBrandIcon, usePalette } from '../brand.ts'
 import { taskTitle, workspaceName } from './Sidebar.tsx'
-import { TaskBoardCard } from './TaskBoardCard.tsx'
 import { FlowView } from './FlowView.tsx'
 import { latestContextUsage } from './ContextRing.tsx'
 import { SkillPagesView } from './SkillPagesView.tsx'
@@ -195,7 +194,7 @@ export function ConversationPage({
           <div className={css.session} data-slot="conversation.session" style={tab === 'flow' || tab === 'skill-pages' ? { height: '100%', flex: 1, display: 'flex', flexDirection: 'column' } : undefined}>
             <div className={root.viewArea} style={tab === 'flow' || tab === 'skill-pages' ? { height: '100%', flex: 1, minHeight: 520, display: 'flex' } : undefined}>
               {tab === 'chat'
-                ? <>{renderSlot('agent.chat', { events: session.events, task, running, onOpenTask: openTask, onChangesUpdated: session.reload })}{task && !isChild && <TaskBoardCard task={task} reload={session.reload} />}</>
+                ? <>{renderSlot('agent.chat', { events: session.events, task, running, onOpenTask: openTask, onChangesUpdated: session.reload })}</>
                 : tab === 'skill-pages'
                 ? <SkillPagesView workspaceRoot={workspace.activeWorkspace ?? workspace.info?.workspace ?? ''} />
                 : tab === 'flow'

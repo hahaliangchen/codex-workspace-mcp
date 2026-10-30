@@ -20,7 +20,6 @@ mod http_probe;
 mod image_analysis;
 mod index_refresh;
 mod interjections;
-mod main_task_anchor;
 mod mcp;
 mod memory;
 mod memory_panel;

@@ -81,10 +81,7 @@ export interface FileDiff {
 export type TaskStatus =
   | 'draft' | 'running' | 'completed' | 'failed' | 'cancelled' | 'cancelling' | 'max_steps' | 'interrupted'
 
-export interface TaskDefinition { readonly objective: string; readonly constraints: readonly string[]; readonly completion_conditions: readonly string[]; readonly version?: number }
-export interface TaskBoard { readonly definition: TaskDefinition | null; readonly pending_definition: { readonly version: number; readonly definition: TaskDefinition } | null }
 export interface Task {
-  readonly task_board?: TaskBoard | null
   readonly task_id: string
   readonly prompt: string
   readonly kind?: 'chat' | 'code'
@@ -317,7 +314,6 @@ function patch<T>(path: string, body?: unknown): Promise<T> {
 const task = (id: string): string => `/agent/tasks/${encodeURIComponent(id)}`
 
 export const api = {
-  decideTaskDefinition: (id: string, version: number, approve: boolean) => post(`${task(id)}/definition/decision`, {version, approve}),
   models: () => request<ModelCatalog>('/agent/models'),
   upload: (id:string,file:File,signal:AbortSignal,onProgress:(percent:number)=>void) => new Promise<{receiptId:string;file:AttachmentRef}>((resolve,reject)=>{
     const xhr=new XMLHttpRequest();xhr.open('POST',`/api/session/uploadFileBinary?sessionId=${encodeURIComponent(id)}&name=${encodeURIComponent(file.name)}`);xhr.setRequestHeader('Content-Type','application/octet-stream');

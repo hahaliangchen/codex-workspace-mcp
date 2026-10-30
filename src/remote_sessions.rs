@@ -115,26 +115,11 @@ fn check_binding(
 }
 /// Generic capability response. The plugin can propose a plan using the host's
 /// existing versioned confirmation UI; it cannot confirm it or change a goal.
-fn tool_value(root: &std::path::Path, task: &str, mut response: Value) -> Result<Value> {
+fn tool_value(mut response: Value) -> Result<Value> {
     ensure!(
         response.is_object() && response.get("value").is_some(),
         "Plugin tool response requires value"
     );
-    if let Some(mut proposal) = response
-        .get_mut("plan_proposal")
-        .map(Value::take)
-        .filter(Value::is_object)
-    {
-        ensure!(
-            response["value"].is_object(),
-            "A plan proposal requires an object tool result"
-        );
-        let board = crate::main_task_anchor::board(root, task, None)?.unwrap_or(Value::Null);
-        proposal["definition_version"] = board["definition"]["version"].clone();
-        let saved = crate::main_task_anchor::propose_plan(root, task, proposal)?;
-        response["value"]["plan_confirmation"] =
-            json!({"version":saved["version"],"status":"awaiting_user_confirmation"});
-    }
     response
         .get_mut("value")
         .map(Value::take)
@@ -170,7 +155,7 @@ impl crate::plugin_io::SessionIo for Transport {
                     }
                     let result = c.call_in(raw, args, call_context).await?;
                     sync(state, &conversation, &c).await?;
-                    return tool_value(state.workspace.root(), &conversation, result);
+                    return tool_value(result);
                 }
             }
             catalog.execute(workspace, name, args).await
@@ -248,15 +233,10 @@ impl crate::plugin_io::SessionIo for Transport {
             }
             let prefix = format!("{}__", plugin.replace('-', "_"));
             let raw = tool.strip_prefix(&prefix).unwrap_or(tool);
-            // The plugin writes instructions against the plan the user confirmed here.
-            let board =
-                crate::main_task_anchor::board(state.workspace.root(), &conversation, None)?
-                    .unwrap_or(Value::Null);
-            let plan = json!({"confirmed":board["plan_confirmed"],"version":board["plan"]["version"],"plan":board["plan"]["plan"]});
             let brief = c
                 .rpc(
                     "plugin/reviewBrief",
-                    json!({"context":context(task,&conversation),"tool":raw,"arguments":args,"document":document,"images":images,"plan":plan}),
+                    json!({"context":context(task,&conversation),"tool":raw,"arguments":args,"document":document,"images":images}),
                 )
                 .await?;
             let Some(instructions) = brief["instructions"]
@@ -447,29 +427,6 @@ async fn handle(
         .context("task_id required")?
         .to_owned();
     let conversation = check_binding(state.workspace.root(), &task, plugin, &c)?;
-    if method == "decide_definition" {
-        return Ok(Json(crate::main_task_anchor::decide_definition(
-            state.workspace.root(),
-            &task,
-            args["version"]
-                .as_i64()
-                .context("Proposal version required")?,
-            args["approve"]
-                .as_bool()
-                .context("approve must be boolean")?,
-            &c.subject,
-        )?)
-        .into_response());
-    }
-    if method == "confirm_plan" {
-        return Ok(Json(crate::main_task_anchor::confirm_plan(
-            state.workspace.root(),
-            &task,
-            args["version"].as_i64().context("Plan version required")?,
-            &c.subject,
-        )?)
-        .into_response());
-    }
     if method == "upload" {
         return Ok(Json(crate::attachments::encoded(&state, &task, &args)?).into_response());
     }
@@ -495,7 +452,6 @@ async fn handle(
         } else {
             Value::Null
         };
-        let board = crate::main_task_anchor::board(state.workspace.root(), &task, None)?;
         let response = crate::plugin_sessions::handle(state, plugin, args).await?;
         if operation == "status" {
             let status = response.status();
@@ -503,7 +459,6 @@ async fn handle(
                 &axum::body::to_bytes(response.into_body(), 1024 * 1024).await?,
             )?;
             value["plugin_state"] = extra;
-            value["task_board"] = json!(board);
             return Ok((status, Json(value)).into_response());
         }
         return Ok(response);
@@ -545,7 +500,7 @@ mod tests {
                     "handshake"=>json!({"version":1,"subject":user,"state":"awaiting_confirmation","connection_id":format!("c-{user}"),"plugin":{"id":"notes-test","title":"Notes","skill":"skill:SKILL.md","pages":[],"tools":[{"name":"save","description":"Save note","inputSchema":{"type":"object","properties":{}}}]}}),
                     "confirm"=>json!({"state":"ready"}),"identity"=>json!({"subject":user}),
                     "session"=>{received.lock().unwrap().push(args.clone());json!({"document_key":"plugin-owned","project_id":"opaque-state"})},
-                    "call"=>{received.lock().unwrap().push(args.clone());json!({"value":{"saved":true},"plan_proposal":{"title":"Notes","items":[{"id":"a","title":"First note","requirements":"Contains the requested text"}]}})},
+                    "call"=>{received.lock().unwrap().push(args.clone());json!({"value":{"saved":true}})},
                     "service"=>json!({"echo":args}),_=>panic!("unexpected {method}")
                 };
                 Json(json!({"type":"server-response","rpcId":body["rpcId"],"result":{"ok":true,"value":result}}))
@@ -616,7 +571,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result["saved"], true);
-        assert!(result["plan_confirmation"]["version"].is_i64());
         assert!(
             calls
                 .lock()
@@ -626,11 +580,6 @@ mod tests {
                     && call["arguments"] == args
                     && call["context"] == context("child", task))
         );
-        let board = crate::main_task_anchor::board(&root, task, None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(board["plan"]["plan"]["items"][0]["id"], "a");
-        assert_eq!(board["plan_confirmed"], false);
         // A plugin that does not declare visual_review is never asked for review instructions.
         assert!(
             crate::plugin_io::review_brief(
@@ -722,10 +671,9 @@ mod tests {
                         let n = rounds.fetch_add(1, Ordering::SeqCst);
                         let message = match n {
                             0 => call("create_task", json!({"goal":"Render and review page 1"}), n),
-                            1 => call("read_task_board", json!({}), n),
-                            2 => call("review_lab__render", json!({"slides":[1,2]}), n),
-                            3 => call("analyze_images", json!({"artifact_ids":ids_in(&body, "visual-"),"question":"I just changed the subtitle."}), n),
-                            4 => call("review_lab__record", json!({"analysis_ids":ids_in(&body, "analysis-")}), n),
+                            1 => call("review_lab__render", json!({"slides":[1,2]}), n),
+                            2 => call("analyze_images", json!({"artifact_ids":ids_in(&body, "visual-"),"question":"I just changed the subtitle."}), n),
+                            3 => call("review_lab__record", json!({"analysis_ids":ids_in(&body, "analysis-")}), n),
                             _ => json!({"role":"assistant","content":"Page 1 reviewed."}),
                         };
                         Json(json!({"choices":[{"finish_reason":if message["tool_calls"].is_array(){"tool_calls"}else{"stop"},"message":message}]}))
@@ -833,7 +781,7 @@ mod tests {
             json!({"revision":2,"stable":true})
         );
         assert_eq!(brief_request["context"], context(&task, &task));
-        assert!(brief_request["plan"].get("plan").is_some());
+        assert!(brief_request.get("plan").is_none(), "there is no task-board plan to send");
 
         let vision = vision_bodies.lock().unwrap().clone();
         assert_eq!(vision.len(), 1);
