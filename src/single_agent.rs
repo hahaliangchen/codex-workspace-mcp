@@ -187,6 +187,7 @@ fn tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     if let program_flow::Role::Leaf(scope) = program_flow::role(w) {
         definitions.retain(|tool| tool["function"]["name"].as_str().is_some_and(|name| scope.contains(name)));
         definitions.push(program_flow::find_tool());
+        definitions.push(program_flow::ask_tool());
     }
     definitions
 }
@@ -1645,9 +1646,13 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         let mut image_messages = Vec::new();
         let mut released_assets = None;
         let mut overflow = false;
+        let mut asked = None;
         for call in calls {
             let Executed { result, is_error, seq, asset_reference, skill_change, refreshed_from, released_assets: released } =
                 execute_call(s, w, &definitions, &node, step, &call, call_count, None).await?;
+            if call.name == program_flow::ASK && !is_error {
+                asked = result["question"].as_str().map(str::to_owned);
+            }
             if released.is_some() {
                 released_assets = released;
             }
@@ -1748,10 +1753,19 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         }
         // A leaf that outgrew its context throws to its coded caller, which
         // can split the work; nothing is compressed.
-        if overflow {
-            let error = json!({"$task_error":{"code":"CONTEXT_OVERFLOW",
+        // A leaf ends early when it asked the user or outgrew its context.
+        let ended = if let Some(question) = asked {
+            let function = w.program_task.as_ref().map(|task| task["name"].clone()).unwrap_or(Value::Null);
+            Some(json!({"$task_error":{"code":program_flow::WAITING,"question":question,"function":function,
+                "message":"the function is waiting for the user's answer"}}))
+        } else if overflow {
+            Some(json!({"$task_error":{"code":"CONTEXT_OVERFLOW",
                 "message":"this function's context ran out before it finished; split the work into smaller calls",
-                "completed_writes":program_flow::completed_writes(s, w)?}});
+                "completed_writes":program_flow::completed_writes(s, w)?}}))
+        } else {
+            None
+        };
+        if let Some(error) = ended {
             let message = json!({"role":"assistant","content":error.to_string()});
             let seq = append(s, "assistant/message", json!({"actor":"host","turn":s.turn,"message":message}), false).await?;
             w.messages.push(sourced(message.clone(), s.task, seq));
@@ -1868,6 +1882,10 @@ async fn execute_call(
                 Ok(json!(results))
             },
             name if name == program_flow::FIND => program_flow::find(s, w, &args),
+            name if name == program_flow::ASK => {
+                let question = args["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).context("question is required")?;
+                Ok(json!({"question":question,"status":"shown_to_user"}))
+            },
             "read_program_guide" => { Ok(json!({"guide":crate::agent_program::CAPABILITIES})) },
             "read_tool_contracts" => {
                 let catalog = program_flow::library_catalog(s, definitions);

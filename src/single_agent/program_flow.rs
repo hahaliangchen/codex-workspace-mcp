@@ -104,6 +104,14 @@ pub(super) fn prompt(role: &str) -> &'static str {
 }
 
 pub(super) const FIND: &str = "find_library_methods";
+pub(super) const ASK: &str = "ask_user";
+/// The error a function ends with when its AI asks the user. It rises to the
+/// main program without being caught by code or rewritten by an author.
+pub(super) const WAITING: &str = "WAITING_FOR_USER";
+pub(super) fn ask_tool() -> Value {
+    function(ASK, "Ask the user for a decision or information this function cannot get otherwise. The program stops here and your question is shown to the user; their answer, whatever it is, starts a new turn in which the work is planned again. Use it only when the work truly depends on the user.",
+        json!({"question":{"type":"string","minLength":1}}), json!(["question"]))
+}
 pub(super) fn find_tool() -> Value {
     function(FIND, "Search the available library methods by keywords when this function needs one it was not given. Matching methods become callable in this function only; permissions are unchanged.",
         json!({"query":{"type":"string","minLength":1}}), json!(["query"]))
@@ -528,6 +536,13 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
             let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
             vec!["程序已完成。".to_owned(), format!("返回：{}", clip(&text, 300))]
         }
+        Err(error) if error["code"] == WAITING => {
+            let function = error["function"].as_str().unwrap_or("程序");
+            vec![
+                format!("程序在 {function} 停下，等你回答：{}", error["question"].as_str().unwrap_or("")),
+                "之后的步骤没有执行。".to_owned(),
+            ]
+        }
         Err(error) => {
             let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string());
             let at = error["location"]["line"].as_u64().map(|line| format!("第 {line} 行")).unwrap_or_default();
@@ -585,7 +600,9 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
         State::Waiting => unreachable!(),
         State::Failed(error) => {
             append(s, "program/error", json!({"error":error}), true).await?;
-            if role(w) == Role::Implement && w.program_task.as_ref().is_some_and(|task| task["role"] == "implement") {
+            // A question for the user is not a bug to fix: it rises unchanged.
+            let waiting = error["code"] == WAITING;
+            if !waiting && role(w) == Role::Implement && w.program_task.as_ref().is_some_and(|task| task["role"] == "implement") {
                 // AI-written code is not right every time: its author gets the
                 // error and what already ran, and rewrites it or gives up.
                 w.program = None;
@@ -1053,8 +1070,8 @@ mod tests {
         }
         let definitions = crate::agent_service::local_tools(&crate::tools::Workspace::new(root.path().to_path_buf()).unwrap(), None, false);
         let io = agent_program::libraries::catalog(&definitions, &json!([]))["io"].values().cloned().collect::<BTreeSet<_>>();
-        assert_eq!(leaf.iter().filter(|name| *name != FIND).cloned().collect::<BTreeSet<_>>(), io,
-            "leaf tools are exactly the implementation's io import");
+        assert_eq!(leaf.iter().filter(|name| *name != FIND && *name != ASK).cloned().collect::<BTreeSet<_>>(), io,
+            "leaf tools are exactly the implementation's io import, plus finding methods and asking the user");
     }
 
     #[tokio::test]
@@ -1132,7 +1149,7 @@ mod tests {
             }
         }).await;
         let leaf_tools = leaf_tools.lock().unwrap();
-        assert_eq!(leaf_tools[0], [FIND], "nothing imported, nothing given");
+        assert_eq!(leaf_tools[0], [FIND, ASK], "nothing imported: only finding methods and asking the user");
         assert!(leaf_tools[1].contains(&"read_file".to_owned()), "a found method becomes callable");
         assert_eq!(std::fs::read_to_string(root.path().join("out.txt")).unwrap(), "alpha");
     }
@@ -1327,5 +1344,46 @@ mod tests {
         let entry = memory["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "task").unwrap().clone();
         assert_eq!(entry["answer"], "程序在第 3 行出错停止：boom\n之后的步骤没有执行。\n写入：done.txt", "{memory}");
         assert_eq!(conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| r.get::<_, String>(0)).unwrap(), "completed");
+    }
+
+    #[tokio::test]
+    async fn a_leaf_question_stops_the_program_and_the_answer_starts_a_new_turn() {
+        let root = TestRoot::new();
+        let implement = Arc::new(AtomicUsize::new(0));
+        let rounds = implement.clone();
+        let memory = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let log = memory.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let answer = match role_of(&body).as_str() {
+                "main" if body["messages"].to_string().contains("Yes, keep both") => {
+                    *log.lock().unwrap() = memory_of(&body);
+                    reply("Keeping both.".into())
+                }
+                "main" => reply(TWO_LEVEL_MAIN.into()),
+                "implement" => {
+                    assert_eq!(rounds.fetch_add(1, Ordering::SeqCst), 0, "a question is not handed back to the author as a bug");
+                    reply("```js\nasync function summarize(paths) {\n  return judge(paths);\n}\n/** @virtual */\nfunction judge(paths) {\n  // Decide which files to keep. Returns {summary:string}.\n}\n```".into())
+                }
+                _ => {
+                    assert!(tool_names(&body).contains(&ASK.to_owned()), "a leaf can ask the user");
+                    json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                        "tool_calls":[{"id":"ask","type":"function","function":{"name":ASK,"arguments":json!({"question":"Keep both files?"}).to_string()}}]}}]})
+                }
+            };
+            async move { Json(answer) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state.clone(), "task".into(), "fake".into(), "Summarize a and b".into(), 20, CancellationToken::new(), 1, false).await.unwrap();
+        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(shown, "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。");
+        assert!(!root.path().join("out.txt").exists(), "nothing after the question ran");
+        run_task(state, "task".into(), "fake".into(), "Yes, keep both".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
+        server.abort();
+        let memory = memory.lock().unwrap().clone().expect("the answer reached the main AI in a new turn");
+        assert!(memory.to_string().contains("等你回答：Keep both files?"), "the new turn knows what was asked: {memory}");
     }
 }
