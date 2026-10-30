@@ -1,6 +1,6 @@
 # Promise 与虚函数调度设计
 
-> 本文记录当前自建 VM 中的 Promise 方案与测试背景；完整 JS / Node 路线尚待验证。见 [设计与实现入口](agent-design-guide.md)。
+> 本文记录当前自建 VM 中的 Promise 方案与测试背景；完整 JS / Node 路线尚待验证。见 [设计与实现入口](../agent-design-guide.md)。
 
 ## 状态
 

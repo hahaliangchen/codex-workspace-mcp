@@ -21,7 +21,7 @@
 - PPT 后端：`/home/goodtime/Documents/project/ai-ppt-server`。
 - PPT 前端：`/home/goodtime/Documents/project/ai-ppt-view`。
 - 编辑器：`/home/goodtime/project/pptx-editor-engine`。
-- 制作人员使用 [模板制作与转换标准](ppt-template-authoring-standard.md)。开发者同时参照编辑器 `docs/template-policy.md` 及设计技能 `references/html-format.md`。
+- 制作人员使用 [模板制作与转换标准](../ppt-template-authoring-standard.md)。开发者同时参照编辑器 `docs/template-policy.md` 及设计技能 `references/html-format.md`。
 
 ## 自动验证
 

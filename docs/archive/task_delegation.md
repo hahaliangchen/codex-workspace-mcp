@@ -1,6 +1,6 @@
 # 函数并发、结果交接与历史排序
 
-并发是当前流程语言的函数能力。主 Agent 在唯一 `main` 中组织任务，用户或适用技能授权并发后，使用 `fork(helper, args...)` 启动分支，再用 `join(handles)` 收集返回。完整语法和五页示例见[语言手册](agent-program.md)。
+并发是当前流程语言的函数能力。主 Agent 在唯一 `main` 中组织任务，用户或适用技能授权并发后，使用 `fork(helper, args...)` 启动分支，再用 `join(handles)` 收集返回。完整语法和五页示例见[语言手册](../agent-program.md)。
 
 ## 唯一派发线路
 

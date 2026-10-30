@@ -75,9 +75,9 @@ Observer 阅读当前任务的原始时间线。需要追查归因时，读取�
 相关实现入口：
 
 - Observer 生命周期与结束复盘：[observer_service.rs](../src/observer_service.rs)。
-- 执行结束、角色调用与续聊：[agent_service.rs](../src/agent_service.rs)。
+- 执行结束、角色调用与续聊：[agent_service.rs](../../src/agent_service.rs)。
 - Organizer 调用与任务状态：[work_organizer.rs](../src/work_organizer.rs)、[work_scheduler.rs](../src/work_scheduler.rs)。
-- 原始记录、实际请求和按需上下文：[session_history.rs](../src/session_history.rs)、[request_context.rs](../src/request_context.rs)、[context_rebuild.rs](../src/context_rebuild.rs)。
+- 原始记录、实际请求和按需上下文：[session_history.rs](../../src/session_history.rs)、[request_context.rs](../../src/request_context.rs)、[context_rebuild.rs](../src/context_rebuild.rs)。
 - 验收提示词：[observer_retrospective.md](../prompts/observer_retrospective.md)。
 
 ## 可以直接发布给 Agent 的测试任务

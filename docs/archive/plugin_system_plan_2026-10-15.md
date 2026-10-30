@@ -250,10 +250,10 @@ DSH 宿主侧 JS/TS 插件需要相应的 Node.js 运行环境；TS 通常先构
 
 - 宿主：`src/plugin_runtime.rs`、`src/plugin_protocol.rs`、`src/skill_packages.rs`、`src/skill_packages/remote.rs`、`src/plugin_sessions.rs`、`src/ppt_sessions.rs`。
 - 宿主前端：`frontend/src/plugins/`、`frontend/src/builtin_plugins/`、`web/skill-page-sdk.js`。
-- 插件说明：[固定插件协议与现状](skill_packages.md)。
+- 插件说明：[固定插件协议与现状](../skill_packages.md)。
 - PPT 后端：`/home/goodtime/Documents/project/ai-ppt-server`，重点为 `service/ppt_runtime/`、`api/v1/system/ppt_plugin.go` 和 `resource/ai_skills/ppt-master/`。
 - PPT 前端：`/home/goodtime/Documents/project/ai-ppt-view`，重点为 `src/api/pptAgent.ts`、`src/store/PptWorkflowStore.ts` 和 `src/plugins/ppt/`。
 
 ## 11. 聊天附件补充（SVG 版先行）
 
-沿用 DSH 的上传 receipt、消息引用、会话归属和历史恢复语义，统一主聊天、模块、iframe 及远程原站。AI PPT 只开放 PNG、JPG/JPEG、WEBP、PDF、DOCX、TXT、MD，完整 PPT 编辑器的能力后续再开放。具体实现、兼容子集和回归入口见[会话附件](attachments.md)。后续增加暂存清理、用户存储配额、DOCX 图片与完整编辑器的 PPTX 输入，不能通过前端开放扩展名跳过后端权限。
+沿用 DSH 的上传 receipt、消息引用、会话归属和历史恢复语义，统一主聊天、模块、iframe 及远程原站。AI PPT 只开放 PNG、JPG/JPEG、WEBP、PDF、DOCX、TXT、MD，完整 PPT 编辑器的能力后续再开放。具体实现、兼容子集和回归入口见[会话附件](../attachments.md)。后续增加暂存清理、用户存储配额、DOCX 图片与完整编辑器的 PPTX 输入，不能通过前端开放扩展名跳过后端权限。

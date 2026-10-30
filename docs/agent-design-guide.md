@@ -114,7 +114,7 @@ async function designPage(shared, page) {
 4. ~~删除特殊 API，改为参数显式传入~~（2026-10-30 完成）：`host.read_scope`／`scope_variables`、`invoke_library`、`define_task_body` 都已删除，虚函数窗口不再继承调用方的变量；主窗口专用的 host 方法不再出现在虚函数的库里。`read_program_guide` 保留为按需查阅的编程指南，第一层实现也可以调用。
 5. ~~停止发送完整工具列表~~（已完成）：请求只附库方法索引，业务工具的完整定义按需用 `read_tool_contracts` 读取；主任务直接公开的只有读契约、读指南、技能和资产这几个宿主工具。
 6. 按本文重写提示词（`prompts/`）和 [task-program Skill](../skills/task-program/SKILL.md)，同步示例和测试。2026-10-29 已去掉其中与新路径矛盾的说法和命令式措辞；主任务提示词里关于计划确认的段落如实描述仍在运行的旧机制，随第 3 步删除；折叠的描述已随第 2 步去掉。
-7. 整理 `docs/`：带日期的历史记录归档或删除。
+7. ~~整理 `docs/`~~（2026-10-30 完成）：带日期的记录、观察记录和已被取代的设计文档移入 `docs/archive/`，链接已随之更新。
 
 界面上的「任务流」节点展示已暂时隐藏，等新路径真正运行起来后按新设计重新加入。
 
@@ -131,7 +131,7 @@ async function designPage(shared, page) {
 | 文档 | 内容 |
 | --- | --- |
 | [执行语言手册](agent-program.md) | 当前 Rust JS 子集的能力与限制 |
-| [JS VM 设计](js-runtime-design.md) | 版本 14 自建 VM 的实现背景 |
-| [Promise 与虚函数](promise-virtual-tasks.md) | Promise 并发实现的测试记录；其中的 `define_task_body`、`invoke_library` 已废弃 |
-| [通用 Agent 设计](generic-agent-design.md) | 设计演进历史，包含已废弃的任务/步骤方案 |
-| `docs/` 中带日期的文档 | 对应日期的实验和计划记录 |
+| [JS VM 设计](archive/js-runtime-design.md) | 版本 14 自建 VM 的实现背景 |
+| [Promise 与虚函数](archive/promise-virtual-tasks.md) | Promise 并发实现的测试记录；其中的 `define_task_body`、`invoke_library` 已废弃 |
+| [通用 Agent 设计](archive/generic-agent-design.md) | 设计演进历史，包含已废弃的任务/步骤方案 |
+| [`docs/archive/`](archive/README.md) | 历史方案、带日期的实验和计划记录 |

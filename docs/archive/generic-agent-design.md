@@ -1,8 +1,8 @@
 # 通用 Agent 设计：流程伪代码、函数作用域与插件边界
 
-> 阅读前先看 [设计与实现入口](agent-design-guide.md)。本文混有不同阶段的方案；旧工具调用方式和语言版本不代表最新设计。
+> 阅读前先看 [设计与实现入口](../agent-design-guide.md)。本文混有不同阶段的方案；旧工具调用方式和语言版本不代表最新设计。
 
-更新日期：2026-10-29。本文记录通用 Agent 的设计边界、当前实现及验证结果。第 1.1 节是设计原则；第 1–8 节描述当前设计（流程语言版本 14：JS VM、词法作用域与闭包、Promise 与 async 虚函数并发，见 [js-runtime-design.md](js-runtime-design.md) 与 [agent-program.md](agent-program.md)）。第 9 节起是按日期保存的历史记录，其中的 fork/join、子 Agent、Git 工作树整合及当时的版本限制均已退役或被替代，不代表当前实现。
+更新日期：2026-10-29。本文记录通用 Agent 的设计边界、当前实现及验证结果。第 1.1 节是设计原则；第 1–8 节描述当前设计（流程语言版本 14：JS VM、词法作用域与闭包、Promise 与 async 虚函数并发，见 [js-runtime-design.md](js-runtime-design.md) 与 [agent-program.md](../agent-program.md)）。第 9 节起是按日期保存的历史记录，其中的 fork/join、子 Agent、Git 工作树整合及当时的版本限制均已退役或被替代，不代表当前实现。
 
 本文作为后续维护通用执行层的设计依据。早期文档中的规划闸门、步骤必须返回专门协议、宿主替业务创建节点、每轮强制折叠、两次无工具回复才结束等方案，不能直接作为当前实现要求。修改前应对照本文和实际代码；有意改变这里的执行语义时，同步说明原因、更新文档及回归测试。
 
@@ -29,7 +29,7 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 
 ### 1.1 流程和普通计算由宿主执行，智能判断显式调用
 
-最新原则：普通函数、JSON 数据、常见循环和运算符表达流程；宿主确定性计算普通表达式，不把 i+1 或条件比较交给 AI。for/while、break/continue、三元和模板字符串降低到已有执行结构，不因模型采用常见写法就拒绝编译。当前范围与值规则见[执行语言手册](agent-program.md)；目标是让 AI 写真实 JavaScript，采用 Node 等技术路线仍需验证。
+最新原则：普通函数、JSON 数据、常见循环和运算符表达流程；宿主确定性计算普通表达式，不把 i+1 或条件比较交给 AI。for/while、break/continue、三元和模板字符串降低到已有执行结构，不因模型采用常见写法就拒绝编译。当前范围与值规则见[执行语言手册](../agent-program.md)；目标是让 AI 写真实 JavaScript，采用 Node 等技术路线仍需验证。
 
 需要内容理解、生成或业务验收时，声明具有注释职责和返回契约的任务函数。例如 const check = inspect(artifact, requirements)，AI 使用真实工具证据返回 {passed,evidence,issues}，宿主执行 if (!check.passed)。artifact !== expected 只比较 JSON 数据，不能同时解释为“业务质量不合格”。计算类型错误明确抛出，不自动请求 AI 解释。
 
@@ -212,17 +212,17 @@ Agent 是通用执行器。用户提出目标，模型结合适用的技能与�
 
 | 内容 | 主要存储／实现 |
 | --- | --- |
-| 模型执行、工具分发、无工具回复直接返回 | [single_agent.rs](../src/single_agent.rs) 的 `run_loop`、`model_round` |
-| 调用帧、串行／并发作用域、返回及释放 | [task_frames.rs](../src/single_agent/task_frames.rs) 的 `create_function_task`、`inherited_frame`、`temporary_frame`、`finish`；[function_scope.rs](../src/single_agent/function_scope.rs) |
+| 模型执行、工具分发、无工具回复直接返回 | [single_agent.rs](../../src/single_agent.rs) 的 `run_loop`、`model_round` |
+| 调用帧、串行／并发作用域、返回及释放 | [task_frames.rs](../../src/single_agent/task_frames.rs) 的 `create_function_task`、`inherited_frame`、`temporary_frame`、`finish`；[function_scope.rs](../../src/single_agent/function_scope.rs) |
 | 程序位置与任务记录 | Runtime 保存指令、帧、PC、变量、catch 栈及 pending effect；`agent_task_nodes` 记录展示状态；finish 仅持有调用方回传地址 |
 | 活动工作帧 | `agent_runtime_windows`；调用方挂起时保留，返回的子任务窗口释放 |
 | 原始用户、模型、工具与图事件 | `agent_task_events`；请求内容另有 `agent_request_contexts` 等记录 |
-| 不可变材料快照、来源及投递索引 | [context_assets.rs](../src/context_assets.rs)；`agent_context_assets`、`agent_context_asset_deliveries` 及资产文件 |
-| async 虚函数的并发窗口、按调用 ID 的回执与恢复 | [program_flow.rs](../src/single_agent/program_flow.rs)、[task_frames.rs](../src/single_agent/task_frames.rs)；并发写同一文件的冲突记录在 [managed_files.rs](../src/single_agent/managed_files.rs)，写入租约在 [workspace_changes.rs](../src/workspace_changes.rs) |
+| 不可变材料快照、来源及投递索引 | [context_assets.rs](../../src/context_assets.rs)；`agent_context_assets`、`agent_context_asset_deliveries` 及资产文件 |
+| async 虚函数的并发窗口、按调用 ID 的回执与恢复 | [program_flow.rs](../../src/single_agent/program_flow.rs)、[task_frames.rs](../../src/single_agent/task_frames.rs)；并发写同一文件的冲突记录在 [managed_files.rs](../../src/single_agent/managed_files.rs)，写入租约在 [workspace_changes.rs](../../src/workspace_changes.rs) |
 | 确定性容量折叠 | [step_context.rs](../src/single_agent/step_context.rs) |
 | 通用任务定义、计划及明确确认 | [main_task_anchor.rs](../src/main_task_anchor.rs) |
-| 插件后台任务及步骤归属 | [plugin_jobs.rs](../src/plugin_jobs.rs)；`agent_plugin_jobs` |
-| 通用执行提示及工具契约 | [single_agent.md](../prompts/single_agent.md)、[flow_capabilities.md](../prompts/flow_capabilities.md)、[task_tree.rs](../src/task_tree.rs) |
+| 插件后台任务及步骤归属 | [plugin_jobs.rs](../../src/plugin_jobs.rs)；`agent_plugin_jobs` |
+| 通用执行提示及工具契约 | [single_agent.md](../../prompts/single_agent.md)、[flow_capabilities.md](../../prompts/flow_capabilities.md)、[task_tree.rs](../src/task_tree.rs) |
 
 执行图上已有的 pending、running、suspended、done 等字段用于保存和展示运行现场，不要求模型逐项调用工具维护，也不应演变成一套必须反复请求批准才能推进的业务状态协议。
 
@@ -308,7 +308,7 @@ Agent 自己只做了文本检查。生成结束后，Codex 对原始产物另�
 
 同日使用新配置的 Luna 接口做两个独立 HTML 的真实小测试：一次用户请求、两个执行 Agent 各负责一页，没有中途指导。130.33 秒、24 次模型请求，主任务与两个分支均完成，工具错误为 0。公共文档只由主任务读取一次；两个分支只进行了各自的文件写入／自检，没有重查工作区、技能和工具组。`join_agents` 一次，`wait_agents` 和 `read_asset` 均为零；父任务读取实际产物并集中运行结构检查后接受结果。没有浏览器视觉验收，也没有以两页结果宣称 20 页性能收益。
 
-小测试记录：[run-report.md](../target/context-acceptance/fork-join-smoke-0a7cf8f8eb0e92a8abc5141b29c54f6b/run-report.md)。本地调试构建已更新；这项修改没有部署到远程服务器。
+小测试记录：[run-report.md](../../target/context-acceptance/fork-join-smoke-0a7cf8f8eb0e92a8abc5141b29c54f6b/run-report.md)。本地调试构建已更新；这项修改没有部署到远程服务器。
 
 
 ### 9.6 所有工具业务的统一伪代码规划（TS 执行器前）
@@ -317,7 +317,7 @@ Agent 自己只做了文本检查。生成结束后，Codex 对原始产物另�
 
 使用 Luna 做普通文件读取实测，用户仅要求“读取 docs/project-info.txt，告诉我项目名称”。18.41 秒完成，首次 `create_task` 将 `function* main` 和读文件／提取／核对返回的程序存入 briefing，随后读取一次文件并正确回答，未修改输入。这不是只对多 Agent 或特定业务生效的规则。
 
-记录：[run-report.md](../target/context-acceptance/universal-program-smoke-2a80fce51b62fa698a93e5c426efbe17/run-report.md)。这是单次模型行为验证，不把提示词要求等同于确定性的业务正确性保证。
+记录：[run-report.md](../../target/context-acceptance/universal-program-smoke-2a80fce51b62fa698a93e5c426efbe17/run-report.md)。这是单次模型行为验证，不把提示词要求等同于确定性的业务正确性保证。
 
 统一提示词后的完整回归仍为 260 通过、0 失败、7 忽略，日志 `/tmp/agent-universal-program-regression-final.log`。分页折叠测试的预算改为相对固定指令大小计算，以容纳两页和交付预留；生产容量阈值未调整。本地调试构建已更新。
 
@@ -376,7 +376,7 @@ Agent 自己只做了文本检查。生成结束后，Codex 对原始产物另�
 
 ## 13. 固定流程语言白名单（2026-10-26，版本 6，已由版本 7 替代）
 
-本节保留版本 6 的历史记录：当时将源码确定为固定的 JavaScript 基础语法子集，AI 仍解释白名单中的语义表达式。该方案已被修正，现行范围与确定性值规则以[版本 9 执行语言](agent-program.md#固定语言范围版本-9)为准。
+本节保留版本 6 的历史记录：当时将源码确定为固定的 JavaScript 基础语法子集，AI 仍解释白名单中的语义表达式。该方案已被修正，现行范围与确定性值规则以[版本 9 执行语言](../agent-program.md#固定语言范围版本-9)为准。
 
 编译器改用 JS 解析模式，不接收 function*/yield、async/await、TS 类型／模块语法、旧 call()/ai() 包装等其他 JS 写法。主程序、当前函数补写和 fork 分支经过相同编译边界，包含未调用函数的整份源码先编译再执行；静态 helper 参数数量也在执行前校验。main 不作为辅助函数调用，赋值只允许独立语句。对象、数组及实参按顺序保存 JSON 快照，避免后续数组追加影响先前字段取值。版本 5 及更早程序保留现场和历史，但明确拒绝执行，不静默升级或重放。
 
@@ -450,7 +450,7 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 本轮验证：相关语言和流程测试 **58 通过、0 失败**，完整本地回归 **319 通过、0 失败**。新测试验证前置／体内标记、占位返回编译拒绝、标记与相邻函数隔离、实际 AI 返回及挂起恢复、当前函数具体补写和嵌套虚函数。
 
-五页真实测试用 gpt-6-luna，模型正确声明虚函数，共享策划和两路制作均已进入执行 AI；一个分支补写源码漏掉结束大括号，51.47 秒后按首次错误停止，产物 0/5。本轮未闭环，不以回归通过替代真实生成成功。保留源码和错误，未人工修补续跑。详见[本地测试记录](../target/context-acceptance/agent-five-v10-8e2c68eef2abae786f647372cfef110d/run-report.md)。
+五页真实测试用 gpt-6-luna，模型正确声明虚函数，共享策划和两路制作均已进入执行 AI；一个分支补写源码漏掉结束大括号，51.47 秒后按首次错误停止，产物 0/5。本轮未闭环，不以回归通过替代真实生成成功。保留源码和错误，未人工修补续跑。详见[本地测试记录](../../target/context-acceptance/agent-five-v10-8e2c68eef2abae786f647372cfef110d/run-report.md)。
 
 ## 18. 源码检查与原作用域修正（2026-10-27）
 
@@ -458,7 +458,7 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 错误修正沿正常工具结果循环，不新建修复 Agent、不追加完成审批、不自动补括号、不重新执行已完成的工具。运行时与业务错误仍走原异常契约。此前五页测试器对任何工具错误立即取消，截断了编译修正机会；新的测试策略仅对源码验证失败允许每个执行 Agent 最多三次修正，重复操作、其他执行错误及五分钟超时仍停止。这是测试边界，不新增生产任务状态机。
 
-本轮回归：**60 项相关测试和 321 项全量测试通过，0 失败，生产构建通过**。捕获的真实缺括号源码已加入夹具，模拟 AI 在同一任务收到诊断后预检并提交完整实现，写入和父任务读回均只发生一次。五页真实复测为 113.40 秒、8 次模型请求、4/5 个文件，编译错误为0；另一分支在写第一份文件后因字符串与数值混合相加失败，按运行时异常停止，未重放写入或续跑。完整交付未通过，真实编译修正本轮未触发。详见[本地测试记录](../target/context-acceptance/agent-five-source-repair-367dd0db31fc44bae51cfa11fdea8547/run-report.md)。
+本轮回归：**60 项相关测试和 321 项全量测试通过，0 失败，生产构建通过**。捕获的真实缺括号源码已加入夹具，模拟 AI 在同一任务收到诊断后预检并提交完整实现，写入和父任务读回均只发生一次。五页真实复测为 113.40 秒、8 次模型请求、4/5 个文件，编译错误为0；另一分支在写第一份文件后因字符串与数值混合相加失败，按运行时异常停止，未重放写入或续跑。完整交付未通过，真实编译修正本轮未触发。详见[本地测试记录](../../target/context-acceptance/agent-five-source-repair-367dd0db31fc44bae51cfa11fdea8547/run-report.md)。
 
 ## 19. 常见基础写法的兼容（2026-10-27，版本 11）
 
@@ -466,9 +466,9 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 修改只落在已有表达式求值器，调用、任务、权限、回执和异常路径不变，不为此增加 AI 调用或业务提示。版本 10 及更早现场保留，但不按新运算语义继续执行。
 
-本轮验证：**62 项相关测试、323 项全量测试通过，0 失败；生产构建通过**。捕获的实际回执拼接源码加入回归夹具，受控执行验证两次写入 effect 及返回、恢复不重复操作。五页真实复测在首次请求收到 HTTP 502（桥接连接重置），约1.57秒即结束，没有工具或子 Agent 启动、产物0/5，未进入业务流程，不能声称真实五页交付通过。详见[本地测试记录](../target/context-acceptance/agent-five-v11-345b5cdcfc6c0507e1faa87df3621c6a/run-report.md)。
+本轮验证：**62 项相关测试、323 项全量测试通过，0 失败；生产构建通过**。捕获的实际回执拼接源码加入回归夹具，受控执行验证两次写入 effect 及返回、恢复不重复操作。五页真实复测在首次请求收到 HTTP 502（桥接连接重置），约1.57秒即结束，没有工具或子 Agent 启动、产物0/5，未进入业务流程，不能声称真实五页交付通过。详见[本地测试记录](../../target/context-acceptance/agent-five-v11-345b5cdcfc6c0507e1faa87df3621c6a/run-report.md)。
 
-同日再次复测：接口已恢复，版本11约88.59秒、7次模型请求后停止，0/5文件。makePages(input) 的真实实参为 {shared,pages}；一分支正确使用 input.pages，另一分支误用 input.input.pages，读取不存在字段后发生运行时错误。参数未丢失；命名参数封装与单参数整体绑定的展示约定易混淆。未用自动别名兜底或修改绑定语义，按异常停止。详见[复测记录](../target/context-acceptance/agent-five-v11-e020cc0997b4fefda9757ba5313d1549/run-report.md)。
+同日再次复测：接口已恢复，版本11约88.59秒、7次模型请求后停止，0/5文件。makePages(input) 的真实实参为 {shared,pages}；一分支正确使用 input.pages，另一分支误用 input.input.pages，读取不存在字段后发生运行时错误。参数未丢失；命名参数封装与单参数整体绑定的展示约定易混淆。未用自动别名兜底或修改绑定语义，按异常停止。详见[复测记录](../../target/context-acceptance/agent-five-v11-e020cc0997b4fefda9757ba5313d1549/run-report.md)。
 
 ## 20. 函数与工具调用契约统一（2026-10-27，版本12）
 
@@ -482,7 +482,7 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 验证结果：最终源码 **325 项通过、0 失败、7 项需环境的测试忽略；生产构建与技能校验通过**。真实 gpt-6-luna 两 Agent 五文件复测产出 **2/5**：首个 fork 参数个数错误在执行前被拒，模型自行改正；后续未重现 input.input、返回包装或运行时类型错误。但三页分支出现 draft_pages → compose_pages → generate_pages 的同义任务连续包装，而两页分支完成。看到重复后停止测试、保留原始状态，没有继续修结构或声称交付通过。
 
-剩余问题属于规划与执行角色：当前虚函数执行 AI 仍可将同一智能职责继续包装给另一虚函数，参数和工具接口一致并不等于任务能落实。此次不新增深度上限或业务规则掩盖该问题。详见[本轮真实测试记录](../target/context-acceptance/agent-five-v12-51e68c3024dc2655d86a3a336f48dcee/run-report.md)。
+剩余问题属于规划与执行角色：当前虚函数执行 AI 仍可将同一智能职责继续包装给另一虚函数，参数和工具接口一致并不等于任务能落实。此次不新增深度上限或业务规则掩盖该问题。详见[本轮真实测试记录](../../target/context-acceptance/agent-five-v12-51e68c3024dc2655d86a3a336f48dcee/run-report.md)。
 
 ## 21. 已确认的规划与执行边界（2026-10-27）
 
@@ -496,7 +496,7 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 随后按相同初始请求真实复测（gpt-6-luna）：两个分支均完成，产出5/5文件；未重现连续同义虚函数包装。主 Agent 发现导航断链并进入修复，但反复读取两文件，约177.53秒被测试器取消，整体交付仍未通过。共14次模型请求，2次源码校验错误均自行修正，运行时错误0。
 
-本轮暴露的结构问题是固定父作用域输入过重，已接近40%的步骤折叠阈值；读完第二份修复材料即折叠第一份，工作上下文交替只保留最新文件，造成重复读取。没有发生模型摘要压缩或目标重写。另有第1、2页可见正文完全相同，说明结构检查还不足以验收逐页内容。两种视口的10次浏览器检查无横向溢出／脚本错误，但导航断链仍在。依约停止，不继续改结构或人工修产物。详见[角色边界复测记录](../target/context-acceptance/agent-five-role-v12-3841daf21786ae368c46c47fb3811553/run-report.md)。
+本轮暴露的结构问题是固定父作用域输入过重，已接近40%的步骤折叠阈值；读完第二份修复材料即折叠第一份，工作上下文交替只保留最新文件，造成重复读取。没有发生模型摘要压缩或目标重写。另有第1、2页可见正文完全相同，说明结构检查还不足以验收逐页内容。两种视口的10次浏览器检查无横向溢出／脚本错误，但导航断链仍在。依约停止，不继续改结构或人工修产物。详见[角色边界复测记录](../../target/context-acceptance/agent-five-role-v12-3841daf21786ae368c46c47fb3811553/run-report.md)。
 
 ## 22. 作用域生命周期与工作空间折叠（2026-10-27）
 
@@ -512,7 +512,7 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 结束后只剩main运行窗口，program为空、scope_values为空，消息仅保留系统提示、用户请求及最终回答。估算输入峰值51,309 token，仍低于175,424预算；本轮无需折叠。自然增长压力的折叠能力由前述回归独立验证，不把无折叠的短测试外推成任意规模保证。
 
-桌面和手机视口的10组浏览器检查全部通过，无脚本错误、断链、横向溢出、坏图或检测到的文字裁剪；五页H1和可见正文各异。前三页浏览器title较泛化，仍可改善元数据。此次验证为五文件HTML流程，未跑真实二十页PPT，也未部署或重启常驻服务。详见[作用域与折叠实测记录](../target/context-acceptance/agent-five-scope-v12-23b14e289daf4317c9ef7b967aaf4c51/run-report.md)。
+桌面和手机视口的10组浏览器检查全部通过，无脚本错误、断链、横向溢出、坏图或检测到的文字裁剪；五页H1和可见正文各异。前三页浏览器title较泛化，仍可改善元数据。此次验证为五文件HTML流程，未跑真实二十页PPT，也未部署或重启常驻服务。详见[作用域与折叠实测记录](../../target/context-acceptance/agent-five-scope-v12-23b14e289daf4317c9ef7b967aaf4c51/run-report.md)。
 
 ## 23. 当前代码统一与退役路径清理（2026-10-27）
 
@@ -533,9 +533,9 @@ program_tool_headers 从真实参数 schema 自动生成 TS 风格声明：固�
 
 验证：完整 Rust 回归 **288 通过、0 失败、3 忽略**；前端 **38 通过、0 失败、2 跳过**；前后端生产构建、Skill 校验和差异格式检查通过。测试数量下降来自删除退役执行器及其专属测试；串行／并发、参数、作用域、异常、权限、插件边界、回执恢复及二十页确定性验收仍有当前流程覆盖。新增测试检查旧入口拒绝、原生 fork 越界拒绝、配置保存及 fork/join 重启后无新任务、无额外模型请求。真实模型测试结果另记。
 
-统一后的真实五文件复测使用 gpt-6.1-terra，约164.27秒、9次模型请求，产出4/5文件；两分支一完成、一失败。第3页虚函数返回的长JSON中，HTML字体名的双引号未转义，解析失败并沿程序上抛；测试器立即停止，无运行中补提示或人工补产物。编译错误0，源材料未改变。本轮完整交付未通过，也未做完整浏览器／PPT验收；不把静态回归通过当作真实生成成功。详见[真实复测记录](../target/context-acceptance/agent-five-scope-v12-8a892fdba03134c114f6e054781ac5d6/run-report.md)。
+统一后的真实五文件复测使用 gpt-6.1-terra，约164.27秒、9次模型请求，产出4/5文件；两分支一完成、一失败。第3页虚函数返回的长JSON中，HTML字体名的双引号未转义，解析失败并沿程序上抛；测试器立即停止，无运行中补提示或人工补产物。编译错误0，源材料未改变。本轮完整交付未通过，也未做完整浏览器／PPT验收；不把静态回归通过当作真实生成成功。详见[真实复测记录](../../target/context-acceptance/agent-five-scope-v12-8a892fdba03134c114f6e054781ac5d6/run-report.md)。
 
-本轮全部本地验证日志及汇总在[统一验证目录](../target/agent-unification-check/summary.json)。未提交、推送、部署或重启常驻服务。
+本轮全部本地验证日志及汇总在[统一验证目录](../../target/agent-unification-check/summary.json)。未提交、推送、部署或重启常驻服务。
 
 ## 24. Git 并发产物的显式交接（2026-10-27）
 
@@ -549,4 +549,4 @@ Luna 十页真实测试的首轮在主任务创建前调用 list_skills，被既
 
 新会话使用相同初始请求，主／子Agent均为 gpt-6-luna，没有运行中补提示或人工改文件。模型自主写出含检查、合并的主流程，10个HTML和shared.css均生成到 agent-design/，子分支已自动合并，inspect_agent_changes、merge_agent_result各调用一次，源文档未改变。整体在300秒测试上限被取消，22次模型请求，两页AI验收完成、第三页进行中；不能声称完整任务通过。按已返回用量合计输入约1,102,002、输出37,884 token（21次有用量记录，不含取消中的未返回用量）。
 
-随后只读浏览器检查20组桌面／手机视口，第5、8、9页含指向不存在index.html的导航，完整视觉／交付验收未通过。未人工补入口或改产物。十页目录发现最初只检查根目录，已将保留的测试器修正为递归检查；当次原始报告保留，实际文件与合并证据另存acceptance.json。完整回归294通过、0失败、5忽略，生产构建与Skill校验通过。Git文件交接修复通过验证，生成质量及剩余验收问题单独记录。证据见[Git十页复测报告](../target/git-integration-check/luna-ten-git-8680591ee947b54a4eedc207b43ad1aa/run-report.md)。未提交、部署或重启服务。
+随后只读浏览器检查20组桌面／手机视口，第5、8、9页含指向不存在index.html的导航，完整视觉／交付验收未通过。未人工补入口或改产物。十页目录发现最初只检查根目录，已将保留的测试器修正为递归检查；当次原始报告保留，实际文件与合并证据另存acceptance.json。完整回归294通过、0失败、5忽略，生产构建与Skill校验通过。Git文件交接修复通过验证，生成质量及剩余验收问题单独记录。证据见[Git十页复测报告](../../target/git-integration-check/luna-ten-git-8680591ee947b54a4eedc207b43ad1aa/run-report.md)。未提交、部署或重启服务。

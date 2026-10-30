@@ -192,9 +192,9 @@ async function buildSite() {
   const sourcePaths = [
     "README.md",
     "docs/agent-program.md",
-    "docs/generic-agent-design.md",
+    "docs/archive/generic-agent-design.md",
     "docs/skill_packages.md",
-    "docs/task_delegation.md"
+    "docs/archive/task_delegation.md"
   ];
   const sources = [];
   for (const sourcePath of sourcePaths) {
@@ -209,7 +209,7 @@ async function buildSite() {
     sources: sources,
     authority: [
       "docs/agent-program.md",
-      "docs/generic-agent-design.md"
+      "docs/archive/generic-agent-design.md"
     ],
     requirements: [
       "使用中文，忠于实际完整读取的五份材料",

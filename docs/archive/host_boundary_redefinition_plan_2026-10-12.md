@@ -4,7 +4,7 @@
 
 状态：代码整改与回归已完成；真实 PPT 页面复验因当前 UI 自动化不支持文件选择而待完成。
 
-依据：用户明确要求宿主负责原始消息传递、上下文引用解析和按历史索引升序装配，禁止宿主擅自判断、筛选、解释或决定角色后续行为。代码基线为 `3fbda85`；[排查记录](../.codex-workspace-mcp/host-message-audit-20261012.md)包含 21 段原代码及调用位置，部分段落属于同一问题的调用链，不代表 21 个独立方法。
+依据：用户明确要求宿主负责原始消息传递、上下文引用解析和按历史索引升序装配，禁止宿主擅自判断、筛选、解释或决定角色后续行为。代码基线为 `3fbda85`；[排查记录](../../.codex-workspace-mcp/host-message-audit-20261012.md)包含 21 段原代码及调用位置，部分段落属于同一问题的调用链，不代表 21 个独立方法。
 
 本计划覆盖排查中发现的消息处理和执行策略问题。此前历史树计划将停滞检测列为另议；本计划将其中的宿主语义判断与强制交接纳入整改，技术资源上限另按明确配置保留。
 
@@ -95,7 +95,7 @@
 | 20 | `user_bans_run_command()`、`strip_quoted_segments()`、`ban_run_command` 派生路径 | 去除宿主关键词推断。AI 识别用户原始要求并在行动中遵守；宿主执行明确的结构化权限和约束，不能让 AI 提升用户配置的权限。 |
 | 21 | `run_agent()` 空响应时自行写入 `worker/yield` 的分支 | 保留真实调用失败状态，不产生 Worker 原始交接事件，不把宿主诊断标为 Worker 发言。Organizer 根据真实错误决定后续。 |
 
-源码路径：[session_history.rs](../src/session_history.rs)、[agent_service.rs](../src/agent_service.rs)、[observer_service.rs](../src/observer_service.rs)、[context_rebuild.rs](../src/context_rebuild.rs)、[work_organizer.rs](../src/work_organizer.rs)、[work_scheduler.rs](../src/work_scheduler.rs)、[worker_read_cache.rs](../src/worker_read_cache.rs)、[work_executor.rs](../src/work_executor.rs)。
+源码路径：[session_history.rs](../../src/session_history.rs)、[agent_service.rs](../../src/agent_service.rs)、[observer_service.rs](../src/observer_service.rs)、[context_rebuild.rs](../src/context_rebuild.rs)、[work_organizer.rs](../src/work_organizer.rs)、[work_scheduler.rs](../src/work_scheduler.rs)、[worker_read_cache.rs](../src/worker_read_cache.rs)、[work_executor.rs](../src/work_executor.rs)。
 
 ## 六、错误、权限、资源与重试
 

@@ -119,9 +119,9 @@
 
 ## 相关代码和已有记录
 
-- 历史装配、查询和来源：[session_history.rs](../src/session_history.rs)。
-- 上下文选择及顺序恢复：[context_rebuild.rs](../src/context_rebuild.rs)、[context_window.rs](../src/context_window.rs)。
-- Observer 验收及超窗分支：[observer_service.rs](../src/observer_service.rs)、[agent_service.rs](../src/agent_service.rs)。
-- 实际请求与图像传递：[request_context.rs](../src/request_context.rs)、[visual_artifacts.rs](../src/visual_artifacts.rs)。
+- 历史装配、查询和来源：[session_history.rs](../../src/session_history.rs)。
+- 上下文选择及顺序恢复：[context_rebuild.rs](../src/context_rebuild.rs)、[context_window.rs](../../src/context_window.rs)。
+- Observer 验收及超窗分支：[observer_service.rs](../src/observer_service.rs)、[agent_service.rs](../../src/agent_service.rs)。
+- 实际请求与图像传递：[request_context.rs](../../src/request_context.rs)、[visual_artifacts.rs](../../src/visual_artifacts.rs)。
 - 上一阶段计划与测试任务：[Observer 验收计划](observer_acceptance_next_plan_2026-10-10.md)。
 - 已有真实执行和已知限制：[验收与历史路由复验](observer_acceptance_recheck_2026-10-11.md)。

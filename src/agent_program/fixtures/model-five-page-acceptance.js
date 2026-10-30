@@ -11,7 +11,7 @@ const PAGE_FILES = [
 const REFERENCE_FILES = [
   "docs/README.md",
   "docs/agent-program.md",
-  "docs/generic-agent-design.md"
+  "docs/archive/generic-agent-design.md"
 ];
 
 const MAX_FILE_BYTES = 250000;

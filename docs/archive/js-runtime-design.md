@@ -1,6 +1,6 @@
 # JS 运行时设计（语言版本 14）
 
-> 本文记录版本 14 自建 VM 的设计与实现背景；是否继续自建 VM 或采用 Node 尚待验证。见 [设计与实现入口](agent-design-guide.md)。
+> 本文记录版本 14 自建 VM 的设计与实现背景；是否继续自建 VM 或采用 Node 尚待验证。见 [设计与实现入口](../agent-design-guide.md)。
 
 状态：M0–M8 的实现、示例迁移和约定回归已完成。运行时保留少量旧快照类型和串行动作适配，以便恢复或明确拒绝已退役的 fork/join 现场；异步只读调用在宿主合批。已知 JS 子集边界和并发验证见 [promise-virtual-tasks.md](promise-virtual-tasks.md)。
 

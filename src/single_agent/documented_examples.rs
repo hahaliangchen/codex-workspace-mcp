@@ -61,7 +61,7 @@ async fn real_luna_typescript_oop_acceptance_design() -> Result<()> {
     let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
     crate::ai_proxy::apply_agent_config(&mut state,&config);
     let model=state.model_map.get("gpt-6-luna").cloned().context("configured provider must retain Luna")?;
-    let prompt="请为一个已有的五页中文 HTML 项目写 TypeScript 验收脚本：先理解工作区 README.md、docs/agent-program.md、docs/generic-agent-design.md 的项目设计，再从整组页面是否有效介绍项目的角度，结合 runs/acceptance-five-ai-review 下五个 HTML 文件，检查整体和各页问题，并把结论、依据、问题和未检查事项写入 acceptance-report.md。不要修改页面。";
+    let prompt="请为一个已有的五页中文 HTML 项目写 TypeScript 验收脚本：先理解工作区 README.md、docs/agent-program.md、docs/archive/generic-agent-design.md 的项目设计，再从整组页面是否有效介绍项目的角度，结合 runs/acceptance-five-ai-review 下五个 HTML 文件，检查整体和各页问题，并把结论、依据、问题和未检查事项写入 acceptance-report.md。不要修改页面。";
     let instruction="使用传统面向对象方式编写 TypeScript：用类组织职责、状态和流程。能用普通代码与现有工具可靠实现的步骤应写出具体实现；需要理解、判断或其他尚无法直接编程实现的能力，声明为职责内聚的抽象方法，清楚定义参数和返回类型，不必编写这些抽象方法的实现类。宿主可提供满足抽象类接口的实例。文件系统能力也可以作为接口声明。适度设计类，避免将整个流程变成一个抽象方法；检查基于真实内容和证据，准确记录无法确认的内容。请只返回完整 TypeScript 源码，不要解释或 Markdown 围栏。无需为当前特定虚拟机限制代码。";
     std::fs::write(evidence.join("request.json"),serde_json::to_vec_pretty(&json!({"model":model,"system":instruction,"user":prompt}))?)?;
     eprintln!("TS_OOP_START {} model={model}",evidence.display());
@@ -93,7 +93,7 @@ async fn real_luna_typescript_minimal_prompt() -> Result<()> {
     let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
     crate::ai_proxy::apply_agent_config(&mut state,&config);
     let model=state.model_map.get("gpt-6-luna").cloned().context("configured provider must retain Luna")?;
-    let prompt="请用 JavaScript 写一份过程式代码，验收我已有的五页 HTML 项目。项目根目录是 /home/goodtime/Documents/project/codex-workspace-mcp，五个页面都在 runs/acceptance-five-ai-review 目录下，分别是 01-overview.html、02-program.html、03-tools.html、04-agents.html、05-quality.html。项目设计资料是根目录下的 README.md、docs/agent-program.md 和 docs/generic-agent-design.md。
+    let prompt="请用 JavaScript 写一份过程式代码，验收我已有的五页 HTML 项目。项目根目录是 /home/goodtime/Documents/project/codex-workspace-mcp，五个页面都在 runs/acceptance-five-ai-review 目录下，分别是 01-overview.html、02-program.html、03-tools.html、04-agents.html、05-quality.html。项目设计资料是根目录下的 README.md、docs/agent-program.md 和 docs/archive/generic-agent-design.md。
 
 请先根据设计资料理解项目目标，再检查五页作为一组是否完整、内容是否与设计一致、各页之间是否协调；同时检查页面本地链接与资源是否有效。根据实际检查结果写一份验收报告，包含整体和逐页结论、具体问题、依据以及没有检查或无法确认的事项。不要修改已有页面。
 

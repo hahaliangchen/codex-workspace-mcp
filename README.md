@@ -1,7 +1,7 @@
 # codex-workspace-mcp
 
-> 当前执行、作用域、语言和插件边界，以[语言手册](docs/agent-program.md)及[通用 Agent 设计](docs/generic-agent-design.md)为准。旧设计执行路径已经移除；设计文档中的有日期测试记录只代表当时版本。
-> 当前执行语言为版本 14：Rust 虚拟机支持对象引用、词法作用域、闭包、可挂起的回调、Promise 和 async/await；具体语法范围及限制见 [JS 运行时设计](docs/js-runtime-design.md)。版本 12 的运行记录及历史测试见[统一清理记录](docs/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。
+> 当前设计以 [Agent 设计](docs/agent-design-guide.md) 为唯一依据，语言细节见[语言手册](docs/agent-program.md)。旧设计执行路径已经移除；历史方案和有日期的测试记录在 [docs/archive](docs/archive/README.md)，只代表当时版本。
+> 当前执行语言为版本 14：Rust 虚拟机支持对象引用、词法作用域、闭包、可挂起的回调、Promise 和 async/await；具体语法范围及限制见 [JS 运行时设计](docs/archive/js-runtime-design.md)。版本 12 的运行记录及历史测试见[统一清理记录](docs/archive/generic-agent-design.md#23-当前代码统一与退役路径清理2026-10-27)。
 
 由 Rust 执行任务的本地通用 Agent，使用基于 DeepSeek Harness（DSH）的 React/Cordis 前端。流程使用 JS 基础语法子集表达，虚函数承载需要 AI 判断的任务，并支持异步并发。模型直接连接提供商的 Chat Completions 接口。
 
@@ -192,4 +192,4 @@ MCP `initialize` 返回 `Mcp-Session-Id`，后续 POST/GET/DELETE 应携带该�
 
 聊天附件支持选择、拖拽和粘贴图片，并使用持久引用在多轮中读取资料及调用视觉分析。插件附件能力由插件声明，协议兼容范围、解析边界及测试见[会话附件](docs/attachments.md)。
 
-Git并发文件交接已补齐：fork句柄明确工作区，join后由流程显式检查、合并，再读回验收。共享目录和Git仓库均有示例回归，详见[Git边界与十页实测](docs/generic-agent-design.md#24-git-并发产物的显式交接2026-10-27)。本次主／子Agent均使用Luna，10页已生成并自动合并；整轮仍因测试时限及导航问题未通过完整交付。
+Git并发文件交接已补齐：fork句柄明确工作区，join后由流程显式检查、合并，再读回验收。共享目录和Git仓库均有示例回归，详见[Git边界与十页实测](docs/archive/generic-agent-design.md#24-git-并发产物的显式交接2026-10-27)。本次主／子Agent均使用Luna，10页已生成并自动合并；整轮仍因测试时限及导航问题未通过完整交付。

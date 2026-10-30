@@ -47,13 +47,13 @@ function* main(input) {
 
 ## 本地证据
 
-三轮完整证据及汇总在 [本地测试目录](../target/context-acceptance/ts-program-20261026/summary.json)：每轮包含 `program-1.ts`、`run-manifest.json`、`probe-report.json`、`summary.json`、原始事件数据库及请求日志。目录被 Git 忽略，不随源码提交。
+三轮完整证据及汇总在 [本地测试目录](../../target/context-acceptance/ts-program-20261026/summary.json)：每轮包含 `program-1.ts`、`run-manifest.json`、`probe-report.json`、`summary.json`、原始事件数据库及请求日志。目录被 Git 忽略，不随源码提交。
 
-- [第一轮](../target/context-acceptance/ts-program-20261026/attempt-1/summary.json)
-- [第二轮](../target/context-acceptance/ts-program-20261026/attempt-2/summary.json)
-- [第三轮](../target/context-acceptance/ts-program-20261026/attempt-3/summary.json)
+- [第一轮](../../target/context-acceptance/ts-program-20261026/attempt-1/summary.json)
+- [第二轮](../../target/context-acceptance/ts-program-20261026/attempt-2/summary.json)
+- [第三轮](../../target/context-acceptance/ts-program-20261026/attempt-3/summary.json)
 
-最终完整回归：**271 通过、0 失败、7 忽略**，用时 24.26 秒；调试构建成功。日志：[回归](../target/context-acceptance/ts-program-20261026/final-regression.log)、[构建](../target/context-acceptance/ts-program-20261026/final-build.log)。未在生产源码中保留临时真实测试钩子。
+最终完整回归：**271 通过、0 失败、7 忽略**，用时 24.26 秒；调试构建成功。日志：[回归](../../target/context-acceptance/ts-program-20261026/final-regression.log)、[构建](../../target/context-acceptance/ts-program-20261026/final-build.log)。未在生产源码中保留临时真实测试钩子。
 
 ## 唯一 main 复测（2026-10-26）
 
@@ -75,12 +75,12 @@ function* main(input) {
 
 最终本地回归：**276 通过、0 失败、7 忽略**，用时 23.66 秒。新增测试验证唯一 main 以及辅助函数返回后继续主流程；模拟双 Agent、权限和回执恢复仍通过。调试构建成功。未部署、未提交或推送。
 
-证据：[两轮汇总](../target/context-acceptance/ts-program-20261026/single-main/summary.json)、[第二轮外部停止记录](../target/context-acceptance/ts-program-20261026/single-main/attempt-2/external-stop-report.json)、[实际主程序](../target/context-acceptance/ts-program-20261026/single-main/attempt-2/program-1.ts)、[回归日志](../target/context-acceptance/ts-program-20261026/single-main/regression.log)。原始事件数据库、模型请求、夹具、完整程序和部分生成文件均随各轮本地证据保存，Git 忽略。
+证据：[两轮汇总](../../target/context-acceptance/ts-program-20261026/single-main/summary.json)、[第二轮外部停止记录](../../target/context-acceptance/ts-program-20261026/single-main/attempt-2/external-stop-report.json)、[实际主程序](../../target/context-acceptance/ts-program-20261026/single-main/attempt-2/program-1.ts)、[回归日志](../../target/context-acceptance/ts-program-20261026/single-main/regression.log)。原始事件数据库、模型请求、夹具、完整程序和部分生成文件均随各轮本地证据保存，Git 忽略。
 
 
 ## 普通函数、注释任务与工具库（版本 3）
 
-按用户进一步明确的写法，增加专门的 [task-program skill](../skills/task-program/SKILL.md)，规划请求固定加载；普通辅助函数可以编排工具库调用，也可以调用只有注释的任务函数。后者把注释作为任务说明、实参按参数名作为输入，在局部作用域使用正常工具循环完成，返回 JSON 后恢复调用方。执行任务体时不再要求重写 main，也不暴露任务／并行调度工具。main 返回仍然结束整个任务，没有新增完成闸门。
+按用户进一步明确的写法，增加专门的 [task-program skill](../../skills/task-program/SKILL.md)，规划请求固定加载；普通辅助函数可以编排工具库调用，也可以调用只有注释的任务函数。后者把注释作为任务说明、实参按参数名作为输入，在局部作用域使用正常工具循环完成，返回 JSON 后恢复调用方。执行任务体时不再要求重写 main，也不暴露任务／并行调度工具。main 返回仍然结束整个任务，没有新增完成闸门。
 
 编译器支持普通调用、嵌套调用和结果引用，仍拒绝运算符与普通 JS 方法。新回归覆盖混合调用、注释提取与参数绑定、双 Agent 内部任务实际写入、类型化返回、局部窗口释放、错误传播和挂起任务回执恢复。最终 **280 通过、0 失败、7 忽略**，用时 25.74 秒。技能格式校验通过。
 
@@ -101,7 +101,7 @@ function* main(input) {
 
 重复调用来自模型新发出的工具调用，不是宿主重放同一条挂起指令。完整源码中的 verify_and_deliver 只有一段笼统注释，没有将各文件检查表达成明确迭代与返回数据。把它细化为可见的循环、逐件检查与汇总，符合用户所说的“函数里编排工具库”的方向；本轮遵守停止边界，没有再加入业务硬判断或临时修改模型程序。折叠与重复在时间上有关，但当前证据不足以单独归因于压缩丢失任务；最后的实际请求中任务输入和最新返回仍存在。
 
-证据：[真实程序](../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/program-1.ts)、[统计与调用记录](../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/summary.json)、[停止记录](../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/external-stop-report.json)、[浏览器报告](../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/inspection/browser-check.json)、[回归](../target/context-acceptance/ts-program-20261026/comment-tasks-v3/regression.log)。该目录保存一致性的原始事件／请求数据库、技能、输入文档、源码与 20 个 HTML。停止前数据库中的主任务 running 是历史快照，测试进程已终止。
+证据：[真实程序](../../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/program-1.ts)、[统计与调用记录](../../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/summary.json)、[停止记录](../../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/external-stop-report.json)、[浏览器报告](../../target/context-acceptance/ts-program-20261026/comment-tasks-v3/attempt-1/inspection/browser-check.json)、[回归](../../target/context-acceptance/ts-program-20261026/comment-tasks-v3/regression.log)。该目录保存一致性的原始事件／请求数据库、技能、输入文档、源码与 20 个 HTML。停止前数据库中的主任务 running 是历史快照，测试进程已终止。
 
 真实测试使用临时编译的测试入口，源码中已移除该入口；没有重启服务、部署、提交或推送。
 
@@ -125,7 +125,7 @@ function* main(input) {
 
 现有回归 **280 通过、0 失败、8 忽略**，25.19 秒；其中多出的一个忽略项是临时真实测试入口，入口已从源码移除。skill 格式校验通过。没有再修改宿主结构，没有重启服务、部署、提交或推送。
 
-证据：[首轮报告](../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-1/probe-report.json)、[第二轮统计](../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/summary.json)、[第二轮完整程序](../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/program-86.ts)、[浏览器检查](../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/inspection/browser-check.json)、[回归](../target/context-acceptance/ts-program-20261026/explicit-flow/regression.log)。两轮均保存原始事件和模型请求数据库，未修改生成源码与产物。
+证据：[首轮报告](../../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-1/probe-report.json)、[第二轮统计](../../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/summary.json)、[第二轮完整程序](../../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/program-86.ts)、[浏览器检查](../../target/context-acceptance/ts-program-20261026/explicit-flow/attempt-2/inspection/browser-check.json)、[回归](../../target/context-acceptance/ts-program-20261026/explicit-flow/regression.log)。两轮均保存原始事件和模型请求数据库，未修改生成源码与产物。
 
 
 ## 函数任务统一与5文件快速闭环（版本4）
@@ -149,4 +149,4 @@ function* main(input) {
 
 完整回归：**285通过、0失败、8忽略**，25.26秒；其中1个忽略项是临时真实测试入口，入口已从源码移除。技能格式校验、调试构建及差异空白检查通过。此前失败记录完整保留，没有改写生成的程序或HTML。该结果只验证了本轮5文件流程，20页与PPT插件未重新测试；常驻服务未重启，未部署、提交或推送。
 
-证据：[最终统计](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/summary.json)、[实际main](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/execute_program-100.ts)、[验收函数补写](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/define_task_body-275.ts)、[验收子任务补写](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/define_task_body-327.ts)、[浏览器报告](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/inspection/browser-check.json)、[回归](../target/context-acceptance/ts-program-20261026/nested-tasks-v4/regression.log)。各轮均保存输入、源码和原始事件／请求数据库。
+证据：[最终统计](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/summary.json)、[实际main](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/execute_program-100.ts)、[验收函数补写](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/define_task_body-275.ts)、[验收子任务补写](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/define_task_body-327.ts)、[浏览器报告](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/attempt-4/inspection/browser-check.json)、[回归](../../target/context-acceptance/ts-program-20261026/nested-tasks-v4/regression.log)。各轮均保存输入、源码和原始事件／请求数据库。
