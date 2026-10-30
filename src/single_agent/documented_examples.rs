@@ -260,7 +260,7 @@ async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-design-guide.md"),root.join("docs/agent-design-guide.md"))?;
     eprintln!("REAL_DECK_START model={model} root={}",root.display());
     // What a user would type: no program, no file names.
-    let prompt="根据 docs/agent-design-guide.md，做 5 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。";
+    let prompt="根据 docs/agent-design-guide.md，做 5 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。页面之间能前后翻页（按钮和左右方向键都行）；5 页版式统一；幻灯片在窗口里居中，窗口大小变化时内容不重叠、不被遮挡。";
     let started=std::time::Instant::now();
     let cancel=CancellationToken::new();
     let result=tokio::time::timeout(Duration::from_secs(1200),run_task(state,"example".into(),model,prompt.into(),120,cancel.clone(),1,false)).await;
@@ -275,6 +275,11 @@ async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
     result.context("deck task timed out")??;
     ensure!(status=="completed","deck task status: {status}");
     ensure!(pages.len()>=5,"expected 5 page files: {pages:?}");
+    // Each page links to another one.
+    for page in &pages {
+        let html=std::fs::read_to_string(root.join(page))?;
+        ensure!(pages.iter().filter(|other|*other!=page).any(|other|html.contains(Path::new(other).file_name().and_then(|n|n.to_str()).unwrap_or("\0"))),"{page} links to no other page");
+    }
     Ok(())
 }
 
