@@ -185,12 +185,17 @@ async fn real_model_serial_published_example() -> Result<()> {
 
 /// The configured default model at low reasoning effort, in a fresh workspace.
 fn real_low_effort(name: &str) -> Result<(std::path::PathBuf, AgentServiceState, String)> {
+    real_with_effort(name, "low")
+}
+
+/// The configured default model at the given reasoning effort, in a fresh workspace.
+fn real_with_effort(name: &str, effort: &str) -> Result<(std::path::PathBuf, AgentServiceState, String)> {
     let root=std::env::temp_dir().join(format!("{name}-{}",agent_service::uuid_like()));
     std::fs::create_dir_all(&root)?;
     let mut state=agent_service::tests::test_state(&root,"127.0.0.1:1".parse()?);
     let config=crate::ai_proxy::load_config(&crate::ai_proxy::dsh_config_path())?;
     crate::ai_proxy::apply_agent_config(&mut state,&config);
-    state.reasoning_effort=Some("low".into());
+    state.reasoning_effort=Some(effort.into());
     let model=state.model_map.get(&state.default_model).cloned().unwrap_or_else(||state.default_model.clone());
     ensure!(!state.provider_url.is_empty() && !state.api_key.is_empty(),"configured model unavailable");
     agent_service::open_db(&root)?.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('example','',?1,'running',0,0)",[&model])?;
@@ -310,6 +315,53 @@ fn walkdir_html(root: &Path) -> Result<Vec<String>> {
             if name.starts_with('.') { continue; }
             if path.is_dir() { dirs.push(path); }
             else if name.ends_with(".html") { found.push(path.strip_prefix(root)?.display().to_string()); }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_writes_a_markdown_library_on_its_own() -> Result<()> {
+    let (root,state,model)=real_with_effort("mdlite-real","medium")?;
+    eprintln!("REAL_MDLITE_START model={model} root={}",root.display());
+    // A real coding task: the agent writes and tests the library itself; the
+    // hidden acceptance cases are applied only afterwards.
+    let prompt="在当前目录用 Python 写一个把 Markdown 转成 HTML 的库：模块 mdlite.py，提供函数 markdown_to_html(text: str) -> str，只用标准库。支持标题、段落、强调（* _ ** __）、行内代码、链接、无序和有序列表（含嵌套）、围栏代码块、引用；HTML 特殊字符要转义；输出按 CommonMark 的 HTML 写法。写单元测试并确保通过。";
+    let started=std::time::Instant::now();
+    let cancel=CancellationToken::new();
+    let result=tokio::time::timeout(Duration::from_secs(1800),run_task(state,"example".into(),model,prompt.into(),300,cancel.clone(),1,false)).await;
+    if result.is_err(){cancel.cancel();}
+    let conn=agent_service::open_db(&root)?;
+    let status:String=conn.query_row("SELECT status FROM agent_tasks WHERE id='example'",[],|row|row.get(0))?;
+    let requests:i64=conn.query_row("SELECT count(*) FROM agent_request_contexts WHERE task_id='example'",[],|row|row.get(0))?;
+    let heals:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='example' AND kind='program/runtime_error'",[],|row|row.get(0))?;
+    let hidden=std::env::temp_dir().join(format!("mdlite-acceptance-{}.py",agent_service::uuid_like()));
+    std::fs::write(&hidden,include_str!("fixtures/mdlite_acceptance.py"))?;
+    let scored=std::process::Command::new("python3").arg("-I").arg(&hidden).arg(&root).output()?;
+    std::fs::remove_file(&hidden)?;
+    let score=String::from_utf8_lossy(&scored.stdout).trim().to_owned();
+    eprintln!("REAL_MDLITE_DONE seconds={:.0} status={status} model_requests={requests} runtime_errors={heals} files={:?} answer={:?}",
+        started.elapsed().as_secs_f64(),walk_files(&root)?,last_answer(&root).ok());
+    eprintln!("REAL_MDLITE_SCORE {score} {}",String::from_utf8_lossy(&scored.stderr).trim());
+    result.context("markdown task timed out")??;
+    ensure!(status=="completed","markdown task status: {status}");
+    let score:Value=serde_json::from_str(&score).context("hidden acceptance did not run")?;
+    let (passed,total)=(score["passed"].as_u64().unwrap_or(0),score["total"].as_u64().unwrap_or(1));
+    ensure!(passed*10>=total*8,"passed {passed} of {total} hidden cases");
+    Ok(())
+}
+
+fn walk_files(root: &Path) -> Result<Vec<String>> {
+    let mut found=Vec::new();
+    let mut dirs=vec![root.to_owned()];
+    while let Some(dir)=dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path=entry?.path();
+            let name=path.file_name().and_then(|n|n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name=="__pycache__" { continue; }
+            if path.is_dir() { dirs.push(path); } else { found.push(path.strip_prefix(root)?.display().to_string()); }
         }
     }
     found.sort();
