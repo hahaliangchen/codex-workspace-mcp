@@ -260,7 +260,7 @@ async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-design-guide.md"),root.join("docs/agent-design-guide.md"))?;
     eprintln!("REAL_DECK_START model={model} root={}",root.display());
     // What a user would type: no program, no file names.
-    let prompt="根据 docs/agent-design-guide.md，做一套 5 页的 HTML，讲这个 Agent 的设计，PPT 风格。";
+    let prompt="根据 docs/agent-design-guide.md，做 5 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。";
     let started=std::time::Instant::now();
     let cancel=CancellationToken::new();
     let result=tokio::time::timeout(Duration::from_secs(1200),run_task(state,"example".into(),model,prompt.into(),120,cancel.clone(),1,false)).await;
@@ -274,9 +274,7 @@ async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
         started.elapsed().as_secs_f64(),program_outcomes(&root)?.iter().filter(|text| text.starts_with("程序")).collect::<Vec<_>>(),last_answer(&root).ok());
     result.context("deck task timed out")??;
     ensure!(status=="completed","deck task status: {status}");
-    // Five pages may be five files or one deck of five slides.
-    let slides=pages.iter().map(|page|std::fs::read_to_string(root.join(page)).map(|html|html.matches("<section").count())).sum::<std::io::Result<usize>>()?;
-    ensure!(pages.len()>=5 || slides>=5,"expected 5 pages: {pages:?}, {slides} sections");
+    ensure!(pages.len()>=5,"expected 5 page files: {pages:?}");
     Ok(())
 }
 
