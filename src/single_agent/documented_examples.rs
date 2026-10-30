@@ -255,26 +255,37 @@ async fn real_model_user_message_pauses_the_program() -> Result<()> {
 #[tokio::test]
 #[ignore = "real configured model, isolated workspace, consumes provider tokens"]
 async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
-    let (root,state,model)=real_low_effort("deck-real")?;
+    real_deck(5, 1200).await
+}
+
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_makes_a_twenty_slide_deck_on_its_own() -> Result<()> {
+    real_deck(20, 2400).await
+}
+
+/// What a user would type, with no program: a deck of separate linked pages.
+async fn real_deck(count: usize, seconds: u64) -> Result<()> {
+    let (root,state,model)=real_low_effort(&format!("deck{count}-real"))?;
     std::fs::create_dir_all(root.join("docs"))?;
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-design-guide.md"),root.join("docs/agent-design-guide.md"))?;
-    eprintln!("REAL_DECK_START model={model} root={}",root.display());
-    // What a user would type: no program, no file names.
-    let prompt="根据 docs/agent-design-guide.md，做 5 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。页面之间能前后翻页（按钮和左右方向键都行）；5 页版式统一；幻灯片在窗口里居中，窗口大小变化时内容不重叠、不被遮挡。";
+    eprintln!("REAL_DECK_START pages={count} model={model} root={}",root.display());
+    let prompt=format!("根据 docs/agent-design-guide.md，做 {count} 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。页面之间能前后翻页（按钮和左右方向键都行）；{count} 页版式统一；幻灯片在窗口里居中，窗口大小变化时内容不重叠、不被遮挡。");
     let started=std::time::Instant::now();
     let cancel=CancellationToken::new();
-    let result=tokio::time::timeout(Duration::from_secs(1200),run_task(state,"example".into(),model,prompt.into(),120,cancel.clone(),1,false)).await;
+    let result=tokio::time::timeout(Duration::from_secs(seconds),run_task(state,"example".into(),model,prompt,400,cancel.clone(),1,false)).await;
     if result.is_err(){cancel.cancel();}
     let conn=agent_service::open_db(&root)?;
     let status:String=conn.query_row("SELECT status FROM agent_tasks WHERE id='example'",[],|row|row.get(0))?;
     let requests:i64=conn.query_row("SELECT count(*) FROM agent_request_contexts WHERE task_id='example'",[],|row|row.get(0))?;
-    let mut pages=Vec::new();
-    for entry in walkdir_html(&root)? { pages.push(entry); }
-    eprintln!("REAL_DECK_DONE seconds={:.0} status={status} model_requests={requests} pages={pages:?} outcomes={:?} answer={:?}",
-        started.elapsed().as_secs_f64(),program_outcomes(&root)?.iter().filter(|text| text.starts_with("程序")).collect::<Vec<_>>(),last_answer(&root).ok());
+    let functions:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='example' AND kind='program/start' AND json_extract(data,'$.function') IS NOT NULL",[],|row|row.get(0))?;
+    let heals:i64=conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id='example' AND kind='program/runtime_error'",[],|row|row.get(0))?;
+    let pages=walkdir_html(&root)?;
+    eprintln!("REAL_DECK_DONE seconds={:.0} status={status} model_requests={requests} implemented_functions={functions} runtime_errors={heals} pages={} files={pages:?} answer={:?}",
+        started.elapsed().as_secs_f64(),pages.len(),last_answer(&root).ok());
     result.context("deck task timed out")??;
     ensure!(status=="completed","deck task status: {status}");
-    ensure!(pages.len()>=5,"expected 5 page files: {pages:?}");
+    ensure!(pages.len()>=count,"expected {count} page files: {pages:?}");
     // Each page links to another one.
     for page in &pages {
         let html=std::fs::read_to_string(root.join(page))?;
