@@ -31,6 +31,7 @@ pub(super) fn function_task(
     program: &agent_program::Program,
     name: &str,
     arguments: &[Value],
+    captured: &BTreeMap<String, Value>,
 ) -> Result<Value> {
     let function = program
         .functions
@@ -58,7 +59,7 @@ pub(super) fn function_task(
     };
     Ok(
         json!({"name":shown,"description":description,"parameters":function.params,"arguments":arguments,
-            "role":role,"leaf_tools":function.leaf_tools,"async":function.is_async}),
+            "captured":captured,"role":role,"leaf_tools":function.leaf_tools,"async":function.is_async}),
     )
 }
 /// What the AI does in a function window. Only virtual functions call AI: a
@@ -212,8 +213,8 @@ pub(super) fn call_view(task: &Value) -> Result<Value> {
         .collect::<serde_json::Map<_, _>>();
     Ok(
         json!({"name":task["name"],"signature":format!("{}function {}({})",if task["async"] == true {"async "} else {""},task["name"].as_str().context("function name missing")?,names.join(", ")),
-        "role":task["role"],"description":task["description"],"bindings":bindings,
-        "binding_rule":"bindings lists actual local parameter values. Use each parameter directly as in the signature; bindings is display metadata, never another property of a parameter. Arguments bind by position only, never by name or automatic object packing."}),
+        "role":task["role"],"description":task["description"],"bindings":bindings,"closure":task["captured"],
+        "binding_rule":"bindings lists actual local parameter values. Use each parameter directly as in the signature; bindings is display metadata, never another property of a parameter. Arguments bind by position only, never by name or automatic object packing. closure lists the outer variables the description names with @uses, read when this function was called; in code they are variables in scope, as in a JavaScript closure."}),
     )
 }
 pub(super) fn task_runtime(task: &Value) -> Result<Option<Runtime>> {
@@ -690,10 +691,10 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
         State::Action(action) => {
             let at = json!(action.at);
             let (name, args) = match &action.kind {
-                ActionKind::Call { name, args } => {
+                ActionKind::Call { name, args, captured } => {
                     let program = &w.program.as_ref().unwrap().program;
                     let function = &program.functions[name];
-                    let mut task = function_task(program, name, args)?;
+                    let mut task = function_task(program, name, args, captured)?;
                     let description = task["description"].clone();
                     if !function.virtual_task {
                         task["body"] = json!({"compiled":program});
@@ -719,7 +720,11 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                                 .context("virtual argument missing")
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let task = function_task(program, name, &arguments)?;
+                    // A nested virtual's captured variables ride in its input.
+                    let captured = program.functions[name].uses.iter()
+                        .map(|used| Ok((used.clone(), input.get(used).cloned().context("captured variable missing")?)))
+                        .collect::<Result<BTreeMap<_, _>>>()?;
+                    let task = function_task(program, name, &arguments, &captured)?;
                     (
                         "create_task".into(),
                         json!({"goal":name,"briefing":description,"program_task":task,"call_site":at}),
@@ -1711,5 +1716,23 @@ mod tests {
         let conn = agent_service::open_db(root.path()).unwrap();
         let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(answer, "程序已完成。\n写入：draft.txt、done.txt");
+    }
+
+    #[tokio::test]
+    async fn a_virtual_sees_and_its_code_uses_what_its_contract_names_with_uses() {
+        let root = TestRoot::new();
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let log = seen.clone();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" => reply("```js\nimport * as io from \"host:io\";\nconst brief = \"Only summarize a\";\nconst result = await summarize([\"a.txt\", \"b.txt\"]);\nio.write({path: \"out.txt\", content: result.summary});\n\n/**\n * @virtual\n * Summarize the files at paths as the brief asks.\n * @uses brief the user's request, verbatim\n * Returns {summary:string}.\n */\nasync function summarize(paths) {}\n```".into()),
+            _ => {
+                *log.lock().unwrap() = Some(body["messages"].to_string());
+                // The implementation reads the captured variable like any closure.
+                reply("```js\nasync function summarize(paths) {\n  return {summary: brief + \": \" + paths[0]};\n}\n```".into())
+            }
+        }).await;
+        let seen = seen.lock().unwrap().clone().expect("the implementation was asked for");
+        assert!(seen.contains("closure") && seen.contains("Only summarize a"), "the AI sees the captured value: {seen}");
+        assert_eq!(std::fs::read_to_string(root.path().join("out.txt")).unwrap(), "Only summarize a: a.txt");
     }
 }

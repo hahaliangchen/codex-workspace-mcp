@@ -220,12 +220,12 @@ pub(super) async fn open_main_task(s: &Session<'_>, w: &mut Window, request: &st
 pub(super) async fn start_parallel_function(
     s: &Session<'_>, parent_frame: &Window, action: &crate::agent_program::Action, step: usize,
 ) -> Result<(String, Window)> {
-    let crate::agent_program::runtime::ActionKind::Call { name, args } = &action.kind else {
+    let crate::agent_program::runtime::ActionKind::Call { name, args, captured } = &action.kind else {
         anyhow::bail!("parallel function requires an async virtual call");
     };
     let runtime = parent_frame.program.as_ref().context("parallel caller has no program")?;
     let snapshot = runtime.async_scope(&action.id).context("parallel call has no saved scope")?.clone();
-    let function = super::program_flow::function_task(&runtime.program, name, args)?;
+    let function = super::program_flow::function_task(&runtime.program, name, args, captured)?;
     let arguments = json!({"goal":name,"briefing":function["description"],"program_task":function,"call_site":action.at});
     let parent_id = frame_task(s, parent_frame);
     let conn = agent_service::open_db(s.state.workspace.root())?;
@@ -391,6 +391,10 @@ fn temporary_frame(s: &Session<'_>, parent: &Window, node: &Node) -> Result<Wind
         inherit_material(parent, &mut messages);
         child.messages = messages;
         child.scope_values.clear();
+        // Except what its contract names with @uses: its closure, as in JS.
+        if let Some(captured) = task["captured"].as_object() {
+            child.scope_values.extend(captured.iter().map(|(name, value)| (name.clone(), value.clone())));
+        }
     }
     child.messages.push(json!({"role":"user","name":"program_task_input","content":input.to_string(),"_frame_input":true}));
     child.program = super::program_flow::task_runtime(&task)?;

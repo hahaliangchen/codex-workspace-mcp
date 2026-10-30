@@ -58,6 +58,10 @@ pub struct Function {
     pub description: String,
     #[serde(default)]
     pub virtual_task: bool,
+    /// Outer variables a virtual function's contract names with `@uses`: its
+    /// closure, read in the scope where it is declared when it is called.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
     /// A virtual declared inside a function implementation is a leaf: a plain
     /// tool loop limited to the tools that implementation imported.
     #[serde(default)]

@@ -323,6 +323,28 @@ impl Compiler {
             ),
         }
     }
+    /// The outer variables a virtual function's contract names with JSDoc
+    /// `@uses <name>` tags: its closure. Each must be visible where the function
+    /// is declared, as a closure's free variables are in JavaScript.
+    fn captures(&self, description: &str, params: &[String], span: Span) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for line in description.lines() {
+            let Some(rest) = line.trim().strip_prefix("@uses") else { continue };
+            let Some(name) = rest.split_whitespace().next().map(|word| word.trim_matches(|c: char| matches!(c, '`' | '{' | '}' | ','))) else {
+                return self.error(span, "@uses names an outer variable: @uses <name> <what it is>");
+            };
+            if params.iter().any(|param| param == name) {
+                return self.error(span, &format!("@uses {name}: {name} is a parameter; a parameter is already in scope"));
+            }
+            if self.resolve(name).is_none() {
+                return self.error(span, &format!("@uses {name}: no variable {name} is in scope where this function is declared"));
+            }
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_owned());
+            }
+        }
+        Ok(names)
+    }
     /// The innermost binding of `name`: Some(true) if it may be reassigned.
     fn resolve(&self, name: &str) -> Option<bool> {
         if self.temp_names.contains(name) {
@@ -757,7 +779,9 @@ impl Compiler {
                 if description.is_empty() {
                     return c.error(body.span, "@virtual needs a task description and return contract");
                 }
-                let input = Expr::Object(params.iter().map(|p| (p.clone(), Expr::Variable(p.clone()))).collect());
+                let uses = self.captures(&description, &params, source.span)?;
+                // Captured variables join the input, read in this closure's scope.
+                let input = Expr::Object(params.iter().chain(&uses).map(|p| (p.clone(), Expr::Variable(p.clone()))).collect());
                 let dest = c.temp();
                 c.emit(body.span, Op::Effect(Some(dest.clone()), Effect::Task { name: id.clone(), description, input }));
                 c.emit(body.span, Op::Return(Expr::Variable(dest)));
@@ -777,11 +801,14 @@ impl Compiler {
         }
         self.nested.extend(c.nested);
         let virtual_task = contract.is_some();
+        let description = contract.map(|(_, description)| description).unwrap_or_default();
+        let uses = if virtual_task { self.captures(&description, &params, source.span)? } else { Vec::new() };
         self.nested.push((
             id.clone(),
             Function {
-                description: contract.map(|(_, description)| description).unwrap_or_default(),
+                description,
                 virtual_task,
+                uses,
                 leaf_tools: if virtual_task { self.leaf_tools.clone() } else { None },
                 params,
                 rest_parameter,
@@ -2700,6 +2727,7 @@ fn compile_inner(
         functions.insert(
             super::ENTRY.into(),
             Function {
+                uses: Vec::new(),
                 description: String::new(),
                 virtual_task: false,
                 leaf_tools: None,
@@ -2813,9 +2841,11 @@ fn compile_inner(
                     "@virtual needs a task description and return contract",
                 );
             }
+            let uses = c.captures(&description, &params, f.function.span)?;
             let input = Expr::Object(
                 params
                     .iter()
+                    .chain(&uses)
                     .map(|p| (p.clone(), Expr::Variable(p.clone())))
                     .collect(),
             );
@@ -2846,11 +2876,13 @@ fn compile_inner(
             c.emit(body.span, Op::Return(Expr::Undefined));
         }
         functions.extend(std::mem::take(&mut c.nested));
+        let uses = if virtual_task { c.captures(&description, &params, f.function.span)? } else { Vec::new() };
         functions.insert(
             f.ident.sym.to_string(),
             Function {
                 description,
                 virtual_task,
+                uses,
                 leaf_tools: if virtual_task { leaf_tools.clone() } else { None },
                 params,
                 rest_parameter,

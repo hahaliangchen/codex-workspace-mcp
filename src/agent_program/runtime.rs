@@ -121,6 +121,9 @@ pub enum ActionKind {
     Call {
         name: String,
         args: Vec<Value>,
+        /// The `@uses` variables of a virtual function, read at the call.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        captured: BTreeMap<String, Value>,
     },
     Tool {
         name: String,
@@ -611,6 +614,24 @@ impl Runtime {
         Ok(())
     }
 
+    /// A virtual function's `@uses` variables, read now in the scope it closes
+    /// over, as a JavaScript closure reads its free variables when it runs.
+    fn captured(&self, function: &str, environment: Option<HeapId>) -> Result<BTreeMap<String, Value>> {
+        let uses = &self.program.functions[function].uses;
+        if uses.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let environment = environment.context("the function's scope is missing")?;
+        uses.iter()
+            .map(|name| {
+                let value = match self.heap.lookup_binding(environment, name)? {
+                    VmValue::Undefined => Value::Null,
+                    value => self.heap.to_json(&value)?,
+                };
+                Ok((name.clone(), value))
+            })
+            .collect()
+    }
     /// Call a function value. A closure runs in a new frame over the scope it
     /// was created in and a built-in runs here; AI functions and tools become
     /// actions for the host.
@@ -641,9 +662,11 @@ impl Runtime {
                         f.params.len(),
                         args.len()
                     );
+                    let captured = self.captured(&function, Some(environment))?;
                     return Ok(Some(ActionKind::Call {
                         name: function,
                         args: json_args(args, &self.heap)?,
+                        captured,
                     }));
                 }
                 // A named function expression refers to itself unless one of
@@ -1466,7 +1489,9 @@ impl Runtime {
                                         function.params.len(),
                                         args.len()
                                     );
-                                    ActionKind::Call { name, args: json_args(args, &self.heap)? }
+                                    // A top-level function closes over the module scope.
+                                    let captured = self.captured(&name, self.module_env)?;
+                                    ActionKind::Call { name, args: json_args(args, &self.heap)?, captured }
                                 } else {
                                     // Functions see the module scope, not their caller's variables.
                                     ensure!(self.frames.len() < 64, "program call depth limit");

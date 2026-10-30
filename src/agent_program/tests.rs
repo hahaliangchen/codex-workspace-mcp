@@ -114,7 +114,7 @@ function inspect(content, summary) { // Judge the page using the actual content 
         panic!("missing AI review")
     };
     assert!(
-        matches!(action.kind, ActionKind::Call { ref name, ref args } if name == "inspect" && args[1] == json!({"hasTitle":true,"links":["href=\"one.html\""]})),
+        matches!(action.kind, ActionKind::Call { ref name, ref args, .. } if name == "inspect" && args[1] == json!({"hasTitle":true,"links":["href=\"one.html\""]})),
         "unexpected action: {:?}",
         action.kind
     );
@@ -551,7 +551,7 @@ fn business_judgment_is_an_explicit_task_with_named_inputs_and_evidence() {
             panic!()
         };
         assert!(
-            matches!(action.kind,ActionKind::Call{name,args} if name=="检查" && args[0]["path"]=="artifact.html" && args[1]["expected"]=="approved")
+            matches!(action.kind,ActionKind::Call{name,args,..} if name=="检查" && args[0]["path"]=="artifact.html" && args[1]["expected"]=="approved")
         );
         r.resume(
             json!({"passed":passed,"evidence":[{"source":"actual tool receipt"}]}),
@@ -741,7 +741,7 @@ function transform(content, request) {
         panic!()
     };
     assert!(
-        matches!(task.kind,ActionKind::Call{name,args} if name=="transform" && args==vec![json!("SOURCE"),json!({"source":"source.txt","output":"out.txt"})])
+        matches!(task.kind,ActionKind::Call{name,args,..} if name=="transform" && args==vec![json!("SOURCE"),json!({"source":"source.txt","output":"out.txt"})])
     );
     let mut restored: Runtime = serde_json::from_value(serde_json::to_value(r).unwrap()).unwrap();
     restored
@@ -824,7 +824,7 @@ function work(input){const local='LOCAL';const answer=think(input);return {answe
         panic!("expected virtual task")
     };
     assert!(
-        matches!(&action.kind, ActionKind::Call { name, args } if name == "think" && args == &vec![json!("INPUT")])
+        matches!(&action.kind, ActionKind::Call { name, args, .. } if name == "think" && args == &vec![json!("INPUT")])
     );
     assert_eq!(run.named_bindings()["outer"], "OUTER");
     assert_eq!(run.named_bindings()["local"], "LOCAL");
@@ -1089,7 +1089,7 @@ impl TutorialRun {
             };
             let result = match action.kind {
                 ActionKind::ParallelReads { .. } => panic!("tutorial does not use parallel reads"),
-                ActionKind::Call { name, args } => {
+                ActionKind::Call { name, args, .. } => {
                     self.run(Runtime::task_program(run.program.clone(), &name, args).unwrap())
                 }
                 ActionKind::Tool { name, args } => {
@@ -1549,7 +1549,7 @@ function inspect(request) {}
         panic!("must enter AI work")
     };
     assert!(
-        matches!(action.kind, ActionKind::Call { ref name, ref args }
+        matches!(action.kind, ActionKind::Call { ref name, ref args, .. }
         if name == "inspect" && args[0]["path"] == "real.txt")
     );
     let mut restored: Runtime =
@@ -2367,7 +2367,7 @@ async function inspect(data) { throw new Error("Host must provide inspect"); }
 "#;
     let mut run = start(source, vec![Value::Null]);
     assert!(
-        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args } if name == "inspect" && args[0] == "data"))
+        matches!(run.next(), State::Action(a) if matches!(a.kind, ActionKind::Call { ref name, ref args, .. } if name == "inspect" && args[0] == "data"))
     );
     run.resume(json!({"text":"reviewed"}), false).unwrap();
     assert!(
@@ -2830,4 +2830,110 @@ fn counted_repetition_over_any_character_compiles_as_in_javascript() {
     let source = "const text = \"可核验的证据\" + \"中间\".repeat(500) + \"不能单独作为证据\";\nassert(/(?:真实的完成证据|可核验的证据)[\\s\\S]{0,1800}(?:不能单独作为证据|不能单独)/.test(text), \"found within 1800\");\nassert(!/(?:真实的完成证据|可核验的证据)[\\s\\S]{0,10}(?:不能单独作为证据|不能单独)/.test(text), \"not within 10\");";
     let mut run = Runtime::task_program(compile(source).unwrap(), crate::agent_program::ENTRY, vec![]).unwrap();
     assert!(matches!(run.next(), State::Returned(_)), "both assertions hold");
+}
+
+#[test]
+fn a_virtual_closes_over_the_scope_it_is_declared_in() {
+    // Lexical, as in JavaScript: a local of the same name at the call site
+    // does not shadow the module variable the declaration closes over.
+    let source = r#"
+const brief = "THE BRIEF";
+function caller() { const brief = "LOCAL"; return judge("x"); }
+const result = caller();
+/**
+ * @virtual
+ * Judge x against the user's brief.
+ * @uses brief what the user asked for
+ * Returns {ok:boolean}.
+ */
+function judge(x) {}
+"#;
+    let mut run = runtime(source);
+    let State::Action(action) = run.next() else { panic!("expected the virtual call") };
+    let ActionKind::Call { name, args, captured } = action.kind else { panic!("expected a call") };
+    assert_eq!((name.as_str(), args), ("judge", vec![json!("x")]));
+    assert_eq!(captured, BTreeMap::from([("brief".to_owned(), json!("THE BRIEF"))]));
+}
+
+#[test]
+fn an_async_virtual_reads_its_closure_when_it_is_called() {
+    let source = r#"
+let note = "BEFORE";
+const pending = judge("x");
+note = "AFTER";
+await pending;
+/**
+ * @virtual
+ * @uses note
+ * Returns a string.
+ */
+async function judge(x) {}
+"#;
+    let mut run = runtime(source);
+    let crate::agent_program::runtime::ConcurrentState::Actions(actions) = run.next_concurrent() else { panic!("expected the async call") };
+    let ActionKind::Call { captured, .. } = &actions[0].kind else { panic!("expected a call") };
+    assert_eq!(captured["note"], json!("BEFORE"), "read when called, not when the host runs it");
+}
+
+#[test]
+fn uses_must_name_a_variable_in_scope_that_is_not_a_parameter() {
+    let missing = compile("/**\n * @virtual\n * @uses missing\n * Returns a string.\n */\nfunction judge(x) {}\nconst r = judge(1);\n").unwrap_err();
+    assert!(format!("{missing:#}").contains("@uses missing: no variable missing is in scope"), "{missing:#}");
+    let parameter = compile("const x = 1;\n/**\n * @virtual\n * @uses x\n * Returns a string.\n */\nfunction judge(x) {}\nconst r = judge(1);\n").unwrap_err();
+    assert!(format!("{parameter:#}").contains("@uses x: x is a parameter"), "{parameter:#}");
+}
+
+#[test]
+fn a_nested_virtual_closes_over_its_enclosing_function() {
+    let source = r#"
+function outer() {
+  const rules = "RULES";
+  return inner("x");
+  /**
+   * @virtual
+   * @uses rules
+   * Returns a string.
+   */
+  function inner(x) {}
+}
+const r = outer();
+"#;
+    let mut run = runtime(source);
+    let State::Action(action) = run.next() else { panic!("expected the virtual task") };
+    let ActionKind::Call { args, captured, .. } = action.kind else { panic!("expected inner") };
+    assert_eq!(args, vec![json!("x")]);
+    assert_eq!(captured["rules"], json!("RULES"));
+}
+
+#[test]
+fn a_variable_named_only_by_uses_stays_alive_until_the_call() {
+    // Dead bindings are collected at each action; @uses is a reference too,
+    // for a function's local closed over by a virtual declared inside it.
+    let source = r#"
+function outer() {
+  const rules = "RULES";
+  const first = draft("y");
+  return inner(first);
+  /**
+   * @virtual
+   * @uses rules
+   * Returns a verdict.
+   */
+  function inner(x) {}
+}
+const result = outer();
+/**
+ * @virtual
+ * Returns a draft.
+ */
+function draft(y) {}
+"#;
+    let mut run = runtime(source);
+    let State::Action(first) = run.next() else { panic!("expected draft") };
+    assert!(matches!(&first.kind, ActionKind::Call { name, .. } if name == "draft"));
+    run.resume(json!("DRAFT"), false).unwrap();
+    let state = run.next();
+    let State::Action(second) = state else { panic!("expected inner: {state:?}") };
+    let ActionKind::Call { captured, .. } = second.kind else { panic!("expected inner") };
+    assert_eq!(captured["rules"], json!("RULES"));
 }
