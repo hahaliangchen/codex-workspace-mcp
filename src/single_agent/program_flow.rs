@@ -500,21 +500,62 @@ pub(super) async fn interrupt_unfinished(s: &Session<'_>, w: &mut Window) -> Res
     }
     save(s, w).await
 }
+/// Files written this turn by any of its programs or AIs, for its outcome.
+fn turn_writes(s: &Session<'_>) -> Result<Vec<String>> {
+    let conn = agent_service::open_db(s.state.workspace.root())?;
+    let paths = conn
+        .prepare("SELECT DISTINCT json_extract(json_extract(c.data,'$.arguments'),'$.path') FROM agent_task_events c
+            WHERE c.task_id=?1 AND c.kind='tool/call' AND json_extract(c.data,'$.turn')=?2
+            AND json_extract(c.data,'$.name') IN ('write_file','edit_file','replace_range')
+            AND EXISTS (SELECT 1 FROM agent_task_events r WHERE r.task_id=c.task_id AND r.kind='tool/result'
+                AND json_extract(r.data,'$.message.toolCallId')=json_extract(c.data,'$.callId')
+                AND json_extract(r.data,'$.message.isError')=0)
+            ORDER BY c.seq")?
+        .query_map(params![s.task, s.turn as i64], |r| r.get::<_, Option<String>>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths.into_iter().flatten().collect())
+}
+/// How a turn's main program ended, in a few lines: what it returned or where
+/// it stopped, and the files it wrote. It is the turn's answer and what later
+/// turns see of it; the code itself stays in the conversation record.
+fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Result<String> {
+    let clip = |text: &str, limit: usize| {
+        if text.chars().count() > limit { format!("{}…", text.chars().take(limit).collect::<String>()) } else { text.to_owned() }
+    };
+    let mut lines = match ended {
+        Ok(value) if value.is_null() => vec!["程序已完成。".to_owned()],
+        Ok(value) => {
+            let text = value.as_str().map(str::to_owned).unwrap_or_else(|| value.to_string());
+            vec!["程序已完成。".to_owned(), format!("返回：{}", clip(&text, 300))]
+        }
+        Err(error) => {
+            let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string());
+            let at = error["location"]["line"].as_u64().map(|line| format!("第 {line} 行")).unwrap_or_default();
+            vec![format!("程序在{at}出错停止：{}", clip(&message, 300)), "之后的步骤没有执行。".to_owned()]
+        }
+    };
+    let writes = turn_writes(s)?;
+    if !writes.is_empty() {
+        let shown = writes.iter().take(20).cloned().collect::<Vec<_>>().join("、");
+        let more = if writes.len() > 20 { format!(" 等 {} 个文件", writes.len()) } else { String::new() };
+        lines.push(format!("写入：{shown}{more}"));
+    }
+    Ok(lines.join("\n"))
+}
 async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value) -> Result<Round> {
-    w.program_value = Some(value.clone());
-    w.program = None;
-    let text = if w.program_task.is_none() && value.is_null() {
-        "程序执行完成。".to_owned()
-    } else if w.program_task.is_some() {
+    let text = if w.program_task.is_some() {
         serde_json::to_string(&value)?
     } else {
-        value
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap())
+        outcome(s, Ok(&value))?
     };
-    let message =
-        json!({"role":"assistant","content":if text.is_empty(){"程序执行完成。".into()}else{text}});
+    end_program(s, w, step, value, text).await
+}
+/// End the window's program with this reply: a function returns its value,
+/// a main program its outcome. The frame then finishes like any reply.
+async fn end_program(s: &Session<'_>, w: &mut Window, step: usize, value: Value, text: String) -> Result<Round> {
+    w.program_value = Some(value);
+    w.program = None;
+    let message = json!({"role":"assistant","content":text});
     let seq = append(
         s,
         "assistant/message",
@@ -559,7 +600,10 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 // A runtime failure throws to the caller, as in JavaScript.
                 return_value(s, w, step, json!({"$task_error":error})).await
             } else {
-                anyhow::bail!("TS_PROGRAM_RUNTIME: {error}")
+                // The main program stopped. Its outcome ends the turn, so the
+                // next message starts fresh instead of resuming the failure.
+                let text = outcome(s, Err(&error))?;
+                end_program(s, w, step, Value::Null, text).await
             }
         }
         State::Returned(value) => return_value(s, w, step, value).await,
@@ -1223,5 +1267,65 @@ mod tests {
         assert!(programs[0]["function"].is_null() && programs[0]["source"].as_str().unwrap().contains("await summarize("));
         assert_eq!(programs[1]["function"], "summarize");
         assert!(programs[1]["source"].as_str().unwrap().contains("function judge("));
+    }
+
+    fn memory_of(body: &Value) -> Option<Value> {
+        body["messages"].as_array().unwrap().iter().find(|m| m["name"] == "conversation_memory")
+            .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_program_outcome_is_the_turns_answer_and_what_the_next_turn_sees() {
+        let root = TestRoot::new();
+        let memory = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let log = memory.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let answer = if body["messages"].to_string().contains("And now?") {
+                *log.lock().unwrap() = memory_of(&body);
+                reply("Noted.".into())
+            } else {
+                reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"one.txt\", content: \"1\"});\nio.write({path: \"two.txt\", content: \"2\"});\n```".into())
+            };
+            async move { Json(answer) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state.clone(), "task".into(), "fake".into(), "Write two files".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        run_task(state, "task".into(), "fake".into(), "And now?".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
+        server.abort();
+        let memory = memory.lock().unwrap().clone().expect("the next turn has the conversation memory");
+        let entry = memory["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "task").unwrap().clone();
+        assert_eq!(entry["answer"], "程序已完成。\n写入：one.txt、two.txt", "{memory}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_main_program_ends_its_turn_and_the_conversation_goes_on() {
+        let root = TestRoot::new();
+        let memory = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let log = memory.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let answer = if body["messages"].to_string().contains("What happened?") {
+                *log.lock().unwrap() = memory_of(&body);
+                reply("It stopped with an error.".into())
+            } else {
+                reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"done.txt\", content: \"1\"});\nthrow new Error(\"boom\");\n```".into())
+            };
+            async move { Json(answer) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state.clone(), "task".into(), "fake".into(), "Do it".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        run_task(state, "task".into(), "fake".into(), "What happened?".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
+        server.abort();
+        let memory = memory.lock().unwrap().clone().expect("the next turn reached the model instead of re-running the failure");
+        let entry = memory["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "task").unwrap().clone();
+        assert_eq!(entry["answer"], "程序在第 3 行出错停止：boom\n之后的步骤没有执行。\n写入：done.txt", "{memory}");
+        assert_eq!(conn.query_row("SELECT status FROM agent_tasks WHERE id='task'", [], |r| r.get::<_, String>(0)).unwrap(), "completed");
     }
 }

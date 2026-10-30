@@ -651,7 +651,8 @@ pub(super) fn memory_index(
         };
         let mut entry = json!({"kind":"task","turn":number,
             "task":{"node_id":node.node_id,"goal":clip(&node.goal,160),"status":node.status},
-            "answer":summary.trim().chars().take(200).collect::<String>()});
+            // A task's answer is its program's outcome: keep enough of it to go on from.
+            "answer":summary.trim().chars().take(600).collect::<String>()});
         if let Some((_, original)) = turns.get(&number) {
             entry["request"] = original["request"].clone();
         }
@@ -1094,8 +1095,8 @@ mod tests {
                     assert_eq!(entries[0]["task"]["status"], "done");
                     assert_eq!(
                         entries[0]["answer"],
-                        "计划已完成".repeat(40),
-                        "the final summary is truncated to 200 characters"
+                        "计划已完成".repeat(50),
+                        "the final summary is kept up to 600 characters"
                     );
                     assert!(!entries.iter().any(|entry| entry["request"] == "continue"));
                     answer(&"问答摘要".repeat(60))
