@@ -999,7 +999,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.iter().map(|(role, _, _)| role.as_str()).collect::<Vec<_>>(), ["main", "implement", "leaf"]);
         let (_, implement, prompt) = &seen[1];
-        assert_eq!(implement, &["read_tool_contracts"], "an implementation is code, not a tool loop");
+        assert_eq!(implement, &["read_tool_contracts", "read_program_guide"], "an implementation is code: it only reads contracts and the guide");
         assert!(prompt.as_str().unwrap().starts_with("You implement one @virtual function"));
         let (_, leaf, prompt) = &seen[2];
         assert!(prompt.as_str().unwrap().starts_with("You perform one @virtual function"));

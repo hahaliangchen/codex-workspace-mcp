@@ -302,7 +302,7 @@ fn validate_tool(s: &Session<'_>, w: &Window, definitions: &[Value], name: &str)
     if w.program.is_none() {
         match program_flow::role(w) {
             program_flow::Role::Implement => ensure!(
-                name == "read_tool_contracts",
+                matches!(name, "read_tool_contracts" | "read_program_guide"),
                 "TOOL_UNAVAILABLE: {name}; implement this function as code in one ```js block"
             ),
             program_flow::Role::Leaf(_) => ensure!(
@@ -628,7 +628,7 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     }
     let mut published = definitions.to_vec();
     if role == "implement" {
-        published.retain(|d| d["function"]["name"] == "read_tool_contracts");
+        published.retain(|d| matches!(d["function"]["name"].as_str(), Some("read_tool_contracts" | "read_program_guide")));
     } else if role == "main" {
         let libraries = program_flow::library_catalog(s, definitions);
         // The planning request gets declarations, not duplicate business schemas.
