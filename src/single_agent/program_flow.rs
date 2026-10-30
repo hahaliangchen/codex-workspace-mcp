@@ -532,6 +532,13 @@ pub(super) async fn interrupt_unfinished(s: &Session<'_>, w: &mut Window) -> Res
     }
     save(s, w).await
 }
+/// How many times a turn's main program may be rewritten after an error.
+const MAIN_REWRITES: i64 = 3;
+fn main_rewrites(s: &Session<'_>) -> Result<i64> {
+    let conn = agent_service::open_db(s.state.workspace.root())?;
+    Ok(conn.query_row("SELECT count(*) FROM agent_task_events WHERE task_id=?1 AND kind='program/runtime_error'
+        AND json_extract(data,'$.main')=1 AND json_extract(data,'$.turn')=?2", params![s.task, s.turn as i64], |r| r.get(0))?)
+}
 /// Files written this turn by any of its programs or AIs, for its outcome.
 fn turn_writes(s: &Session<'_>) -> Result<Vec<String>> {
     let conn = agent_service::open_db(s.state.workspace.root())?;
@@ -660,9 +667,21 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
             } else if w.program_task.is_some() {
                 // A runtime failure throws to the caller, as in JavaScript.
                 return_value(s, w, step, json!({"$task_error":error})).await
+            } else if !waiting && main_rewrites(s)? < MAIN_REWRITES {
+                // The main program heals the same way, a few times a turn: the
+                // main AI gets the error and the files already written.
+                w.program = None;
+                let diagnostic = json!({"code":"PROGRAM_RUNTIME_ERROR","executed":true,"error":error,
+                    "completed_writes":turn_writes(s)?,
+                    "instruction":"Your program stopped with this error. Reply with a corrected complete ```js block; it runs from its start, so do not redo the listed writes unless the task needs them redone. If the task cannot be done, tell the user why in plain text instead."});
+                let seq = append(s, "program/runtime_error", json!({"diagnostic":diagnostic,"turn":s.turn,"main":true}), false).await?;
+                w.messages.push(sourced(json!({"role":"user","name":"program_diagnostic","content":diagnostic.to_string()}), s.task, seq));
+                save(s, w).await?;
+                Ok(Round::Rewrite)
             } else {
-                // The main program stopped. Its outcome ends the turn, so the
-                // next message starts fresh instead of resuming the failure.
+                // A question, or a program that keeps failing: its outcome ends
+                // the turn, so the next message starts fresh instead of
+                // resuming the failure.
                 let text = outcome(s, Err(&error))?;
                 end_program(s, w, step, Value::Null, text).await
             }
@@ -1376,8 +1395,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_main_program_ends_its_turn_and_the_conversation_goes_on() {
+    async fn a_main_program_that_keeps_failing_ends_its_turn_and_the_conversation_goes_on() {
         let root = TestRoot::new();
+        let main = Arc::new(AtomicUsize::new(0));
+        let rounds = main.clone();
         let memory = Arc::new(std::sync::Mutex::new(None::<Value>));
         let log = memory.clone();
         let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
@@ -1385,6 +1406,7 @@ mod tests {
                 *log.lock().unwrap() = memory_of(&body);
                 reply("It stopped with an error.".into())
             } else {
+                rounds.fetch_add(1, Ordering::SeqCst);
                 reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"done.txt\", content: \"1\"});\nthrow new Error(\"boom\");\n```".into())
             };
             async move { Json(answer) }
@@ -1397,6 +1419,7 @@ mod tests {
         run_task(state.clone(), "task".into(), "fake".into(), "Do it".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
         run_task(state, "task".into(), "fake".into(), "What happened?".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
         server.abort();
+        assert_eq!(main.load(Ordering::SeqCst), 4, "the first program and three rewrites");
         let memory = memory.lock().unwrap().clone().expect("the next turn reached the model instead of re-running the failure");
         let entry = memory["entries"].as_array().unwrap().iter().find(|e| e["kind"] == "task").unwrap().clone();
         assert_eq!(entry["answer"], "程序在第 3 行出错停止：boom\n之后的步骤没有执行。\n写入：done.txt", "{memory}");
@@ -1625,7 +1648,7 @@ mod tests {
             let leaf_requests = leaf_requests.clone();
             async move {
                 Json(match role_of(&body).as_str() {
-                    "main" if body["messages"].to_string().contains("出错停止") => reply("Noted.".into()),
+                    "main" if body["messages"].to_string().contains("PROGRAM_RUNTIME_ERROR") => reply("Noted.".into()),
                     "main" => reply("```js\nconst kept = await Promise.all([judge(\"a.txt\"), judge(\"b.txt\")]);\n\n/** @virtual */\nasync function judge(path) {\n  // Decide whether to keep the file at path. Returns {keep:boolean}.\n}\n```".into()),
                     "implement" => reply("```js\nasync function judge(path) {\n  return decide(path);\n}\n/** @virtual */\nfunction decide(path) {\n  // Decide whether to keep the file. Returns {keep:boolean}.\n}\n```".into()),
                     _ => {
@@ -1652,8 +1675,8 @@ mod tests {
         run_task(state, "task".into(), "fake".into(), "Go on".into(), 20, CancellationToken::new(), 2, false).await.unwrap();
         server.abort();
         assert_eq!(leaf.load(Ordering::SeqCst), 2, "a call cut off mid-step is not run again");
-        let lines = program_lines(&conn);
-        assert!(lines.last().is_some_and(|line| line.contains("出错停止")), "{lines:?}");
+        let error: String = conn.query_row("SELECT data FROM agent_task_events WHERE kind='program/runtime_error' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert!(error.contains("interrupted"), "the cut-off calls failed instead: {error}");
     }
 
     #[tokio::test]
@@ -1670,5 +1693,23 @@ mod tests {
         let lines = program_lines(&conn);
         assert_eq!(lines.last().unwrap(), "程序停在 第 2 行 judge(\"a.txt\") → 第 2 行 decide(\"a.txt\")，等你回答：Keep a.txt?\n之后的步骤没有执行。", "{lines:?}");
         assert!(!root.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_main_program_heals_in_the_same_turn() {
+        let root = TestRoot::new();
+        run_scripted(root.path(), move |body| {
+            let messages = body["messages"].to_string();
+            if messages.contains("PROGRAM_RUNTIME_ERROR") {
+                assert!(messages.contains("draft.txt"), "the main AI sees what was already written: {messages}");
+                reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"done.txt\", content: \"fixed\"});\n```".into())
+            } else {
+                reply("```js\nimport * as io from \"host:io\";\nio.write({path: \"draft.txt\", content: \"1\"});\nthrow new Error(\"boom\");\n```".into())
+            }
+        }).await;
+        assert_eq!(std::fs::read_to_string(root.path().join("done.txt")).unwrap(), "fixed");
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(answer, "程序已完成。\n写入：draft.txt、done.txt");
     }
 }
