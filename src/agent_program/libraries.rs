@@ -100,6 +100,10 @@ pub fn builtin() -> Libraries {
         .into_iter()
         .map(|(method, tool)| (method.into(), tool.into()))
         .collect(),
+    ), (
+        // Published only while a program the user's message paused can be resumed.
+        "previous".into(),
+        BTreeMap::from([("resume".into(), "resume_previous_program".into())]),
     )])
 }
 /// Only tools present in this frame's catalog are published. Colliding plugin

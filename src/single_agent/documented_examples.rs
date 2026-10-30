@@ -229,7 +229,7 @@ async fn real_model_leaf_asks_and_the_answer_continues() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "real configured model, isolated workspace, consumes provider tokens"]
-async fn real_model_user_message_stops_the_program() -> Result<()> {
+async fn real_model_user_message_pauses_the_program() -> Result<()> {
     let (root,state,model)=real_low_effort("interject-real")?;
     eprintln!("REAL_INTERJECT_START model={model} root={}",root.display());
     let source="import * as io from \"host:io\";\nconst topics = [\"agents\", \"programs\", \"tools\"];\nfor (const topic of topics) {\n  const page = await writePage(topic);\n  io.write({path: topic + \".html\", content: page.html});\n}\n\n/** @virtual */\nasync function writePage(topic) {\n  // Write a short standalone HTML page, under 40 lines, explaining topic in an agent runtime. Returns {html:string}.\n}";
@@ -247,7 +247,7 @@ async fn real_model_user_message_stops_the_program() -> Result<()> {
     let files=["agents.html","programs.html","tools.html","faq.html"].into_iter().filter(|file|root.join(file).is_file()).collect::<Vec<_>>();
     let outcomes=program_outcomes(&root)?;
     eprintln!("REAL_INTERJECT_DONE seconds={:.0} files={files:?} outcomes={outcomes:?} answer={:?}",started.elapsed().as_secs_f64(),last_answer(&root)?);
-    ensure!(outcomes.iter().any(|text| text.contains("被你的新消息打断")),"the program was not stopped: {outcomes:?}");
+    ensure!(outcomes.iter().any(|text| text.contains("被你的新消息暂停")),"the program was not paused: {outcomes:?}");
     ensure!(root.join("faq.html").is_file(),"the main AI did not handle the message");
     Ok(())
 }

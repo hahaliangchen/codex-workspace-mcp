@@ -51,7 +51,7 @@ pub(super) fn is_user_original(m: &Value) -> bool {
 }
 
 /// A frame is one main request or one function call; it is its own context.
-fn new_task(
+pub(super) fn new_task(
     parent: &Node,
     args: &Value,
     ordinal: usize,
@@ -829,7 +829,7 @@ fn inherit_material(parent: &Window, messages: &mut Vec<Value>) {
     }
 }
 
-fn write_window(tx: &rusqlite::Transaction<'_>, task: &str, scope: &str, w: &Window) -> Result<()> {
+pub(super) fn write_window(tx: &rusqlite::Transaction<'_>, task: &str, scope: &str, w: &Window) -> Result<()> {
     tx.execute("INSERT INTO agent_runtime_windows VALUES (?1,?2,?3) ON CONFLICT(task_id,scope) DO UPDATE SET state=excluded.state",params![task,scope,serde_json::to_string(w)?])?;
     Ok(())
 }
@@ -1027,7 +1027,7 @@ mod tests {
         h.user("What is 2+2?").await;
         let mut window = h.w.clone();
         assert!(matches!(
-            run_loop(&h.session(), &mut window, 3).await.unwrap(),
+            run_loop(&h.session(), &mut window, 3, true).await.unwrap(),
             LoopResult::Answer
         ));
         server.abort();

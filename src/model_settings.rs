@@ -7,8 +7,11 @@ pub const OUTPUT_RESERVE: usize = 24_576;
 /// Used when the DSH model entry does not declare `maxTokens`.
 pub const DEFAULT_MAX_OUTPUT: usize = 32_768;
 
+/// A model's context window, never above MAX_TOKENS whatever its config declares.
 pub fn context_window(state: &AgentServiceState, model: &str) -> usize {
-    declared_context_window(state, model).unwrap_or(crate::context_window::MAX_TOKENS)
+    declared_context_window(state, model)
+        .unwrap_or(crate::context_window::MAX_TOKENS)
+        .min(crate::context_window::MAX_TOKENS)
 }
 
 fn declared_context_window(state: &AgentServiceState, model: &str) -> Option<usize> {

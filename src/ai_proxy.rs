@@ -2348,11 +2348,12 @@ mod tests {
         let mut state =
             crate::agent_service::tests::test_state(&root, "127.0.0.1:1".parse().unwrap());
         apply_agent_config(&mut state, &config);
+        // What a request may use is capped, whatever the config declares.
         assert_eq!(
             crate::model_settings::context_window(&state, "upstream-m"),
-            500000
+            crate::context_window::MAX_TOKENS
         );
-        assert_eq!(crate::model_settings::context_window(&state, "m"), 500000);
+        assert_eq!(crate::model_settings::context_window(&state, "m"), crate::context_window::MAX_TOKENS);
         let _ = std::fs::remove_dir_all(root);
         assert_eq!(view["defaults"]["visual_tool"]["model"], "m");
         let encoded = view.to_string();

@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 mod documented_examples;
 mod function_scope;
 mod managed_files;
+mod paused_programs;
 mod program_flow;
 mod task_frames;
 
@@ -53,6 +54,13 @@ struct Window {
     failed_programs: Vec<crate::agent_program::Runtime>,
     messages: Vec<Value>,
     previous_node: Option<String>,
+    // The frame of a program the user's message paused, which this window's
+    // program may resume.
+    #[serde(default)]
+    resumable: Option<String>,
+    // What resuming it returned, for the step that asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumed: Option<(Value, bool)>,
     #[serde(default)]
     token_calibration: crate::context_window::TokenCalibration,
 }
@@ -101,6 +109,8 @@ impl Session<'_> {
 enum LoopResult {
     Answer,
     Limit,
+    // The user spoke: this frame stopped with its state kept, to be resumed.
+    Paused,
 }
 
 async fn db<T: Send + 'static>(
@@ -209,6 +219,9 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     };
     tools.push(crate::session_history::tool());
     tools.push(crate::attachments::tool());
+    if w.resumable.is_some() {
+        tools.push(paused_programs::resume_tool());
+    }
     tools.push(function("read_asset", "Read a stable asset_id without searching or repeating the original operation. Default restores the saved result in full; use char_offset/max_chars for explicit pages. Images select the saved pixels for the next AI request, without taking another screenshot. Read only if the needed content is no longer in your current context.",
         json!({"asset_id":{"type":"string"},"char_offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":PAGE_CHARS}}),json!(["asset_id"])));
     tools.push(function("release_assets", "Explicitly replace selected asset bodies in this working context by their durable references. Original files/history stay saved. Must be called alone, after receiving the material in a model request. The host never releases an asset automatically.",
@@ -1437,7 +1450,46 @@ async fn deliver_visual_jobs(s: &Session<'_>, w: &mut Window) -> Result<()> {
     Ok(())
 }
 
-fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LoopResult>> + Send + 'a>> {
+/// Run a concurrent call's frame in its own loop; when it cannot finish, its
+/// frames return the failure to the caller.
+fn spawn_call(children: &mut tokio::task::JoinSet<Result<()>>, s: &Session<'_>, scope: String, child: Window) {
+    let state = s.state.clone(); let task = s.task.to_owned(); let model = s.model.to_owned();
+    let turn = s.turn; let cancel = s.cancel.clone(); let ban_execution = s.ban_execution;
+    let plugin = s.plugin.clone(); let budget = s.input_budget;
+    children.spawn(async move {
+        let mut session = Session { agent_id: None, task_node_id: child.task_node_id.clone(),
+            plugin, state: &state, task: &task, model: &model, turn, cancel: &cancel,
+            ban_execution, scope, parent: None, input_budget: budget };
+        let mut child = child;
+        match Box::pin(run_loop(&session, &mut child, 64, false)).await {
+            Ok(LoopResult::Answer | LoopResult::Paused) => Ok(()),
+            result => {
+                if child.program.as_ref().is_some_and(|program| !program.inflight_actions().is_empty()) {
+                    let mut cleanup = session.clone();
+                    if let Some(id) = child.task_node_id.as_deref() {
+                        if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
+                            if let Ok(node) = crate::function_frames::get(&conn, &task, id) { cleanup.scope = crate::function_frames::frame_scope(&node); }
+                        }
+                    }
+                    program_flow::recover(&cleanup, &mut child).await?;
+                    program_flow::interrupt_unfinished(&cleanup, &mut child).await?;
+                }
+                let message = match result { Ok(LoopResult::Limit) => "async function reached its execution limit".to_owned(), Err(error) => format!("{error:#}"), _ => unreachable!() };
+                let error = json!({"role":"assistant", "content":json!({"$task_error":{"message":message}}).to_string()});
+                for _ in 0..=crate::function_frames::MAX_TEMP_TASKS {
+                    if let Some((scope, parent)) = task_frames::finish(&session, &mut child, &error).await? {
+                        child = parent; session.scope = scope;
+                    } else { break; }
+                }
+                Ok(())
+            }
+        }
+    });
+}
+
+/// `top` is the turn's own loop, where the main AI answers the user; the
+/// others run a concurrent call or a resumed program.
+fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize, top: bool) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LoopResult>> + Send + 'a>> {
     Box::pin(async move {
     let mut step = 0;
     let mut model_rounds = 0;
@@ -1448,27 +1500,31 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         current.task_node_id = w.task_node_id.clone();
         let s = &current;
         activate_page_plugin(s, w).await?;
-        // The user spoke while a program ran: each frame stops at this step,
-        // innermost first, and the main AI hears the message.
+        // The user spoke while a program ran: it pauses at this step, keeping
+        // its state, and the main AI hears the message.
         if s.is_primary() && program_flow::in_program(w) && interjection_pending(s).await? {
-            // Concurrent calls stop at their own next step; wait for them.
+            // Concurrent calls pause at their own next step; wait for them.
             while let Some(result) = async_children.join_next().await {
                 result.context("async function task failed")??;
             }
+            save(s, w).await?;
+            if !top {
+                return Ok(LoopResult::Paused);
+            }
             if w.program_task.is_some() {
-                let error = program_flow::interrupted_at(s, w)?;
-                program_flow::recover(s, w).await?;
-                program_flow::interrupt_unfinished(s, w).await?;
-                w.program = None;
-                let stopped = json!({"role":"assistant","content":json!({"$task_error":error}).to_string()});
-                let Some((scope, frame)) = task_frames::finish(s, w, &stopped).await? else {
-                    return Ok(LoopResult::Answer);
-                };
-                *w = frame;
-                current.scope = scope;
+                // A called function keeps its frame; the main window takes over.
+                let task = s.task.to_owned();
+                let main = db(s.state.workspace.root(), move |conn| {
+                    let raw: String = conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope='main'", [&task], |r| r.get(0))
+                        .context("main working window missing")?;
+                    Ok(serde_json::from_str::<Window>(&raw)?)
+                })
+                .await?;
+                *w = main;
+                current.scope = "main".into();
                 continue;
             }
-            program_flow::stop_main(s, w, step).await?;
+            program_flow::pause_main(s, w, step).await?;
         }
         if s.is_primary() && w.parallel_root.is_none() {
             deliver_interjections(s, w).await?;
@@ -1494,38 +1550,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                 program_flow::Round::Concurrent(actions) => {
                     for action in actions {
                         let (scope, child) = task_frames::start_parallel_function(s, w, &action, step).await?;
-                        let state = s.state.clone(); let task = s.task.to_owned(); let model = s.model.to_owned();
-                        let turn = s.turn; let cancel = s.cancel.clone(); let ban_execution = s.ban_execution;
-                        let plugin = s.plugin.clone(); let budget = s.input_budget;
-                        async_children.spawn(async move {
-                            let mut session = Session { agent_id: None, task_node_id: child.task_node_id.clone(),
-                                plugin, state: &state, task: &task, model: &model, turn, cancel: &cancel,
-                                ban_execution, scope, parent: None, input_budget: budget };
-                            let mut child = child;
-                            match Box::pin(run_loop(&session, &mut child, 64)).await {
-                                Ok(LoopResult::Answer) => Ok(()),
-                                result => {
-                                    if child.program.as_ref().is_some_and(|program| !program.inflight_actions().is_empty()) {
-                                        let mut cleanup = session.clone();
-                                        if let Some(id) = child.task_node_id.as_deref() {
-                                            if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
-                                                if let Ok(node) = crate::function_frames::get(&conn, &task, id) { cleanup.scope = crate::function_frames::frame_scope(&node); }
-                                            }
-                                        }
-                                        program_flow::recover(&cleanup, &mut child).await?;
-                                        program_flow::interrupt_unfinished(&cleanup, &mut child).await?;
-                                    }
-                                    let message = match result { Ok(LoopResult::Limit) => "async function reached its execution limit".to_owned(), Err(error) => format!("{error:#}"), _ => unreachable!() };
-                                    let error = json!({"role":"assistant", "content":json!({"$task_error":{"message":message}}).to_string()});
-                                    for _ in 0..=crate::function_frames::MAX_TEMP_TASKS {
-                                        if let Some((scope, parent)) = task_frames::finish(&session, &mut child, &error).await? {
-                                            child = parent; session.scope = scope;
-                                        } else { break; }
-                                    }
-                                    Ok(())
-                                }
-                            }
-                        });
+                        spawn_call(&mut async_children, s, scope, child);
                     }
                     continue;
                 }
@@ -1533,7 +1558,14 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                     if let Some(result) = async_children.join_next().await {
                         result.context("async function task failed")??;
                     } else {
-                        program_flow::interrupt_unfinished(s, w).await?;
+                        // Calls of a resumed program continue where they paused.
+                        let paused = paused_programs::paused_calls(s, w)?;
+                        if paused.is_empty() {
+                            program_flow::interrupt_unfinished(s, w).await?;
+                        }
+                        for (scope, child) in paused {
+                            spawn_call(&mut async_children, s, scope, child);
+                        }
                     }
                     continue;
                 }
@@ -1651,6 +1683,12 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                 // A function's finished answer still returns; its caller then stops.
                 if s.is_primary() && w.parallel_root.is_none() && !program_flow::in_program(w) && deliver_interjections(s, w).await? {
                     continue;
+                }
+                // A resumed program returned: its value goes back to the step
+                // that resumed it.
+                if paused_programs::is_previous(w) {
+                    save(s, w).await?;
+                    return Ok(LoopResult::Answer);
                 }
                 // A no-tool reply returns this function. Finish resumes the
                 // waiting caller without another model verdict.
@@ -1910,6 +1948,10 @@ async fn execute_call(
                 Ok(json!(results))
             },
             name if name == program_flow::FIND => program_flow::find(s, w, &args),
+            name if name == paused_programs::RESUME => match w.resumed.clone().context("the paused program was not resumed")? {
+                (value, false) => Ok(value),
+                (error, true) => Err(anyhow::anyhow!("{}", error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string()))),
+            },
             name if name == program_flow::ASK => {
                 let question = args["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).context("question is required")?;
                 Ok(json!({"question":question,"status":"shown_to_user"}))
@@ -2237,7 +2279,9 @@ pub(crate) async fn run_task(
     if task_frames::no_task(&s, &w) {
         task_frames::open_main_task(&s, &mut w, &prompt).await?;
     }
-    let outcome = run_loop(&s, &mut w, max_rounds).await;
+    let outcome = run_loop(&s, &mut w, max_rounds, true).await;
+    // A program paused and not resumed in this turn is discarded with it.
+    paused_programs::discard_unresumed(&s, &mut w).await?;
     if !matches!(&outcome, Ok(LoopResult::Answer)) {
         if w.program.as_ref().is_some_and(|program| !program.inflight_actions().is_empty()) {
             let mut cleanup = s.clone();
