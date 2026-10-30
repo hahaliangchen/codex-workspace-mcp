@@ -116,6 +116,48 @@ pub(super) const INTERRUPTED: &str = "INTERRUPTED";
 pub(super) fn interrupted() -> Value {
     json!({"name":"Interrupted","code":INTERRUPTED,"message":"the user sent a new message; the program stopped"})
 }
+/// Where a frame stopped, for the outcome: the line and callee of each step its
+/// code had in flight, followed by where that call stopped, or the AI still at
+/// work in a function without code.
+pub(super) fn stop_point(s: &Session<'_>, w: &Window) -> Result<String> {
+    let Some(runtime) = w.program.as_ref() else {
+        return Ok(match role(w) {
+            Role::Implement => "（AI 正在编写实现）".into(),
+            _ => "（AI 处理中）".into(),
+        });
+    };
+    let mut actions: Vec<Action> = runtime.pending.iter().cloned().chain(runtime.inflight_actions()).collect();
+    let mut steps = Vec::new();
+    for action in actions {
+        // Arguments tell apart calls to one function made side by side.
+        let callee = match &action.kind {
+            ActionKind::Call { name, args } => {
+                let args = args.iter().map(Value::to_string).collect::<Vec<_>>().join(", ");
+                let args = if args.chars().count() > 40 { format!("{}…", args.chars().take(40).collect::<String>()) } else { args };
+                format!("{name}({args})")
+            }
+            ActionKind::Task { name, .. } | ActionKind::Tool { name, .. } => name.clone(),
+            _ => "并行读取".into(),
+        };
+        // A called function that stopped returned its own stop point.
+        let below = recorded(s, &action.id)?
+            .and_then(|(_, event)| event["meta"]["result"]["result"].as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()))
+            .and_then(|result| result["$task_error"]["stopped_at"].as_str().map(str::to_owned))
+            .filter(|below| !below.is_empty())
+            .map(|below| if below.starts_with('（') { below } else { format!(" → {below}") })
+            .unwrap_or_default();
+        steps.push(((action.at.line, action.at.column), format!("第 {} 行 {callee}{below}", action.at.line)));
+    }
+    // In source order; calls made side by side on one line by what they say.
+    steps.sort();
+    Ok(steps.into_iter().map(|(_, step)| step).collect::<Vec<_>>().join("、"))
+}
+/// A frame's stop for the user's message, carrying where it stopped.
+pub(super) fn interrupted_at(s: &Session<'_>, w: &Window) -> Result<Value> {
+    let mut error = interrupted();
+    error["stopped_at"] = json!(stop_point(s, w)?);
+    Ok(error)
+}
 /// The window is a frame of a running program: the main program or a function it called.
 pub(super) fn in_program(w: &Window) -> bool {
     w.program.is_some() || w.program_task.is_some()
@@ -556,7 +598,8 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
             ]
         }
         Err(error) if error["code"] == INTERRUPTED => {
-            vec!["程序被你的新消息打断。".to_owned(), "之后的步骤没有执行。".to_owned()]
+            let at = error["stopped_at"].as_str().filter(|at| !at.is_empty()).map(|at| format!("，停在 {at}")).unwrap_or_default();
+            vec![format!("程序被你的新消息打断{at}。"), "停下的这一步没有完成，之后的步骤没有执行。".to_owned()]
         }
         Err(error) => {
             let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string());
@@ -575,10 +618,11 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
 /// Stop the main program for the user's new message, settling what is in flight
 /// without replaying it; its outcome is the reply the message then follows.
 pub(super) async fn stop_main(s: &Session<'_>, w: &mut Window, step: usize) -> Result<()> {
+    let error = interrupted_at(s, w)?;
     recover(s, w).await?;
     interrupt_unfinished(s, w).await?;
-    append(s, "program/interrupted", json!({"turn":s.turn}), false).await?;
-    let text = outcome(s, Err(&interrupted()))?;
+    append(s, "program/interrupted", json!({"turn":s.turn,"stopped_at":error["stopped_at"]}), false).await?;
+    let text = outcome(s, Err(&error))?;
     end_program(s, w, step, Value::Null, text).await?;
     Ok(())
 }
@@ -1455,6 +1499,8 @@ mod tests {
         let conn = agent_service::open_db(root.path()).unwrap();
         let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(answer, "Only a then.");
+        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(shown, "程序被你的新消息打断，停在 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 3 行 judge([\"a.txt\",\"b.txt\"])（AI 处理中）。\n停下的这一步没有完成，之后的步骤没有执行。");
     }
 
     #[tokio::test]
@@ -1485,5 +1531,7 @@ mod tests {
         let conn = agent_service::open_db(root.path()).unwrap();
         let concurrent: i64 = conn.query_row("SELECT count(*) FROM agent_task_events WHERE data LIKE '%parallel_call_id%'", [], |r| r.get(0)).unwrap();
         assert!(concurrent > 0, "the calls ran concurrently");
+        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(shown, "程序被你的新消息打断，停在 第 2 行 judge(\"a.txt\") → 第 2 行 decide(\"a.txt\")（AI 处理中）、第 2 行 judge(\"b.txt\") → 第 2 行 decide(\"b.txt\")（AI 处理中）。\n停下的这一步没有完成，之后的步骤没有执行。");
     }
 }

@@ -1451,16 +1451,16 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         // The user spoke while a program ran: each frame stops at this step,
         // innermost first, and the main AI hears the message.
         if s.is_primary() && program_flow::in_program(w) && interjection_pending(s).await? {
-            ensure!(w.parallel_root.is_none(), "{}: the user sent a new message", program_flow::INTERRUPTED);
             // Concurrent calls stop at their own next step; wait for them.
             while let Some(result) = async_children.join_next().await {
                 result.context("async function task failed")??;
             }
             if w.program_task.is_some() {
+                let error = program_flow::interrupted_at(s, w)?;
                 program_flow::recover(s, w).await?;
                 program_flow::interrupt_unfinished(s, w).await?;
                 w.program = None;
-                let stopped = json!({"role":"assistant","content":json!({"$task_error":program_flow::interrupted()}).to_string()});
+                let stopped = json!({"role":"assistant","content":json!({"$task_error":error}).to_string()});
                 let Some((scope, frame)) = task_frames::finish(s, w, &stopped).await? else {
                     return Ok(LoopResult::Answer);
                 };
