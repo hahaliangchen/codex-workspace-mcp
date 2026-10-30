@@ -1386,4 +1386,19 @@ mod tests {
         let memory = memory.lock().unwrap().clone().expect("the answer reached the main AI in a new turn");
         assert!(memory.to_string().contains("等你回答：Keep both files?"), "the new turn knows what was asked: {memory}");
     }
+
+    #[tokio::test]
+    async fn code_that_catches_errors_can_tell_a_question_apart_and_rethrow_it() {
+        let root = TestRoot::new();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" => reply(TWO_LEVEL_MAIN.into()),
+            "implement" => reply("```js\nasync function summarize(paths) {\n  try {\n    return judge(paths);\n  } catch (error) {\n    if (error.name === \"WaitingForUser\") throw error;\n    return {summary: \"fallback\"};\n  }\n}\n/** @virtual */\nfunction judge(paths) {\n  // Decide which files to keep. Returns {summary:string}.\n}\n```".into()),
+            _ => json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"ask","type":"function","function":{"name":ASK,"arguments":json!({"question":"Keep both files?"}).to_string()}}]}}]}),
+        }).await;
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(shown, "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。", "the catch-all let the question through");
+        assert!(!root.path().join("out.txt").exists(), "the fallback did not run");
+    }
 }

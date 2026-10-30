@@ -1756,10 +1756,11 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         // A leaf ends early when it asked the user or outgrew its context.
         let ended = if let Some(question) = asked {
             let function = w.program_task.as_ref().map(|task| task["name"].clone()).unwrap_or(Value::Null);
-            Some(json!({"$task_error":{"code":program_flow::WAITING,"question":question,"function":function,
+            // Named so code that catches errors can tell it apart and rethrow it.
+            Some(json!({"$task_error":{"name":"WaitingForUser","code":program_flow::WAITING,"question":question,"function":function,
                 "message":"the function is waiting for the user's answer"}}))
         } else if overflow {
-            Some(json!({"$task_error":{"code":"CONTEXT_OVERFLOW",
+            Some(json!({"$task_error":{"name":"ContextOverflow","code":"CONTEXT_OVERFLOW",
                 "message":"this function's context ran out before it finished; split the work into smaller calls",
                 "completed_writes":program_flow::completed_writes(s, w)?}}))
         } else {
