@@ -108,6 +108,18 @@ pub(super) const ASK: &str = "ask_user";
 /// The error a function ends with when its AI asks the user. It rises to the
 /// main program without being caught by code or rewritten by an author.
 pub(super) const WAITING: &str = "WAITING_FOR_USER";
+/// A message from the user stops a running program at its next step: the rest
+/// was planned before the user spoke, so the main AI hears the message with the
+/// outcome and decides what to run next. The host stops each frame from
+/// outside, so no catch in the program can keep it running.
+pub(super) const INTERRUPTED: &str = "INTERRUPTED";
+pub(super) fn interrupted() -> Value {
+    json!({"name":"Interrupted","code":INTERRUPTED,"message":"the user sent a new message; the program stopped"})
+}
+/// The window is a frame of a running program: the main program or a function it called.
+pub(super) fn in_program(w: &Window) -> bool {
+    w.program.is_some() || w.program_task.is_some()
+}
 pub(super) fn ask_tool() -> Value {
     function(ASK, "Ask the user for a decision or information this function cannot get otherwise. The program stops here and your question is shown to the user; their answer, whatever it is, starts a new turn in which the work is planned again. Use it only when the work truly depends on the user.",
         json!({"question":{"type":"string","minLength":1}}), json!(["question"]))
@@ -543,6 +555,9 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
                 "之后的步骤没有执行。".to_owned(),
             ]
         }
+        Err(error) if error["code"] == INTERRUPTED => {
+            vec!["程序被你的新消息打断。".to_owned(), "之后的步骤没有执行。".to_owned()]
+        }
         Err(error) => {
             let message = error["message"].as_str().map(str::to_owned).unwrap_or_else(|| error.to_string());
             let at = error["location"]["line"].as_u64().map(|line| format!("第 {line} 行")).unwrap_or_default();
@@ -556,6 +571,16 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
         lines.push(format!("写入：{shown}{more}"));
     }
     Ok(lines.join("\n"))
+}
+/// Stop the main program for the user's new message, settling what is in flight
+/// without replaying it; its outcome is the reply the message then follows.
+pub(super) async fn stop_main(s: &Session<'_>, w: &mut Window, step: usize) -> Result<()> {
+    recover(s, w).await?;
+    interrupt_unfinished(s, w).await?;
+    append(s, "program/interrupted", json!({"turn":s.turn}), false).await?;
+    let text = outcome(s, Err(&interrupted()))?;
+    end_program(s, w, step, Value::Null, text).await?;
+    Ok(())
 }
 async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value) -> Result<Round> {
     let text = if w.program_task.is_some() {
@@ -1400,5 +1425,65 @@ mod tests {
         let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
         assert_eq!(shown, "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。", "the catch-all let the question through");
         assert!(!root.path().join("out.txt").exists(), "the fallback did not run");
+    }
+
+    #[tokio::test]
+    async fn a_user_message_stops_a_running_program_and_reaches_the_main_ai() {
+        let root = TestRoot::new();
+        let path = root.path().to_owned();
+        let leaf = Arc::new(AtomicUsize::new(0));
+        let leaf_rounds = leaf.clone();
+        let heard = Arc::new(std::sync::Mutex::new(None::<String>));
+        let log = heard.clone();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" if body["messages"].to_string().contains("程序被你的新消息打断") => {
+                *log.lock().unwrap() = Some(body["messages"].to_string());
+                reply("Only a then.".into())
+            }
+            "main" => reply(TWO_LEVEL_MAIN.into()),
+            "implement" => reply("```js\nasync function summarize(paths) {\n  try {\n    return judge(paths);\n  } catch (error) {\n    return {summary: \"fallback\"};\n  }\n}\n/** @virtual */\nfunction judge(paths) {\n  // Decide which files to keep. Returns {summary:string}.\n}\n```".into()),
+            _ => {
+                assert_eq!(leaf_rounds.fetch_add(1, Ordering::SeqCst), 0, "the leaf stops before its next step");
+                crate::interjections::submit(&path, "task", "Only summarize a").unwrap();
+                json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"find","type":"function","function":{"name":FIND,"arguments":json!({"query":"read"}).to_string()}}]}}]})
+            }
+        }).await;
+        let heard = heard.lock().unwrap().clone().expect("the main AI heard the message after the outcome");
+        assert!(heard.contains("Only summarize a"), "{heard}");
+        assert!(!root.path().join("out.txt").exists(), "neither the catch-all nor the rest of the program ran");
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(answer, "Only a then.");
+    }
+
+    #[tokio::test]
+    async fn a_user_message_stops_concurrent_calls_too() {
+        let root = TestRoot::new();
+        let path = root.path().to_owned();
+        let leaf = Arc::new(AtomicUsize::new(0));
+        let leaf_rounds = leaf.clone();
+        let heard = Arc::new(AtomicUsize::new(0));
+        let main_heard = heard.clone();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" if body["messages"].to_string().contains("程序被你的新消息打断") => {
+                main_heard.fetch_add(1, Ordering::SeqCst);
+                reply("Stopped.".into())
+            }
+            "main" => reply("```js\nimport * as io from \"host:io\";\nconst kept = await Promise.all([judge(\"a.txt\"), judge(\"b.txt\")]);\nio.write({path: \"out.txt\", content: JSON.stringify(kept)});\n\n/** @virtual */\nasync function judge(path) {\n  // Decide whether to keep the file at path. Returns {keep:boolean}.\n}\n```".into()),
+            "implement" => reply("```js\nasync function judge(path) {\n  return decide(path);\n}\n/** @virtual */\nfunction decide(path) {\n  // Decide whether to keep the file. Returns {keep:boolean}.\n}\n```".into()),
+            _ => {
+                leaf_rounds.fetch_add(1, Ordering::SeqCst);
+                crate::interjections::submit(&path, "task", "Stop, keep everything").unwrap();
+                json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"find","type":"function","function":{"name":FIND,"arguments":json!({"query":"read"}).to_string()}}]}}]})
+            }
+        }).await;
+        assert!(leaf.load(Ordering::SeqCst) <= 2, "each concurrent leaf stopped before its next step");
+        assert_eq!(heard.load(Ordering::SeqCst), 1, "the main AI heard the message once");
+        assert!(!root.path().join("out.txt").exists());
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let concurrent: i64 = conn.query_row("SELECT count(*) FROM agent_task_events WHERE data LIKE '%parallel_call_id%'", [], |r| r.get(0)).unwrap();
+        assert!(concurrent > 0, "the calls ran concurrently");
     }
 }

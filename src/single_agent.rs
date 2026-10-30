@@ -1294,6 +1294,10 @@ fn has_visual_jobs(s: &Session<'_>, w: &Window) -> Result<bool> {
     }
     Ok(false)
 }
+async fn interjection_pending(s: &Session<'_>) -> Result<bool> {
+    let task = s.task.to_owned();
+    db(s.state.workspace.root(), move |conn| crate::interjections::pending(conn, &task)).await
+}
 /// Move messages the user sent mid-turn into the working window; true when any arrived.
 async fn deliver_interjections(s: &Session<'_>, w: &mut Window) -> Result<bool> {
     let (task, scope, mut next) = (s.task.to_owned(), s.scope.clone(), w.clone());
@@ -1444,6 +1448,28 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         current.task_node_id = w.task_node_id.clone();
         let s = &current;
         activate_page_plugin(s, w).await?;
+        // The user spoke while a program ran: each frame stops at this step,
+        // innermost first, and the main AI hears the message.
+        if s.is_primary() && program_flow::in_program(w) && interjection_pending(s).await? {
+            ensure!(w.parallel_root.is_none(), "{}: the user sent a new message", program_flow::INTERRUPTED);
+            // Concurrent calls stop at their own next step; wait for them.
+            while let Some(result) = async_children.join_next().await {
+                result.context("async function task failed")??;
+            }
+            if w.program_task.is_some() {
+                program_flow::recover(s, w).await?;
+                program_flow::interrupt_unfinished(s, w).await?;
+                w.program = None;
+                let stopped = json!({"role":"assistant","content":json!({"$task_error":program_flow::interrupted()}).to_string()});
+                let Some((scope, frame)) = task_frames::finish(s, w, &stopped).await? else {
+                    return Ok(LoopResult::Answer);
+                };
+                *w = frame;
+                current.scope = scope;
+                continue;
+            }
+            program_flow::stop_main(s, w, step).await?;
+        }
         if s.is_primary() && w.parallel_root.is_none() {
             deliver_interjections(s, w).await?;
         }
@@ -1622,7 +1648,8 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                     "model returned an empty answer"
                 );
                 // The user spoke while this answer was being written: keep working on it.
-                if s.is_primary() && w.parallel_root.is_none() && deliver_interjections(s, w).await? {
+                // A function's finished answer still returns; its caller then stops.
+                if s.is_primary() && w.parallel_root.is_none() && !program_flow::in_program(w) && deliver_interjections(s, w).await? {
                     continue;
                 }
                 // A no-tool reply returns this function. Finish resumes the
