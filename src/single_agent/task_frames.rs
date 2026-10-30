@@ -679,7 +679,7 @@ pub(super) fn memory_index(
         .collect::<Vec<_>>();
     Ok(Some(
         json!({"host_status":true,"not_a_user_request":true,"entries":entries,"entries_omitted":omitted,
-        "instruction":"Index of completed main tasks and task-free questions, oldest completion first. Each task has one entry with its goal, final summary and node_id even if it spanned multiple turns. Temporary tasks are included in their main task, not separate entries. Working context is not loaded here. Read details with read_session_history using the task node_id and include_descendants=true, or turn for a question/answer entry."}),
+        "instruction":"Index of completed main tasks and task-free questions, oldest completion first. Each task has one entry with its goal, final summary and node_id even if it spanned multiple turns. Function calls are included in their main task, not separate entries. Working context and programs are not loaded here. Read details with read_session_history using the task node_id and include_descendants=true, or turn for a question/answer entry; add programs:true with the turn to read the code that turn ran."}),
     ))
 }
 

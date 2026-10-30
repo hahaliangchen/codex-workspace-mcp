@@ -113,8 +113,33 @@ pub fn tool() -> Value {
         "limit":{"type":"integer","minimum":1,"maximum":12},
         "char_offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":256,"maximum":12000},
         "include_event":{"type":"boolean","description":"Return the original event envelope instead of just the sender's message/return or tool output; useful for inspecting provenance."},
+        "programs":{"type":"boolean","description":"Return the programs this conversation ran instead of messages: each turn's main program and the implementations written for its virtual functions, with their source. Filter with turn; read them only when earlier code matters to the current request."},
         "include_context":{"type":"boolean","description":"Include recorded model input views for audit, filterable by the receiving role. Default false. An exact event_seq also resolves a context reference. These views cite the shared history; they are not new actions or independent facts."}
     }}}})
+}
+
+/// The programs this conversation ran: each turn's main program and the
+/// implementations its AI wrote for virtual functions, in the order they ran.
+fn read_programs(conn: &rusqlite::Connection, task: &str, args: &Value) -> Result<Value> {
+    let task = args["task_id"].as_str().unwrap_or(task);
+    let turn = args["turn"].as_i64();
+    let limit = args["limit"].as_u64().unwrap_or(12).clamp(1, 12) as usize;
+    let rows = conn
+        .prepare("SELECT seq,data FROM agent_task_events WHERE task_id=?1 AND kind='program/start'
+            AND json_extract(data,'$.source') IS NOT NULL AND (?2 IS NULL OR json_extract(data,'$.turn')=?2) ORDER BY seq")?
+        .query_map(rusqlite::params![task, turn], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let more = rows.len() > limit;
+    let programs = rows
+        .into_iter()
+        .take(limit)
+        .map(|(seq, raw)| {
+            let data: Value = serde_json::from_str(&raw).unwrap_or_default();
+            json!({"event_seq":seq,"turn":data["turn"],"function":data["function"],"frame":data["task_node_id"],"source":data["source"]})
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({"programs":programs,"more":more,
+        "note":"function is null for a turn's main program, else the virtual function this code implements. A program records how work was done; check current files for their present state."}))
 }
 
 pub async fn read(root: &Path, task: &str, args: &Value) -> Result<Value> {
@@ -126,6 +151,9 @@ pub async fn read(root: &Path, task: &str, args: &Value) -> Result<Value> {
 
 fn read_saved(root: &Path, task: &str, args: &Value) -> Result<Value> {
     let conn = crate::agent_service::open_db(root)?;
+    if args["programs"] == true {
+        return read_programs(&conn, task, args);
+    }
     let store::SearchSelection {
         rows,
         project,

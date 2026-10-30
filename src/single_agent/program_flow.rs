@@ -1177,4 +1177,51 @@ mod tests {
         let message = json!({"content":"```js\nfunction f() {\n  return 1;\n}```\nDone."});
         assert_eq!(reply_source(&message).unwrap().unwrap(), "function f() {\n  return 1;\n}");
     }
+
+    #[tokio::test]
+    async fn a_later_turn_reads_earlier_programs_from_the_conversation_history() {
+        let root = TestRoot::new();
+        std::fs::write(root.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(root.path().join("b.txt"), "beta").unwrap();
+        let read_back = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let log = read_back.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let turn2 = body["messages"].to_string().contains("What did the last program do");
+            let answer = match role_of(&body).as_str() {
+                "main" if !turn2 => reply(TWO_LEVEL_MAIN.into()),
+                "main" => {
+                    let messages = body["messages"].as_array().unwrap();
+                    match messages.iter().rev().find(|m| m["role"] == "tool") {
+                        None => {
+                            assert!(!body.to_string().contains("async function summarize"), "no earlier code sits in the new turn's context");
+                            assert!(tool_names(&body).contains(&"read_session_history".to_owned()), "the main AI reads history itself");
+                            json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                                "tool_calls":[{"id":"history","type":"function","function":{"name":"read_session_history","arguments":json!({"programs":true,"turn":1}).to_string()}}]}}]})
+                        }
+                        Some(result) => {
+                            *log.lock().unwrap() = Some(serde_json::from_str(result["content"].as_str().unwrap()).unwrap());
+                            reply("It summarized a.txt and b.txt into out.txt.".into())
+                        }
+                    }
+                }
+                "implement" => reply("```js\nimport * as io from \"host:io\";\nasync function summarize(paths) {\n  const texts = [];\n  for (const path of paths) { texts.push(io.read({path: path}).content); }\n  return judge(texts);\n}\n/** @virtual */\nfunction judge(texts) {\n  // Join the texts into one summary. Returns {summary:string}.\n}\n```".into()),
+                _ => reply(json!({"summary":"alpha+beta"}).to_string()),
+            };
+            async move { Json(answer) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        run_task(state.clone(), "task".into(), "fake".into(), "Summarize a and b".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
+        run_task(state, "task".into(), "fake".into(), "What did the last program do?".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
+        server.abort();
+        let read_back = read_back.lock().unwrap().clone().expect("the second turn read the history");
+        let programs = read_back["programs"].as_array().unwrap();
+        assert_eq!(programs.len(), 2, "the main program and the implementation it led to: {read_back}");
+        assert!(programs[0]["function"].is_null() && programs[0]["source"].as_str().unwrap().contains("await summarize("));
+        assert_eq!(programs[1]["function"], "summarize");
+        assert!(programs[1]["source"].as_str().unwrap().contains("function judge("));
+    }
 }

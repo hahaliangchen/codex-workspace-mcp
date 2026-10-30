@@ -632,9 +632,12 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
     } else if role == "main" {
         let libraries = program_flow::library_catalog(s, definitions);
         // The planning request gets declarations, not duplicate business schemas.
+        // Reading this conversation's history, programs included, is the main
+        // AI's own: its result is something to read, not a program value.
         published.retain(|d| {
             d["function"]["name"].as_str().is_none_or(|name| {
-                crate::agent_program::libraries::public_name(&libraries, name).is_none()
+                name == "read_session_history"
+                    || crate::agent_program::libraries::public_name(&libraries, name).is_none()
             })
         });
         // Historical exchanges and compiled effects use private dispatcher names
@@ -1545,7 +1548,10 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                             .and_then(|_| program_flow::install_scoped(s, w, &args, body));
                         match installed {
                             Ok(receipt) => {
-                                append(s, "program/start", json!({"turn":s.turn,"receipt":receipt}), false).await?;
+                                // The program is part of the conversation record: read back with
+                                // read_session_history({programs:true}), never kept in a context.
+                                let function = w.program_task.as_ref().map(|task| task["name"].clone()).unwrap_or(Value::Null);
+                                append(s, "program/start", json!({"turn":s.turn,"receipt":receipt,"function":function,"source":args["source"]}), false).await?;
                             }
                             Err(error) => {
                                 let diagnostic = program_flow::source_error("program", &args, &error);
