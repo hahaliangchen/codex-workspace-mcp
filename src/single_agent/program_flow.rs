@@ -461,7 +461,22 @@ fn resolve(
             }
         }
     }
+    if failed {
+        locate_question(action, &mut value);
+    }
     w.program.as_mut().unwrap().resume(value, failed)
+}
+/// A question rising through a call gains the caller's step, so its outcome
+/// says where the program stopped, as a pause's does.
+fn locate_question(action: &Action, error: &mut Value) {
+    if error["code"] != WAITING {
+        return;
+    }
+    let step = super::paused_programs::step_label(action);
+    error["stopped_at"] = json!(match error["stopped_at"].as_str().filter(|at| !at.is_empty()) {
+        Some(inner) => format!("{step} → {inner}"),
+        None => step,
+    });
 }
 pub(super) async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
     // Version rejection must precede receipt consumption or dispatch.
@@ -486,6 +501,9 @@ pub(super) async fn recover(s: &Session<'_>, w: &mut Window) -> Result<()> {
                 Some(result) => value = result,
                 None => { failed = true; value = json!({"message":"async function returned no valid JSON value"}); }
             }
+        }
+        if failed {
+            locate_question(&action, &mut value);
         }
         w.program.as_mut().unwrap().resume_action(&action.id, value, failed)?;
         save(s, w).await?;
@@ -543,9 +561,11 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
             vec!["程序已完成。".to_owned(), format!("返回：{}", clip(&text, 300))]
         }
         Err(error) if error["code"] == WAITING => {
-            let function = error["function"].as_str().unwrap_or("程序");
+            let question = error["question"].as_str().unwrap_or("");
+            let at = error["stopped_at"].as_str().filter(|at| !at.is_empty()).map(str::to_owned)
+                .unwrap_or_else(|| error["function"].as_str().unwrap_or("程序").to_owned());
             vec![
-                format!("程序在 {function} 停下，等你回答：{}", error["question"].as_str().unwrap_or("")),
+                format!("程序停在 {at}，等你回答：{question}"),
                 "之后的步骤没有执行。".to_owned(),
             ]
         }
@@ -1416,7 +1436,7 @@ mod tests {
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
         run_task(state.clone(), "task".into(), "fake".into(), "Summarize a and b".into(), 20, CancellationToken::new(), 1, false).await.unwrap();
         let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(shown, "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。");
+        assert_eq!(shown, "程序停在 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 2 行 judge([\"a.txt\",\"b.txt\"])，等你回答：Keep both files?\n之后的步骤没有执行。");
         assert!(!root.path().join("out.txt").exists(), "nothing after the question ran");
         run_task(state, "task".into(), "fake".into(), "Yes, keep both".into(), 10, CancellationToken::new(), 2, false).await.unwrap();
         server.abort();
@@ -1435,7 +1455,7 @@ mod tests {
         }).await;
         let conn = agent_service::open_db(root.path()).unwrap();
         let shown: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' AND json_extract(data,'$.actor')='program' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
-        assert_eq!(shown, "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。", "the catch-all let the question through");
+        assert_eq!(shown, "程序停在 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 3 行 judge([\"a.txt\",\"b.txt\"])，等你回答：Keep both files?\n之后的步骤没有执行。", "the catch-all let the question through");
         assert!(!root.path().join("out.txt").exists(), "the fallback did not run");
     }
 
@@ -1591,7 +1611,7 @@ mod tests {
         }).await;
         let conn = agent_service::open_db(root.path()).unwrap();
         let lines = program_lines(&conn);
-        assert_eq!(lines.last().unwrap(), "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。", "{lines:?}");
+        assert_eq!(lines.last().unwrap(), "程序停在 第 2 行 previous.resume() → 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 2 行 judge([\"a.txt\",\"b.txt\"])，等你回答：Keep both files?\n之后的步骤没有执行。", "{lines:?}");
         assert!(!root.path().join("out.txt").exists());
         assert_eq!(paused_nodes(&conn), 0);
     }
@@ -1634,5 +1654,21 @@ mod tests {
         assert_eq!(leaf.load(Ordering::SeqCst), 2, "a call cut off mid-step is not run again");
         let lines = program_lines(&conn);
         assert!(lines.last().is_some_and(|line| line.contains("出错停止")), "{lines:?}");
+    }
+
+    #[tokio::test]
+    async fn a_question_from_a_concurrent_call_says_where_it_stopped() {
+        let root = TestRoot::new();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" => reply("```js\nimport * as io from \"host:io\";\nconst kept = await Promise.all([judge(\"a.txt\"), judge(\"b.txt\")]);\nio.write({path: \"out.txt\", content: JSON.stringify(kept)});\n\n/** @virtual */\nasync function judge(path) {\n  // Decide whether to keep the file at path. Returns {keep:boolean}.\n}\n```".into()),
+            "implement" => reply("```js\nasync function judge(path) {\n  return decide(path);\n}\n/** @virtual */\nfunction decide(path) {\n  // Decide whether to keep the file. Returns {keep:boolean}.\n}\n```".into()),
+            _ if body["messages"].to_string().contains("a.txt") => json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                "tool_calls":[{"id":"ask","type":"function","function":{"name":ASK,"arguments":json!({"question":"Keep a.txt?"}).to_string()}}]}}]}),
+            _ => reply(json!({"keep":true}).to_string()),
+        }).await;
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let lines = program_lines(&conn);
+        assert_eq!(lines.last().unwrap(), "程序停在 第 2 行 judge(\"a.txt\") → 第 2 行 decide(\"a.txt\")，等你回答：Keep a.txt?\n之后的步骤没有执行。", "{lines:?}");
+        assert!(!root.path().join("out.txt").exists());
     }
 }

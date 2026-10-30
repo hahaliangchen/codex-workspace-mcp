@@ -70,17 +70,6 @@ fn describe(conn: &rusqlite::Connection, task: &str, nodes: &[Node], w: &Window)
     let actions: Vec<Action> = runtime.pending.iter().cloned().chain(runtime.inflight_actions()).collect();
     let mut steps = Vec::new();
     for action in actions {
-        // Arguments tell apart calls to one function made side by side.
-        let callee_name = match &action.kind {
-            ActionKind::Call { name, args } => {
-                let args = args.iter().map(Value::to_string).collect::<Vec<_>>().join(", ");
-                let args = if args.chars().count() > 40 { format!("{}…", args.chars().take(40).collect::<String>()) } else { args };
-                format!("{name}({args})")
-            }
-            ActionKind::Tool { name, .. } if name == RESUME => "previous.resume()".into(),
-            ActionKind::Task { name, .. } | ActionKind::Tool { name, .. } => name.clone(),
-            _ => "并行读取".into(),
-        };
         let mut below = String::new();
         // A resume runs the paused program; a call runs in its own frame.
         let frame = match &action.kind {
@@ -97,11 +86,27 @@ fn describe(conn: &rusqlite::Connection, task: &str, nodes: &[Node], w: &Window)
             let inner = describe(conn, task, nodes, &frame)?;
             below = if inner.starts_with('（') || inner.is_empty() { inner } else { format!(" → {inner}") };
         }
-        steps.push(((action.at.line, action.at.column), format!("第 {} 行 {callee_name}{below}", action.at.line)));
+        steps.push(((action.at.line, action.at.column), format!("{}{below}", step_label(&action))));
     }
     // In source order; calls made side by side on one line by what they say.
     steps.sort();
     Ok(steps.into_iter().map(|(_, step)| step).collect::<Vec<_>>().join("、"))
+}
+
+/// A step as the outcome names it: its line and what it calls. Arguments tell
+/// apart calls to one function made side by side.
+pub(super) fn step_label(action: &Action) -> String {
+    let callee = match &action.kind {
+        ActionKind::Call { name, args } => {
+            let args = args.iter().map(Value::to_string).collect::<Vec<_>>().join(", ");
+            let args = if args.chars().count() > 40 { format!("{}…", args.chars().take(40).collect::<String>()) } else { args };
+            format!("{name}({args})")
+        }
+        ActionKind::Tool { name, .. } if name == RESUME => "previous.resume()".into(),
+        ActionKind::Task { name, .. } | ActionKind::Tool { name, .. } => name.clone(),
+        _ => "并行读取".into(),
+    };
+    format!("第 {} 行 {callee}", action.at.line)
 }
 
 /// Move the main window's program into a paused frame of its own and leave the
