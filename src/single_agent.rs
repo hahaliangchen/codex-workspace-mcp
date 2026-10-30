@@ -1,5 +1,5 @@
 //! Durable flow execution with scoped functions, tools and bounded delegates.
-//! One Runtime owns control flow; working context folds by remaining capacity.
+//! One Runtime owns control flow; working context is never folded.
 use crate::{
     agent_service::{self, AgentServiceState},
     context_window::estimate,
@@ -20,7 +20,6 @@ mod documented_examples;
 mod function_scope;
 mod managed_files;
 mod program_flow;
-mod step_context;
 mod task_frames;
 
 #[cfg(test)]
@@ -655,12 +654,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         }
     }
     wire.extend(host_messages);
-    if let Some(task) = messages.iter().find(|m| m["name"] == "program_task_input") {
-        // Keep the exact current call available after folded working history.
-        if !wire.iter().any(|m| m["name"] == "program_task_input") {
-            wire.push(task.clone());
-        }
-    }
 
     // Main capacity is monitored by the host, not a changing system prompt.
     if s.state
@@ -866,13 +859,9 @@ async fn model_round(
         w.input_tokens(s, &body) <= s.input_budget,
         "INPUT_OVER_CAPACITY: context remains saved; no request sent. Read large material in explicit pages, or hand it to a child task that returns only the needed result."
     );
-    {
-        // Shown as the composer's context ring; older steps fold from compact_at.
-        let (fixed, at, _) = step_context::limits(s, w, definitions);
-        append(s,"context/usage",json!({"turn":s.turn,"step":step,"nodeId":node,"estimated_input_tokens":w.input_tokens(s, &body),"raw_estimated_input_tokens":estimate(&body),
-            "input_budget":s.input_budget,"fixed_input_tokens":fixed,
-            "compact_at":at}),false).await?;
-    }
+    // Shown as the composer's context ring.
+    append(s,"context/usage",json!({"turn":s.turn,"step":step,"nodeId":node,"estimated_input_tokens":w.input_tokens(s, &body),"raw_estimated_input_tokens":estimate(&body),
+        "input_budget":s.input_budget}),false).await?;
     // Image delivery can change the input size; size the output afterwards.
     body["max_tokens"] = json!(crate::model_settings::output_tokens(
         s.state,
@@ -1549,11 +1538,9 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         step += 1;
         let definitions = tools(s, w);
         ensure!(!s.cancel.is_cancelled(), "cancelled");
-        // A leaf never folds its context: running out ends it with an error.
+        // No context is folded: a result that does not fit is not delivered,
+        // and a leaf that runs out ends with an error.
         let leaf = matches!(program_flow::role(w), program_flow::Role::Leaf(_));
-        if !leaf {
-            step_context::prepare(s, w, &definitions).await?;
-        }
         let (node, message) = if w.program.is_some() {
             match program_flow::next(s, w, step).await? {
                 program_flow::Round::Exchange(node, message) => (node, message),
@@ -2042,24 +2029,8 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
             {
                 candidate.push(json!({"role":"user","content":[{"type":"image_ref","artifact_id":result["artifact_id"]}]}));
             }
-            let mut required_input_tokens =
+            let required_input_tokens =
                 w.input_tokens(s, &request(s, &candidate, &definitions));
-            if !leaf && required_input_tokens.saturating_add(4096) >= s.input_budget {
-                let current = w.input_tokens(s, &request(s, &w.messages, &definitions));
-                let incoming = candidate[w.messages.len()..].to_vec();
-                step_context::make_room(
-                    s,
-                    w,
-                    &definitions,
-                    required_input_tokens
-                        .saturating_sub(current)
-                        .saturating_add(4096),
-                )
-                .await?;
-                let mut retry = w.messages.clone();
-                retry.extend(incoming);
-                required_input_tokens = w.input_tokens(s, &request(s, &retry, &definitions));
-            }
             let fits = required_input_tokens.saturating_add(4096) < s.input_budget;
             if fits
                 && !is_error

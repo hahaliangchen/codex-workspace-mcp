@@ -406,23 +406,6 @@ pub fn reference_only(message: &mut Value) {
         .unwrap()
         .remove("viewed_by_context_agent");
 }
-pub fn presentation_key(message: &Value) -> (String, String) {
-    let payload = if let Some(calls) = message["tool_calls"].as_array() {
-        Value::Array(calls.iter().map(|c| c["function"].clone()).collect())
-    } else if let Some(text) = message["content"].as_str() {
-        let value = serde_json::from_str::<Value>(text).unwrap_or(json!(text));
-        value.get("original_result").cloned().unwrap_or(value)
-    } else {
-        message["content"].clone()
-    };
-    (
-        message[REFERENCE]["asset_id"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned(),
-        crate::visual_artifacts::hash(payload.to_string().as_bytes()),
-    )
-}
 /// Mechanical edit of AI-selected assets. Native tool envelopes and IDs stay
 /// intact; saved history and files are never modified. Unknown IDs reject all.
 pub fn release(messages: &mut [Value], ids: &[String]) -> Result<()> {
@@ -475,26 +458,6 @@ pub fn catalog(messages: &[Value]) -> Value {
     json!({"assets":entries.into_values().collect::<Vec<_>>(),"note":"Loaded material remains in context until an explicit AI edit. image_selected is not proof of pixel delivery."})
 }
 
-/// Keep delivery order in the durable asset index when per-step records leave
-/// the working view. These are existing event facts, not new asset versions.
-pub fn remember_deliveries(root: &Path, task: &str, deliveries: &Value) -> Result<()> {
-    let mut conn = connection(root)?;
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    for delivery in deliveries.as_array().into_iter().flatten() {
-        if let (Some(id), Some(seq)) = (
-            delivery["reference"]["asset_id"].as_str(),
-            delivery["event_seq"].as_i64(),
-        ) {
-            tx.execute(
-                "INSERT OR IGNORE INTO agent_context_asset_deliveries(task_id,asset_id,event_seq)
-                SELECT ?1,?2,seq FROM agent_task_events WHERE task_id=?1 AND seq=?3",
-                params![task, id, seq],
-            )?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
 
 pub fn frame_index(root: &Path, task: &str, node: &str, messages: &[Value]) -> Result<Value> {
     let conn = connection(root)?;

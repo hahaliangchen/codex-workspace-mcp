@@ -4,7 +4,6 @@ import type { AgentEvent } from '../api.ts'
 export interface ContextUsage {
   readonly used: number
   readonly budget: number
-  readonly compactAt: number
 }
 
 /** The latest request's size, as recorded by the main agent before sending it. */
@@ -15,7 +14,7 @@ export function latestContextUsage(events: readonly AgentEvent[]): ContextUsage 
     const used = Number(event.data.estimated_input_tokens)
     const budget = Number(event.data.input_budget)
     if (!(used >= 0) || !(budget > 0)) return undefined
-    return { used, budget, compactAt: Number(event.data.compact_at) || budget }
+    return { used, budget }
   }
   return undefined
 }
@@ -25,14 +24,14 @@ const thousands = (value: number) => value >= 10_000 ? `${Math.round(value / 100
 /** A small ring by the model name: how full this conversation's context is. */
 export function ContextRing({ usage }: { usage: ContextUsage | undefined }) {
   if (!usage) return null
-  // Fullness is measured against the point where automatic compression starts.
-  const ratio = Math.min(1, usage.used / usage.compactAt)
+  // Fullness is measured against the input budget; nothing is compressed.
+  const ratio = Math.min(1, usage.used / usage.budget)
   const tone = ratio >= 0.85 ? 'var(--theme-ring-high)' : ratio >= 0.6 ? 'var(--theme-ring-mid)' : 'var(--theme-ring-low)'
   const radius = 7
   const circumference = 2 * Math.PI * radius
   const label = ratio >= 0.85
-    ? `上下文快满了：已用 ${thousands(usage.used)} tokens，到 ${thousands(usage.compactAt)} 会自动压缩。换个话题时可以开新会话。`
-    : `上下文已用 ${thousands(usage.used)} / ${thousands(usage.compactAt)} tokens（${Math.round(ratio * 100)}%），满了会自动压缩`
+    ? `上下文快满了：已用 ${thousands(usage.used)} / ${thousands(usage.budget)} tokens。换个话题时可以开新会话。`
+    : `上下文已用 ${thousands(usage.used)} / ${thousands(usage.budget)} tokens（${Math.round(ratio * 100)}%）`
   return <Tooltip label={label} side="top" delayMs={200}>
     <span role="img" aria-label={label} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--codex-text-muted, #6b7280)' }}>
       <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">

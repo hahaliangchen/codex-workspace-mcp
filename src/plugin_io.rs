@@ -157,7 +157,6 @@ mod tests {
             ("browser", include_str!("browser_control.rs")),
             ("attachments", include_str!("attachments.rs")),
             ("task frames", include_str!("single_agent/task_frames.rs")),
-            ("step context", include_str!("single_agent/step_context.rs")),
             ("task tree", include_str!("task_tree.rs")),
             ("task board", include_str!("main_task_anchor.rs")),
             ("context assets", include_str!("context_assets.rs")),

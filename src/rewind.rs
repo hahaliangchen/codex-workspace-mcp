@@ -381,16 +381,13 @@ mod tests {
             &json!({"content":"future"}),
         )
         .unwrap();
-        crate::context_assets::remember_deliveries(
-            &root,
-            "t",
-            &json!([
-                {"reference":kept,"event_seq":first},
-                {"reference":kept,"event_seq":last},
-                {"reference":removed,"event_seq":last}
-            ]),
-        )
-        .unwrap();
+        for (asset, seq) in [(&kept, first), (&kept, last), (&removed, last)] {
+            conn.execute(
+                "INSERT INTO agent_context_asset_deliveries(task_id,asset_id,event_seq) VALUES ('t',?1,?2)",
+                params![asset["asset_id"].as_str().unwrap(), seq],
+            )
+            .unwrap();
+        }
         for (id, through) in [("old", first), ("new", second)] {
             conn.execute(
                 "INSERT INTO agent_context_materials VALUES ('t',?1,?2)",

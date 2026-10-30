@@ -218,49 +218,6 @@ pub(super) fn tool_description(definitions: &[Value], name: &str, arguments: &st
 /// Rebuilt beside the next request, independent of compressible chat history.
 /// This is an execution ledger, not a host decision about what to do next.
 
-/// Keep identifying parameters while replacing document/code payloads with size facts.
-pub(super) fn brief_arguments(value: &Value) -> Value {
-    fn brief(value: &Value, key: &str, depth: usize) -> Value {
-        if value.is_string()
-            && matches!(
-                key,
-                "content"
-                    | "html"
-                    | "svg"
-                    | "code"
-                    | "script"
-                    | "data"
-                    | "body"
-                    | "text"
-                    | "diff"
-                    | "patch"
-            )
-        {
-            return json!({"characters":value.as_str().map(|text| text.chars().count()).unwrap_or_else(||value.to_string().chars().count())});
-        }
-        match value {
-            Value::String(text) if text.chars().count() > 160 => {
-                json!({"characters":text.chars().count()})
-            }
-            Value::Object(fields) if depth < 2 => fields
-                .iter()
-                .map(|(key, value)| (key.clone(), brief(value, key, depth + 1)))
-                .collect(),
-            Value::Array(items) if depth < 2 => json!(
-                items
-                    .iter()
-                    .take(8)
-                    .map(|item| brief(item, key, depth + 1))
-                    .collect::<Vec<_>>()
-            ),
-            Value::Object(_) | Value::Array(_) => {
-                json!({"characters":value.to_string().chars().count()})
-            }
-            _ => value.clone(),
-        }
-    }
-    brief(value, "", 0)
-}
 
 /// Copy returned metadata as-is; failure is never interpreted as "not applied".
 
