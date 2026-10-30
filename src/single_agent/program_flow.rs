@@ -5,6 +5,10 @@ use crate::agent_program::{self, Action, Runtime, State, runtime::ActionKind};
 
 pub(super) enum Round {
     Exchange(String, Value),
+    /// A program step ran; continue the program.
+    Continue,
+    /// A function call opened the frame with this scope.
+    Entered(String),
     /// The current AI rewrites its failed implementation.
     Rewrite,
     Concurrent(Vec<Action>),
@@ -144,28 +148,28 @@ pub(super) fn find(s: &Session<'_>, w: &Window, args: &Value) -> Result<Value> {
         .collect::<Vec<_>>();
     Ok(json!({"methods":methods}))
 }
-/// Files a function wrote successfully, from its own tool exchanges.
-pub(super) fn completed_writes(messages: &[Value]) -> Vec<Value> {
-    let failed = messages
-        .iter()
-        .filter(|m| m["role"] == "tool")
-        .filter(|m| {
-            serde_json::from_str::<Value>(m["content"].as_str().unwrap_or(""))
-                .map(|v| v.get("error").is_some() || v["error_code"].is_string())
-                .unwrap_or(true)
+/// Files a function wrote successfully: write calls recorded under its frame,
+/// whether its AI or its program made them, whose results were not errors.
+pub(super) fn completed_writes(s: &Session<'_>, w: &Window) -> Result<Vec<Value>> {
+    let Some(frame) = w.task_node_id.as_deref() else { return Ok(Vec::new()) };
+    let conn = agent_service::open_db(s.state.workspace.root())?;
+    let rows = conn
+        .prepare("SELECT json_extract(c.data,'$.name'),json_extract(c.data,'$.arguments') FROM agent_task_events c
+            WHERE c.task_id=?1 AND c.kind='tool/call' AND json_extract(c.data,'$.task_node_id')=?2
+            AND json_extract(c.data,'$.name') IN ('write_file','edit_file','replace_range')
+            AND EXISTS (SELECT 1 FROM agent_task_events r WHERE r.task_id=c.task_id AND r.kind='tool/result'
+                AND json_extract(r.data,'$.message.toolCallId')=json_extract(c.data,'$.callId')
+                AND json_extract(r.data,'$.message.isError')=0)
+            ORDER BY c.seq")?
+        .query_map(params![s.task, frame], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(tool, arguments)| {
+            let path = serde_json::from_str::<Value>(&arguments).map(|a| a["path"].clone()).unwrap_or(Value::Null);
+            json!({"tool":tool,"path":path})
         })
-        .filter_map(|m| m["tool_call_id"].as_str())
-        .collect::<BTreeSet<_>>();
-    messages
-        .iter()
-        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
-        .filter(|c| matches!(c["function"]["name"].as_str(), Some("write_file" | "edit_file" | "replace_range")))
-        .filter(|c| c["id"].as_str().is_some_and(|id| !failed.contains(id)))
-        .filter_map(|c| {
-            let args = serde_json::from_str::<Value>(c["function"]["arguments"].as_str()?).ok()?;
-            Some(json!({"tool":c["function"]["name"],"path":args["path"]}))
-        })
-        .collect()
+        .collect())
 }
 fn call_arguments(task: &Value) -> Result<(&Vec<Value>, &Vec<Value>)> {
     let parameters = task["parameters"].as_array().context(
@@ -496,24 +500,6 @@ pub(super) async fn interrupt_unfinished(s: &Session<'_>, w: &mut Window) -> Res
     }
     save(s, w).await
 }
-async fn exchange(
-    s: &Session<'_>,
-    w: &mut Window,
-    step: usize,
-    id: &str,
-    name: &str,
-    args: Value,
-    at: &Value,
-) -> Result<(String, Value)> {
-    let node = format!("program_{}", agent_service::uuid_like());
-    let execution = s.clone();
-    let message = json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
-    let seq=append(&execution,"assistant/message",json!({"actor":"program","turn":s.turn,"step":step,"nodeId":node,"program_location":at,"message":message}),false).await?;
-    w.messages.push(sourced(message.clone(), s.task, seq));
-    w.previous_node = Some(node.clone());
-    save(s, w).await?;
-    Ok((node, message))
-}
 async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value) -> Result<Round> {
     w.program_value = Some(value.clone());
     w.program = None;
@@ -563,7 +549,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 // error and what already ran, and rewrites it or gives up.
                 w.program = None;
                 let diagnostic = json!({"code":"FUNCTION_RUNTIME_ERROR","executed":true,"error":error,
-                    "completed_writes":completed_writes(&w.messages),
+                    "completed_writes":completed_writes(s, w)?,
                     "instruction":"Your implementation stopped with this error. Reply with a corrected complete ```js block; it runs from its start, so do not redo the listed writes unless the contract needs them redone. If the contract cannot be met, reply with {\"$task_error\":{\"message\":\"concrete cause\"}} instead."});
                 let seq = append(s, "program/runtime_error", json!({"diagnostic":diagnostic}), false).await?;
                 w.messages.push(sourced(json!({"role":"user","name":"program_diagnostic","content":diagnostic.to_string()}), s.task, seq));
@@ -622,8 +608,20 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 ),
                 ActionKind::Fork { .. } | ActionKind::Join { .. } => anyhow::bail!("saved fork/join calls are retired"),
             };
-            let (node, message) = exchange(s, w, step, &action.id, &name, args, &at).await?;
-            Ok(Round::Exchange(node, message))
+            let node = format!("program_{}", agent_service::uuid_like());
+            let call = crate::model_stream::ToolCall { call_id: action.id.clone(), name, arguments: args.to_string() };
+            // A function call opens its frame; a tool step runs and its result is
+            // the value of the program's expression. Neither enters an AI window.
+            if call.name == "create_task" {
+                let scope = task_frames::create_task(s, w, &call, &node, step).await?;
+                return Ok(Round::Entered(scope));
+            }
+            let definitions = super::tools(s, w);
+            let done = super::execute_call(s, w, &definitions, &node, step, &call, 1, Some(&at)).await?;
+            super::stop_on_conflict(s, &done.result).await?;
+            resolve(s, w, &action, done.result, done.is_error, done.seq)?;
+            save(s, w).await?;
+            Ok(Round::Continue)
         }
     }
 }
@@ -987,6 +985,17 @@ mod tests {
         run_task(state, "task".into(), "fake".into(), "Summarize a and b".into(), 10, CancellationToken::new(), 1, false).await.unwrap();
         server.abort();
         assert_eq!(std::fs::read_to_string(root.path().join("out.txt")).unwrap(), "alpha+beta");
+        // The program's reads and writes ran as its own steps: no AI window holds them.
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let windows = conn.prepare("SELECT state FROM agent_runtime_windows WHERE task_id='task'").unwrap()
+            .query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        for window in windows {
+            let window: Value = serde_json::from_str(&window).unwrap();
+            assert!(window["messages"].as_array().unwrap().iter().all(|m| m["tool_calls"].is_null() && m["role"] != "tool"),
+                "no synthesized program exchange in {window}");
+        }
+        let program_steps: i64 = conn.query_row("SELECT count(*) FROM agent_task_events WHERE kind='tool/call' AND json_extract(data,'$.program_location') IS NOT NULL", [], |r| r.get(0)).unwrap();
+        assert!(program_steps >= 3, "the program's steps are still recorded, with their source location");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.iter().map(|(role, _, _)| role.as_str()).collect::<Vec<_>>(), ["main", "implement", "leaf"]);
         let (_, implement, prompt) = &seen[1];

@@ -216,9 +216,6 @@ fn available_tools(s: &Session<'_>, w: &Window) -> Vec<Value> {
     {
         tools.push(crate::agent_program::declarations::contract_tool());
         tools.push(function("read_program_guide", "Read supported flow language capabilities and differences from JavaScript on demand.", json!({}), json!([])));
-        if w.program_task.is_some() {
-            tools.push(crate::agent_program::body_tool());
-        }
     }
     {
         tools.push(function("list_skills", "List installed skill packages and their short applicability descriptions. Load only a skill useful for the current task; the host does not classify the request.",json!({}),json!([])));
@@ -494,21 +491,6 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
         && first.get("name").is_none()
     {
         first["content"] = json!(program_flow::prompt(role));
-    }
-    // An implementer only calls read_tool_contracts; its program's own steps
-    // stay in the window, and a runtime diagnostic lists the writes they made.
-    if role == "implement" {
-        let own = |call: &Value| call["function"]["name"] == "read_tool_contracts";
-        let program_calls = wire
-            .iter()
-            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
-            .filter(|call| !own(call))
-            .filter_map(|call| call["id"].as_str().map(str::to_owned))
-            .collect::<BTreeSet<_>>();
-        wire.retain(|m| {
-            !(m["tool_calls"].as_array().is_some_and(|calls| !calls.is_empty() && !calls.iter().any(own))
-                || m["role"] == "tool" && m["tool_call_id"].as_str().is_some_and(|id| program_calls.contains(id)))
-        });
     }
     // Code writers get the language environment and the library index; a
     // leaf only calls its tools.
@@ -1474,7 +1456,11 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         let (node, message) = if w.program.is_some() {
             match program_flow::next(s, w, step).await? {
                 program_flow::Round::Exchange(node, message) => (node, message),
-                program_flow::Round::Rewrite => continue,
+                program_flow::Round::Rewrite | program_flow::Round::Continue => continue,
+                program_flow::Round::Entered(scope) => {
+                    current.scope = scope;
+                    continue;
+                }
                 program_flow::Round::Concurrent(actions) => {
                     for action in actions {
                         let (scope, child) = task_frames::start_parallel_function(s, w, &action, step).await?;
@@ -1650,265 +1636,15 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
             "duplicate or missing tool call id"
         );
         let call_count = calls.len();
-        // Function frames are created only for the program's own pending call;
-        // anything else named create_task is an unavailable tool to the AI.
-        let program_call = w.program.as_ref().and_then(|p| p.pending.as_ref()).is_some_and(|a| {
-            a.id == calls[0].call_id
-                && matches!(
-                    a.kind,
-                    crate::agent_program::runtime::ActionKind::Task { .. }
-                        | crate::agent_program::runtime::ActionKind::Call { .. }
-                )
-        });
-        if call_count == 1 && calls[0].name == "create_task" && program_call {
-            current.scope = task_frames::create_task(s, w, &calls[0], &node, step).await?;
-            continue;
-        }
         let mut image_messages = Vec::new();
         let mut released_assets = None;
         let mut overflow = false;
-        for mut call in calls {
-            let mut transport_error = None;
-            if call.name == crate::agent_program::declarations::CALL {
-                let resolve = (|| -> Result<(String, String)> {
-                    ensure!(
-                        w.program_task.is_some() && w.program.is_none(),
-                        "invoke_library is available only in an executing comment task"
-                    );
-                    let payload: Value = serde_json::from_str(&call.arguments)?;
-                    ensure!(
-                        payload["args"].is_object(),
-                        "library arguments must be an object"
-                    );
-                    let method = payload["method"]
-                        .as_str()
-                        .context("library method required")?;
-                    let catalog = program_flow::library_catalog(s, &definitions);
-                    let target = crate::agent_program::libraries::target(&catalog, method)
-                        .context("unknown or unavailable library method")?;
-                    let definition = definitions.iter().find(|d| d["function"]["name"] == target)
-                        .context("tool contract unavailable")?;
-                    let schema = &definition["function"]["parameters"];
-                    let validator = jsonschema::validator_for(schema)
-                        .map_err(|e| anyhow::anyhow!("invalid tool schema: {e}"))?;
-                    validator.validate(&payload["args"])
-                        .map_err(|e| anyhow::anyhow!("invalid arguments for {method}: {e}"))?;
-                    Ok((target.to_owned(), payload["args"].to_string()))
-                })();
-                match resolve {
-                    Ok((name, args)) => {
-                        call.name = name;
-                        call.arguments = args;
-                    }
-                    Err(error) => transport_error = Some(error),
-                }
+        for call in calls {
+            let Executed { result, is_error, seq, asset_reference, skill_change, refreshed_from, released_assets: released } =
+                execute_call(s, w, &definitions, &node, step, &call, call_count, None).await?;
+            if released.is_some() {
+                released_assets = released;
             }
-            let mut skill_change = None;
-            let kind = { "tool/call" };
-            append(s,kind,json!({"actor":s.actor(),"turn":s.turn,"step":step,"flowNodeId":node,"callId":call.call_id,"name":call.name,"arguments":call.arguments,
-                "description":task_frames::tool_description(&definitions,&call.name,&call.arguments)}),false).await?;
-            let mut material_source: Option<(String, Value)> = None;
-            let mut refreshed_from: Option<Value> = None;
-            let mut validating_source = false;
-            let output=async {
-                if let Some(error)=transport_error { return Err(error); }
-                let args:Value=serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
-                // Mode enforcement is independent of the model's advertised schema.
-                if !program_flow::internal_call(w,&call) {validate_tool(s,w,&definitions,&call.name)?;}
-                if crate::function_frames::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill"|"define_task_body") {
-                    ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
-                }
-                match call.name.as_str() {
-                    "parallel_read_batch" => {
-                        ensure!(program_flow::internal_call(w, &call), "parallel reads require a pending compiled program");
-                        let operations = args["operations"].as_array().context("operations must be an array")?;
-                        ensure!(operations.len() <= 32, "parallel read limit exceeded");
-                        for operation in operations {
-                            let name = operation["name"].as_str().context("read tool name required")?;
-                            ensure!(matches!(name,"read_file"|"read_file_lines"|"search_text"|"list_dir"), "only read-only file operations may run in parallel");
-                            ensure!(operation["args"].is_object(), "read arguments must be an object");
-                            validate_tool(s,w,&definitions,name)?;
-                        }
-                        let node_ref = &node;
-                        let futures = operations.iter().enumerate().map(|(index, operation)| {
-                            let name = operation["name"].as_str().unwrap().to_owned();
-                            let input = operation["args"].clone();
-                            let subcall = format!("{}-{}", call.call_id, index);
-                            async move { business_tool(s, node_ref, &name, input, &subcall).await }
-                        });
-                        let settled = futures::future::join_all(futures).await;
-                        for (index, result) in settled.iter().enumerate() {
-                            let (failed, value) = match result {
-                                Ok(value) => (value["error_code"] == "ASSET_CONFLICT", value.clone()),
-                                Err(error) => (true, json!({"error":format!("{error:#}")})),
-                            };
-                            append(s, "parallel_read/item", json!({"turn":s.turn,"batch_call_id":call.call_id,"index":index,
-                                "name":operations[index]["name"],"arguments":operations[index]["args"],"is_error":failed,"result":value}), false).await?;
-                        }
-                        let mut results = Vec::with_capacity(operations.len());
-                        if args["settled"] == true {
-                            for result in settled {
-                                match result {
-                                    Ok(value) => results.push(json!({"failed":value["error_code"] == "ASSET_CONFLICT", "value":value})),
-                                    Err(error) => results.push(json!({"failed":true, "value":{"message":format!("{error:#}")}})),
-                                }
-                            }
-                        } else {
-                            for result in settled {
-                                let value = result?;
-                                if value["error_code"] == "ASSET_CONFLICT" { return Ok(value); }
-                                results.push(value);
-                            }
-                        }
-                        material_source = Some((call.name.clone(), args.clone()));
-                        Ok(json!(results))
-                    },
-                    name if name == program_flow::FIND => program_flow::find(s, w, &args),
-                    "read_program_guide" => { Ok(json!({"guide":crate::agent_program::CAPABILITIES})) },
-                    "read_tool_contracts" => {
-                        let catalog = program_flow::library_catalog(s, &definitions);
-                        let selected = crate::agent_program::declarations::selected(&catalog, &args)?;
-                        Ok(json!({"declarations":crate::agent_program::declarations::headers(&selected, &definitions)}))
-                    },
-                    "define_task_body" => { validating_source = true; program_flow::install_scoped(s,w,&args,true) },
-                    "propose_project_note" => {
-                        ensure!(s.is_primary() && s.plugin.is_none(),"project notes are proposed by the main Agent of a code session");
-                        let note=args["note"].as_str().map(str::trim).filter(|note|!note.is_empty()).context("note is required")?;
-                        Ok(json!({"proposed":true,"note":note,"status":"awaiting_user","instruction":"The user decides in the UI card. Do not wait, repeat the proposal or write AGENTS.md yourself; continue the task."}))
-                    },
-                    "list_skills" => {
-                        let all=s.state.tool_catalog.as_ref().map(|c|c.packages.skills()).unwrap_or_else(||json!([]));
-                        let mut listed=all.as_array().unwrap().iter().filter(|item|s.plugin.as_ref().is_none_or(|id|item["name"]==*id)).cloned().collect::<Vec<_>>();
-                        if let Some(project)=crate::project_notes::task_project(s.state.workspace.root(),s.task)? {
-                            listed.extend(crate::flow_skills::list(&project).into_iter().map(|skill|json!({"name":skill.name,"description":skill.description,"scope":"project"})));
-                        }
-                        Ok(json!(listed))
-                    },
-                    "read_skill" => {
-                        let name=args["name"].as_str().context("skill name is required")?;
-                        ensure!(s.plugin.as_ref().is_none_or(|owner|owner==name),"PLUGIN_SCOPE_DENIED: skill {name}");
-                        let project=crate::project_notes::task_project(s.state.workspace.root(),s.task)?;
-                        if let Some(result)=project.as_deref().and_then(|project|crate::flow_skills::read(project,name)) {
-                            // Project skills are instructions only: there are no tools to activate.
-                            material_source=Some(("read_skill".to_owned(),args.clone()));
-                            result
-                        } else {
-                            let catalog=s.state.tool_catalog.as_ref().context("skill package registry unavailable")?;
-                            let result=catalog.packages.read(name)?;
-                            material_source=Some(("read_skill".to_owned(),args.clone()));
-                            skill_change=Some((name.to_owned(),true,result["package_scope"].as_u64()));
-                            Ok(result)
-                        }
-                    },
-                    "unload_skill" => {
-                        ensure!(s.plugin.is_none(),"PLUGIN_SESSION_ACTIVE: leave the plugin page or disable the plugin to unload it");
-                        let name=args["name"].as_str().context("skill name is required")?;
-                        ensure!(s.plugin.as_ref().is_none_or(|owner|owner==name),"PLUGIN_SCOPE_DENIED: skill {name}");
-                        skill_change=Some((name.to_owned(),false,None));
-                        Ok(json!({"skill":name,"tools_hidden":true}))
-                    },
-                    "read_attachment" => {
-                        material_source=Some((call.name.clone(),args.clone()));
-                        crate::plugin_io::sync_attachments(s.state,s.task).await?;
-                        crate::attachments::read(s.state,s.task,&args).await
-                    },
-                    "analyze_images" => {
-
-                        ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
-                        material_source=Some((call.name.clone(),args.clone()));
-                        let visual=visual_context(s,&node)?;
-                        let sources = crate::visual_jobs::sources(s.state.workspace.root(),&visual,&args)?;
-                        let mut output = if args["background"].as_bool().unwrap_or(false) {
-                            crate::visual_jobs::submit(s.state,&visual,&args,&call.call_id,s.model,s.cancel)?
-                        } else {
-                            crate::image_analysis::execute(s.state,&visual,&args,&call.call_id,s.model,s.cancel).await?
-                        };
-                        // Covers synchronous/mixed-image checks and a completed
-                        // background job returned by submit's deduplication path.
-                        if output["status"] != "accepted" {
-                            output["sources"] = json!(sources);
-                        }
-                        Ok(output)
-                    },
-                    "image_analysis_results" => {
-
-                        ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
-                        let output = crate::visual_jobs::results(s.state.workspace.root(),s.task,&args,s.cancel).await?;
-                        Ok(output)
-                    },
-                    "list_context_assets" => Ok(crate::context_assets::catalog(&w.messages)),
-                    "release_assets" => {
-                        let ids=args["asset_ids"].as_array().context("asset_ids must be an array")?.iter()
-                            .map(|id|id.as_str().map(str::to_owned).context("asset id must be a string")).collect::<Result<Vec<_>>>()?;
-                        ensure!(!ids.is_empty(),"asset_ids must not be empty");
-                        let mut candidate=w.messages.clone();
-                        crate::context_assets::release(&mut candidate,&ids)?;
-                        released_assets=Some(ids.clone());
-                        Ok(json!({"released_assets":ids,"history_and_files_preserved":true}))
-                    },
-                    "read_asset" => {
-                        let mut result=load_saved_asset(s,&args).await?;
-                        if let Some(image_id)=result["asset_reference"]["artifact_id"].as_str() {
-                            let viewed=business_tool(s,&node,"view_image",json!({"artifact_id":image_id,"original":true}),&call.call_id).await?;
-                            result["artifact_id"]=viewed["artifact_id"].clone();
-                            result["image_delivery"] = json!("selected_for_next_model_request");
-                        }
-                        Ok(result)
-                    },
-                    "refresh_asset" => {
-                        let id=args["asset_id"].as_str().context("asset_id is required")?.to_owned();
-                        let root=s.state.workspace.root().to_path_buf(); let task=s.task.to_owned();
-                        let (previous,(name,read_args))=tokio::task::spawn_blocking(move||->Result<_> {
-                            Ok((crate::context_assets::reference(&root,&task,&id,None)?,crate::context_assets::refresh_request(&root,&task,&id)?))
-                        }).await??;
-                        refreshed_from=Some(previous);
-                        material_source=Some((name.clone(),read_args.clone()));
-                        business_tool(s,&node,&name,read_args,&call.call_id).await
-                    },
-                    name => {
-                        ensure!(!crate::function_frames::is_tool(name),"task-changing tools must be called alone");
-                        // A delegate's small write receipts are artifacts too: preserve
-                        // their paths/versions even after its working window is gone.
-                        if crate::context_assets::is_material_tool(name) || s.delegate_id().is_some() {material_source=Some((name.to_owned(),args.clone()));}
-                        business_tool(s,&node,name,args,&call.call_id).await
-                    },
-                }
-            }.await;
-            let is_error = output.is_err() || output.as_ref().is_ok_and(|value| value["error_code"] == "ASSET_CONFLICT");
-            let result = output.unwrap_or_else(|error| {
-                if validating_source {
-                    let args =
-                        serde_json::from_str::<Value>(&call.arguments).unwrap_or(Value::Null);
-                    program_flow::source_error(&call.name, &args, &error)
-                } else {
-                    json!({"error":format!("{error:#}")})
-                }
-            });
-            let seq=append(s,"tool/result",json!({
-                "actor":s.actor(),"turn":s.turn,"step":step,"flowNodeId":node,
-                "message":{"id":agent_service::uuid_like(),"role":"tool","toolCallId":call.call_id,"isError":is_error,
-                    "content":[{"type":"text","text":result.to_string()}]},"meta":{"result":result}}),true).await?;
-            let asset_reference = if !is_error {
-                if let Some((name, args)) = material_source {
-                    let root = s.state.workspace.root().to_path_buf();
-                    let task = s.task.to_owned();
-                    let original = result.clone();
-                    Some(
-                        tokio::task::spawn_blocking(move || {
-                            crate::context_assets::register(
-                                &root, &task, seq, &name, &args, &original,
-                            )
-                        })
-                        .await??,
-                    )
-                } else if call.name == "read_asset" {
-                    Some(result["asset_reference"].clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             let mut delivery = if call.name == "read_asset" {
                 result.clone()
             } else {
@@ -1993,16 +1729,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                 image_messages.push(image);
             }
             save(s, w).await?;
-            if result["error_code"] == "ASSET_CONFLICT" {
-                let message = if let Some(copy) = result["candidate_path"].as_str() {
-                    let saved = if result["candidate"] == "request" { "这次的修改请求" } else { "待写副本" };
-                    format!("文件 {} 在任务期间被外部修改，当前文件未覆盖。{}保存在 {}。请决定如何处理；系统不会自动合并或重试。", result["path"].as_str().unwrap_or(""), saved, copy)
-                } else {
-                    format!("文件 {} 在读取期间发生变化，未进行编辑。请决定如何处理；系统不会自动重试。", result["path"].as_str().unwrap_or(""))
-                };
-                append(s, "assistant/message", json!({"actor":"host","turn":s.turn,"message":{"role":"assistant","content":message}}), true).await?;
-                anyhow::bail!("ASSET_CONFLICT: {}", result);
-            }
+            stop_on_conflict(s, &result).await?;
         }
         // Keep all native results adjacent to their assistant call message.
         // Image inputs follow the complete exchange, even if a provider returns
@@ -2018,7 +1745,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
         if overflow {
             let error = json!({"$task_error":{"code":"CONTEXT_OVERFLOW",
                 "message":"this function's context ran out before it finished; split the work into smaller calls",
-                "completed_writes":program_flow::completed_writes(&w.messages)}});
+                "completed_writes":program_flow::completed_writes(s, w)?}});
             let message = json!({"role":"assistant","content":error.to_string()});
             let seq = append(s, "assistant/message", json!({"actor":"host","turn":s.turn,"message":message}), false).await?;
             w.messages.push(sourced(message.clone(), s.task, seq));
@@ -2033,6 +1760,247 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
     }
     Ok(LoopResult::Limit)
     })
+}
+
+/// A file changed outside the Agent while a write was pending: tell the user
+/// where the candidate was kept and stop, without merging or retrying.
+async fn stop_on_conflict(s: &Session<'_>, result: &Value) -> Result<()> {
+    if result["error_code"] == "ASSET_CONFLICT" {
+        let message = if let Some(copy) = result["candidate_path"].as_str() {
+            let saved = if result["candidate"] == "request" { "这次的修改请求" } else { "待写副本" };
+            format!("文件 {} 在任务期间被外部修改，当前文件未覆盖。{}保存在 {}。请决定如何处理；系统不会自动合并或重试。", result["path"].as_str().unwrap_or(""), saved, copy)
+        } else {
+            format!("文件 {} 在读取期间发生变化，未进行编辑。请决定如何处理；系统不会自动重试。", result["path"].as_str().unwrap_or(""))
+        };
+        append(s, "assistant/message", json!({"actor":"host","turn":s.turn,"message":{"role":"assistant","content":message}}), true).await?;
+        anyhow::bail!("ASSET_CONFLICT: {}", result);
+    }
+    Ok(())
+}
+
+/// One executed call: its result and what delivering it to an AI needs.
+struct Executed {
+    result: Value,
+    is_error: bool,
+    seq: i64,
+    asset_reference: Option<Value>,
+    skill_change: Option<(String, bool, Option<u64>)>,
+    refreshed_from: Option<Value>,
+    released_assets: Option<Vec<String>>,
+}
+
+/// Run one call, made by the AI or by the program, and record it in the event
+/// log. Delivering the result is the caller's business: an AI gets it in its
+/// window, a program gets it as the value of its expression.
+#[allow(clippy::too_many_arguments)]
+async fn execute_call(
+    s: &Session<'_>,
+    w: &Window,
+    definitions: &[Value],
+    node: &str,
+    step: usize,
+    call: &crate::model_stream::ToolCall,
+    call_count: usize,
+    at: Option<&Value>,
+) -> Result<Executed> {
+    let mut skill_change = None;
+    let mut released_assets = None;
+    append(s,"tool/call",json!({"actor":s.actor(),"turn":s.turn,"step":step,"flowNodeId":node,"callId":call.call_id,"name":call.name,"arguments":call.arguments,
+        "program_location":at,"description":task_frames::tool_description(definitions,&call.name,&call.arguments)}),false).await?;
+    let mut material_source: Option<(String, Value)> = None;
+    let mut refreshed_from: Option<Value> = None;
+    let output=async {
+        let args:Value=serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
+        // Mode enforcement is independent of the model's advertised schema.
+        if !program_flow::internal_call(w,call) {validate_tool(s,w,definitions,&call.name)?;}
+        if crate::function_frames::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill") {
+            ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
+        }
+        match call.name.as_str() {
+            "parallel_read_batch" => {
+                ensure!(program_flow::internal_call(w, call), "parallel reads require a pending compiled program");
+                let operations = args["operations"].as_array().context("operations must be an array")?;
+                ensure!(operations.len() <= 32, "parallel read limit exceeded");
+                for operation in operations {
+                    let name = operation["name"].as_str().context("read tool name required")?;
+                    ensure!(matches!(name,"read_file"|"read_file_lines"|"search_text"|"list_dir"), "only read-only file operations may run in parallel");
+                    ensure!(operation["args"].is_object(), "read arguments must be an object");
+                    validate_tool(s,w,definitions,name)?;
+                }
+                let node_ref = &node;
+                let futures = operations.iter().enumerate().map(|(index, operation)| {
+                    let name = operation["name"].as_str().unwrap().to_owned();
+                    let input = operation["args"].clone();
+                    let subcall = format!("{}-{}", call.call_id, index);
+                    async move { business_tool(s, node_ref, &name, input, &subcall).await }
+                });
+                let settled = futures::future::join_all(futures).await;
+                for (index, result) in settled.iter().enumerate() {
+                    let (failed, value) = match result {
+                        Ok(value) => (value["error_code"] == "ASSET_CONFLICT", value.clone()),
+                        Err(error) => (true, json!({"error":format!("{error:#}")})),
+                    };
+                    append(s, "parallel_read/item", json!({"turn":s.turn,"batch_call_id":call.call_id,"index":index,
+                        "name":operations[index]["name"],"arguments":operations[index]["args"],"is_error":failed,"result":value}), false).await?;
+                }
+                let mut results = Vec::with_capacity(operations.len());
+                if args["settled"] == true {
+                    for result in settled {
+                        match result {
+                            Ok(value) => results.push(json!({"failed":value["error_code"] == "ASSET_CONFLICT", "value":value})),
+                            Err(error) => results.push(json!({"failed":true, "value":{"message":format!("{error:#}")}})),
+                        }
+                    }
+                } else {
+                    for result in settled {
+                        let value = result?;
+                        if value["error_code"] == "ASSET_CONFLICT" { return Ok(value); }
+                        results.push(value);
+                    }
+                }
+                material_source = Some((call.name.clone(), args.clone()));
+                Ok(json!(results))
+            },
+            name if name == program_flow::FIND => program_flow::find(s, w, &args),
+            "read_program_guide" => { Ok(json!({"guide":crate::agent_program::CAPABILITIES})) },
+            "read_tool_contracts" => {
+                let catalog = program_flow::library_catalog(s, definitions);
+                let selected = crate::agent_program::declarations::selected(&catalog, &args)?;
+                Ok(json!({"declarations":crate::agent_program::declarations::headers(&selected, definitions)}))
+            },
+            "propose_project_note" => {
+                ensure!(s.is_primary() && s.plugin.is_none(),"project notes are proposed by the main Agent of a code session");
+                let note=args["note"].as_str().map(str::trim).filter(|note|!note.is_empty()).context("note is required")?;
+                Ok(json!({"proposed":true,"note":note,"status":"awaiting_user","instruction":"The user decides in the UI card. Do not wait, repeat the proposal or write AGENTS.md yourself; continue the task."}))
+            },
+            "list_skills" => {
+                let all=s.state.tool_catalog.as_ref().map(|c|c.packages.skills()).unwrap_or_else(||json!([]));
+                let mut listed=all.as_array().unwrap().iter().filter(|item|s.plugin.as_ref().is_none_or(|id|item["name"]==*id)).cloned().collect::<Vec<_>>();
+                if let Some(project)=crate::project_notes::task_project(s.state.workspace.root(),s.task)? {
+                    listed.extend(crate::flow_skills::list(&project).into_iter().map(|skill|json!({"name":skill.name,"description":skill.description,"scope":"project"})));
+                }
+                Ok(json!(listed))
+            },
+            "read_skill" => {
+                let name=args["name"].as_str().context("skill name is required")?;
+                ensure!(s.plugin.as_ref().is_none_or(|owner|owner==name),"PLUGIN_SCOPE_DENIED: skill {name}");
+                let project=crate::project_notes::task_project(s.state.workspace.root(),s.task)?;
+                if let Some(result)=project.as_deref().and_then(|project|crate::flow_skills::read(project,name)) {
+                    // Project skills are instructions only: there are no tools to activate.
+                    material_source=Some(("read_skill".to_owned(),args.clone()));
+                    result
+                } else {
+                    let catalog=s.state.tool_catalog.as_ref().context("skill package registry unavailable")?;
+                    let result=catalog.packages.read(name)?;
+                    material_source=Some(("read_skill".to_owned(),args.clone()));
+                    skill_change=Some((name.to_owned(),true,result["package_scope"].as_u64()));
+                    Ok(result)
+                }
+            },
+            "unload_skill" => {
+                ensure!(s.plugin.is_none(),"PLUGIN_SESSION_ACTIVE: leave the plugin page or disable the plugin to unload it");
+                let name=args["name"].as_str().context("skill name is required")?;
+                ensure!(s.plugin.as_ref().is_none_or(|owner|owner==name),"PLUGIN_SCOPE_DENIED: skill {name}");
+                skill_change=Some((name.to_owned(),false,None));
+                Ok(json!({"skill":name,"tools_hidden":true}))
+            },
+            "read_attachment" => {
+                material_source=Some((call.name.clone(),args.clone()));
+                crate::plugin_io::sync_attachments(s.state,s.task).await?;
+                crate::attachments::read(s.state,s.task,&args).await
+            },
+            "analyze_images" => {
+
+                ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
+                material_source=Some((call.name.clone(),args.clone()));
+                let visual=visual_context(s,&node)?;
+                let sources = crate::visual_jobs::sources(s.state.workspace.root(),&visual,&args)?;
+                let mut output = if args["background"].as_bool().unwrap_or(false) {
+                    crate::visual_jobs::submit(s.state,&visual,&args,&call.call_id,s.model,s.cancel)?
+                } else {
+                    crate::image_analysis::execute(s.state,&visual,&args,&call.call_id,s.model,s.cancel).await?
+                };
+                // Covers synchronous/mixed-image checks and a completed
+                // background job returned by submit's deduplication path.
+                if output["status"] != "accepted" {
+                    output["sources"] = json!(sources);
+                }
+                Ok(output)
+            },
+            "image_analysis_results" => {
+
+                ensure!(s.state.permission_mode.allows("analyze_images"),"permission_denied: analyze_images");
+                let output = crate::visual_jobs::results(s.state.workspace.root(),s.task,&args,s.cancel).await?;
+                Ok(output)
+            },
+            "list_context_assets" => Ok(crate::context_assets::catalog(&w.messages)),
+            "release_assets" => {
+                let ids=args["asset_ids"].as_array().context("asset_ids must be an array")?.iter()
+                    .map(|id|id.as_str().map(str::to_owned).context("asset id must be a string")).collect::<Result<Vec<_>>>()?;
+                ensure!(!ids.is_empty(),"asset_ids must not be empty");
+                let mut candidate=w.messages.clone();
+                crate::context_assets::release(&mut candidate,&ids)?;
+                released_assets=Some(ids.clone());
+                Ok(json!({"released_assets":ids,"history_and_files_preserved":true}))
+            },
+            "read_asset" => {
+                let mut result=load_saved_asset(s,&args).await?;
+                if let Some(image_id)=result["asset_reference"]["artifact_id"].as_str() {
+                    let viewed=business_tool(s,&node,"view_image",json!({"artifact_id":image_id,"original":true}),&call.call_id).await?;
+                    result["artifact_id"]=viewed["artifact_id"].clone();
+                    result["image_delivery"] = json!("selected_for_next_model_request");
+                }
+                Ok(result)
+            },
+            "refresh_asset" => {
+                let id=args["asset_id"].as_str().context("asset_id is required")?.to_owned();
+                let root=s.state.workspace.root().to_path_buf(); let task=s.task.to_owned();
+                let (previous,(name,read_args))=tokio::task::spawn_blocking(move||->Result<_> {
+                    Ok((crate::context_assets::reference(&root,&task,&id,None)?,crate::context_assets::refresh_request(&root,&task,&id)?))
+                }).await??;
+                refreshed_from=Some(previous);
+                material_source=Some((name.clone(),read_args.clone()));
+                business_tool(s,&node,&name,read_args,&call.call_id).await
+            },
+            name => {
+                ensure!(!crate::function_frames::is_tool(name),"task-changing tools must be called alone");
+                // A delegate's small write receipts are artifacts too: preserve
+                // their paths/versions even after its working window is gone.
+                if crate::context_assets::is_material_tool(name) || s.delegate_id().is_some() {material_source=Some((name.to_owned(),args.clone()));}
+                business_tool(s,&node,name,args,&call.call_id).await
+            },
+        }
+    }.await;
+    let is_error = output.is_err() || output.as_ref().is_ok_and(|value| value["error_code"] == "ASSET_CONFLICT");
+    let result = output.unwrap_or_else(|error| {
+            json!({"error":format!("{error:#}")})
+    });
+    let seq=append(s,"tool/result",json!({
+        "actor":s.actor(),"turn":s.turn,"step":step,"flowNodeId":node,
+        "message":{"id":agent_service::uuid_like(),"role":"tool","toolCallId":call.call_id,"isError":is_error,
+            "content":[{"type":"text","text":result.to_string()}]},"meta":{"result":result}}),true).await?;
+    let asset_reference = if !is_error {
+        if let Some((name, args)) = material_source {
+            let root = s.state.workspace.root().to_path_buf();
+            let task = s.task.to_owned();
+            let original = result.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::context_assets::register(
+                        &root, &task, seq, &name, &args, &original,
+                    )
+                })
+                .await??,
+            )
+        } else if call.name == "read_asset" {
+            Some(result["asset_reference"].clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(Executed { result, is_error, seq, asset_reference, skill_change, refreshed_from, released_assets })
 }
 
 pub(crate) async fn run_task(

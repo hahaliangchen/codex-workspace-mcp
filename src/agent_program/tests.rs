@@ -1529,11 +1529,6 @@ fn raw_tool_spellings_are_rejected_before_any_effect() {
             assert!(super::compile(&source).is_err(), "{source}");
         }
     }
-    assert!(
-        super::body_tool()["function"]["parameters"]["properties"]
-            .get("libraries")
-            .is_none()
-    );
 }
 
 #[test]

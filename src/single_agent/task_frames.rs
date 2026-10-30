@@ -39,15 +39,6 @@ fn required_text(args: &Value, field: &str) -> Result<String> {
     Ok(text.to_owned())
 }
 
-fn with_seq(result: &Value, seq: i64) -> Value {
-    let mut delivery = if result.is_object() {
-        result.clone()
-    } else {
-        json!({"result":result})
-    };
-    delivery["event_seq"] = json!(seq);
-    delivery
-}
 
 /// A message the user wrote: the request that started a turn or an interjection.
 pub(super) fn is_user_original(m: &Value) -> bool {
@@ -344,7 +335,7 @@ async fn create_function_task(
         Ok(node) => temporary_frame(s, w, &node).map(|frame| (node, frame)),
         Err(error) => Err(error),
     };
-    let (task, turn, scope, mut parent_frame, call, request_id, parent_id) = (
+    let (task, turn, scope, parent_frame, call, request_id, parent_id) = (
         s.task.to_owned(),
         s.turn,
         s.scope.clone(),
@@ -371,8 +362,8 @@ async fn create_function_task(
             }
             Err(error) => {
                 let result = json!({"error":format!("{error:#}")});
-                let seq = record_result(&tx, &task, turn, &json!(step), &json!(request_id), &call.call_id, &parent_id, &result)?;
-                parent_frame.messages.push(sourced(json!({"role":"tool","tool_call_id":call.call_id,"content":with_seq(&result,seq).to_string()}), &task, seq));
+                // The program reads the failure from the recorded result.
+                record_result(&tx, &task, turn, &json!(step), &json!(request_id), &call.call_id, &parent_id, &result)?;
                 write_window(&tx, &task, &scope, &parent_frame)?;
                 (scope, parent_frame)
             }
@@ -542,11 +533,8 @@ pub(super) async fn finish(
         let mut resumed: Window = serde_json::from_str(&raw)?;
         ensure!(resumed.task_node_id.as_deref()==Some(parent.node_id.as_str()),"TASK_CALLER_FRAME_MISMATCH");
         let answer = json!({"task":node.title,"node_id":node.node_id,"return_event_seq":returned,"result":text,"assets":saved});
-        let seq = record_result(&tx, &task, turn, &serial_caller["step"], &serial_caller["flowNodeId"], &call_id, &parent.node_id, &answer)?;
-        let mut delivery = sourced(json!({"role":"tool","tool_call_id":call_id,"content":with_seq(&answer,seq).to_string()}), &task, seq);
-        // Handles, not a request for bodies: the caller reads what it needs.
-        delivery["_child_return"] = json!(true);
-        resumed.messages.push(delivery);
+        // The caller's program reads the return from the recorded result.
+        record_result(&tx, &task, turn, &serial_caller["step"], &serial_caller["flowNodeId"], &call_id, &parent.node_id, &answer)?;
         // What the user said meanwhile belongs to the whole main task.
         for original in frame.messages.iter().filter(|m| is_user_original(m)) {
             if !resumed.messages.iter().any(|m| m["source"]["seq"] == original["source"]["seq"] && m["content"] == original["content"]) {

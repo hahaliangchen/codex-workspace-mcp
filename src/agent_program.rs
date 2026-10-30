@@ -195,8 +195,3 @@ pub const SKILL: &str = include_str!("../skills/task-program/SKILL.md");
 pub const ENVIRONMENT: &str = include_str!("../prompts/flow_environment.md");
 pub const CAPABILITIES: &str = include_str!("../prompts/flow_capabilities.md");
 
-pub fn body_tool() -> Value {
-    json!({"type":"function","function":{"name":"define_task_body",
-        "description":"Implement the current virtual function using its existing name, positional parameters and return contract. Submit concrete source without @virtual on this function; helper AI capabilities may be marked @virtual. It runs in the current scope and returns to the existing caller. Preserve completed work. Import authorized tools and read their contracts when needed. Compilation errors return diagnostics before effects; correct in this scope. Call alone.",
-        "parameters":{"type":"object","properties":{"source":{"type":"string","maxLength":100000}},"required":["source"],"additionalProperties":false}}})
-}
