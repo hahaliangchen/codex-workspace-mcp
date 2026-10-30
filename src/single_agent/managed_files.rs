@@ -268,7 +268,7 @@ mod tests {
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", [])?;
         let cancel = tokio_util::sync::CancellationToken::new();
         let session = super::super::Session {
-            agent_id: None, task_node_id: None, step_node_id: None, plugin: None,
+            agent_id: None, task_node_id: None, plugin: None,
             state: &state, task: "task", model: "fake", turn: 1, cancel: &cancel,
             ban_execution: false, scope: "main".into(), parent: None, input_budget: 100_000,
         };

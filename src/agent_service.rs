@@ -403,7 +403,7 @@ pub(crate) fn open_db(root: &std::path::Path) -> anyhow::Result<rusqlite::Connec
         }
         tx.commit()?;
     }
-    crate::task_tree::schema(&conn)?;
+    crate::function_frames::schema(&conn)?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS task_events_node ON agent_task_events(task_id,node_id,seq);",
     )?;
@@ -638,7 +638,7 @@ pub(crate) fn append_event_tx(
     } else if let Some(agent) = data["agent_id"].as_str() {
         tx.query_row("SELECT node_id FROM agent_task_nodes WHERE task_id=?1 AND json_extract(data,'$.agent_id')=?2", params![task_id,agent], |r|r.get::<_,String>(0)).optional()?
     } else {
-        crate::task_tree::active(tx, task_id)?.map(|n| n.node_id)
+        crate::function_frames::active(tx, task_id)?.map(|n| n.node_id)
     };
     // Work done inside a task belongs to the step it is executing. Task graph
     // events name their own node.

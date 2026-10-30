@@ -1,4 +1,4 @@
-//! Durable task state. Transitions run in the same transaction as frame changes.
+//! Durable function frames: one per main request and one per function call, linked to their caller. Transitions run in the same transaction as window changes.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
@@ -88,19 +88,7 @@ pub fn is_temp(node: &Node) -> bool {
     node.metadata["role"] == "temp"
 }
 
-/// The step a task is executing. Steps share their task's context.
-pub fn current_step(conn: &Connection, task: &str, owner: &str) -> Result<Option<Node>> {
-    Ok(children(conn, task, owner)?
-        .into_iter()
-        .find(|n| n.kind == "step" && n.status == "current"))
-}
 
-/// The finish node records a function return.
-pub fn finish_node(conn: &Connection, task: &str, owner: &str) -> Result<Option<Node>> {
-    Ok(children(conn, task, owner)?
-        .into_iter()
-        .find(|n| n.kind == "finish"))
-}
 
 /// The window that holds a node's context. The conversation level and its
 /// main task share the main window; temporary tasks get their own.
@@ -244,8 +232,6 @@ fn text(args: &Value, field: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-/// Every task ends at its finish node; steps are ordered before it.
-pub const FINISH_ORDINAL: usize = 1_000_000;
 
 
 
@@ -318,12 +304,3 @@ pub fn is_tool(name: &str) -> bool {
     name == "create_task"
 }
 
-pub fn tool() -> Value {
-    json!({"type":"function","function":{"name":"create_task",
-        "description":"Create one main task scope with its goal and necessary background before substantive tool-based work. Call alone. Then express the complete work, checks and delivery in execute_program with one main. Helpers create serial function scopes and authorized fork/join creates parallel function scopes. Do not call create_task per operation or to build child task lists; the runtime owns function calls, steps and returns.",
-        "parameters":{"type":"object","properties":{
-            "goal":{"type":"string","minLength":1,"maxLength":16000,"description":"The main task objective."},
-            "reason":{"type":"string","description":"Optional background for this task."},
-            "briefing":{"type":"string","description":"Short workflow sketch and necessary background; executable source is submitted to execute_program."}},
-            "required":["goal"],"additionalProperties":false}}})
-}

@@ -506,9 +506,7 @@ async fn exchange(
     at: &Value,
 ) -> Result<(String, Value)> {
     let node = format!("program_{}", agent_service::uuid_like());
-    task_frames::begin_round(s, w, &node).await?;
-    let mut execution = s.clone();
-    execution.step_node_id = w.current_step_node_id.clone();
+    let execution = s.clone();
     let message = json!({"role":"assistant","content":null,"tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]});
     let seq=append(&execution,"assistant/message",json!({"actor":"program","turn":s.turn,"step":step,"nodeId":node,"program_location":at,"message":message}),false).await?;
     w.messages.push(sourced(message.clone(), s.task, seq));
@@ -592,7 +590,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     }
                     (
                         "create_task".into(),
-                        json!({"goal":name,"briefing":description,"program_task":task}),
+                        json!({"goal":name,"briefing":description,"program_task":task,"call_site":at}),
                     )
                 }
                 ActionKind::Task {
@@ -614,7 +612,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                     let task = function_task(program, name, &arguments)?;
                     (
                         "create_task".into(),
-                        json!({"goal":name,"briefing":description,"program_task":task}),
+                        json!({"goal":name,"briefing":description,"program_task":task,"call_site":at}),
                     )
                 }
                 ActionKind::Tool { name, args } => (name.clone(), args.clone()),
@@ -792,7 +790,6 @@ mod tests {
         let s = Session {
             agent_id: None,
             task_node_id: None,
-            step_node_id: None,
             plugin: None,
             state: &state,
             task: "task",
@@ -1134,6 +1131,14 @@ mod tests {
         }).await;
         assert_eq!(implement.load(Ordering::SeqCst), 2);
         assert_eq!(std::fs::read_to_string(root.path().join("out.txt")).unwrap(), "caught:no source files");
+        // The function's frame shows where it was called and that it failed.
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let frame: Value = serde_json::from_str(&conn.query_row(
+            "SELECT data FROM agent_task_events WHERE kind='task/node_returned' AND json_extract(data,'$.inputs.program_task.name')='summarize'",
+            [], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert_eq!(frame["status"], "failed");
+        assert_eq!(frame["metadata"]["call_site"]["line"], 4, "the await summarize(...) line");
+        assert!(frame["metadata"]["caller"]["task"].is_string(), "the frame knows its caller");
     }
 
     #[tokio::test]

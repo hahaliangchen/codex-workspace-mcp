@@ -1,5 +1,5 @@
 use super::*;
-use crate::task_tree::{self as tree, Node};
+use crate::function_frames::{self as tree, Node};
 
 fn node_id<'a>(s: &'a Session<'_>) -> &'a str {
     s.task_node_id.as_deref().unwrap_or(tree::ROOT)
@@ -59,14 +59,14 @@ pub(super) fn is_user_original(m: &Value) -> bool {
             .is_some_and(|parts| parts.iter().all(|part| part["type"] == "image_ref"))
 }
 
-/// Tasks are goal/context boundaries; execution steps are created on request.
+/// A frame is one main request or one function call; it is its own context.
 fn new_task(
     parent: &Node,
     args: &Value,
     ordinal: usize,
     role: &str,
     turn: usize,
-) -> Result<(Node, Node)> {
+) -> Result<Node> {
     let goal = required_text(args, "goal")?;
     let mut inputs = json!({});
     if role == "temp" && args["program_task"].is_object() {
@@ -85,97 +85,18 @@ fn new_task(
         .unwrap_or("")
         .to_owned();
     task.metadata = json!({"role":role,"turn":turn});
+    // Where the program called this function, for showing the call in its flow.
+    if !args["call_site"].is_null() {
+        task.metadata["call_site"] = args["call_site"].clone();
+    }
     if parent.metadata["parallel"] == true {
         task.metadata["parallel"] = json!(true);
         task.metadata["parallel_owner"] = parent.metadata["parallel_owner"].clone();
     }
-    let finish = tree::planned(
-        &task,
-        &json!({"title":"Finish","goal":"Return this task result to the waiting caller or serial iterator; never call AI here"}),
-        tree::FINISH_ORDINAL,
-        "finish",
-    )?;
-    Ok((task, finish))
+    Ok(task)
 }
 
-/// Record exactly one execution step for an AI request in this frame.
-pub(super) async fn begin_round(s: &Session<'_>, w: &mut Window, request: &str) -> Result<()> {
-    if no_task(s, w) {
-        return Ok(());
-    }
-    complete_round(s, w).await?;
-    let (task, owner, agent, turn, request, scope, mut frame) = (
-        s.task.to_owned(),
-        frame_task(s, w),
-        s.delegate_id().map(str::to_owned),
-        s.turn,
-        request.to_owned(),
-        s.scope.clone(),
-        w.clone(),
-    );
-    *w = db(s.state.workspace.root(), move |conn| {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let parent = tree::get(&tx, &task, &owner)?;
-        ensure!(
-            tree::is_task(&parent) && parent.status == "running" && parent.agent_id == agent,
-            "TASK_EXECUTION_FRAME_MISMATCH"
-        );
-        let ordinal = tree::children(&tx, &task, &owner)?
-            .iter()
-            .filter(|n| n.kind == "step")
-            .count();
-        let title = format!("Round {}", ordinal + 1);
-        let mut node = tree::planned(
-            &parent,
-            &json!({"title":title,"goal":"One AI request, its response, tool calls and results"}),
-            ordinal,
-            "step",
-        )?;
-        node.agent_id = agent;
-        node.status = "current".into();
-        node.metadata = json!({"request_id":request,"scope":scope,"phase":"executing"});
-        tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
-        frame.current_step_node_id = Some(node.node_id);
-        write_window(&tx, &task, &scope, &frame)?;
-        tx.commit()?;
-        Ok(frame)
-    })
-    .await?;
-    Ok(())
-}
 
-/// Store references to the native exchange; do not invent a lossy step summary.
-pub(super) async fn complete_round(s: &Session<'_>, w: &mut Window) -> Result<()> {
-    let Some(id) = w.current_step_node_id.clone() else {
-        return Ok(());
-    };
-    let agent = s.delegate_id().map(str::to_owned);
-    let (task, turn, scope, mut frame) = (s.task.to_owned(), s.turn, s.scope.clone(), w.clone());
-    *w=db(s.state.workspace.root(),move|conn| {
-        let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut node=tree::get(&tx,&task,&id)?;
-        ensure!(node.kind=="step" && node.parent_id==frame.task_node_id && node.agent_id==agent,"STEP_EXECUTION_FRAME_MISMATCH");
-        if node.status=="current" {
-            let rows=crate::session_history::load_events(&tx,&task,&crate::session_history::EventQuery{node_id:Some(&id),..Default::default()})?;
-            let mut response=Value::Null;let mut events=Vec::new();
-            for row in rows {
-                let data=row.data()?;
-                let (seq,kind)=(row.seq,row.kind);
-                let event=if kind=="subagent/event" {&data["event"]} else {&data};
-                let event_kind=if kind=="subagent/event" {data["event_type"].as_str().unwrap_or("")} else {&kind};
-                if matches!(event_kind,"assistant/message"|"assistant/draft") {response=json!({"event_seq":seq,"tool_call_ids":event["message"]["tool_calls"].as_array().map(|calls|calls.iter().map(|c|c["id"].clone()).collect::<Vec<_>>())});}
-                if matches!(event_kind,"tool/call"|"tool/result"|"assistant/message"|"assistant/draft") {events.push(json!({"event_seq":seq,"kind":event_kind}));}
-            }
-            node.status="done".into();
-            node.result=Some(json!({"response":response,"events":events,"request_id":node.metadata["request_id"],"details":{"tool":"read_session_history","arguments":{"node_id":id}}}));
-            tree::emit(&tx,&task,"task/node_returned",&mut node,turn)?;
-        }
-        frame.current_step_node_id=None;
-        write_window(&tx,&task,&scope,&frame)?;
-        tx.commit()?;Ok(frame)
-    }).await?;
-    Ok(())
-}
 
 fn record_call(
     tx: &rusqlite::Transaction<'_>,
@@ -192,9 +113,15 @@ fn record_call(
         "tool/call",
         json!({"actor":"agent","turn":turn,"step":step,"task_node_id":node,"flowNodeId":request,
         "callId":call.call_id,"name":call.name,"arguments":call.arguments,
-        "description":tool_description(&[tree::tool()],&call.name,&call.arguments)}),
+        "description":function_description(&call.arguments)}),
         None,
     )
+}
+
+/// A function call is described by the function's own contract.
+fn function_description(arguments: &str) -> String {
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    args["briefing"].as_str().or(args["goal"].as_str()).unwrap_or("").to_owned()
 }
 
 pub(super) fn tool_description(definitions: &[Value], name: &str, arguments: &str) -> String {
@@ -212,13 +139,6 @@ pub(super) fn tool_description(definitions: &[Value], name: &str, arguments: &st
         .to_owned()
 }
 
-/// Walk the caller tasks and their steps, carrying descriptions and handles,
-/// never the tool output bodies or a model-generated recap.
-
-/// Rebuilt beside the next request, independent of compressible chat history.
-/// This is an execution ledger, not a host decision about what to do next.
-
-
 /// Copy returned metadata as-is; failure is never interpreted as "not applied".
 
 fn record_event(
@@ -228,11 +148,6 @@ fn record_event(
     mut data: Value,
     surface: Option<&str>,
 ) -> Result<i64> {
-    if let Some(owner) = data["task_node_id"].as_str()
-        && let Some(step) = tree::current_step(tx, task, owner)?
-    {
-        data["task_node_id"] = json!(step.node_id);
-    }
     if let Some(agent) = data["task_node_id"]
         .as_str()
         .map(|id| tree::get(tx, task, id))
@@ -295,15 +210,13 @@ pub(super) async fn open_main_task(s: &Session<'_>, w: &mut Window, request: &st
         let mut root = tree::get(&tx, &task, tree::ROOT)?;
         ensure!(root.status == "running", "TASK_STACK_FRAME_MISMATCH: the conversation is not at its top level");
         let ordinal = tree::children(&tx, &task, tree::ROOT)?.len();
-        let (mut node, mut finish) = new_task(&root, &json!({"goal":goal}), ordinal, "main", turn)?;
+        let mut node = new_task(&root, &json!({"goal":goal}), ordinal, "main", turn)?;
         tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
-        tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
         root.status = "suspended".into();
         tree::emit(&tx, &task, "task/node_suspended", &mut root, turn)?;
         node.status = "running".into();
         tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
         frame.task_node_id = Some(node.node_id);
-        frame.current_step_node_id = None;
         write_window(&tx, &task, &scope, &frame)?;
         tx.commit()?;
         Ok(frame)
@@ -322,7 +235,7 @@ pub(super) async fn start_parallel_function(
     let runtime = parent_frame.program.as_ref().context("parallel caller has no program")?;
     let snapshot = runtime.async_scope(&action.id).context("parallel call has no saved scope")?.clone();
     let function = super::program_flow::function_task(&runtime.program, name, args)?;
-    let arguments = json!({"goal":name,"briefing":function["description"],"program_task":function});
+    let arguments = json!({"goal":name,"briefing":function["description"],"program_task":function,"call_site":action.at});
     let parent_id = frame_task(s, parent_frame);
     let conn = agent_service::open_db(s.state.workspace.root())?;
     let parent = tree::get(&conn, s.task, &parent_id)?;
@@ -330,11 +243,12 @@ pub(super) async fn start_parallel_function(
     let depth = tree::path(&conn, s.task, &parent_id)?.iter().filter(|node| tree::is_temp(node)).count();
     ensure!(depth < tree::MAX_TEMP_TASKS, "TASK_DEPTH_LIMIT");
     let ordinal = tree::children(&conn, s.task, &parent_id)?.len();
-    let (mut node, mut finish) = new_task(&parent, &arguments, ordinal, "temp", s.turn)?;
+    let mut node = new_task(&parent, &arguments, ordinal, "temp", s.turn)?;
     node.metadata["parallel"] = json!(true);
     node.metadata["parallel_owner"] = json!(node.node_id);
     node.metadata["parallel_call_id"] = json!(action.id);
-    finish.metadata = json!({"parallel":{"task":parent_id,"scope":s.scope,"call_id":action.id,"step":step,"flowNodeId":action.id}});
+    // The frame knows its caller: a concurrent call records its result there.
+    node.metadata["caller"] = json!({"task":parent_id,"scope":s.scope,"call_id":action.id,"step":step,"flowNodeId":action.id,"concurrent":true});
     let mut inherited = parent_frame.clone();
     inherited.program = None;
     inherited.scope_values.extend(snapshot);
@@ -345,10 +259,9 @@ pub(super) async fn start_parallel_function(
     let (task, turn, scope, child_copy, action_id, parent_id) = (s.task.to_owned(), s.turn, child_scope.clone(), child.clone(), action.id.clone(), parent_id);
     db(s.state.workspace.root(), move |conn| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut node = node; let mut finish = finish;
+        let mut node = node;
         record_call(&tx, &task, turn, step, &action_id, &call, &parent_id)?;
         tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
-        tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
         node.status = "running".into();
         tree::emit(&tx, &task, "task/node_started", &mut node, turn)?;
         write_window(&tx, &task, &scope, &child_copy)?;
@@ -390,7 +303,7 @@ async fn create_function_task(
     request_id: &str,
     step: usize,
 ) -> Result<String> {
-    let prepared = (|| -> Result<(Node, Node)> {
+    let prepared = (|| -> Result<Node> {
         let args: Value = serde_json::from_str(&call.arguments)?;
         let pending = w
             .program
@@ -415,19 +328,20 @@ async fn create_function_task(
             .count();
         ensure!(depth < tree::MAX_TEMP_TASKS, "TASK_DEPTH_LIMIT");
         let owner =
-            tree::current_step(&conn, s.task, &parent.node_id)?.unwrap_or_else(|| parent.clone());
-        let (node, mut finish) = new_task(
+            parent.clone();
+        let mut node = new_task(
             &owner,
             &args,
             tree::children(&conn, s.task, &owner.node_id)?.len(),
             "temp",
             s.turn,
         )?;
-        finish.metadata = json!({"iterator":{"task":parent.node_id,"scope":s.scope,"call_id":call.call_id,"step":step,"flowNodeId":request_id}});
-        Ok((node, finish))
+        // The frame knows its caller: returning resumes the caller's window.
+        node.metadata["caller"] = json!({"task":parent.node_id,"scope":s.scope,"call_id":call.call_id,"step":step,"flowNodeId":request_id});
+        Ok(node)
     })();
     let prepared = match prepared {
-        Ok((node, finish)) => temporary_frame(s, w, &node).map(|frame| (node, finish, frame)),
+        Ok(node) => temporary_frame(s, w, &node).map(|frame| (node, frame)),
         Err(error) => Err(error),
     };
     let (task, turn, scope, mut parent_frame, call, request_id, parent_id) = (
@@ -443,9 +357,8 @@ async fn create_function_task(
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         record_call(&tx, &task, turn, step, &request_id, &call, &parent_id)?;
         let switched = match prepared {
-            Ok((mut node, mut finish, frame)) => {
+            Ok((mut node, frame)) => {
                 tree::emit(&tx, &task, "task/node_planned", &mut node, turn)?;
-                tree::emit(&tx, &task, "task/node_planned", &mut finish, turn)?;
                 let mut parent = tree::get(&tx, &task, &parent_id)?;
                 parent.status = "suspended".into();
                 tree::emit(&tx, &task, "task/node_suspended", &mut parent, turn)?;
@@ -575,40 +488,37 @@ pub(super) async fn finish(
         }
         ensure!(node.agent_id==agent,"TASK_EXECUTION_FRAME_MISMATCH");
         let summary = json!({"result":text,"assets":saved});
-        if let Some(mut step) = tree::current_step(&tx, &task, &id)? {
-            step.status = "done".into();
-            tree::emit(&tx, &task, "task/node_returned", &mut step, turn)?;
-        }
-        let finish = tree::finish_node(&tx, &task, &id)?;
-        let iterator = finish.as_ref().map(|f| f.metadata["iterator"].clone()).unwrap_or(Value::Null);
-        let parallel = finish.as_ref().map(|f| f.metadata["parallel"].clone()).unwrap_or(Value::Null);
-        node.status = "done".into();
-        node.result = Some(summary.clone());
+        // A returning frame finds its caller on itself.
+        let caller = node.metadata["caller"].clone();
+        let (serial_caller, concurrent_caller) = if caller["concurrent"] == true {
+            (Value::Null, caller)
+        } else {
+            (caller, Value::Null)
+        };
+        // A function that gave up returns $task_error: its frame failed.
+        let failed = serde_json::from_str::<Value>(&text).is_ok_and(|value| value.get("$task_error").is_some());
+        node.status = if failed { "failed" } else { "done" }.into();
+        node.result = Some(summary);
         let returned = tree::emit(&tx, &task, "task/node_returned", &mut node, turn)?;
-        if let Some(mut finish) = finish {
-            finish.status = "done".into();
-            finish.result = Some(summary);
-            tree::emit(&tx, &task, "task/node_returned", &mut finish, turn)?;
-        }
-        if parallel.is_object() {
-            let parent = parallel["task"].as_str().context("parallel caller missing")?;
-            let call_id = parallel["call_id"].as_str().context("parallel call id missing")?;
+        if concurrent_caller.is_object() {
+            let parent = concurrent_caller["task"].as_str().context("concurrent caller missing")?;
+            let call_id = concurrent_caller["call_id"].as_str().context("concurrent call id missing")?;
             let answer = json!({"task":node.title,"node_id":node.node_id,"return_event_seq":returned,"result":text,"assets":saved});
-            record_result(&tx, &task, turn, &parallel["step"], &parallel["flowNodeId"], call_id, parent, &answer)?;
+            record_result(&tx, &task, turn, &concurrent_caller["step"], &concurrent_caller["flowNodeId"], call_id, parent, &answer)?;
             let mut frame = frame;
             super::function_scope::release_finished(&mut frame);
             write_window(&tx, &task, &old_scope, &frame)?;
             tx.commit()?;
             return Ok(None);
         }
-        if iterator.is_null() && node.agent_id.is_some() {
+        if serial_caller.is_null() && node.agent_id.is_some() {
             let mut frame=frame;
             super::function_scope::release_finished(&mut frame);
             write_window(&tx, &task, &old_scope, &frame)?;
             tx.commit()?;
             return Ok(None);
         }
-        if !tree::is_temp(&node) || iterator.is_null() {
+        if !tree::is_temp(&node) || serial_caller.is_null() {
             // A main task: the conversation is back at its top level.
             let mut root = tree::get(&tx, &task, tree::ROOT)?;
             if root.status == "suspended" {
@@ -617,23 +527,22 @@ pub(super) async fn finish(
             }
             let mut frame = frame;
             frame.task_node_id = Some(tree::ROOT.into());
-            frame.current_step_node_id = None;
-            super::function_scope::release_finished(&mut frame);
+                super::function_scope::release_finished(&mut frame);
             write_window(&tx, &task, &old_scope, &frame)?;
             tx.commit()?;
             return Ok(None);
         }
-        let mut parent = tree::get(&tx, &task, iterator["task"].as_str().context("finish node holds no iterator")?)?;
+        let mut parent = tree::get(&tx, &task, serial_caller["task"].as_str().context("returning frame has no caller")?)?;
         ensure!(parent.agent_id==agent,"TASK_CALLER_AGENT_MISMATCH");
-        let scope = iterator["scope"].as_str().context("iterator scope missing")?.to_owned();
-        let call_id = iterator["call_id"].as_str().context("iterator call missing")?.to_owned();
+        let scope = serial_caller["scope"].as_str().context("caller scope missing")?.to_owned();
+        let call_id = serial_caller["call_id"].as_str().context("caller call missing")?.to_owned();
         let raw: String = tx
             .query_row("SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope=?2", params![task, scope], |r| r.get(0))
             .context("waiting task frame missing")?;
         let mut resumed: Window = serde_json::from_str(&raw)?;
         ensure!(resumed.task_node_id.as_deref()==Some(parent.node_id.as_str()),"TASK_CALLER_FRAME_MISMATCH");
         let answer = json!({"task":node.title,"node_id":node.node_id,"return_event_seq":returned,"result":text,"assets":saved});
-        let seq = record_result(&tx, &task, turn, &iterator["step"], &iterator["flowNodeId"], &call_id, &parent.node_id, &answer)?;
+        let seq = record_result(&tx, &task, turn, &serial_caller["step"], &serial_caller["flowNodeId"], &call_id, &parent.node_id, &answer)?;
         let mut delivery = sourced(json!({"role":"tool","tool_call_id":call_id,"content":with_seq(&answer,seq).to_string()}), &task, seq);
         // Handles, not a request for bodies: the caller reads what it needs.
         delivery["_child_return"] = json!(true);
@@ -977,7 +886,6 @@ mod tests {
             Session {
                 agent_id: None,
                 task_node_id: None,
-                step_node_id: None,
                 plugin: None,
                 state: &self.state,
                 task: "t",
@@ -1342,247 +1250,4 @@ mod tests {
     }
 
 
-    #[tokio::test]
-    async fn parallel_frames_keep_identity_and_serial_returns_do_not_touch_a_sibling() {
-        let h = Harness::new().await;
-        let mut conn = agent_service::open_db(&h.root).unwrap();
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_delegates(id TEXT PRIMARY KEY,task_id TEXT,turn INTEGER,call_id TEXT,name TEXT,specification TEXT,status TEXT,created_at INTEGER,event_count INTEGER NOT NULL DEFAULT 0);").unwrap();
-        let tx = conn.transaction().unwrap();
-        let root = tree::get(&tx, "t", tree::ROOT).unwrap();
-        let mut frames = Vec::new();
-        for id in ["worker-a", "worker-b"] {
-            tx.execute("INSERT INTO agent_delegates(id,task_id,turn,call_id,name,specification,status,created_at) VALUES (?1,'t',1,?1,?1,'{}','running',0)",[id]).unwrap();
-            let mut task = tree::planned(
-                &root,
-                &json!({"title":id,"goal":id,"executor":"delegate"}),
-                frames.len(),
-                "task",
-            )
-            .unwrap();
-            task.agent_id = Some(id.into());
-            task.status = "running".into();
-            task.metadata = json!({"role":"delegate"});
-            tree::emit(&tx, "t", "task/node_started", &mut task, 1).unwrap();
-            let mut end = tree::planned(
-                &task,
-                &json!({"title":"Finish","goal":"End"}),
-                tree::FINISH_ORDINAL,
-                "finish",
-            )
-            .unwrap();
-            tree::emit(&tx, "t", "task/node_planned", &mut end, 1).unwrap();
-            frames.push(Window {
-                task_node_id: Some(task.node_id),
-                messages: vec![json!({"role":"system","content":MAIN_PROMPT})],
-                ..Default::default()
-            });
-        }
-        tx.commit().unwrap();
-        drop(conn);
-        let mut a = h.session();
-        a.agent_id = Some("worker-a".into());
-        a.scope = "delegate:worker-a".into();
-        let mut b = h.session();
-        b.agent_id = Some("worker-b".into());
-        b.scope = "delegate:worker-b".into();
-        let mut wa = frames.remove(0);
-        let mut wb = frames.remove(0);
-        begin_round(&a, &mut wa, "request-a").await.unwrap();
-        begin_round(&b, &mut wb, "request-b").await.unwrap();
-        let a_step = wa.current_step_node_id.clone().unwrap();
-        let b_step = wb.current_step_node_id.clone().unwrap();
-        // Call IDs may collide across Agents and later requests. Persist the
-        // original step on each job instead of choosing the latest matching call.
-        for (session, step, job) in [(&a, &a_step, "plugin-a"), (&b, &b_step, "plugin-b")] {
-            let mut scoped = session.clone();
-            scoped.step_node_id = Some(step.clone());
-            append(
-                &scoped,
-                "tool/call",
-                json!({"callId":"call_1","name":"demo__render","arguments":"{}"}),
-                false,
-            )
-            .await
-            .unwrap();
-            crate::plugin_jobs::record(&h.root, "t", "demo__render", job, "call_1", Some(step))
-                .unwrap();
-        }
-        assert_eq!(pending_plugin_jobs(&a, &wa).unwrap().len(), 1);
-        assert_eq!(pending_plugin_jobs(&b, &wb).unwrap().len(), 1);
-        assert!(
-            crate::session_history::tool_call_node(
-                &agent_service::open_db(&h.root).unwrap(),
-                "t",
-                "call_1"
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("ASYNC_JOB_OWNER_AMBIGUOUS")
-        );
-        crate::visual_jobs::outstanding_calls(&h.root, "t").unwrap(); // initialize the queue
-        let conn = agent_service::open_db(&h.root).unwrap();
-        for (step, job) in [(&a_step, "vision-a"), (&b_step, "vision-b")] {
-            conn.execute("INSERT INTO agent_visual_jobs(id,task_id,turn,status,call_id,arguments,sources,result,created_at,updated_at,owner_node_id) VALUES (?1,'t',1,'completed','call_1','{}','[]',?2,0,0,?3)",
-                params![job,json!({"status":"completed","analysis":job}).to_string(),step]).unwrap();
-        }
-        drop(conn);
-        let program=crate::agent_program::compile("function main(){return repairScope();} /** @virtual */ function repairScope(){ // Resolve this scope's missing prerequisite and return its result.\n}").unwrap();
-        let mut runtime =
-            crate::agent_program::Runtime::task_program(program, "main", vec![]).unwrap();
-        let crate::agent_program::State::Action(action) = runtime.next() else {
-            panic!()
-        };
-        let call=crate::model_stream::ToolCall{call_id:action.id,name:"create_task".into(),arguments:json!({"goal":"repairScope","program_task":{"name":"repairScope","description":"Repair the local prerequisite","parameters":[],"arguments":[]}}).to_string()};
-        wa.program = Some(runtime);
-        wa.messages.push(json!({"role":"assistant","tool_calls":[{"id":call.call_id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}]}));
-        let child_scope = create_task(&a, &mut wa, &call, "request-a", 1)
-            .await
-            .unwrap();
-        let mut child = a.clone();
-        child.scope = child_scope;
-        assert_eq!(child.delegate_id(), Some("worker-a"));
-        assert!(!child.is_primary());
-        begin_round(&child, &mut wa, "request-a-child")
-            .await
-            .unwrap();
-        assert!(
-            pending_plugin_jobs(&child, &wa).unwrap().is_empty(),
-            "a serial child cannot collect its caller's plugin result"
-        );
-        assert!(
-            !has_visual_jobs(&child, &wa).unwrap(),
-            "a serial child cannot collect its caller's vision result"
-        );
-        let mut scoped = child.clone();
-        scoped.step_node_id = wa.current_step_node_id.clone();
-        let seq = append(
-            &scoped,
-            "tool/result",
-            json!({"message":{"toolCallId":"child-read"},"meta":{"result":{"value":"A-only"}}}),
-            false,
-        )
-        .await
-        .unwrap();
-        complete_round(&child, &mut wa).await.unwrap();
-        let (scope, mut resumed) = finish(&child, &mut wa, &answer("Prerequisite repaired"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(scope, "delegate:worker-a");
-        assert!(
-            resumed.messages.last().unwrap()["content"]
-                .as_str()
-                .unwrap()
-                .contains("Prerequisite repaired")
-        );
-        let conn = agent_service::open_db(&h.root).unwrap();
-        assert_eq!(tree::get(&conn, "t", &b_step).unwrap().status, "current");
-        assert_eq!(
-            tree::get(&conn, "t", wb.task_node_id.as_deref().unwrap())
-                .unwrap()
-                .status,
-            "running"
-        );
-        assert_eq!(
-            tree::active(&conn, "t").unwrap().unwrap().node_id,
-            tree::ROOT
-        );
-        let owner: String = conn
-            .query_row(
-                "SELECT node_id FROM agent_task_events WHERE task_id='t' AND seq=?1",
-                [seq],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_ne!(owner, b_step);
-        assert_eq!(
-            tree::get(&conn, "t", &owner).unwrap().agent_id.as_deref(),
-            Some("worker-a")
-        );
-        let sibling:String=conn.query_row("SELECT state FROM agent_runtime_windows WHERE task_id='t' AND scope='delegate:worker-b'",[],|r|r.get(0)).unwrap();
-        let sibling: Window = serde_json::from_str(&sibling).unwrap();
-        assert_eq!(
-            sibling.current_step_node_id.as_deref(),
-            Some(b_step.as_str())
-        );
-        assert!(
-            !json!(sibling.messages)
-                .to_string()
-                .contains("Prerequisite repaired")
-        );
-        drop(conn);
-
-        // A newer request reuses call_1 as well. The saved ownership must still
-        // survive task switching, later requests and reopening the job tables.
-        begin_round(&a, &mut resumed, "request-a-later")
-            .await
-            .unwrap();
-        let mut later = a.clone();
-        later.step_node_id = resumed.current_step_node_id.clone();
-        append(
-            &later,
-            "tool/call",
-            json!({"callId":"call_1","name":"read_file","arguments":"{}"}),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            pending_plugin_jobs(&a, &resumed)
-                .unwrap()
-                .iter()
-                .map(|job| job.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["plugin-a"]
-        );
-        assert_eq!(
-            pending_plugin_jobs(&b, &wb)
-                .unwrap()
-                .iter()
-                .map(|job| job.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["plugin-b"]
-        );
-
-        struct ReadyPlugin;
-        impl crate::plugin_io::SessionIo for ReadyPlugin {
-            fn execute<'a>(
-                &'a self,
-                _state: &'a AgentServiceState,
-                _task: &'a str,
-                _workspace: Arc<crate::tools::Workspace>,
-                _name: &'a str,
-                args: Value,
-            ) -> futures::future::BoxFuture<'a, Result<Value>> {
-                Box::pin(async move { Ok(json!({"status":"succeeded","task_id":args["task_id"]})) })
-            }
-        }
-        let plugin = format!("scoped-jobs-{}", agent_service::uuid_like());
-        agent_service::open_db(&h.root)
-            .unwrap()
-            .execute("INSERT INTO plugin_sessions VALUES ('t',?1)", [&plugin])
-            .unwrap();
-        crate::plugin_io::register(&plugin, Arc::new(ReadyPlugin));
-        assert!(deliver_plugin_jobs(&a, &mut resumed).await.unwrap());
-        deliver_visual_jobs(&a, &mut resumed).await.unwrap();
-        assert!(!has_visual_jobs(&a, &resumed).unwrap());
-        assert!(
-            has_visual_jobs(&b, &wb).unwrap(),
-            "A must not consume B's pending result"
-        );
-        let a_messages = json!(resumed.messages).to_string();
-        assert!(a_messages.contains("plugin-a") && a_messages.contains("vision-a"));
-        assert!(!a_messages.contains("plugin-b") && !a_messages.contains("vision-b"));
-        assert!(deliver_plugin_jobs(&b, &mut wb).await.unwrap());
-        deliver_visual_jobs(&b, &mut wb).await.unwrap();
-        let b_messages = json!(wb.messages).to_string();
-        assert!(b_messages.contains("plugin-b") && b_messages.contains("vision-b"));
-        assert!(!b_messages.contains("plugin-a") && !b_messages.contains("vision-a"));
-        assert!(!deliver_plugin_jobs(&a, &mut resumed).await.unwrap());
-        assert!(!has_visual_jobs(&b, &wb).unwrap());
-        let conn = agent_service::open_db(&h.root).unwrap();
-        let owners:Vec<String>=conn.prepare("SELECT node_id FROM agent_task_events WHERE task_id='t' AND kind='subagent/event' AND json_extract(data,'$.event_type')='tool/async_result' ORDER BY seq").unwrap()
-            .query_map([],|r|r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert_eq!(owners, vec![a_step.clone(), a_step, b_step.clone(), b_step]);
-    }
 }

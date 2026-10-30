@@ -201,7 +201,7 @@ pub fn rewind(root: &std::path::Path, task: &str, turn: usize) -> Result<Value> 
             )?;
         }
     }
-    crate::task_tree::rebuild(&tx, task)?;
+    crate::function_frames::rebuild(&tx, task)?;
     tx.execute(
         "DELETE FROM agent_window_snapshots WHERE task_id=?1 AND turn>=?2",
         params![task, turn as i64],

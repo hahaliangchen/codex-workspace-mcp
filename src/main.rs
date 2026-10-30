@@ -50,7 +50,7 @@ mod source_read;
 mod symbol_description;
 mod symbol_index_state;
 mod symbol_query;
-mod task_tree;
+mod function_frames;
 mod tool_approvals;
 mod tools;
 mod ts_index;

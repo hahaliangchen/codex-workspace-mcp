@@ -35,8 +35,6 @@ struct Window {
     #[serde(default)]
     task_node_id: Option<String>,
     #[serde(default)]
-    current_step_node_id: Option<String>,
-    #[serde(default)]
     instruction_versions: BTreeMap<String, String>,
     #[serde(default)]
     active_skills: BTreeSet<String>,
@@ -73,7 +71,6 @@ fn calibration_route(s: &Session<'_>) -> String {
 struct Session<'a> {
     agent_id: Option<String>,
     task_node_id: Option<String>,
-    step_node_id: Option<String>,
     plugin: Option<String>,
     state: &'a AgentServiceState,
     task: &'a str,
@@ -136,9 +133,8 @@ async fn save(s: &Session<'_>, w: &Window) -> Result<()> {
 async fn append(s: &Session<'_>, kind: &str, mut data: Value, surface: bool) -> Result<i64> {
     if data.get("task_node_id").is_none() {
         if let Some(id) = s
-            .step_node_id
+            .task_node_id
             .as_deref()
-            .or(s.task_node_id.as_deref())
             .or_else(|| s.scope.strip_prefix("node:"))
         {
             data["task_node_id"] = json!(id);
@@ -293,7 +289,7 @@ fn page_allows(s: &Session<'_>, name: &str) -> bool {
             | "read_asset"
             | "release_assets"
             | "list_context_assets"
-    ) || crate::task_tree::is_tool(name)
+    ) || crate::function_frames::is_tool(name)
         || s.state
             .tool_catalog
             .as_ref()
@@ -453,7 +449,7 @@ async fn page_tool_result(
 fn visual_context(s: &Session<'_>, node: &str) -> Result<crate::visual_artifacts::VisualContext> {
     Ok(crate::visual_artifacts::VisualContext {
         turn: Some(s.turn),
-        identity: json!({"task_id":s.task,"request_id":s.turn,"node_id":node,"runtime":"single_agent","agent_id":s.delegate_id(),"task_node_id":s.step_node_id.as_ref().or(s.task_node_id.as_ref())}),
+        identity: json!({"task_id":s.task,"request_id":s.turn,"node_id":node,"runtime":"single_agent","agent_id":s.delegate_id(),"task_node_id":s.task_node_id.as_ref()}),
         allowed_artifact_ids: crate::visual_artifacts::task_artifact_ids(
             s.state.workspace.root(),
             s.task,
@@ -560,14 +556,14 @@ fn request(s: &Session<'_>, messages: &[Value], definitions: &[Value]) -> Value 
             .task_node_id
             .clone()
             .or(frame_id.clone())
-            .unwrap_or_else(|| crate::task_tree::ROOT.to_owned());
+            .unwrap_or_else(|| crate::function_frames::ROOT.to_owned());
         // The main window's active task decides whose saved materials are indexed.
         if role == "main"
             && s.task_node_id.is_none()
             && frame_id.is_none()
             && s.delegate_id().is_none()
             && let Ok(conn) = agent_service::open_db(s.state.workspace.root())
-            && let Ok(Some(active)) = crate::task_tree::active(&conn, s.task)
+            && let Ok(Some(active)) = crate::function_frames::active(&conn, s.task)
         {
             frame_node = active.node_id;
         }
@@ -770,10 +766,6 @@ async fn model_round(
     definitions: &[Value],
 ) -> Result<(String, Value)> {
     let node = format!("request_{}", agent_service::uuid_like());
-    task_frames::begin_round(s, w, &node).await?;
-    let mut round_session = s.clone();
-    round_session.step_node_id = w.current_step_node_id.clone();
-    let s = &round_session;
     let mut body = request(s, &w.messages, definitions);
     if let Some(error) = body
         .as_object_mut()
@@ -835,19 +827,11 @@ async fn model_round(
         s.input_budget,
         w.input_tokens(s, &body)
     ));
-    // A request belongs to the step being executed, so Flow shows it under that step.
-    let mut flow_node = w
-        .current_step_node_id
+    // A request belongs to the function frame it runs in.
+    let flow_node = w
+        .task_node_id
         .clone()
-        .or(w.task_node_id.clone())
         .or_else(|| s.scope.strip_prefix("node:").map(str::to_owned));
-    if w.current_step_node_id.is_none()
-        && let Some(task) = flow_node.clone()
-        && let Ok(conn) = agent_service::open_db(s.state.workspace.root())
-        && let Ok(Some(current)) = crate::task_tree::current_step(&conn, s.task, &task)
-    {
-        flow_node = Some(current.node_id);
-    }
     let trace = crate::request_context::record(s.state.workspace.root(), s.task,
         json!({"actor":s.actor(),"stage":"execution",
             "turn":s.turn,"step":step,"nodeId":node,"request_id":s.turn,"request_flow":true,
@@ -1102,7 +1086,7 @@ async fn business_tool(
     };
     let parallel_owner = s.task_node_id.as_deref().and_then(|id| {
         let conn = agent_service::open_db(s.state.workspace.root()).ok()?;
-        let node = crate::task_tree::get(&conn, s.task, id).ok()?;
+        let node = crate::function_frames::get(&conn, s.task, id).ok()?;
         node.metadata["parallel_owner"].as_str().map(str::to_owned)
     });
     let managed = if matches!(name, "write_file" | "edit_file" | "replace_range") {
@@ -1189,7 +1173,7 @@ async fn business_tool(
                     name,
                     job,
                     call_id,
-                    s.step_node_id.as_deref().or(s.task_node_id.as_deref()),
+                    s.task_node_id.as_deref(),
                 )?;
                 output["host"] = json!(
                     "Accepted as a background task. The host delivers its result as tool_completion when it finishes: continue with work that does not depend on it, or end your reply to wait."
@@ -1294,7 +1278,7 @@ fn owns_job(s: &Session<'_>, w: &Window, owner: Option<&str>) -> Result<bool> {
         return Ok(task_frames::no_task(s, w));
     };
     let conn = agent_service::open_db(s.state.workspace.root())?;
-    let node = crate::task_tree::get(&conn, s.task, &owner)?;
+    let node = crate::function_frames::get(&conn, s.task, &owner)?;
     if node.agent_id.as_deref() != s.delegate_id() {
         return Ok(false);
     }
@@ -1472,7 +1456,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
     let mut current = s.clone();
     while model_rounds < max_rounds {
         current.task_node_id = w.task_node_id.clone();
-        current.step_node_id = w.current_step_node_id.clone();
         let s = &current;
         activate_page_plugin(s, w).await?;
         if s.is_primary() && w.parallel_root.is_none() {
@@ -1499,7 +1482,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                         let turn = s.turn; let cancel = s.cancel.clone(); let ban_execution = s.ban_execution;
                         let plugin = s.plugin.clone(); let budget = s.input_budget;
                         async_children.spawn(async move {
-                            let mut session = Session { agent_id: None, task_node_id: child.task_node_id.clone(), step_node_id: None,
+                            let mut session = Session { agent_id: None, task_node_id: child.task_node_id.clone(),
                                 plugin, state: &state, task: &task, model: &model, turn, cancel: &cancel,
                                 ban_execution, scope, parent: None, input_budget: budget };
                             let mut child = child;
@@ -1510,7 +1493,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                                         let mut cleanup = session.clone();
                                         if let Some(id) = child.task_node_id.as_deref() {
                                             if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
-                                                if let Ok(node) = crate::task_tree::get(&conn, &task, id) { cleanup.scope = crate::task_tree::frame_scope(&node); }
+                                                if let Ok(node) = crate::function_frames::get(&conn, &task, id) { cleanup.scope = crate::function_frames::frame_scope(&node); }
                                             }
                                         }
                                         program_flow::recover(&cleanup, &mut child).await?;
@@ -1518,7 +1501,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                                     }
                                     let message = match result { Ok(LoopResult::Limit) => "async function reached its execution limit".to_owned(), Err(error) => format!("{error:#}"), _ => unreachable!() };
                                     let error = json!({"role":"assistant", "content":json!({"$task_error":{"message":message}}).to_string()});
-                                    for _ in 0..=crate::task_tree::MAX_TEMP_TASKS {
+                                    for _ in 0..=crate::function_frames::MAX_TEMP_TASKS {
                                         if let Some((scope, parent)) = task_frames::finish(&session, &mut child, &error).await? {
                                             child = parent; session.scope = scope;
                                         } else { break; }
@@ -1543,13 +1526,11 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
             model_rounds += 1;
             model_round(s, w, step, &definitions).await?
         };
-        let mut execution = s.clone();
-        execution.step_node_id = w.current_step_node_id.clone();
+        let execution = s.clone();
         let s = &execution;
         let calls = crate::model_stream::tool_calls(&message);
         if calls.is_empty() {
             {
-                task_frames::complete_round(s, w).await?;
                 // A main-task reply that contains a JavaScript block is the
                 // program: the host compiles and runs it, or returns the
                 // compile diagnostics to the same AI.
@@ -1652,7 +1633,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                     continue;
                 }
                 // A no-tool reply returns this function. Finish resumes the
-                // waiting caller/serial iterator without another model verdict.
+                // waiting caller without another model verdict.
                 if let Some((scope, frame)) = task_frames::finish(s, w, &message).await? {
                     *w = frame;
                     current.scope = scope;
@@ -1669,25 +1650,17 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
             "duplicate or missing tool call id"
         );
         let call_count = calls.len();
-        if call_count == 1 && calls[0].name == "create_task" {
-            let args: Value = serde_json::from_str(&calls[0].arguments)?;
-            ensure!(
-                args["program_task"].is_null()
-                    || w.program
-                        .as_ref()
-                        .and_then(|p| p.pending.as_ref())
-                        .is_some_and(|a| a.id == calls[0].call_id
-                            && matches!(
-                                a.kind,
-                                crate::agent_program::runtime::ActionKind::Task { .. }
-                                    | crate::agent_program::runtime::ActionKind::Call { .. }
-                            )),
-                "comment task descriptors must come from the compiled program"
-            );
-            ensure!(
-                w.program_task.is_none() || !args["program_task"].is_null(),
-                "use define_task_body and helper calls to refine the current task"
-            );
+        // Function frames are created only for the program's own pending call;
+        // anything else named create_task is an unavailable tool to the AI.
+        let program_call = w.program.as_ref().and_then(|p| p.pending.as_ref()).is_some_and(|a| {
+            a.id == calls[0].call_id
+                && matches!(
+                    a.kind,
+                    crate::agent_program::runtime::ActionKind::Task { .. }
+                        | crate::agent_program::runtime::ActionKind::Call { .. }
+                )
+        });
+        if call_count == 1 && calls[0].name == "create_task" && program_call {
             current.scope = task_frames::create_task(s, w, &calls[0], &node, step).await?;
             continue;
         }
@@ -1742,7 +1715,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                 let args:Value=serde_json::from_str(&call.arguments).context("invalid tool arguments JSON")?;
                 // Mode enforcement is independent of the model's advertised schema.
                 if !program_flow::internal_call(w,&call) {validate_tool(s,w,&definitions,&call.name)?;}
-                if crate::task_tree::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill"|"define_task_body") {
+                if crate::function_frames::is_tool(&call.name) || matches!(call.name.as_str(),"release_assets"|"read_skill"|"unload_skill"|"define_task_body") {
                     ensure!(call_count==1,"context-changing tools must be called alone so every read result reaches a subsequent AI request");
                 }
                 match call.name.as_str() {
@@ -1893,7 +1866,7 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
                         business_tool(s,&node,&name,read_args,&call.call_id).await
                     },
                     name => {
-                        ensure!(!crate::task_tree::is_tool(name),"task-changing tools must be called alone");
+                        ensure!(!crate::function_frames::is_tool(name),"task-changing tools must be called alone");
                         // A delegate's small write receipts are artifacts too: preserve
                         // their paths/versions even after its working window is gone.
                         if crate::context_assets::is_material_tool(name) || s.delegate_id().is_some() {material_source=Some((name.to_owned(),args.clone()));}
@@ -2040,9 +2013,6 @@ fn run_loop<'a, 'b: 'a>(s: &'a Session<'b>, w: &'a mut Window, max_rounds: usize
             crate::context_assets::release(&mut w.messages, &ids)?;
             save(s, w).await?;
         }
-        {
-            task_frames::complete_round(s, w).await?;
-        }
         // A leaf that outgrew its context throws to its coded caller, which
         // can split the work; nothing is compressed.
         if overflow {
@@ -2078,7 +2048,6 @@ pub(crate) async fn run_task(
     let mut s = Session {
         agent_id: None,
         task_node_id: None,
-        step_node_id: None,
         plugin: crate::plugin_sessions::owner(state.workspace.root(), &task)?,
         state: &state,
         task: &task,
@@ -2102,15 +2071,15 @@ pub(crate) async fn run_task(
         // What the agent knew before this turn: "rewind to before turn N" restores it.
         crate::rewind::snapshot(conn, &task_copy, turn, main.as_deref())?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut root = crate::task_tree::ensure_root(&tx, &task_copy, turn)?;
-        let active = if let Some(active) = crate::task_tree::active(&tx, &task_copy)? {
+        let mut root = crate::function_frames::ensure_root(&tx, &task_copy, turn)?;
+        let active = if let Some(active) = crate::function_frames::active(&tx, &task_copy)? {
             active
         } else {
             root.status = "running".into();
-            crate::task_tree::emit(&tx, &task_copy, "task/node_resumed", &mut root, turn)?;
+            crate::function_frames::emit(&tx, &task_copy, "task/node_resumed", &mut root, turn)?;
             root
         };
-        let scope = crate::task_tree::frame_scope(&active);
+        let scope = crate::function_frames::frame_scope(&active);
         let saved: Option<String> = tx
             .query_row(
                 "SELECT state FROM agent_runtime_windows WHERE task_id=?1 AND scope=?2",
@@ -2118,7 +2087,7 @@ pub(crate) async fn run_task(
                 |r| r.get(0),
             )
             .optional()?;
-        let at_top = active.node_id == crate::task_tree::ROOT;
+        let at_top = active.node_id == crate::function_frames::ROOT;
         let memory = if at_top {
             task_frames::memory_index(&tx, &task_copy, turn)?
         } else {
@@ -2254,7 +2223,7 @@ pub(crate) async fn run_task(
             let mut cleanup = s.clone();
             if let Some(id) = w.task_node_id.as_deref() {
                 if let Ok(conn) = agent_service::open_db(state.workspace.root()) {
-                    if let Ok(node) = crate::task_tree::get(&conn, &task, id) { cleanup.scope = crate::task_tree::frame_scope(&node); }
+                    if let Ok(node) = crate::function_frames::get(&conn, &task, id) { cleanup.scope = crate::function_frames::frame_scope(&node); }
                 }
             }
             program_flow::recover(&cleanup, &mut w).await?;
@@ -2283,9 +2252,9 @@ pub(crate) async fn run_task(
         .and_then(|id| {
             agent_service::open_db(state.workspace.root())
                 .ok()
-                .and_then(|conn| crate::task_tree::get(&conn, &task, id).ok())
+                .and_then(|conn| crate::function_frames::get(&conn, &task, id).ok())
         })
-        .map(|node| crate::task_tree::frame_scope(&node))
+        .map(|node| crate::function_frames::frame_scope(&node))
         .unwrap_or_else(|| "main".into());
     append(
         &terminal_session,
@@ -2381,7 +2350,7 @@ mod tests {
         let conn = agent_service::open_db(root.path()).unwrap();
         conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','test','fake','running',0,0)", []).unwrap();
         let cancel = CancellationToken::new();
-        let session = Session { agent_id:None, task_node_id:None, step_node_id:None, plugin:None, state:&state, task:"task", model:"fake", turn:1, cancel:&cancel, ban_execution:false, scope:"main".into(), parent:None, input_budget:INPUT_BUDGET };
+        let session = Session { agent_id:None, task_node_id:None, plugin:None, state:&state, task:"task", model:"fake", turn:1, cancel:&cancel, ban_execution:false, scope:"main".into(), parent:None, input_budget:INPUT_BUDGET };
         let (a,b) = tokio::join!(
             business_tool(&session,"node","write_file",json!({"path":"a.txt","content":"a"}),"a"),
             business_tool(&session,"node","write_file",json!({"path":"b.txt","content":"b"}),"b")
@@ -2411,7 +2380,6 @@ mod tests {
         let session = Session {
             agent_id: None,
             task_node_id: None,
-            step_node_id: None,
             plugin: None,
             state,
             task: "transport-test",
@@ -2960,8 +2928,8 @@ mod tests {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
-        let mut top = crate::task_tree::ensure_root(&tx, task, 1).unwrap();
-        let mut node = crate::task_tree::planned(
+        let mut top = crate::function_frames::ensure_root(&tx, task, 1).unwrap();
+        let mut node = crate::function_frames::planned(
             &top,
             &json!({"title":"Test task","goal":"Test task"}),
             0,
@@ -2969,23 +2937,10 @@ mod tests {
         )
         .unwrap();
         node.metadata = json!({"role":"main","turn":1});
-        let mut step =
-            crate::task_tree::planned(&node, &json!({"title":"Work","goal":"Work"}), 0, "step")
-                .unwrap();
-        step.status = "current".into();
-        let mut finish = crate::task_tree::planned(
-            &node,
-            &json!({"title":"Finish","goal":"Finish"}),
-            crate::task_tree::FINISH_ORDINAL,
-            "finish",
-        )
-        .unwrap();
-        crate::task_tree::emit(&tx, task, "task/node_planned", &mut finish, 1).unwrap();
         top.status = "suspended".into();
-        crate::task_tree::emit(&tx, task, "task/node_suspended", &mut top, 1).unwrap();
+        crate::function_frames::emit(&tx, task, "task/node_suspended", &mut top, 1).unwrap();
         node.status = "running".into();
-        crate::task_tree::emit(&tx, task, "task/node_started", &mut node, 1).unwrap();
-        crate::task_tree::emit(&tx, task, "task/node_started", &mut step, 1).unwrap();
+        crate::function_frames::emit(&tx, task, "task/node_started", &mut node, 1).unwrap();
         let window = Window {
             messages: vec![json!({"role":"system","content":MAIN_PROMPT})],
             task_node_id: Some(node.node_id.clone()),
@@ -3022,7 +2977,6 @@ mod tests {
         let mut s = Session {
             agent_id: None,
             task_node_id: None,
-            step_node_id: None,
             plugin: Some("ppt-master".into()),
             state: &state,
             task: "task",
@@ -3127,7 +3081,6 @@ mod tests {
         let session = Session {
             agent_id: None,
             task_node_id: None,
-            step_node_id: None,
             plugin: None,
             state: &state,
             task: "task",
@@ -3490,7 +3443,6 @@ mod tests {
         let session = Session {
             agent_id: None,
             task_node_id: None,
-            step_node_id: None,
             plugin: None,
             state: &state,
             task: "task",

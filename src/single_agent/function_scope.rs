@@ -49,6 +49,5 @@ pub(super) fn release_finished(window: &mut Window) {
         window.messages.push(answer);
     }
     window.scope_values.clear();
-    window.current_step_node_id = None;
     window.previous_node = None;
 }
