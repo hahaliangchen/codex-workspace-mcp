@@ -47,6 +47,8 @@ struct Compiler {
 }
 
 /// Global built-in functions that can be used as values, as in `.filter(Boolean)`.
+/// `console` methods: output for the AI that wrote the program to read.
+const CONSOLE_METHODS: [&str; 5] = ["log", "info", "warn", "error", "debug"];
 const NATIVE_GLOBALS: [&str; 7] = [
     "String", "Number", "Boolean", "parseInt", "parseFloat", "isNaN", "isFinite",
 ];
@@ -873,6 +875,8 @@ impl Compiler {
                             );
                         }
                     }
+                } else if namespace == "console" && self.global("console") && CONSOLE_METHODS.contains(&property) {
+                    Some(Expr::Native(format!("console.{property}")))
                 } else {
                     let name = format!("{namespace}.{property}");
                     (matches!(namespace, "Math" | "Number" | "Object" | "Array" | "JSON")
@@ -1591,6 +1595,20 @@ impl Compiler {
                     let args = self.lower(&array)?;
                     let dest = self.temp();
                     self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Apply { callee, args }));
+                    return Ok(Expr::Variable(dest));
+                }
+                // console output is a call into the runtime, which keeps it.
+                if let ast::Callee::Expr(target) = &call.callee
+                    && let Some(callee) = self.native_value(target)?
+                    && matches!(&callee, Expr::Native(name) if name.starts_with("console."))
+                {
+                    let mut args = Vec::new();
+                    for arg in &call.args {
+                        let value = self.lower(&arg.expr)?;
+                        args.push(self.snapshot(arg.span(), value));
+                    }
+                    let dest = self.temp();
+                    self.emit(call.span, Op::Effect(Some(dest.clone()), Effect::Dynamic { callee, args }));
                     return Ok(Expr::Variable(dest));
                 }
                 if let ast::Callee::Expr(target) = &call.callee

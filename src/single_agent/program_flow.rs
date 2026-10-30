@@ -555,10 +555,20 @@ fn turn_writes(s: &Session<'_>) -> Result<Vec<String>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(paths.into_iter().flatten().collect())
 }
+/// The program's latest console lines, short enough for an outcome.
+fn printed(w: &Window) -> Vec<String> {
+    const SHOWN: usize = 20;
+    let logs = w.program.as_ref().map(|program| program.logs()).unwrap_or_default();
+    let mut shown = logs.iter().rev().take(SHOWN).rev().cloned().collect::<Vec<_>>();
+    if logs.len() > SHOWN {
+        shown.insert(0, format!("（前面还有 {} 行）", logs.len() - SHOWN));
+    }
+    shown
+}
 /// How a turn's main program ended, in a few lines: what it returned or where
 /// it stopped, and the files it wrote. It is the turn's answer and what later
 /// turns see of it; the code itself stays in the conversation record.
-fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Result<String> {
+fn outcome(s: &Session<'_>, printed: &[String], ended: std::result::Result<&Value, &Value>) -> Result<String> {
     let clip = |text: &str, limit: usize| {
         if text.chars().count() > limit { format!("{}…", text.chars().take(limit).collect::<String>()) } else { text.to_owned() }
     };
@@ -591,6 +601,10 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
             vec![format!("程序在{at}出错停止：{}", clip(&message, 300)), "之后的步骤没有执行。".to_owned()]
         }
     };
+    // What the program printed reaches the AI that wrote it.
+    if !printed.is_empty() {
+        lines.push(format!("输出：\n{}", printed.join("\n")));
+    }
     let writes = turn_writes(s)?;
     if !writes.is_empty() {
         let shown = writes.iter().take(20).cloned().collect::<Vec<_>>().join("、");
@@ -602,8 +616,9 @@ fn outcome(s: &Session<'_>, ended: std::result::Result<&Value, &Value>) -> Resul
 /// Pause the main program for the user's new message; its outcome is the
 /// reply the message then follows, and the main AI decides what runs next.
 pub(super) async fn pause_main(s: &Session<'_>, w: &mut Window, step: usize) -> Result<()> {
+    let console = printed(w);
     let stopped_at = super::paused_programs::pause_main(s, w).await?;
-    let text = outcome(s, Err(&json!({"code":PAUSED,"stopped_at":stopped_at})))?;
+    let text = outcome(s, &console, Err(&json!({"code":PAUSED,"stopped_at":stopped_at})))?;
     end_program(s, w, step, Value::Null, text).await?;
     // The turn goes on: the main AI may answer the message with a new program.
     w.program_value = None;
@@ -613,7 +628,7 @@ async fn return_value(s: &Session<'_>, w: &mut Window, step: usize, value: Value
     let text = if w.program_task.is_some() {
         serde_json::to_string(&value)?
     } else {
-        outcome(s, Ok(&value))?
+        outcome(s, &printed(w), Ok(&value))?
     };
     end_program(s, w, step, value, text).await
 }
@@ -654,12 +669,14 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
             append(s, "program/error", json!({"error":error}), true).await?;
             // A question for the user is not a bug to fix: it rises unchanged.
             let waiting = error["code"] == WAITING;
+            // Read before the program is dropped below.
+            let console = printed(w);
             if !waiting && role(w) == Role::Implement && w.program_task.as_ref().is_some_and(|task| task["role"] == "implement") {
                 // AI-written code is not right every time: its author gets the
                 // error and what already ran, and rewrites it or gives up.
                 w.program = None;
                 let diagnostic = json!({"code":"FUNCTION_RUNTIME_ERROR","executed":true,"error":error,
-                    "completed_writes":completed_writes(s, w)?,
+                    "completed_writes":completed_writes(s, w)?,"console":console,
                     "instruction":"Your implementation stopped with this error. Reply with a corrected complete ```js block; it runs from its start, so do not redo the listed writes unless the contract needs them redone. If the contract cannot be met, reply with {\"$task_error\":{\"message\":\"concrete cause\"}} instead."});
                 let seq = append(s, "program/runtime_error", json!({"diagnostic":diagnostic}), false).await?;
                 w.messages.push(sourced(json!({"role":"user","name":"program_diagnostic","content":diagnostic.to_string()}), s.task, seq));
@@ -673,7 +690,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 // main AI gets the error and the files already written.
                 w.program = None;
                 let diagnostic = json!({"code":"PROGRAM_RUNTIME_ERROR","executed":true,"error":error,
-                    "completed_writes":turn_writes(s)?,
+                    "completed_writes":turn_writes(s)?,"console":console,
                     "instruction":"Your program stopped with this error. Reply with a corrected complete ```js block; it runs from its start, so do not redo the listed writes unless the task needs them redone. If the task cannot be done, tell the user why in plain text instead."});
                 let seq = append(s, "program/runtime_error", json!({"diagnostic":diagnostic,"turn":s.turn,"main":true}), false).await?;
                 w.messages.push(sourced(json!({"role":"user","name":"program_diagnostic","content":diagnostic.to_string()}), s.task, seq));
@@ -683,7 +700,7 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
                 // A question, or a program that keeps failing: its outcome ends
                 // the turn, so the next message starts fresh instead of
                 // resuming the failure.
-                let text = outcome(s, Err(&error))?;
+                let text = outcome(s, &console, Err(&error))?;
                 end_program(s, w, step, Value::Null, text).await
             }
         }
@@ -1734,5 +1751,26 @@ mod tests {
         let seen = seen.lock().unwrap().clone().expect("the implementation was asked for");
         assert!(seen.contains("closure") && seen.contains("Only summarize a"), "the AI sees the captured value: {seen}");
         assert_eq!(std::fs::read_to_string(root.path().join("out.txt")).unwrap(), "Only summarize a: a.txt");
+    }
+
+    #[tokio::test]
+    async fn console_output_reaches_the_ai_that_wrote_the_program() {
+        let root = TestRoot::new();
+        let healed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let log = healed.clone();
+        run_scripted(root.path(), move |body| {
+            let messages = body["messages"].to_string();
+            if messages.contains("PROGRAM_RUNTIME_ERROR") {
+                *log.lock().unwrap() = Some(messages);
+                reply("```js\nconsole.log(\"checked\", 2, \"files\");\nconsole.warn(\"b.txt is empty\");\n```".into())
+            } else {
+                reply("```js\nconsole.log(\"found\", {files: 2});\nthrow new Error(\"boom\");\n```".into())
+            }
+        }).await;
+        let healed = healed.lock().unwrap().clone().expect("the error came back to heal");
+        assert!(healed.contains("found {") && healed.contains("files"), "the diagnostic carries what it printed: {healed}");
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let answer: String = conn.query_row("SELECT json_extract(data,'$.message.content') FROM agent_task_events WHERE kind='assistant/message' ORDER BY seq DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(answer, "程序已完成。\n输出：\nchecked 2 files\n[warn] b.txt is empty");
     }
 }

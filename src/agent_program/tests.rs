@@ -2937,3 +2937,23 @@ function draft(y) {}
     let ActionKind::Call { captured, .. } = second.kind else { panic!("expected inner") };
     assert_eq!(captured["rules"], json!("RULES"));
 }
+
+#[test]
+fn console_prints_lines_for_the_ai_that_wrote_the_program() {
+    let source = r#"
+const files = [{path: "a.txt"}, {path: "b.txt"}];
+console.log("found", files.length, "files:", files);
+console.warn("b.txt is empty");
+const log = console.info;
+log({done: true}, null, undefined, "end");
+const result = console.error("x") === undefined;
+"#;
+    let mut run = runtime(source);
+    while !matches!(run.next(), State::Returned(_) | State::Failed(_)) {}
+    assert_eq!(run.logs(), [
+        r#"found 2 files: [{"path":"a.txt"},{"path":"b.txt"}]"#,
+        "[warn] b.txt is empty",
+        r#"{"done":true} null undefined end"#,
+        "[error] x",
+    ]);
+}

@@ -104,6 +104,9 @@ pub struct Runtime {
     active_async_batch: Vec<PendingAsyncAction>,
     #[serde(default)]
     inflight_async: BTreeMap<String, PendingAsyncAction>,
+    /// What the program printed with console, for the AI that wrote it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    logs: Vec<String>,
     pub finished: bool,
     pub result: Value,
     pub error: Option<Value>,
@@ -456,6 +459,7 @@ impl Runtime {
             active_reaction: None,
             active_async_batch: Vec::new(),
             inflight_async: BTreeMap::new(),
+            logs: Vec::new(),
             finished: false,
             result: Value::Null,
             error: None,
@@ -614,6 +618,38 @@ impl Runtime {
         Ok(())
     }
 
+    /// One line of console output, as Node prints it: strings as they are,
+    /// other values as JSON. Only the latest lines are kept.
+    fn print(&mut self, method: &str, args: &[VmValue]) -> Result<()> {
+        const KEPT: usize = 200;
+        const LINE: usize = 2_000;
+        let parts = args
+            .iter()
+            .map(|value| match value {
+                VmValue::Reference(_) => match self.heap.to_json(value) {
+                    Ok(json) => Ok(json.to_string()),
+                    Err(_) => super::js_value::to_string(&self.heap, value),
+                },
+                value => super::js_value::to_string(&self.heap, value),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut line = parts.join(" ");
+        if matches!(method, "warn" | "error") {
+            line = format!("[{method}] {line}");
+        }
+        if line.chars().count() > LINE {
+            line = format!("{}…", line.chars().take(LINE).collect::<String>());
+        }
+        self.logs.push(line);
+        if self.logs.len() > KEPT {
+            self.logs.remove(0);
+        }
+        Ok(())
+    }
+    /// What the program has printed with console so far.
+    pub fn logs(&self) -> &[String] {
+        &self.logs
+    }
     /// A virtual function's `@uses` variables, read now in the scope it closes
     /// over, as a JavaScript closure reads its free variables when it runs.
     fn captured(&self, function: &str, environment: Option<HeapId>) -> Result<BTreeMap<String, Value>> {
@@ -704,6 +740,11 @@ impl Runtime {
                 Ok(None)
             }
             HeapNode::Native(name) => {
+                if let Some(method) = name.strip_prefix("console.") {
+                    self.print(method, &args)?;
+                    self.store(destination, VmValue::Undefined)?;
+                    return Ok(None);
+                }
                 if let Some(tool) = name.strip_prefix("tool:") {
                     let mut args = json_args(args, &self.heap)?;
                     let args = if args.is_empty() { json!({}) } else { args.remove(0) };
