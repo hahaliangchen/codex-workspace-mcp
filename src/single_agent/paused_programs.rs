@@ -143,16 +143,10 @@ pub(super) async fn pause_main(s: &Session<'_>, w: &mut Window) -> Result<String
                 callee.metadata["caller"]["scope"] = json!(scope);
             }
         }
-        for mut member in chain(&nodes, &node.node_id) {
-            if member.node_id == node.node_id || !matches!(member.status.as_str(), "running" | "suspended") {
-                continue;
-            }
-            if member.status == "running" {
-                member.status = PAUSED.into();
-            }
-            member.metadata["parallel"] = json!(true);
-            tree::emit(&tx, &task, "task/node_paused", &mut member, turn)?;
+        for callee in nodes.iter().filter(|callee| callee.metadata["caller"]["task"] == node.node_id.as_str()) {
+            tree::emit(&tx, &task, "task/node_paused", &mut callee.clone(), turn)?;
         }
+        mark_paused(&tx, &task, &node.node_id, turn)?;
         let mut main = tree::get(&tx, &task, &main_id)?;
         if main.status != "running" {
             main.status = "running".into();
@@ -169,12 +163,29 @@ pub(super) async fn pause_main(s: &Session<'_>, w: &mut Window) -> Result<String
     Ok(stopped_at)
 }
 
-fn set_chain_status(tx: &rusqlite::Transaction<'_>, task: &str, root: &str, from: &str, to: &str, turn: usize) -> Result<()> {
-    let kind = if to == PAUSED { "task/node_paused" } else { "task/node_resumed" };
+/// Pause every frame under a paused program. They stopped at a safe point,
+/// with every finished step recorded, so they may later run on; a frame cut
+/// off any other way never does, since its last step may be unrecorded.
+fn mark_paused(tx: &rusqlite::Transaction<'_>, task: &str, root: &str, turn: usize) -> Result<()> {
     for mut member in chain(&tree::nodes(tx, task)?, root) {
-        if member.status == from {
-            member.status = to.into();
-            tree::emit(tx, task, kind, &mut member, turn)?;
+        if !matches!(member.status.as_str(), "running" | "suspended" | PAUSED) {
+            continue;
+        }
+        if member.status == "running" {
+            member.status = PAUSED.into();
+        }
+        // It runs beside the main AI, so it never counts as the task in view.
+        member.metadata["parallel"] = json!(true);
+        member.metadata["safe_stop"] = json!(true);
+        tree::emit(tx, task, "task/node_paused", &mut member, turn)?;
+    }
+    Ok(())
+}
+fn mark_resumed(tx: &rusqlite::Transaction<'_>, task: &str, root: &str, turn: usize) -> Result<()> {
+    for mut member in chain(&tree::nodes(tx, task)?, root) {
+        if member.status == PAUSED {
+            member.status = "running".into();
+            tree::emit(tx, task, "task/node_resumed", &mut member, turn)?;
         }
     }
     Ok(())
@@ -189,7 +200,7 @@ pub(super) async fn resume(s: &Session<'_>, w: &Window) -> Result<Option<(Value,
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let previous = load(&tx, &task, &scope)?.context("the paused program already finished or was discarded")?;
         let previous_id = previous.task_node_id.clone().context("paused program frame has no task")?;
-        set_chain_status(&tx, &task, &previous_id, PAUSED, "running", turn)?;
+        mark_resumed(&tx, &task, &previous_id, turn)?;
         // It continues where it stopped: in its innermost serial call.
         let nodes = tree::nodes(&tx, &task)?;
         let (mut at, mut frame) = (scope, previous);
@@ -216,7 +227,7 @@ pub(super) async fn resume(s: &Session<'_>, w: &Window) -> Result<Option<(Value,
     if matches!(result, Ok(LoopResult::Paused)) {
         db(s.state.workspace.root(), move |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            set_chain_status(&tx, &task, &previous_id, "running", PAUSED, turn)?;
+            mark_paused(&tx, &task, &previous_id, turn)?;
             tx.commit()?;
             Ok(())
         })
@@ -289,24 +300,29 @@ pub(super) async fn discard_unresumed(s: &Session<'_>, w: &mut Window) -> Result
 }
 
 /// Concurrent calls of a resumed program that paused with it, each from its
-/// innermost frame, to run again.
+/// innermost frame, to run again. Only a pause's safe stop qualifies, once.
 pub(super) fn paused_calls(s: &Session<'_>, w: &Window) -> Result<Vec<(String, Window)>> {
     let Some(runtime) = w.program.as_ref() else { return Ok(Vec::new()) };
-    let conn = agent_service::open_db(s.state.workspace.root())?;
-    let nodes = tree::nodes(&conn, s.task)?;
+    let mut conn = agent_service::open_db(s.state.workspace.root())?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let nodes = tree::nodes(&tx, s.task)?;
     let mut calls = Vec::new();
     for action in runtime.inflight_actions() {
-        let Some(node) = callee(&nodes, &action.id) else { continue };
+        let Some(node) = callee(&nodes, &action.id).filter(|node| node.metadata["safe_stop"] == true) else { continue };
         let mut at = tree::frame_scope(node);
-        let Some(mut frame) = load(&conn, s.task, &at)? else { continue };
+        let Some(mut frame) = load(&tx, s.task, &at)? else { continue };
+        let mut started = node.clone();
+        started.metadata["safe_stop"] = json!(false);
+        tree::emit(&tx, s.task, "task/node_resumed", &mut started, s.turn)?;
         while let Some(action) = frame.program.as_ref().and_then(|program| program.pending.clone())
             && let Some(node) = callee(&nodes, &action.id)
-            && let Some(child) = load(&conn, s.task, &tree::frame_scope(node))?
+            && let Some(child) = load(&tx, s.task, &tree::frame_scope(node))?
         {
             at = tree::frame_scope(node);
             frame = child;
         }
         calls.push((at, frame));
     }
+    tx.commit()?;
     Ok(calls)
 }

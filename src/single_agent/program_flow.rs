@@ -711,9 +711,13 @@ pub(super) async fn next(s: &Session<'_>, w: &mut Window, step: usize) -> Result
             }
             let definitions = super::tools(s, w);
             let done = super::execute_call(s, w, &definitions, &node, step, &call, 1, Some(&at)).await?;
-            w.resumed = None;
             super::stop_on_conflict(s, &done.result).await?;
-            resolve(s, w, &action, done.result, done.is_error, done.seq)?;
+            // A resumed program's error rises as it was, so a question keeps its code.
+            let (result, is_error) = match w.resumed.take() {
+                Some((error, true)) => (error, true),
+                _ => (done.result, done.is_error),
+            };
+            resolve(s, w, &action, result, is_error, done.seq)?;
             save(s, w).await?;
             Ok(Round::Continue)
         }
@@ -1566,5 +1570,65 @@ mod tests {
         assert_eq!(lines.iter().filter(|line| line.starts_with("程序被你的新消息暂停")).count(), 2, "{lines:?}");
         assert!(lines.iter().any(|line| line.starts_with("程序被你的新消息暂停，停在 第 3 行 previous.resume() → 第 2 行 summarize([\"a.txt\",\"b.txt\"]) → 第 3 行 judge([\"a.txt\",\"b.txt\"])（AI 处理中），这一步还没完成。")), "the second pause is in the new program: {lines:?}");
         assert_eq!(paused_nodes(&conn), 0);
+    }
+
+    #[tokio::test]
+    async fn a_question_asked_after_resuming_reaches_the_user() {
+        let root = TestRoot::new();
+        let path = root.path().to_owned();
+        let leaf = Arc::new(AtomicUsize::new(0));
+        let leaf_rounds = leaf.clone();
+        run_scripted(root.path(), move |body| match role_of(body).as_str() {
+            "main" if body["messages"].to_string().contains("程序被你的新消息暂停") =>
+                reply("```js\nimport * as previous from \"host:previous/promises\";\nawait previous.resume();\n```".into()),
+            "main" => reply(TWO_LEVEL_MAIN.into()),
+            "implement" => reply("```js\nasync function summarize(paths) {\n  return judge(paths);\n}\n/** @virtual */\nfunction judge(paths) {\n  // Decide which files to keep. Returns {summary:string}.\n}\n```".into()),
+            _ => match leaf_rounds.fetch_add(1, Ordering::SeqCst) {
+                0 => { crate::interjections::submit(&path, "task", "Carry on").unwrap(); find_call() }
+                _ => json!({"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":null,
+                    "tool_calls":[{"id":"ask","type":"function","function":{"name":ASK,"arguments":json!({"question":"Keep both files?"}).to_string()}}]}}]}),
+            },
+        }).await;
+        let conn = agent_service::open_db(root.path()).unwrap();
+        let lines = program_lines(&conn);
+        assert_eq!(lines.last().unwrap(), "程序在 judge 停下，等你回答：Keep both files?\n之后的步骤没有执行。", "{lines:?}");
+        assert!(!root.path().join("out.txt").exists());
+        assert_eq!(paused_nodes(&conn), 0);
+    }
+
+    #[tokio::test]
+    async fn calls_cut_off_by_a_crash_are_not_run_again() {
+        let root = TestRoot::new();
+        let leaf = Arc::new(AtomicUsize::new(0));
+        let leaf_requests = leaf.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+            let leaf_requests = leaf_requests.clone();
+            async move {
+                Json(match role_of(&body).as_str() {
+                    "main" if body["messages"].to_string().contains("出错停止") => reply("Noted.".into()),
+                    "main" => reply("```js\nconst kept = await Promise.all([judge(\"a.txt\"), judge(\"b.txt\")]);\n\n/** @virtual */\nasync function judge(path) {\n  // Decide whether to keep the file at path. Returns {keep:boolean}.\n}\n```".into()),
+                    "implement" => reply("```js\nasync function judge(path) {\n  return decide(path);\n}\n/** @virtual */\nfunction decide(path) {\n  // Decide whether to keep the file. Returns {keep:boolean}.\n}\n```".into()),
+                    _ => {
+                        // The process dies while the leaves wait for the model.
+                        leaf_requests.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        reply(json!({"keep":true}).to_string())
+                    }
+                })
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = agent_service::tests::test_state(root.path(), listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let conn = agent_service::open_db(root.path()).unwrap();
+        conn.execute("INSERT INTO agent_tasks(id,prompt,model,status,created_at,updated_at) VALUES ('task','','fake','running',0,0)", []).unwrap();
+        let cut = tokio::time::timeout(Duration::from_secs(2), run_task(state.clone(), "task".into(), "fake".into(), "Judge a and b".into(), 20, CancellationToken::new(), 1, false)).await;
+        assert!(cut.is_err(), "the first turn was cut off");
+        assert_eq!(leaf.load(Ordering::SeqCst), 2);
+        run_task(state, "task".into(), "fake".into(), "Go on".into(), 20, CancellationToken::new(), 2, false).await.unwrap();
+        server.abort();
+        assert_eq!(leaf.load(Ordering::SeqCst), 2, "a call cut off mid-step is not run again");
+        let lines = program_lines(&conn);
+        assert!(lines.last().is_some_and(|line| line.contains("出错停止")), "{lines:?}");
     }
 }
