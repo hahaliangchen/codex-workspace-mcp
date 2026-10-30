@@ -251,3 +251,47 @@ async fn real_model_user_message_pauses_the_program() -> Result<()> {
     ensure!(root.join("faq.html").is_file(),"the main AI did not handle the message");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_makes_a_five_slide_deck_on_its_own() -> Result<()> {
+    let (root,state,model)=real_low_effort("deck-real")?;
+    std::fs::create_dir_all(root.join("docs"))?;
+    std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-design-guide.md"),root.join("docs/agent-design-guide.md"))?;
+    eprintln!("REAL_DECK_START model={model} root={}",root.display());
+    // What a user would type: no program, no file names.
+    let prompt="根据 docs/agent-design-guide.md，做一套 5 页的 HTML，讲这个 Agent 的设计，PPT 风格。";
+    let started=std::time::Instant::now();
+    let cancel=CancellationToken::new();
+    let result=tokio::time::timeout(Duration::from_secs(1200),run_task(state,"example".into(),model,prompt.into(),120,cancel.clone(),1,false)).await;
+    if result.is_err(){cancel.cancel();}
+    let conn=agent_service::open_db(&root)?;
+    let status:String=conn.query_row("SELECT status FROM agent_tasks WHERE id='example'",[],|row|row.get(0))?;
+    let requests:i64=conn.query_row("SELECT count(*) FROM agent_request_contexts WHERE task_id='example'",[],|row|row.get(0))?;
+    let mut pages=Vec::new();
+    for entry in walkdir_html(&root)? { pages.push(entry); }
+    eprintln!("REAL_DECK_DONE seconds={:.0} status={status} model_requests={requests} pages={pages:?} outcomes={:?} answer={:?}",
+        started.elapsed().as_secs_f64(),program_outcomes(&root)?.iter().filter(|text| text.starts_with("程序")).collect::<Vec<_>>(),last_answer(&root).ok());
+    result.context("deck task timed out")??;
+    ensure!(status=="completed","deck task status: {status}");
+    // Five pages may be five files or one deck of five slides.
+    let slides=pages.iter().map(|page|std::fs::read_to_string(root.join(page)).map(|html|html.matches("<section").count())).sum::<std::io::Result<usize>>()?;
+    ensure!(pages.len()>=5 || slides>=5,"expected 5 pages: {pages:?}, {slides} sections");
+    Ok(())
+}
+
+fn walkdir_html(root: &Path) -> Result<Vec<String>> {
+    let mut found=Vec::new();
+    let mut dirs=vec![root.to_owned()];
+    while let Some(dir)=dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path=entry?.path();
+            let name=path.file_name().and_then(|n|n.to_str()).unwrap_or("");
+            if name.starts_with('.') { continue; }
+            if path.is_dir() { dirs.push(path); }
+            else if name.ends_with(".html") { found.push(path.strip_prefix(root)?.display().to_string()); }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
