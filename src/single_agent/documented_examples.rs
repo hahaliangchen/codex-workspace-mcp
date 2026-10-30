@@ -264,13 +264,19 @@ async fn real_model_makes_a_twenty_slide_deck_on_its_own() -> Result<()> {
     real_deck(20, 2400).await
 }
 
+#[tokio::test]
+#[ignore = "real configured model, isolated workspace, consumes provider tokens"]
+async fn real_model_makes_a_fifty_slide_deck_on_its_own() -> Result<()> {
+    real_deck(50, 3600).await
+}
+
 /// What a user would type, with no program: a deck of separate linked pages.
 async fn real_deck(count: usize, seconds: u64) -> Result<()> {
     let (root,state,model)=real_low_effort(&format!("deck{count}-real"))?;
     std::fs::create_dir_all(root.join("docs"))?;
     std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/agent-design-guide.md"),root.join("docs/agent-design-guide.md"))?;
     eprintln!("REAL_DECK_START pages={count} model={model} root={}",root.display());
-    let prompt=format!("根据 docs/agent-design-guide.md，做 {count} 个单独的 HTML 文件，每个文件一页，讲这个 Agent 的设计，PPT 风格。页面之间能前后翻页（按钮和左右方向键都行）；{count} 页版式统一；幻灯片在窗口里居中，窗口大小变化时内容不重叠、不被遮挡。");
+    let prompt=format!("根据 docs/agent-design-guide.md，做 {count} 个单独的 HTML 文件，每个文件一页，把这个 Agent 的设计完整讲清楚，PPT 风格。页面之间能前后翻页（按钮和左右方向键都行）；{count} 页版式统一；幻灯片在窗口里居中，窗口大小变化时内容不重叠、不被遮挡。");
     let started=std::time::Instant::now();
     let cancel=CancellationToken::new();
     let result=tokio::time::timeout(Duration::from_secs(seconds),run_task(state,"example".into(),model,prompt,400,cancel.clone(),1,false)).await;
